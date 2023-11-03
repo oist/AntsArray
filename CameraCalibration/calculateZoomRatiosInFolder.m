@@ -31,7 +31,7 @@ end
 
 function isTarget = isTargetFile(fileName)
     % Define the pattern for target files: 8 digits followed by .png
-    pattern = '^\d{8}\.png$';
+    pattern = '^\d{8}[*]*\.png$';
     isTarget = ~isempty(regexp(fileName, pattern, 'once'));
 end
 
@@ -52,7 +52,7 @@ function zoomRatio = calculateImageZoomRatio(imagePath)
     [B, ~] = bwboundaries(edges, 'noholes');
     
     % Calculate the bounding box of the largest contour
-    [x, y, w, h] = boundingBox(B);
+    [~, ~, w, h] = boundingBox(B);
     
     % Known physical size of the lattice in millimeters
     realSizeMm = 10; % mm
