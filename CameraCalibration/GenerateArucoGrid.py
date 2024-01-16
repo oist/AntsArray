@@ -11,10 +11,10 @@ def create_aruco_marker(marker_id, marker_size, aruco_dict_type=cv2.aruco.DICT_5
     return marker_image
 
 # Grid parameters
-markers_x = 29  # Number of markers in the x direction
-markers_y = 41  # Number of markers in the y direction
-marker_size = 7  # Size of the marker in pixels
-spacing = 4 * marker_size     # Spacing between markers in pixels
+markers_x = 29 * 4 # Number of markers in the x direction
+markers_y = 41 * 4 # Number of markers in the y direction
+marker_size = 8  # Size of the marker in pixels
+spacing = 1 * marker_size     # Spacing between markers in pixels
 
 # Create a blank image for the grid
 grid_width = markers_x * (marker_size + spacing)
