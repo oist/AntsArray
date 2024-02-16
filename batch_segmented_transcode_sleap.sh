@@ -12,6 +12,7 @@ fi
 # Directory containing .avi files
 DIR="$1"
 
+emailurl=makoto.hiroi@oist.jp
 base_folder=$(basename "$DIR")
 output_folder=/flash/ReiterU/ant_tmp/${base_folder}
 deigo_folder=/deigo_flash/ReiterU/ant_tmp/${base_folder}
@@ -39,10 +40,10 @@ do
 #SBATCH --output=./output/jobs/%x_%j.out
 #SBATCH --error=./output/jobs/%x_%j.err
 #SBATCH --mail-type=FAIL
-#SBATCH --mail-user=makoto.hiroi@oist.jp
+#SBATCH --mail-user=$emailurl
 
 # Use exiftool to get the frame count and fps, filtering the output
-FRAME_COUNT=\$(exiftool "${video_file}" | grep 'Video Frame Count' | awk -F': ' '{print \$2}' | tr -d ' ')
+FRAME_COUNT=\$(ffprobe -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of default=nokey=1:noprint_wrappers=1 ${video_file})
 FPS=\$(exiftool "${video_file}" | grep 'Video Frame Rate' | awk -F': ' '{print \$2}' | tr -d ' ')
 echo "FPS: \${FPS}"
 echo "FRAME_COUNT: \${FRAME_COUNT}"
@@ -159,6 +160,7 @@ while IFS=, read -r line; do
 #SBATCH --output=./output/jobs/%x_%j.out
 #SBATCH --error=./output/jobs/%x_%j.err
 #SBATCH --mail-type=END,FAIL
+#SBATCH --mail-user=$emailurl
 
 ml use /apps/unit/ReiterU/.modulefiles
 ml load sleap
