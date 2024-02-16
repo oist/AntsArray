@@ -12,7 +12,10 @@ fi
 # Directory containing .avi files
 DIR="$1"
 
+# Email address for job notifications
 emailurl=makoto.hiroi@oist.jp
+
+# Create the output folder and set the environment variables
 base_folder=$(basename "$DIR")
 output_folder=/flash/ReiterU/ant_tmp/${base_folder}
 deigo_folder=/deigo_flash/ReiterU/ant_tmp/${base_folder}
