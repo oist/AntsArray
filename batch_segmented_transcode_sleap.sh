@@ -114,7 +114,55 @@ EOF
 #SBATCH --output=./output/jobs/%x_%j.out
 #SBATCH --error=./output/jobs/%x_%j.err
 
+# Submit the job to the Saion system
 ssh saion sbatch "${deigo_folder}/job3-$video_name.sh"
+
+# This wrapper script will count the number of files you want to process, apply a maximum cap if necessary, and then submit the job to SLURM with the appropriate --array parameter.
+# Path to the text file containing the file names
+FILE_LIST=${output_folder}/${video_name}_frame_counts.csv
+
+# Count the number of non-empty lines in the file
+NUM_FILES=$(grep -cve '^\s*$' "$FILE_LIST")
+
+# Define the maximum cap for the array jobs
+MAX_CAP=100
+
+# Submit job5 to deigo with the calculated array size
+sbatch --array=1-\$NUM_FILES%MAX_CAP ${output_folder}/job5-$video_name.sh
+EOF
+
+    # Create a chain job script on the Deigo system (run_aruco.py)
+    cat > "${output_folder}/job5-$video_name.sh" <<EOF
+#!/bin/bash -l
+#SBATCH -t 0-24
+#SBATCH -c 32
+#SBATCH --partition=compute
+#SBATCH --mem=0
+#SBATCH --job-name=aruco-${video_name}
+#SBATCH --array=1-10
+#SBATCH --output=./output/jobs/%x_%A_%a.out
+#SBATCH --error=./output/jobs/%x_%A_%a.err
+#SBATCH --mail-type=FAIL
+#SBATCH --mail-user=$emailurl
+
+# Load the required modules
+ml use /apps/unit/ReiterU/.modulefiles
+ml load opencv/4.9.0
+
+# Read the first column from the CSV into an array
+mapfile -t video_files < <(cut -d',' -f1 "${output_folder}/${video_name}_frame_counts.csv")
+
+# Calculate the array index
+index=$(($SLURM_ARRAY_TASK_ID - 1))
+
+# Execute the Python script for the current video file
+python /apps/unit/ReiterU/ant_tracking/run_aruco.py --video-file ${output_folder}/\${video_files[\$index]}.avi --output-path $output_folder
+
+# Transfer the output file to the Saion system
+scp $output_folder/\${video_files[\$index]}.aviaruco_tracks_.npy saion:/work/ReiterU/ant_tmp/${base_folder}/
+rm $output_folder/\${video_files[\$index]}.aviaruco_tracks_.npy
+
+echo "Processed: \${video_files[\$index]}.avi"
 EOF
 
     # Create the follow-up job script on the Saion system
@@ -146,7 +194,7 @@ while IFS=, read -r line; do
     echo "frames: \${frames}"
 
     # Check if the segmented file base name matches the pattern ***_NNN
-    if [[ \${segmented_file_base} =~ ^\${BASE_NAME}_[0-9]{3}$ ]]; then
+    if [[ \${segmented_file_base} =~ ^\${BASE_NAME}_[0-9]{3}\$ ]]; then
 
 		# Dynamically create a job4 script for the current segmented file
 		cat > "/work/ReiterU/ant_tmp/${base_folder}/job4-\${segmented_file_base}.sh" <<EOJ
@@ -184,7 +232,6 @@ matlab -nosplash -nodisplay -nojvm -nodesktop -r "addpath('/apps/unit/ReiterU/ma
 
 # Delete video files on flash
 # ssh deigo rm -rf ${output_folder}/\${segmented_file_base}.avi
-
 EOJ
 
 		# Submit the job4 script
