@@ -125,17 +125,13 @@ ssh saion sbatch "${deigo_folder}/job3-$video_name.sh"
 FILE_LIST=${output_folder}/${video_name}_frame_counts.csv
 
 # Count the number of non-empty lines in the file
-NUM_FILES=$(grep -cve '^\s*$' "$FILE_LIST")
+NUM_FILES=\$(grep -cve '^\s*\$' "\${FILE_LIST}")
 
 # Define the maximum cap for the array jobs
 MAX_CAP=100
 
-# Submit job5 to deigo with the calculated array size
-sbatch --array=1-\$NUM_FILES%MAX_CAP ${output_folder}/job5-$video_name.sh
-EOF
-
-    # Create a chain job script on the Deigo system (run_aruco.py)
-    cat > "${output_folder}/job5-$video_name.sh" <<EOF
+# Create a chain job script (job5) on the Deigo system (run_aruco.py)
+cat > "${output_folder}/job5-$video_name.sh" <<EOJ
 #!/bin/bash -l
 #SBATCH -t 0-24
 #SBATCH -c 32
@@ -156,16 +152,24 @@ ml load opencv/4.9.0
 mapfile -t video_files < <(cut -d',' -f1 "${output_folder}/${video_name}_frame_counts.csv")
 
 # Calculate the array index
-index=$(($SLURM_ARRAY_TASK_ID - 1))
+index=\$((\$SLURM_ARRAY_TASK_ID - 1))
 
 # Execute the Python script for the current video file
-python /apps/unit/ReiterU/ant_tracking/run_aruco.py --video-file ${output_folder}/\${video_files[\$index]}.avi --output-path $output_folder
+python /apps/unit/ReiterU/ant_tracking/run_aruco.py --video-file ${output_folder}/\${video_files[\$index]}.avi --output-path ${output_folder}/
 
 # Transfer the output file to the Saion system
 scp $output_folder/\${video_files[\$index]}.aviaruco_tracks_.npy saion:/work/ReiterU/ant_tmp/${base_folder}/
 rm $output_folder/\${video_files[\$index]}.aviaruco_tracks_.npy
 
 echo "Processed: \${video_files[\$index]}.avi"
+EOJ
+
+# Submit job5 to deigo with the calculated array size
+if [ "\$NUM_FILES" -gt 1 ]; then
+  sbatch --array=1-\$NUM_FILES%\$MAX_CAP ${output_folder}/job5-$video_name.sh
+else
+  sbatch --array=1 ${output_folder}/job5-$video_name.sh
+fi
 EOF
 
     # Create the follow-up job script on the Saion system
@@ -202,7 +206,7 @@ while IFS=, read -r line; do
 		# Dynamically create a job4 script for the current segmented file
 		cat > "/work/ReiterU/ant_tmp/${base_folder}/job4-\${segmented_file_base}.sh" <<EOJ
 #!/bin/bash -l
-#SBATCH -t 0-72
+#SBATCH -t 0-48
 #SBATCH -c 8
 #SBATCH --partition=gpu
 #SBATCH --mem=128G
@@ -253,3 +257,4 @@ EOF
     sbatch --dependency=afterok:$jobid "${job2_path}"
   fi
 done
+
