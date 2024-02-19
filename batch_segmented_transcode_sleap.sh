@@ -1,24 +1,49 @@
 #!/bin/bash -l
 
-# Check if the directory is passed as an argument
-if [ "$#" -ne 1 ]; then
-    echo "Error: No directory provided."
-    echo "Usage: $0 <directory>"
-    echo "Please provide the path to the directory as an argument when running this script."
-    echo "For example: $0 /path/to/your/directory_containing_videos"
+# Initialize variables
+DIR=""
+SAION_NODE="gpu" # Default value
+
+# Function to display usage
+usage() {
+    echo "Usage: $0 --dir <directory> [--node <node>]"
+    echo "  --dir  Specify the directory path containing .avi files."
+    echo "  --node Specify the node name (optional). Default is 'gpu'."
     exit 1
+}
+
+# Parse command line arguments
+while [[ "$#" -gt 0 ]]; do
+    case $1 in
+        --dir) DIR="$2"; shift ;; # Shift twice to skip argument
+        --node) SAION_NODE="$2"; shift ;;
+        *) usage ;; # Display usage for unrecognized options
+    esac
+    shift # Move to next argument
+done
+
+# Check if the directory path is not empty
+if [[ -z "$DIR" ]]; then
+    echo "Error: No directory provided."
+    usage
 fi
 
-# Directory containing .avi files
-DIR="$1"
+# Your script logic here
+echo "Directory: $DIR"
+echo "Node: $SAION_NODE"
 
 # Email address for job notifications
 emailurl=makoto.hiroi@oist.jp
 
 # Create the output folder and set the environment variables
 base_folder=$(basename "$DIR")
+data_folder=$DIR/data
 output_folder=/flash/ReiterU/ant_tmp/${base_folder}
 deigo_folder=/deigo_flash/ReiterU/ant_tmp/${base_folder}
+sleap_model1=/bucket/ReiterU/Ants/SLEAP_files/topdown/IR/231223_113827.centroid.n=82/training_config.json
+sleap_model2=/bucket/ReiterU/Ants/SLEAP_files/topdown/IR/231223_142806.centered_instance.n=82/training_config.json
+
+mkdir -p $data_folder
 mkdir -p $output_folder
 export output_folder
 export deigo_folder
@@ -209,9 +234,9 @@ while IFS=, read -r line; do
 #!/bin/bash -l
 #SBATCH -t 0-48
 #SBATCH -c 8
-#SBATCH --partition=gpu
+#SBATCH --partition=$SAION_NODE
 #SBATCH --mem=128G
-#SBATCH --gres=gpu:V100:1
+#SBATCH --gres=gpu:1
 #SBATCH --job-name=process-\${segmented_file_base}
 #SBATCH --output=./output/jobs/%x_%j.out
 #SBATCH --error=./output/jobs/%x_%j.err
@@ -227,8 +252,8 @@ echo "Processing \${segmented_file_base} with \${frames} frames."
 total_frames=\${frames}
 
 sleap-track ${deigo_folder}/\${segmented_file_base}.avi --batch_size 1 --frames 0-\$((\${frames} - 1)) \
--m /bucket/ReiterU/Ants/SLEAP_files/topdown/IR/231223_113827.centroid.n=82/training_config.json \
--m /bucket/ReiterU/Ants/SLEAP_files/topdown/IR/231223_142806.centered_instance.n=82/training_config.json \
+-m ${sleap_model1} \
+-m ${sleap_model2} \
 --tracking.tracker none \
 -o /work/ReiterU/ant_tmp/${base_folder}/\${segmented_file_base}.slp --verbosity json --no-empty-frames
 
@@ -242,8 +267,8 @@ matlab -nosplash -nodisplay -nojvm -nodesktop -r "addpath('/apps/unit/ReiterU/ma
 # ssh deigo rm -rf ${output_folder}/\${segmented_file_base}.avi
 EOJ
 
-			# Submit the job4 script
-			sbatch "/work/ReiterU/ant_tmp/${base_folder}/job4-\${segmented_file_base}.sh"
+		# Submit the job4 script
+		sbatch "/work/ReiterU/ant_tmp/${base_folder}/job4-\${segmented_file_base}.sh"
     fi
 done < "${deigo_folder}/${video_name}_frame_counts.csv"
 EOF
@@ -256,6 +281,52 @@ EOF
     # Submit the second job with a dependency on the first job
     job2_path="${output_folder}/job2-$video_name.sh"
     sbatch --dependency=afterok:$jobid "${job2_path}"
+	
+	# Create file monitoring job
+	cat > "${data_folder}/monitor-$video_name.sh" <<EOF
+#!/bin/bash -l
+#SBATCH -t 0-48
+#SBATCH -c 1
+#SBATCH --partition=compute
+#SBATCH --mem=0
+#SBATCH --job-name=monitor-${video_name}
+#SBATCH --output=./output/jobs/%x_%j.out
+#SBATCH --error=./output/jobs/%x_%j.err
+#SBATCH --mail-type=END,FAIL
+#SBATCH --mail-user=$emailurl
+
+monitor_dir=/saion_work/ReiterU/ant_tmp/$basename/ # Directory to monitor
+TARGET_DIR=$data_folder # Directory to move files to
+INTERVAL=30 # How often to check the directory (in seconds)
+
+while true; do
+	# Loop through each .csv file in the directory
+	for csv_file in "${monitor_dir}"/*.csv; do
+		# Skip if no .csv files are found
+		[ -e "\$csv_file" ] || continue
+
+		# Extract the filename without the extension
+		filename=\$(basename "\$csv_file" .csv)
+
+		# Define the companion file
+		companion_file="${monitor_dir}/\${filename}.aviaruco_tracks_.npy"
+
+		# Check if both files exist
+		if [ -f "\$csv_file" ] && [ -f "\$companion_file" ]; then
+			echo "Both files for \$filename found."
+
+			# Move all files starting with \${filename} to the target directory
+			ssh saion mv "/work/ReiterU/ant_tmp/$basename/\${filename}"* "$TARGET_DIR"/
+			echo "Moved files starting with \${filename} to $TARGET_DIR on saion"
+			
+			mv "${output_folder}/\${filename}"* "$TARGET_DIR"/
+			echo "Moved files starting with \${filename} to $TARGET_DIR on deigo"
+		done
+	sleep $INTERVAL
+done
+EOF
+	# Submit the monitoring job
+	sbatch ${data_folder}/monitor-$video_name.sh
   fi
 done
 
