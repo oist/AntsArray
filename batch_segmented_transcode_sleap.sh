@@ -27,7 +27,7 @@ export deigo_folder
 for video_file in ${DIR}*.avi
 do
   # Check if the file name ends with '_renc.avi' or '_nvenc.avi'
-  if [[ ! $video_file =~ _renc\.avi$ ]] && [[ ! $video_file =~ _nvenc\.avi$ ]]; then
+  if [[ ! $video_file =~ ^\. ]] && [[ ! $video_file =~ _renc\.avi$ ]] && [[ ! $video_file =~ _nvenc\.avi$ ]]; then
   
     # Extract the base name of the file for job naming
     video_name=$(basename "$video_file" .avi)
@@ -152,16 +152,17 @@ ml load opencv/4.9.0
 mapfile -t video_files < <(cut -d',' -f1 "${output_folder}/${video_name}_frame_counts.csv")
 
 # Calculate the array index
-index=\$((\$SLURM_ARRAY_TASK_ID - 1))
+index=\\\$((\\\${SLURM_ARRAY_TASK_ID} - 1))
+echo "SLURM_ARRAY_TASK_ID: \\\${SLURM_ARRAY_TASK_ID}"
 
 # Execute the Python script for the current video file
-python /apps/unit/ReiterU/ant_tracking/run_aruco.py --video-file ${output_folder}/\${video_files[\$index]}.avi --output-path ${output_folder}/
+python /apps/unit/ReiterU/ant_tracking/run_aruco.py --video-file ${output_folder}/\\\${video_files[\\\$index]} --output-path ${output_folder}/
 
 # Transfer the output file to the Saion system
-scp $output_folder/\${video_files[\$index]}.aviaruco_tracks_.npy saion:/work/ReiterU/ant_tmp/${base_folder}/
-rm $output_folder/\${video_files[\$index]}.aviaruco_tracks_.npy
+scp $output_folder/\\\${video_files[\\\$index]}aruco_tracks_.npy saion:/work/ReiterU/ant_tmp/${base_folder}/
+rm $output_folder/\\\${video_files[\\\$index]}aruco_tracks_.npy
 
-echo "Processed: \${video_files[\$index]}.avi"
+echo "Processed: \\\${video_files[\\\$index]}"
 EOJ
 
 # Submit job5 to deigo with the calculated array size
@@ -241,7 +242,7 @@ matlab -nosplash -nodisplay -nojvm -nodesktop -r "addpath('/apps/unit/ReiterU/ma
 # ssh deigo rm -rf ${output_folder}/\${segmented_file_base}.avi
 EOJ
 
-		# Submit the job4 script
+			# Submit the job4 script
 			sbatch "/work/ReiterU/ant_tmp/${base_folder}/job4-\${segmented_file_base}.sh"
     fi
 done < "${deigo_folder}/${video_name}_frame_counts.csv"
