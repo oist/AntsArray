@@ -370,15 +370,18 @@ done
 EOF
 
     # Submit the first job and get its job ID
-    job1_path="${output_folder}/job1-$video_name.sh"
-    jobstring=$(sbatch "${job1_path}")
-    jobid=${jobstring##* }
+	job1_path="${output_folder}/job1-$video_name.sh"
+	jobstring=$(sbatch "${job1_path}")
+	job1_id=${jobstring##* }
 
-    # Submit the second job with a dependency on job1
-    job2_path="${output_folder}/job2-$video_name.sh"
-    sbatch --dependency=afterok:$jobid "${job2_path}"
-	
-	# Submit the monitoring job with a dependency on job1
-	sbatch --dependency=afterok:$jobid "${data_folder}/monitor-$video_name.sh"
+	# Submit the second job with a dependency on job1
+	job2_path="${output_folder}/job2-$video_name.sh"
+	job2_string=$(sbatch --dependency=afterok:$job1_id "${job2_path}")
+	job2_id=${job2_string##* }
+
+	# Submit the monitoring job with a dependency on job2
+	monitor_path="${data_folder}/monitor-$video_name.sh"
+	sbatch --dependency=afterok:$job2_id "${monitor_path}"
+
   fi
 done
