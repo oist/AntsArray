@@ -282,6 +282,7 @@ EOF
     job2_path="${output_folder}/job2-$video_name.sh"
     sbatch --dependency=afterok:$jobid "${job2_path}"
   fi
+done
 
 # Create a folder monitoring job
 cat > "${data_folder}/monitor-$base_folder.sh" <<EOF
@@ -329,5 +330,3 @@ EOF
 
 # Submit the monitoring job
 sbatch ${data_folder}/monitor-$base_folder.sh
-done
-
