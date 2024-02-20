@@ -340,10 +340,10 @@ while true; do
 			for file in "\${related_files[@]}"; do
 				if [[ "\$file" == /saion_work/* ]]; then
 					# Extract the path after /saion_work/ for use in the ssh command
-					ssh saion mv "\$file" "\$TARGET_DIR"/
+					relative_path="\${file#/saion_work/}"
+					ssh saion mv "/work/\$relative_path" "\$TARGET_DIR/"
 					echo "Moved \$file to \$TARGET_DIR on saion"
 				elif [[ "\$file" == /flash/* ]]; then
-					# Extract the path after /flash/ for use in the ssh command
 					ssh deigo mv "\$file" "\$TARGET_DIR"/
 					echo "Moved \$file to \$TARGET_DIR on deigo"
 				else
