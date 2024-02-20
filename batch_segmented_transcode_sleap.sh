@@ -28,9 +28,15 @@ if [[ -z "$DIR" ]]; then
     usage
 fi
 
-# Your script logic here
 echo "Directory: $DIR"
 echo "Node: $SAION_NODE"
+
+# Specify the gpu type 
+if [ "$SAION_NODE" = "gpu" ]; then
+    gputype="gpu:V100:1"
+else
+    gputype="gpu:1"
+fi
 
 # Email address for job notifications
 emailurl=makoto.hiroi@oist.jp
@@ -158,8 +164,8 @@ MAX_CAP=100
 # Create a chain job script (job5) on the Deigo system (run_aruco.py)
 cat > "${output_folder}/job5-$video_name.sh" <<EOJ
 #!/bin/bash -l
-#SBATCH -t 0-24
-#SBATCH -c 32
+#SBATCH -t 0-48
+#SBATCH -c 8
 #SBATCH --partition=compute
 #SBATCH --mem=0
 #SBATCH --job-name=aruco-${video_name}
@@ -236,8 +242,8 @@ while IFS=, read -r line; do
 #SBATCH -c 8
 #SBATCH --partition=$SAION_NODE
 #SBATCH --mem=128G
-#SBATCH --gres=gpu:1
-#SBATCH --job-name=process-\${segmented_file_base}
+#SBATCH --gres=${gputype}
+#SBATCH --job-name=sleap-\${segmented_file_base}
 #SBATCH --output=./output/jobs/%x_%j.out
 #SBATCH --error=./output/jobs/%x_%j.err
 #SBATCH --mail-type=END,FAIL
@@ -273,61 +279,103 @@ EOJ
 done < "${deigo_folder}/${video_name}_frame_counts.csv"
 EOF
 
-    # Submit the first job and get its job ID
-    job1_path="${output_folder}/job1-$video_name.sh"
-    jobstring=$(sbatch "${job1_path}")
-    jobid=${jobstring##* }
-
-    # Submit the second job with a dependency on the first job
-    job2_path="${output_folder}/job2-$video_name.sh"
-    sbatch --dependency=afterok:$jobid "${job2_path}"
-  fi
-done
-
-# Create a folder monitoring job
-cat > "${data_folder}/monitor-$base_folder.sh" <<EOF
+	# Create a folder monitoring job
+cat > "${data_folder}/monitor-${video_name}.sh" <<EOF
 #!/bin/bash -l
 #SBATCH -t 0-48
 #SBATCH -c 1
 #SBATCH --partition=compute
 #SBATCH --mem=8G
-#SBATCH --job-name=monitor-${base_folder}
+#SBATCH --job-name=monitor-${video_name}
 #SBATCH --output=./output/jobs/%x_%j.out
 #SBATCH --error=./output/jobs/%x_%j.err
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=$emailurl
 
-monitor_dir=/saion_work/ReiterU/ant_tmp/$base_folder/ # Directory to monitor
+echo "$data_folder"
+monitor_dir1=${output_folder} # Directory to monitor for original segmented avi files
+monitor_dir2=/saion_work/ReiterU/ant_tmp/${base_folder} # Directory to monitor for csv and npy files
 TARGET_DIR=$data_folder # Directory to move files to
-INTERVAL=30 # How often to check the directory (in seconds)
+INTERVAL=120 # How often to check the directories (in seconds)
 
 while true; do
-	# Loop through each .csv file in the directory
-	for csv_file in ${monitor_dir}/*.csv; do
-		# Skip if no .csv files are found
-		[ -e "\$csv_file" ] || continue
+    files_transferred=0 # Initialize flag to check if files were transferred in this iteration
 
-		# Extract the filename without the extension
-		filename=\$(basename "\$csv_file" .csv)
+    # Search for segmented avi files in folder1
+    for avi_file in \${monitor_dir1}/${video_name}*.avi; do
+        # Skip if no .avi files are found
+        [ -e "\$avi_file" ] || continue
 
-		# Define the companion file
-		companion_file="${monitor_dir}/\${filename}.aviaruco_tracks_.npy"
+        # Extract the filename without the path and extension
+        base_name=\$(basename "\$avi_file" .avi)
 
-		# Check if both files exist
-		if [ -f "\$csv_file" ] && [ -f "\$companion_file" ]; then
-			echo "Both files for \$filename found."
+        # Initialize an array to keep track of all related files to move
+        declare -a related_files=()
 
-			# Move all files starting with \${filename} to the target directory
-			ssh saion mv "/work/ReiterU/ant_tmp/${base_folder}/\${filename}"* "$TARGET_DIR"/
-			echo "Moved files starting with \${filename} to $TARGET_DIR on saion"
-			
-			mv "${output_folder}/\${filename}"* "$TARGET_DIR"/
-			echo "Moved files starting with \${filename} to $TARGET_DIR on deigo"
-		done
-	sleep $INTERVAL
-	done
+        # Loop through folder2 for corresponding csv and npy files for each segmented avi
+        for csv_file in \${monitor_dir2}/\${base_name}*.csv; do
+            # Skip if no .csv files are found
+            [ -e "\$csv_file" ] || continue
+
+            segment_base_name=\$(basename "\$csv_file" .csv)
+            npy_file="\${monitor_dir2}/\${segment_base_name}.aviaruco_tracks_.npy"
+
+            # Check if the npy file exists for the same segment
+            if [ -f "\$npy_file" ]; then
+                # Add both csv and npy files to the list of related files
+                related_files+=( "\$csv_file" "\$npy_file" )
+
+                # Find the corresponding segmented avi file in folder1
+                segment_avi_file="\${monitor_dir1}/\${segment_base_name}.avi"
+                if [ -f "\$segment_avi_file" ]; then
+                    related_files+=( "\$segment_avi_file" )
+                fi
+
+                files_transferred=1 # Mark that files were transferred
+            fi
+        done
+
+        # If related files are found, move them to the TARGET_DIR
+        if [ \${#related_files[@]} -gt 0 ]; then
+			for file in "\${related_files[@]}"; do
+				if [[ "\$file" == /saion_work/* ]]; then
+					# Extract the path after /saion_work/ for use in the ssh command
+					ssh saion mv "\$file" "\$TARGET_DIR"/
+					echo "Moved \$file to \$TARGET_DIR on saion"
+				elif [[ "\$file" == /flash/* ]]; then
+					# Extract the path after /flash/ for use in the ssh command
+					ssh deigo mv "\$file" "\$TARGET_DIR"/
+					echo "Moved \$file to \$TARGET_DIR on deigo"
+				else
+					# Local move operation if not matching the above cases
+					mv "\$file" "\$TARGET_DIR/"
+					echo "Moved \$file to \$TARGET_DIR locally"
+				fi
+			done
+			echo "Moved files related to \${base_name} to \$TARGET_DIR"
+        fi
+    done
+
+    # Exit the loop if no files were transferred in this iteration
+    if [ \$files_transferred -eq 0 ]; then
+        echo "No more files to transfer. Exiting."
+        break
+    fi
+
+    sleep \${INTERVAL}
 done
 EOF
 
-# Submit the monitoring job
-sbatch ${data_folder}/monitor-$base_folder.sh
+    # Submit the first job and get its job ID
+    job1_path="${output_folder}/job1-$video_name.sh"
+    jobstring=$(sbatch "${job1_path}")
+    jobid=${jobstring##* }
+
+    # Submit the second job with a dependency on job1
+    job2_path="${output_folder}/job2-$video_name.sh"
+    sbatch --dependency=afterok:$jobid "${job2_path}"
+	
+	# Submit the monitoring job with a dependency on job1
+	sbatch --dependency=afterok:$jobid "${data_folder}/monitor-$base_folder.sh"
+  fi
+done
