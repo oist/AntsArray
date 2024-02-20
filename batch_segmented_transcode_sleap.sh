@@ -22,6 +22,9 @@ while [[ "$#" -gt 0 ]]; do
     shift # Move to next argument
 done
 
+# Remove trailing slash from DIR if it exists
+DIR="${DIR%/}"
+
 # Check if the directory path is not empty
 if [[ -z "$DIR" ]]; then
     echo "Error: No directory provided."
