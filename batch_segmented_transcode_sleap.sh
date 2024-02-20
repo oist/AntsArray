@@ -379,6 +379,6 @@ EOF
     sbatch --dependency=afterok:$jobid "${job2_path}"
 	
 	# Submit the monitoring job with a dependency on job1
-	sbatch --dependency=afterok:$jobid "${data_folder}/monitor-$base_folder.sh"
+	sbatch --dependency=afterok:$jobid "${data_folder}/monitor-$video_name.sh"
   fi
 done
