@@ -281,27 +281,28 @@ EOF
     # Submit the second job with a dependency on the first job
     job2_path="${output_folder}/job2-$video_name.sh"
     sbatch --dependency=afterok:$jobid "${job2_path}"
-	
-	# Create file monitoring job
-	cat > "${data_folder}/monitor-$video_name.sh" <<EOF
+  fi
+
+# Create a folder monitoring job
+cat > "${data_folder}/monitor-$base_folder.sh" <<EOF
 #!/bin/bash -l
 #SBATCH -t 0-48
 #SBATCH -c 1
 #SBATCH --partition=compute
 #SBATCH --mem=0
-#SBATCH --job-name=monitor-${video_name}
+#SBATCH --job-name=monitor-${base_folder}
 #SBATCH --output=./output/jobs/%x_%j.out
 #SBATCH --error=./output/jobs/%x_%j.err
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=$emailurl
 
-monitor_dir=/saion_work/ReiterU/ant_tmp/$basename/ # Directory to monitor
+monitor_dir=/saion_work/ReiterU/ant_tmp/$base_folder/ # Directory to monitor
 TARGET_DIR=$data_folder # Directory to move files to
 INTERVAL=30 # How often to check the directory (in seconds)
 
 while true; do
 	# Loop through each .csv file in the directory
-	for csv_file in "${monitor_dir}"/*.csv; do
+	for csv_file in ${monitor_dir}/*.csv; do
 		# Skip if no .csv files are found
 		[ -e "\$csv_file" ] || continue
 
@@ -316,7 +317,7 @@ while true; do
 			echo "Both files for \$filename found."
 
 			# Move all files starting with \${filename} to the target directory
-			ssh saion mv "/work/ReiterU/ant_tmp/$basename/\${filename}"* "$TARGET_DIR"/
+			ssh saion mv "/work/ReiterU/ant_tmp/${base_folder}/\${filename}"* "$TARGET_DIR"/
 			echo "Moved files starting with \${filename} to $TARGET_DIR on saion"
 			
 			mv "${output_folder}/\${filename}"* "$TARGET_DIR"/
@@ -325,8 +326,8 @@ while true; do
 	sleep $INTERVAL
 done
 EOF
-	# Submit the monitoring job
-	sbatch ${data_folder}/monitor-$video_name.sh
-  fi
+
+# Submit the monitoring job
+sbatch ${data_folder}/monitor-$base_folder.sh
 done
 
