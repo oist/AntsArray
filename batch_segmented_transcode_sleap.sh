@@ -289,7 +289,7 @@ cat > "${data_folder}/monitor-$base_folder.sh" <<EOF
 #SBATCH -t 0-48
 #SBATCH -c 1
 #SBATCH --partition=compute
-#SBATCH --mem=0
+#SBATCH --mem=8G
 #SBATCH --job-name=monitor-${base_folder}
 #SBATCH --output=./output/jobs/%x_%j.out
 #SBATCH --error=./output/jobs/%x_%j.err
