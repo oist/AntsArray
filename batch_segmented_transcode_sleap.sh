@@ -58,7 +58,7 @@ export output_folder
 export deigo_folder
 
 # Loop through each .avi file in the directory
-for video_file in ${DIR}*.avi
+for video_file in ${DIR}/*.avi
 do
   # Check if the file name ends with '_renc.avi' or '_nvenc.avi'
   if [[ ! $video_file =~ ^\. ]] && [[ ! $video_file =~ _renc\.avi$ ]] && [[ ! $video_file =~ _nvenc\.avi$ ]]; then
