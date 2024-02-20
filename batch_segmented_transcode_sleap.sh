@@ -325,6 +325,7 @@ while true; do
 			echo "Moved files starting with \${filename} to $TARGET_DIR on deigo"
 		done
 	sleep $INTERVAL
+	done
 done
 EOF
 
