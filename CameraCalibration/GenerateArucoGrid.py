@@ -1,7 +1,7 @@
 import cv2
 import numpy as np
 
-aruco_type = cv2.aruco.DICT_5X5_1000
+aruco_type = cv2.aruco.DICT_APRILTAG_36h10
 
 def create_aruco_marker(marker_id, marker_size, aruco_dict_type=aruco_type):
     """
@@ -37,16 +37,17 @@ def get_dictionary_name(aruco_dict_type):
         cv2.aruco.DICT_APRILTAG_16h5: "DICT_APRILTAG_16h5",
         cv2.aruco.DICT_APRILTAG_25h9: "DICT_APRILTAG_25h9",
         cv2.aruco.DICT_APRILTAG_36h10: "DICT_APRILTAG_36h10",
-        cv2.aruco.DICT_APRILTAG_36h11: "DICT_APRILTAG_36h11"
+        cv2.aruco.DICT_APRILTAG_36h11: "DICT_APRILTAG_36h11",
+        cv2.aruco.DICT_ARUCO_MIP_36h12: "DICT_ARUCO_MIP_36h12"
     }
 
     return dictionary_mapping.get(aruco_dict_type, "UnknownDict")
 
 # Grid parameters
-markers_x = 29 * 4 # Number of markers in the x direction
-markers_y = 41 * 4 # Number of markers in the y direction
+markers_x = 46 * 1 # Number of markers in the x direction
+markers_y = 35 * 1 # Number of markers in the y direction
 marker_size = 8  # Size of the marker in pixels
-spacing = 1 * marker_size     # Spacing between markers in pixels
+spacing = 4 * marker_size     # Spacing between markers in pixels
 
 # Create a blank image for the grid
 grid_width = markers_x * (marker_size + spacing)
@@ -58,7 +59,7 @@ marker_id = 0
 for y in range(markers_y):
     for x in range(markers_x):
         # Ensure marker_id is within the range of the dictionary
-        if marker_id >= 1000:
+        if marker_id >= 2320:
             marker_id = 0
         marker = create_aruco_marker(marker_id, marker_size)
         start_x = x * (marker_size + spacing)
