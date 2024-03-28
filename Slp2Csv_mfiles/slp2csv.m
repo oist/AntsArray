@@ -37,7 +37,9 @@ else
     % load attribution data
     dset(fileIdx).Attr = jsondecode(D.Groups.Attributes(...
         strcmp({D.Groups.Attributes.Name},'json')).Value);
-    [dset(fileIdx).Attr.nodes.('id')] = dset(fileIdx).Attr.skeletons.nodes.id;
+    if ~isempty(dset(fileIdx).Attr.skeletons)
+        [dset(fileIdx).Attr.nodes.('id')] = dset(fileIdx).Attr.skeletons.nodes.id;
+    end
 
     % load each dataset
     for n = 1:numel(DatasetNames)
