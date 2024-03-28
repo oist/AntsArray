@@ -1,12 +1,28 @@
 %%
 
-im_path = '/home/sam/bucket/Ants/basler/cameraArray_calib/2023-12-26-22-42_AruCo_DICT_6X6_1000_glass/';
+im_path = '/home/sam/bucket/Ants/basler/cameraArray_calib/2024_Feb/2024-02-27-18-39_AprilTag36h10_2mm/';
 
 % load images
 cd(im_path)
-im_files=dir('*png');
-im_n=length(im_files);
-im_file_list=char([]);
+im_files=dir('*tiff');
+im_files(startsWith({im_files.name},'.')) = []; % remove unexpected hidden files
+
+im_file_list={};
+
+im_file_list=fullfile(im_path, {im_files.name}); % fullfile for multi-platform
+
+% Extract 'camXX' pattern using regular expressions
+cam_pattern = 'cam\d{2}';
+cams = regexp(im_file_list, cam_pattern, 'match', 'once');
+
+% Convert extracted patterns to numeric values
+cams_numeric = cellfun(@(x) str2double(x(4:end)), cams);
+
+% Reorder the file list based on the numeric values of 'camXX'
+[~, idx] = sort(cams_numeric);
+im_file_list_reordered = im_file_list(idx);
+
+im_n=length(im_file_list_reordered);
 im=cell(im_n,1);
 imsize = zeros(im_n,2);
 
@@ -16,18 +32,18 @@ intv_mesh = 50; % interval in pixels for the computing of deformation functions
 K_smooth = 5; % the smooth transition width in the non-overlapping region is set to K_smooth times of the maximum bias.
 
 
-for i = 1:numel(im_files)
-    im_file_list(i,:)=[im_path im_files(i).name];
-    currImg=imread(im_file_list(i,:));
-    im{i}=im2single(rgb2gray(currImg));
+for i = 1:im_n
+    currImg=imread(im_file_list_reordered{i});
+    im{i}=im2single(currImg);
     imsize(i,:) = size(im{i});
 end
+
 %%
 disp('feature detection and matching')
 
 % establish neighbors
-array_size = [5, 5];
-cam_layout = transpose(reshape(0:(im_n-1), array_size(1), array_size(2)));
+array_size = [5,5];
+cam_layout = transpose(reshape(0:(im_n-1), array_size(2), array_size(1)));
 cam_neighbors = cell(array_size(1), array_size(2));
 
 edge_list=[];
@@ -35,7 +51,7 @@ for row = 1:array_size(1)
     for column = 1:array_size(2)
         row_range = max(row - 1, 1):min(row + 1, array_size(1));
         column_range = max(column - 1, 1):min(column + 1, array_size(2));
-        cam_neighbors{row, column} = reshape(cam_layout(row_range, column_range),1,[]);
+        cam_neighbors{row, column} = reshape(cam_layout(row_range,column_range),1,[]);
         curr_edges=cam_neighbors{row, column};
         curr_cam=cam_layout(row,column);
         curr_edges(curr_edges<=curr_cam)=[]; %only take greater values to not repeat calculations
@@ -54,9 +70,10 @@ points = cell(im_n, 1);
 features = cell(im_n, 1);
 valid_points = cell(im_n, 1);
 
+
 for i = 1:im_n
     points{i} = detectSURFFeatures(im{i},...
-        'MetricThreshold', 500, 'NumOctaves',1, 'NumScaleLevels', 4);
+        'MetricThreshold', 600, 'NumOctaves',1, 'NumScaleLevels', 4);
     [features{i}, valid_points{i}] = extractFeatures(im{i}, points{i});
 end
 
@@ -67,21 +84,21 @@ matchNum=[];
 for ei = 1 : edge_n
     i = edge_list(ei, 1);
     j = edge_list(ei, 2);
-
+    
     indexPairs = matchFeatures(features{i}, features{j},'MatchThreshold',10,'Method','Approximate');
     matched_points_1 = valid_points{i}(indexPairs(:, 1), :);
     matched_points_2 = valid_points{j}(indexPairs(:, 2), :);
 
     try
         [tform, inlierIndices] = ...
-            estgeotform2d (matched_points_1, matched_points_2, 'similarity','Confidence',99,'MaxDistance',20);
+            estimateGeometricTransform2D(matched_points_1, matched_points_2, 'similarity','Confidence',99,'MaxDistance',20);
         X_1 = [matched_points_1(inlierIndices).Location'; ones(1,size(matched_points_1(inlierIndices), 1))];
         X_2 = [matched_points_2(inlierIndices).Location'; ones(1,size(matched_points_2(inlierIndices), 1))];
-        Hall_init{ei}=tform.A;
+        Hall_init{ei}=eye(3);%tform.T seems simple initiliazation works fine
     catch
         X_1=[];
         X_2=[];
-        Hall_init=[];
+        Hall_init{ei}=eye(3);
     end
 
     X{ei,1} = double(X_1);
@@ -93,26 +110,31 @@ Xorig=X;
 
 % filter out edges that have a small number of shared features (they can
 %wreak havoc!) Can happen even where there are lots of points
-badEdges=matchNum<10;
+badEdges=matchNum<20;
+
+%badEdges(7:end)=1; %for debugging!
+
 X(badEdges,:)=[];
 edge_list(badEdges,:)=[];
 edge_n = size(edge_list, 1);
 Hall_init(badEdges)=[];
 
-% %  for debugging
-% fi=1
-% si=2
-%
+
+% 
+% % for debugging
+% fi=2
+% si=6
+% 
 % figure
 % imagesc(im{ fi})
 % hold on
 % scatter(X{ fi}(1,:),X{ fi}(2,:),10,'r','filled')
-%
+% 
 % figure
-% imagesc(im{2})
+% imagesc(im{6})
 % hold on
 % scatter(X{2}(1,:),X{2}(2,:),10,'r','filled')
-%
+% % 
 % figure;
 % for x=1:size(X,1)
 % showMatchedFeatures(im{edge_list(x,1)}, im{edge_list(x,2)}, X{x,1}(1:2,:)', X{x,2}(1:2,:)','montage');
@@ -122,10 +144,19 @@ Hall_init(badEdges)=[];
 %% Bundle adjustment under similarity transformation
 disp('bundle adjustment')
 
+
+
 paras_init=[];
 for H=1:numel(Hall_init)
     paras_init=double([paras_init, Hall_init{H}(1,1) Hall_init{H}(1,2)  Hall_init{H}(1,3)  Hall_init{H}(2,3)]);
 end
+
+
+% paras_init=[];
+% for H=1:numel(Hall_init)
+%     paras_init=double([paras_init, 0,0,0,0]);
+% end
+
 
 options = optimoptions('lsqnonlin', 'Algorithm','levenberg-marquardt', 'Display','off',...
     'MaxFunEvals',1000*im_n, 'MaxIter',1e3, 'TolFun',1e-6, 'TolX',1e-6, 'Jacobian','off');
@@ -251,7 +282,7 @@ figure ;
 imshow(mosaic, 'border', 'tight') ;
 drawnow;
 
-imwrite(mosaic, [im_path, 'mosaic_global.png']);
+%imwrite(mosaic, [im_path, 'mosaic_global.png']);
 
 
 %     %     if save_results
