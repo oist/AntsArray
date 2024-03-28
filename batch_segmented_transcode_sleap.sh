@@ -168,7 +168,7 @@ MAX_CAP=100
 cat > "${output_folder}/job5-$video_name.sh" <<EOJ
 #!/bin/bash -l
 #SBATCH -t 0-48
-#SBATCH -c 8
+#SBATCH -c 4
 #SBATCH --partition=compute
 #SBATCH --mem=0
 #SBATCH --job-name=aruco-${video_name}
