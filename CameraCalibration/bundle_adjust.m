@@ -8,7 +8,6 @@ im_files=dir('*tiff');
 im_files(startsWith({im_files.name},'.')) = []; % remove unexpected hidden files
 
 im_file_list={};
-
 im_file_list=fullfile(im_path, {im_files.name}); % fullfile for multi-platform
 
 % Extract 'camXX' pattern using regular expressions
@@ -34,7 +33,7 @@ K_smooth = 5; % the smooth transition width in the non-overlapping region is set
 
 for i = 1:im_n
     currImg=imread(im_file_list_reordered{i});
-    im{i}=im2single(currImg);
+    im{i}=im2gray(currImg);
     imsize(i,:) = size(im{i});
 end
 
