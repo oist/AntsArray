@@ -1,13 +1,13 @@
 %%
 
-im_path = '/home/sam/bucket/Ants/basler/cameraArray_calib/2024_Feb/2024-02-27-18-39_AprilTag36h10_2mm/';
+im_path = '\\wsl.localhost\Ubuntu-22.04\home\makoto\bucket\Ants\basler\cameraArray_calib\2024-03-25\frame1';
 
 % load images
-cd(im_path)
-im_files=dir('*tiff');
+% cd(im_path)
+im_files=dir(fullfile(im_path,'*tiff'));
 im_files(startsWith({im_files.name},'.')) = []; % remove unexpected hidden files
 
-im_file_list={};
+% im_file_list={};
 im_file_list=fullfile(im_path, {im_files.name}); % fullfile for multi-platform
 
 % Extract 'camXX' pattern using regular expressions
@@ -143,8 +143,6 @@ Hall_init(badEdges)=[];
 %% Bundle adjustment under similarity transformation
 disp('bundle adjustment')
 
-
-
 paras_init=[];
 for H=1:numel(Hall_init)
     paras_init=double([paras_init, Hall_init{H}(1,1) Hall_init{H}(1,2)  Hall_init{H}(1,3)  Hall_init{H}(2,3)]);
@@ -168,7 +166,7 @@ for sigma = [1000, 100, 10]
         paras_init = paras;
     end
 end
-save([im_path,'bundle_adjustment_paras.mat'],'paras');
+save(fullfile(im_path,'bundle_adjustment_paras.mat'),'paras');
 
 H_pair = cell(im_n, im_n);
 for i = 1 : im_n
@@ -190,7 +188,7 @@ for i = 2:im_n-1
     end
 end
 
-Hall=H_pair(12,:); %taking 1 row as the mappings. They should all be consistent after BA, but I licked a camera in the middle
+Hall=H_pair(13,:); %taking 1 row as the mappings. They should all be consistent after BA, but I licked a camera in the middle
 
 %% compute mosaic 
 
@@ -281,7 +279,7 @@ figure ;
 imshow(mosaic, 'border', 'tight') ;
 drawnow;
 
-%imwrite(mosaic, [im_path, 'mosaic_global.png']);
+imwrite(mosaic, fullfile(im_path, 'mosaic_global.png'));
 
 
 %     %     if save_results
