@@ -53,8 +53,10 @@ sleap_model1=/bucket/ReiterU/Ants/SLEAP_files/topdown/IR/231223_113827.centroid.
 sleap_model2=/bucket/ReiterU/Ants/SLEAP_files/topdown/IR/231223_142806.centered_instance.n=82/training_config.json
 
 mkdir -p $data_folder
+chmod 760 $data_folder
 chmod g+s $data_folder
 mkdir -p $output_folder
+chmod 760 $output_folder
 chmod g+s $output_folder
 export output_folder
 export deigo_folder
@@ -226,6 +228,7 @@ SEGMENT_DIR=${deigo_folder}
 BASE_NAME=${video_name}
 
 mkdir -p /work/ReiterU/ant_tmp/${base_folder}
+chmod 760 /work/ReiterU/ant_tmp/${base_folder}
 chmod g+s /work/ReiterU/ant_tmp/${base_folder}
 
 # List and iterate over each line in the frame counts file
