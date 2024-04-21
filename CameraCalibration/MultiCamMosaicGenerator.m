@@ -33,20 +33,20 @@ end
 % Set cam13 as init
 Hall=H_pair(13,:);
 
-% Sort the filenames based on the camera numbers extracted from the filenames
+%% Sort the filenames based on the camera numbers extracted from the filenames
 [~, idx] = sort(cellfun(@(x) sscanf(x, 'cam%*d_%*d-%*d-%*d-%*d-%*d-%*d_cam%d.avi'), fileNames));
 sortedFiles = fileNames(idx);
 
-%% Create a VideoWriter object to write the mosaic video
-% outputVideo = VideoWriter(fullfile(videoDir, 'mosaic_video'), 'MPEG-4');
-% outputVideo.FrameRate = 25;  % Adjust as needed based on the input videos
-% outputVideo.Quality = 100;
-% open(outputVideo);
+% Create a VideoWriter object to write the mosaic video
+outputVideo = VideoWriter(fullfile(videoDir, 'mosaic_video'), 'MPEG-4');
+outputVideo.FrameRate = 25;  % Adjust as needed based on the input videos
+outputVideo.Quality = 100;
+open(outputVideo);
 mkdir(fullfile(videoDir, 'mosaic_video'))
 
 % Define the frame number to start from and the total frames to process
 startFrame = 10;  % For example, N-th frame
-totalFrames = 25*60;  % Total frames to process
+totalFrames = 25;  % Total frames to process
 
 tic;
 % Process each frame
@@ -69,18 +69,17 @@ parfor frame = startFrame:(startFrame + totalFrames - 1)
     % Assuming Hall is defined earlier
     mosaic = createMosaicFromImageArray(images, Hall);
 
-    % % Resize the mosaic to the required output resolution
-    % mosaicResized = imresize(mosaic, [2160, NaN]);  % [height width]
-    % % Clip the mosaic values to be within the range [0, 1]
-    % if isa(mosaicResized, 'double')
-    %     mosaicResized = max(0, min(1, mosaicResized));  % This will clip the values
-    % end
+    % Resize the mosaic to the required output resolution
+    mosaicResized = imresize(mosaic, [2160, NaN]);  % [height width]
+    % Clip the mosaic values to be within the range [0, 1]
+    if isa(mosaicResized, 'double')
+        mosaicResized = max(0, min(1, mosaicResized));  % This will clip the values
+    end
 
     % Write the frame to the video
-    % writeVideo(outputVideo, mosaicResized);
-    imwrite(mosaic,fullfile(videoDir, 'mosaic_video',sprintf('frame_%08d.png',frame)),'png')
+    writeVideo(outputVideo, mosaicResized);
 end
 
 % Close the video file
-% close(outputVideo);
+close(outputVideo);
 toc;
