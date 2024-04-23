@@ -1,15 +1,57 @@
 #!/bin/bash
 
-# Define the base directory for videos and output
-video_dir="/flash/ReiterU/makoto/20240415"
-output_dir=${video_dir}"/tmp"
+# Initialize variables
+video_dir=""
+start_frame=""
+total_frames=""
+
+# Parse command line options
+while [[ $# -gt 0 ]]; do
+    key="$1"
+
+    case $key in
+        --dir)
+        video_dir="$2"
+        shift # past argument
+        shift # past value
+        ;;
+        --st)
+        start_frame="$2"
+        shift # past argument
+        shift # past value
+        ;;
+        --to)
+        total_frames="$2"
+        shift # past argument
+        shift # past value
+        ;;
+        *)    # unknown option
+        echo "Unknown option: $1"
+        echo "Usage: $0 --dir <video_dir> --st <start_frame> --to <total_frames>"
+        exit 1
+        ;;
+    esac
+done
+
+# Check if all parameters are set
+if [ -z "$video_dir" ] || [ -z "$start_frame" ] || [ -z "$total_frames" ]; then
+    echo "All parameters are required."
+    echo "Usage: $0 --dir <video_dir> --st <start_frame> --to <total_frames>"
+    exit 1
+fi
+
+frame_interval=1  # Adjust the frame interval if needed
+
+# Generate a unique directory name using the date and time
+unique_dir=$(date +%Y%m%d_%H%M%S)
+
+# Remove trailing slash if it exists
+[[ "${video_dir}" == */ ]] && output_dir="${video_dir%/}"
+
+# Create a new working directory in the video directory
+output_dir="${video_dir}/${unique_dir}"
 mkdir -p $output_dir
 mkdir -p $output_dir/jobs
-
-# Frame extraction parameters
-start_frame=1289
-total_frames=220
-frame_interval=1  # Adjust the frame interval if needed
 
 # File names for the sbatch scripts
 extract_frames_sbatch="extract_frames.sbatch"
@@ -19,13 +61,13 @@ mosaic_generator_sbatch="mosaic_generator.sbatch"
 cat > ${output_dir}/$extract_frames_sbatch << EOF
 #!/bin/bash
 #SBATCH --job-name=extract_frames
-#SBATCH --partition=short
+#SBATCH --partition=compute
 #SBATCH --output=$output_dir/jobs/%A_%a.out
 #SBATCH --error=$output_dir/jobs/%A_%a.err
 #SBATCH --array=1-25
 #SBATCH --nodes=1
 #SBATCH --time=02:00:00
-#SBATCH --cpus-per-task=4
+#SBATCH --cpus-per-task=16
 #SBATCH --mem=32G
 
 cam_number=\$(printf "cam%02d" \${SLURM_ARRAY_TASK_ID})
@@ -50,10 +92,9 @@ cat > ${output_dir}/$mosaic_generator_sbatch << EOF
 #SBATCH --partition=short
 #SBATCH --output=$output_dir/jobs/mosaic_%A_%a.out
 #SBATCH --error=$output_dir/jobs/mosaic_%A_%a.err
-#SBATCH --array=1-$total_frames%100
-#SBATCH --nodes=1
+#SBATCH --array=1-${total_frames}%65
 #SBATCH --time=01:00:00
-#SBATCH --cpus-per-task=1
+#SBATCH --cpus-per-task=2
 #SBATCH --mem=32G
 
 # Run the mosaic generator
