@@ -54,5 +54,6 @@ for i = 1:nCam
 end
 
 % Create and save the mosaic image
-mosaic = createMosaicFromImageArray(images, Hall);
+% mosaic = createMosaicFromImageArray(images, Hall);
+mosaic = createPanorama(images, Hall, 0); %no blending, just overlay
 imwrite(mosaic, fullfile(outputDir, sprintf('frame_%08d.png', startframe+frame-1)), 'png');
