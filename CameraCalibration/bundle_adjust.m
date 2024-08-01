@@ -1,6 +1,6 @@
 %%
 
-im_path = '\\wsl.localhost\Ubuntu-22.04\home\makoto\bucket\Ants\basler\cameraArray_calib\2024-03-25\frame1';
+im_path = '\\wsl.localhost\Ubuntu-22.04\home\makoto\bucketReiterU\Ants\basler\cameraArray_calib\2024-03-25\frame1';
 
 % load images
 % cd(im_path)
@@ -166,7 +166,7 @@ for sigma = [1000, 100, 10]
         paras_init = paras;
     end
 end
-save(fullfile(im_path,'bundle_adjustment_paras.mat'),'paras');
+% save(fullfile(im_path,'bundle_adjustment_paras.mat'),'paras');
 
 H_pair = cell(im_n, im_n);
 for i = 1 : im_n
@@ -279,7 +279,7 @@ figure ;
 imshow(mosaic, 'border', 'tight') ;
 drawnow;
 
-imwrite(mosaic, fullfile(im_path, 'mosaic_global.png'));
+% imwrite(mosaic, fullfile(im_path, 'mosaic_global.png'));
 
 
 %     %     if save_results
