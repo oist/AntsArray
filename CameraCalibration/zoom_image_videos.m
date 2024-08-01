@@ -18,7 +18,6 @@ fps = 25;
 %% zoom out to whole arena
 f1 = figure;
 ax1 = imshow(uint8(zeros(output_res(2), output_res(1))));
-point = [14000, 1150];
 startframe = 1;
 
 time_control = [...
