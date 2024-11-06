@@ -52,6 +52,7 @@ deigo_folder=/deigo_flash/ReiterU/ant_tmp/${base_folder}
 sleap_model1=/bucket/ReiterU/Ants/SLEAP_files/topdown/IR/231223_113827.centroid.n=82/training_config.json
 sleap_model2=/bucket/ReiterU/Ants/SLEAP_files/topdown/IR/231223_142806.centered_instance.n=82/training_config.json
 
+mkdir -p ~/output/jobs
 mkdir -p $data_folder
 chmod 2775 $data_folder
 mkdir -p $output_folder
