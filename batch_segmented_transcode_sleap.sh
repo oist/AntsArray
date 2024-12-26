@@ -88,8 +88,8 @@ FPS=\$(exiftool "${video_file}" | grep 'Video Frame Rate' | awk -F': ' '{print \
 echo "FPS: \${FPS}"
 echo "FRAME_COUNT: \${FRAME_COUNT}"
 
-# Calculate segment time in seconds for 2 hours
-SEG_TIME_SEC=\$((60*60*2))
+# Calculate segment time in seconds for 20 minutes
+SEG_TIME_SEC=\$((60*20))
 echo "SEG_TIME_SEC: \${SEG_TIME_SEC}"
 
 # Calculate total segments based on video duration in frames and segment duration in frames
@@ -97,7 +97,7 @@ SEG_FRAMES=\$((\$SEG_TIME_SEC * \$FPS))
 echo "SEG_FRAMES: \${SEG_FRAMES}"
 SEG_FRAMES_STRING=""
 
-# Assuming we need a segment every 2 hours, calculate how many segments we have
+# Assuming we need a segment every 20 minutes, calculate how many segments we have
 # We'll divide the total frame count by SEG_FRAMES to determine the number of segments
 TOTAL_SEGMENTS=\$((\$FRAME_COUNT / \$SEG_FRAMES))
 echo "TOTAL_SEGMENTS: \${TOTAL_SEGMENTS}"
@@ -123,7 +123,7 @@ if [[ -f "${output_folder}/${video_name}_frame_counts.csv" ]]; then
 fi
 
 # Transcode the video to segmented frames with ffmpeg
-ffmpeg -fflags +genpts -y -i ${video_file} -threads 32 -c:v libx264 -pix_fmt yuv420p -preset superfast -crf 23 -f segment -reset_timestamps 1 -segment_list ${output_folder}/${video_name}_frame_counts.csv -segment_frames \${SEG_FRAMES_STRING} -break_non_keyframes 1 -force_key_frames "expr:gte(t,n_forced*\${SEG_TIME_SEC})" ${output_folder}/${video_name}_%03d.avi
+ffmpeg -fflags +genpts -y -i ${video_file} -threads 32 -c:v libx264 -pix_fmt yuv420p -preset slow -crf 23 -f segment -reset_timestamps 1 -segment_list ${output_folder}/${video_name}_frame_counts.csv -segment_frames \${SEG_FRAMES_STRING} -break_non_keyframes 1 -force_key_frames "expr:gte(t,n_forced*\${SEG_TIME_SEC})" ${output_folder}/${video_name}_%03d.avi
 
 # Section to calculate and save frame counts for each segment
 csv_file="${output_folder}/${video_name}_frame_counts.csv"
