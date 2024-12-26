@@ -1,6 +1,6 @@
 %%
 
-im_path = '\\wsl.localhost\Ubuntu-22.04\home\makoto\bucketReiterU\Ants\basler\cameraArray_calib\2024-03-25\frame1';
+im_path = '/bucket/.deigo/ReiterU/Ants/basler/cameraArray_calib/2024-11-03_1/frame_1';
 
 % load images
 % cd(im_path)
@@ -33,7 +33,7 @@ K_smooth = 5; % the smooth transition width in the non-overlapping region is set
 
 for i = 1:im_n
     currImg=imread(im_file_list_reordered{i});
-    im{i}=im2gray(currImg);
+    im{i}=squeeze(currImg(:,:,1));
     imsize(i,:) = size(im{i});
 end
 
@@ -166,7 +166,7 @@ for sigma = [1000, 100, 10]
         paras_init = paras;
     end
 end
-% save(fullfile(im_path,'bundle_adjustment_paras.mat'),'paras');
+save(fullfile(im_path,'bundle_adjustment_paras.mat'),'paras');
 
 H_pair = cell(im_n, im_n);
 for i = 1 : im_n
