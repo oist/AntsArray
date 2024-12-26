@@ -12,24 +12,27 @@ from cv2 import aruco
 import argparse
 import os
 
-def get_aruco_tracks(video_file,dictionary_size=1000):
+def get_aruco_tracks(video_file,dictionary_size=300):
     
     cap = cv2.VideoCapture(video_file)
     length = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    # Create a (num_frames x 300 x 2) array
     tracks=np.zeros((length,dictionary_size,2))
 
     for frame_count in tqdm(range(length),total=length):
-
-     	ret, img = cap.read() 
+        ret, img = cap.read() 
+        if not ret:
+            break
         corners,ids,rejected=detector.detectMarkers(img)
 
-       	if ids is not None:
-
+        if ids is not None:
             #get com from corners
             com=[]
             for corner in corners:
                 com.append(np.mean(corner[0], axis=0))
 
+            # flatten ids
             extract_ids=[]
             for i, curr_id in enumerate(ids):
                 extract_ids.append(curr_id[0])
@@ -37,7 +40,9 @@ def get_aruco_tracks(video_file,dictionary_size=1000):
             extract_ids=np.unique(extract_ids)
 
             for i, curr_id in enumerate(extract_ids):
-                 tracks[frame_count,ids[i][0],:] = [com[i][0],com[i][1]]  
+                # Only store if curr_id < dictionary_size (i.e., < 300)
+                if curr_id < dictionary_size:
+                    tracks[frame_count, curr_id, :] = com[i] 
     
     return tracks
 
