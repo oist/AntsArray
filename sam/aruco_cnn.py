@@ -8,6 +8,8 @@ from torchvision import datasets, transforms, models
 import matplotlib.pyplot as plt
 import numpy as np
 
+BATCH_SIZE=128
+
 # Visualize a batch of data
 def visualize_batch(dataloader):
     data_iter = iter(dataloader)
@@ -25,6 +27,7 @@ def visualize_batch(dataloader):
 train_transforms = transforms.Compose([
     transforms.Resize((224, 224)) ,  # Adjust for ResNet input
     transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0, hue=0),
+    transforms.RandomRotation(degrees=15),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # ResNet normalization
 ])
@@ -53,7 +56,7 @@ weight = 1. / class_sample_count
 samples_weight = np.array([weight[t] for t in y_train])
 samples_weight = torch.from_numpy(samples_weight)
 sampler = WeightedRandomSampler(samples_weight.type('torch.DoubleTensor'), len(samples_weight))
-train_loader = DataLoader(train_dataset, batch_size=32, num_workers=4, sampler=sampler)
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, num_workers=4, sampler=sampler)
 
 y_val_indices = val_dataset.indices
 y_val = [dataset.targets[i] for i in y_val_indices]
@@ -63,7 +66,7 @@ weight = 1. / class_sample_count
 samples_weight = np.array([weight[t] for t in y_val])
 samples_weight = torch.from_numpy(samples_weight)
 sampler = WeightedRandomSampler(samples_weight.type('torch.DoubleTensor'), len(samples_weight))
-val_loader = DataLoader(val_dataset, batch_size=32, num_workers=4, sampler=sampler)
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, num_workers=4, sampler=sampler)
 
 
 visualize_batch(train_loader)
@@ -76,14 +79,15 @@ model = models.resnet50(weights='ResNet50_Weights.DEFAULT')
 # Replace the final fully connected layer
 model.fc = nn.Linear(model.fc.in_features, num_classes)
 
+# Freeze earlier layers
+for name, param in model.named_parameters():
+    if "layer3" not in name and "layer4" not in name and "fc" not in name:
+        param.requires_grad = False
+        
 # Send the model to the device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = model.to(device)
 
-# 4) Loss Function and Optimizer
-criterion = nn.CrossEntropyLoss()
-optimizer = optim.AdamW(model.parameters(), lr=1e-4)
-scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
 
 # 5) Training and Validation Functions
 def train_one_epoch(model, dataloader, criterion, optimizer, device):
@@ -136,6 +140,12 @@ def validate(model, dataloader, criterion, device):
 # 6) Training Loop
 num_epochs = 20
 best_val_acc = 0.0
+
+# 4) Loss Function and Optimizer
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.AdamW(model.parameters(), lr=1e-3)
+scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
+
 
 for epoch in range(num_epochs):
     train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device)
