@@ -11,6 +11,7 @@ from tqdm import tqdm
 from cv2 import aruco
 import argparse
 import os
+import h5py
 
 def get_aruco_tracks(video_file,dictionary_size=300):
     
@@ -72,7 +73,11 @@ detectParams.errorCorrectionRate=1
 detector=aruco.ArucoDetector(aruco_dict,detectParams)
 
 
-tracks=get_aruco_tracks(args.video_file,1000) #size of aruco dict
-np.save(args.output_path + basename + 'aruco_tracks_.npy', tracks)  
+tracks=get_aruco_tracks(args.video_file,300) #size of aruco dict
+# Save data in HDF5 format
+hdf5_path = args.output_path + basename + 'aruco_tracks_.h5'
+with h5py.File(hdf5_path, 'w') as hdf:
+    hdf.create_dataset('aruco_tracks', data=tracks)
+# np.save(args.output_path + basename + 'aruco_tracks_.npy', tracks)  
 
 
