@@ -58,16 +58,17 @@ samples_weight = torch.from_numpy(samples_weight)
 sampler = WeightedRandomSampler(samples_weight.type('torch.DoubleTensor'), len(samples_weight))
 train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, num_workers=4, sampler=sampler)
 
-y_val_indices = val_dataset.indices
-y_val = [dataset.targets[i] for i in y_val_indices]
-class_sample_count = np.array(
-    [len(np.where(y_val== t)[0]) for t in np.unique(y_val)])
-weight = 1. / class_sample_count
-samples_weight = np.array([weight[t] for t in y_val])
-samples_weight = torch.from_numpy(samples_weight)
-sampler = WeightedRandomSampler(samples_weight.type('torch.DoubleTensor'), len(samples_weight))
-val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, num_workers=4, sampler=sampler)
+# y_val_indices = val_dataset.indices
+# y_val = [dataset.targets[i] for i in y_val_indices]
+# class_sample_count = np.array(
+#     [len(np.where(y_val== t)[0]) for t in np.unique(y_val)])
+# weight = 1. / class_sample_count
+# samples_weight = np.array([weight[t] for t in y_val])
+# samples_weight = torch.from_numpy(samples_weight)
+# sampler = WeightedRandomSampler(samples_weight.type('torch.DoubleTensor'), len(samples_weight))
+# val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, num_workers=4, sampler=sampler)
 
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, num_workers=4, shuffle=False)
 
 visualize_batch(train_loader)
 
@@ -77,7 +78,10 @@ num_classes = len(dataset.classes)
 # 3) Pre-trained ResNet-50 Model
 model = models.resnet50(weights='ResNet50_Weights.DEFAULT')
 # Replace the final fully connected layer
-model.fc = nn.Linear(model.fc.in_features, num_classes)
+model.fc = nn.Sequential(
+    nn.Dropout(0.5),
+    nn.Linear(model.fc.in_features, num_classes)
+)
 
 # Freeze earlier layers
 for name, param in model.named_parameters():
@@ -138,12 +142,12 @@ def validate(model, dataloader, criterion, device):
 
 
 # 6) Training Loop
-num_epochs = 20
+num_epochs = 50
 best_val_acc = 0.0
 
 # 4) Loss Function and Optimizer
 criterion = nn.CrossEntropyLoss()
-optimizer = optim.AdamW(model.parameters(), lr=1e-3)
+optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
 scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
 
 
