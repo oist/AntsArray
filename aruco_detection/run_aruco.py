@@ -11,25 +11,29 @@ from tqdm import tqdm
 from cv2 import aruco
 import argparse
 import os
+import h5py
 
-def get_aruco_tracks(video_file,dictionary_size=1000):
+def get_aruco_tracks(video_file,dictionary_size=300):
     
     cap = cv2.VideoCapture(video_file)
     length = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    # Create a (num_frames x 300 x 2) array
     tracks=np.zeros((length,dictionary_size,2))
 
     for frame_count in tqdm(range(length),total=length):
-
-     	ret, img = cap.read() 
+        ret, img = cap.read() 
+        if not ret:
+            break
         corners,ids,rejected=detector.detectMarkers(img)
 
-       	if ids is not None:
-
+        if ids is not None:
             #get com from corners
             com=[]
             for corner in corners:
                 com.append(np.mean(corner[0], axis=0))
 
+            # flatten ids
             extract_ids=[]
             for i, curr_id in enumerate(ids):
                 extract_ids.append(curr_id[0])
@@ -37,7 +41,9 @@ def get_aruco_tracks(video_file,dictionary_size=1000):
             extract_ids=np.unique(extract_ids)
 
             for i, curr_id in enumerate(extract_ids):
-                 tracks[frame_count,ids[i][0],:] = [com[i][0],com[i][1]]  
+                # Only store if curr_id < dictionary_size (i.e., < 300)
+                if curr_id < dictionary_size:
+                    tracks[frame_count, curr_id, :] = com[i] 
     
     return tracks
 
@@ -67,7 +73,11 @@ detectParams.errorCorrectionRate=1
 detector=aruco.ArucoDetector(aruco_dict,detectParams)
 
 
-tracks=get_aruco_tracks(args.video_file,1000) #size of aruco dict
-np.save(args.output_path + basename + 'aruco_tracks_.npy', tracks)  
+tracks=get_aruco_tracks(args.video_file,300) #size of aruco dict
+# Save data in HDF5 format
+hdf5_path = args.output_path + basename + 'aruco_tracks_.h5'
+with h5py.File(hdf5_path, 'w') as hdf:
+    hdf.create_dataset('aruco_tracks', data=tracks)
+# np.save(args.output_path + basename + 'aruco_tracks_.npy', tracks)  
 
 
