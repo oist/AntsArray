@@ -55,9 +55,9 @@ def interpolate_missing_positions(merged_all_pos):
 
 
 
-video_file='/home/sam/bucket/Ants/trials/20241108_1/20241108_1_first_hour/cam4_2024-11-07-23-40-43_cam05_first_hour.avi'
-aruco_file='/home/sam/bucket/Ants/trials/20241108_1/20241108_1_first_hour/data/cam4_2024-11-07-23-40-43_cam05_first_hour_000.aviaruco_tracks_.npy'
-sleap_file='/home/sam/bucket/Ants/trials/20241108_1/20241108_1_first_hour/data/cam4_2024-11-07-23-40-43_cam05_first_hour_000.csv'
+video_file='/home/sam/bucket/Ants/trials/20241108_1/20241108_1_first_hour/cam5_2024-11-07-23-40-43_cam06_first_hour.avi'
+aruco_file='/home/sam/bucket/Ants/trials/20241108_1/20241108_1_first_hour/data/cam5_2024-11-07-23-40-43_cam06_first_hour_000.aviaruco_tracks_.npy'
+sleap_file='/home/sam/bucket/Ants/trials/20241108_1/20241108_1_first_hour/data/cam5_2024-11-07-23-40-43_cam06_first_hour_000.csv'
 
 #aruco
 aruco_tracks = np.load(aruco_file)
@@ -76,7 +76,7 @@ df['Instance'] = df.groupby('Frame').cumcount() - 1
 #%% 
 #------------------- PARAMETERS -------------------
 brightness_factor = 1.2
-visualize = 0
+visualize = 1
 
 max_sleap = 1000
 max_distance = 60        # detection->track distance threshold

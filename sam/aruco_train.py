@@ -15,7 +15,7 @@ BATCH_SIZE=16
 #data_path='/home/sam/bucket/sam/ant_tracking/aruco_imgs/train_dataset/'
 data_path='/bucket/ReiterU/sam/ant_tracking/aruco_imgs/train_dataset/'
 
-output='/flash/ReiterU/sam/antnet.pth'
+output='/work/ReiterU/sam/antnet.pth'
 # Visualize a batch of data
 def visualize_batch(dataloader):
     data_iter = iter(dataloader)
