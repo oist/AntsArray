@@ -7,46 +7,114 @@ from torch.utils.data.sampler import WeightedRandomSampler
 from torchvision import datasets, transforms, models
 import matplotlib.pyplot as plt
 import numpy as np
+import cv2
+import random
+from PIL import Image
 
-BATCH_SIZE=128
+BATCH_SIZE=16
+#data_path='/home/sam/bucket/sam/ant_tracking/aruco_imgs/train_dataset/'
+data_path='/bucket/ReiterU/sam/ant_tracking/aruco_imgs/train_dataset/'
 
+output='/flash/ReiterU/sam/antnet.pth'
 # Visualize a batch of data
 def visualize_batch(dataloader):
     data_iter = iter(dataloader)
     images, labels = next(data_iter)
-    plt.figure(figsize=(10, 10))
-    for i in range(9):
-        plt.subplot(3, 3, i + 1)
-        plt.imshow(images[i].permute(1, 2, 0).numpy() * 0.5 + 0.5)  # Un-normalize
+
+    # Unnormalize for visualization
+    mean = torch.tensor([0.485, 0.456, 0.406])
+    std = torch.tensor([0.229, 0.224, 0.225])
+    images = images * std[:, None, None] + mean[:, None, None]
+
+    plt.figure(figsize=(16, 16))
+    for i in range(16):
+        plt.subplot(4, 4, i + 1)
+        plt.imshow(images[i].permute(1, 2, 0).numpy())
         plt.title(f"Label: {labels[i]}")
         plt.axis("off")
     plt.show()
 
+def simulate_aruco_view(image, degree=0.2):
+    """
+    Simulates an ArUco tag viewed from different angles by applying a 3D perspective transformation.
+
+    Args:
+        image (PIL.Image): Input image of the ArUco tag.
+        max_angle (int): Maximum rotation angle in degrees for the simulation.
+                         Higher values mean stronger perspective effects.
+
+    Returns:
+        PIL.Image: Transformed image simulating the view of an ArUco tag from a different angle.
+    """
+
+    width, height = image.size
+
+    # Define the source points (original corners of the image)
+    src_points = np.float32([
+        [0, 0],
+        [width, 0],
+        [width, height],
+        [0, height]
+    ])
+
+    # Generate random perturbations for perspective transformation
+    max_shift_x = width * degree # Up to 20% of width
+    max_shift_y = height * degree  # Up to 20% of height
+
+    dst_points = np.float32([
+        [random.uniform(-max_shift_x, max_shift_x), random.uniform(-max_shift_y, max_shift_y)],  # Top-left
+        [width + random.uniform(-max_shift_x, max_shift_x), random.uniform(-max_shift_y, max_shift_y)],  # Top-right
+        [width + random.uniform(-max_shift_x, max_shift_x), height + random.uniform(-max_shift_y, max_shift_y)],  # Bottom-right
+        [random.uniform(-max_shift_x, max_shift_x), height + random.uniform(-max_shift_y, max_shift_y)]  # Bottom-left
+    ])
+
+    # Compute the perspective transformation matrix
+    matrix = cv2.getPerspectiveTransform(src_points, dst_points)
+
+    # Convert the image to a NumPy array with correct channel order (BGR for OpenCV)
+    img_np = np.array(image)
+
+    if len(img_np.shape) == 2:  # Grayscale
+        img_np = cv2.cvtColor(img_np, cv2.COLOR_GRAY2BGR)
+
+    mean_color = tuple(map(int, img_np.mean(axis=(0, 1))))
+
+    # Apply the perspective transformation with the mean color as the border
+    transformed_img = cv2.warpPerspective(img_np, matrix, (width, height), borderMode=cv2.BORDER_CONSTANT, borderValue=mean_color)
+
+    # Convert back to PIL Image
+    transformed_img_pil = Image.fromarray(cv2.cvtColor(transformed_img, cv2.COLOR_BGR2RGB))
+
+    return transformed_img_pil
+
+
+
+
 
 # 1) Transforms (augmentations for training)
 train_transforms = transforms.Compose([
+    transforms.Lambda(lambda img: simulate_aruco_view(img,degree=0.3)),
     transforms.Resize((224, 224)) ,  # Adjust for ResNet input
-    transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0, hue=0),
-    transforms.RandomRotation(degrees=15),
+   # transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0, hue=0),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # ResNet normalization
+   # transforms.ToTensor()
 ])
 
-val_transforms = transforms.Compose([
-    transforms.Resize((224, 224)), 
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # ResNet normalization
-])
+# val_transforms = transforms.Compose([
+#     transforms.Resize((224, 224)), 
+#     transforms.ToTensor(),
+#     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # ResNet normalization
+# ])
 
 # 2) Load Dataset
-dataset = datasets.ImageFolder(root='/home/sam/bucket/sam/ant_tracking/aruco_imgs/train_dataset/')
+dataset = datasets.ImageFolder(root=data_path)
 train_percentage = 0.8
 train_size = int(train_percentage * len(dataset))
 val_size = len(dataset) - train_size
 
 train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
-train_dataset.dataset.transform = train_transforms
-val_dataset.dataset.transform = val_transforms
+train_dataset.dataset.transform = train_transforms #changes val_dataloader too
 
 y_train_indices = train_dataset.indices
 y_train = [dataset.targets[i] for i in y_train_indices]
@@ -58,19 +126,18 @@ samples_weight = torch.from_numpy(samples_weight)
 sampler = WeightedRandomSampler(samples_weight.type('torch.DoubleTensor'), len(samples_weight))
 train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, num_workers=4, sampler=sampler)
 
-# y_val_indices = val_dataset.indices
-# y_val = [dataset.targets[i] for i in y_val_indices]
-# class_sample_count = np.array(
-#     [len(np.where(y_val== t)[0]) for t in np.unique(y_val)])
-# weight = 1. / class_sample_count
-# samples_weight = np.array([weight[t] for t in y_val])
-# samples_weight = torch.from_numpy(samples_weight)
-# sampler = WeightedRandomSampler(samples_weight.type('torch.DoubleTensor'), len(samples_weight))
-# val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, num_workers=4, sampler=sampler)
 
-val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, num_workers=4, shuffle=False)
+y_val_indices = val_dataset.indices
+y_val = [dataset.targets[i] for i in y_val_indices]
+class_sample_count = np.array(
+    [len(np.where(y_val== t)[0]) for t in np.unique(y_val)])
+weight = 1. / class_sample_count
+samples_weight = np.array([weight[t] for t in y_val])
+samples_weight = torch.from_numpy(samples_weight)
+sampler = WeightedRandomSampler(samples_weight.type('torch.DoubleTensor'), len(samples_weight))
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, num_workers=4, sampler=sampler)
 
-visualize_batch(train_loader)
+#visualize_batch(train_loader)
 
 # Number of classes
 num_classes = len(dataset.classes)
@@ -158,7 +225,7 @@ for epoch in range(num_epochs):
     # Save the best model
     if val_acc > best_val_acc:
         best_val_acc = val_acc
-        torch.save(model.state_dict(), "best_resnet50_model.pth")
+        torch.save(model.state_dict(), output)
 
     # Step the learning rate scheduler
     scheduler.step()
