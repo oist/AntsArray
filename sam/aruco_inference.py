@@ -8,7 +8,7 @@ from torchvision import models
 from PIL import Image
 import torch.nn as nn
 import argparse
-import h5py
+import pickle
 
 def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -129,12 +129,8 @@ def main(args):
                 break
     
     # Save aruco_detection to an HDF5 file
-    with h5py.File(args.output_file, "w") as f:
-        # Convert dictionary to a nested structure for saving
-        for frame_idx, frame_data in aruco_detection.items():
-            grp = f.create_group(str(frame_idx))
-            for aruco_id, positions in frame_data.items():
-                grp.create_dataset(str(aruco_id), data=np.array(positions))
+    with open(args.output_file, "wb") as f:
+        pickle.dump(aruco_detection, f)
 
 
     cap.release()
