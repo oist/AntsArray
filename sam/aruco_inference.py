@@ -105,10 +105,28 @@ def main(args):
                 predicted_ids = predicted_ids.cpu().numpy()
 
                 predicted_ids = np.where(confidence < args.confidence_threshold, -1, predicted_ids)
-
+                
+                # Track the closest detection for each predicted_id
+                detected_positions = {}
                 for (x, y), predicted_id in zip(batch_positions, predicted_ids):
                     if predicted_id != -1:
-                        aruco_detection[predicted_id, frame_idx, :] = (x, y)
+                        # Compute distance to the previous detection
+                        if frame_idx > 0:  # Avoid index out-of-bounds for the first frame
+                            prev_position = aruco_detection[predicted_id, frame_idx - 1, :]
+                            if np.all(prev_position >= 0):  # If a previous position exists
+                                distance = np.linalg.norm(prev_position - np.array([x, y]))
+                            else:
+                                distance = float('inf')  # No previous position, allow this detection
+                        else:
+                            distance = float('inf')  # First frame, no previous detection
+            
+                        # Keep the closest detection for each ID
+                        if predicted_id not in detected_positions or detected_positions[predicted_id][1] > distance:
+                            detected_positions[predicted_id] = ((x, y), distance)
+            
+                # Update aruco_detection with the closest positions
+                for predicted_id, (position, _) in detected_positions.items():
+                    aruco_detection[predicted_id, frame_idx, :] = position
 
         if args.visualize:
             for (x, y), predicted_id in zip(crop_positions, predicted_ids):

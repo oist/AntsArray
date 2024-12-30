@@ -1,11 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Created on Sun Dec 29 15:11:39 2024
-
-@author: sam
-"""
-
 #!/bin/bash
 
 # Define input arguments
@@ -13,26 +5,39 @@ DATA_FOLDER='/bucket/ReiterU/Ants/trials/20241108_1/20241108_1_first_hour/data'
 MODEL_PATH='/work/ReiterU/sam/antnet.pth'
 OUTPUT_FOLDER='/work/ReiterU/sam/'
 
-
 # Ensure output folder exists
 mkdir -p "$OUTPUT_FOLDER"
 
 # Iterate over all video files in the data folder
 for VIDEO_FILE in "$DATA_FOLDER"/*.avi; do
-  # Extract base name without extension
-  BASE_NAME=$(basename "$VIDEO_FILE" .avi)
+    # Extract base name without extension
+    BASE_NAME=$(basename "$VIDEO_FILE" .avi)
 
-  # Define corresponding SLEAP file
-  SLEAP_FILE="$DATA_FOLDER/$BASE_NAME.csv"
+    # Define corresponding SLEAP file
+    SLEAP_FILE="$DATA_FOLDER/$BASE_NAME.csv"
 
-  # Define output HDF5 file
-  OUTPUT_FILE="$OUTPUT_FOLDER/$BASE_NAME.h5"
+    # Define output HDF5 file
+    OUTPUT_FILE="$OUTPUT_FOLDER/$BASE_NAME.h5"
 
-  # Submit job to the cluster
-  sbatch -p largegpu -c 32 --x11 --mem=64G -t 0-24 --gres=gpu:1 <<EOF
-#!/bin/bash
-module load python  # Load appropriate Python module
-python /path/to/aruco_detection_script.py \\
+    # Create a temporary SLURM script for the job
+    SLURM_SCRIPT=$(mktemp)
+
+    cat <<EOF > "$SLURM_SCRIPT"
+#!/bin/bash -l
+#SBATCH -t 0-24
+#SBATCH -c 32
+#SBATCH --partition=largegpu
+#SBATCH --mem=64G
+#SBATCH --gres=gpu:1
+#SBATCH --job-name=$BASE_NAME
+#SBATCH --output=$OUTPUT_FOLDER/${BASE_NAME}_%j.out
+
+# Activate the Python environment
+source /opt/conda/etc/profile.d/conda.sh
+conda activate torch
+
+# Run the Python script
+python /home/s/samuel-reiter/AntsArray/sam/aruco_inference.py \\
   --video_file "$VIDEO_FILE" \\
   --sleap_file "$SLEAP_FILE" \\
   --model_name "$MODEL_PATH" \\
@@ -44,4 +49,10 @@ python /path/to/aruco_detection_script.py \\
   --confidence_threshold 0.99 \\
   --visualize 0
 EOF
+
+    # Submit the SLURM job
+    sbatch "$SLURM_SCRIPT"
+
+    # Clean up temporary SLURM script
+    rm "$SLURM_SCRIPT"
 done
