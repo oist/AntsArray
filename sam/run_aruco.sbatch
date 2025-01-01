@@ -17,7 +17,7 @@ for VIDEO_FILE in "$DATA_FOLDER"/*.avi; do
     SLEAP_FILE="$DATA_FOLDER/$BASE_NAME.csv"
 
     # Define output HDF5 file
-    OUTPUT_FILE="$OUTPUT_FOLDER/$BASE_NAME.h5"
+    OUTPUT_FILE="$OUTPUT_FOLDER/$BASE_NAME.pkl"
 
     # Create a temporary SLURM script for the job
     SLURM_SCRIPT=$(mktemp)

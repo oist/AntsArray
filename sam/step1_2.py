@@ -16,7 +16,7 @@ import scipy.io
 import matplotlib.pyplot as plt
 import matplotlib
 import os
-#import h5py
+import pickle 
 import matplotlib.cm as cm
 from collections import defaultdict
 
@@ -88,58 +88,138 @@ def check_calibration(xy_arra, H_mats):
 
 
 
-def combine_aruco(H_mats, curr_dir,output_folder_path, output_file_name):
-    # Retrieve all .npy files in the current directory if they are not frame counts
-    npy_files = sorted(glob.glob(os.path.join(curr_dir, '*.npy')))
-    filtered_files = [file for file in npy_files if 'global' not in file]
+# def combine_aruco(H_mats, curr_dir,output_folder_path, output_file_name):
+#     # Retrieve all .npy files in the current directory if they are not frame counts
+#     npy_files = sorted(glob.glob(os.path.join(curr_dir, '*.npy')))
+#     filtered_files = [file for file in npy_files if 'global' not in file]
+
+#     grouped_files = defaultdict(list)
+#     for file in filtered_files:
+#         # Extract the index (e.g., '003') from the filename
+#         index = file.split('_')[-3].split('.')[0]
+#         grouped_files[index].append(file)
+        
+#     # For each camera, map the points to the panorama using H_mats and load new coordinates into a DataFrame
+#     for ind, chunk_files in enumerate(grouped_files.items()):
+        
+#         total_aruco_data = []  # Use a list to store DataFrames for concatenation later
+        
+#         for npy_file in chunk_files[1]:
+#             # Extract camera index from the filename
+#             print('Processing file:', npy_file)
+#             curr_cam = int(os.path.basename(npy_file).split('_')[2][-2:]) - 1  # Adjust camera index
+    
+#             # Load the tracks
+#             aruco_tracks = np.load(npy_file)
+    
+#             # Reshape array and create DataFrame
+#             num_frames, num_arucos, num_positions = aruco_tracks.shape
+#             reshaped_array = aruco_tracks.reshape((num_arucos * num_frames, num_positions))
+#             df_aruco = pd.DataFrame(reshaped_array, columns=['X', 'Y'])
+            
+#             # Add frame number, ARUCO number, and camera columns directly
+#             df_aruco['Frame_number'] = np.repeat(np.arange(num_frames), num_arucos)
+#             df_aruco['ARUCO_number'] = np.tile(np.arange(num_arucos), num_frames)
+#             df_aruco['Cam'] = curr_cam
+    
+#             # Filter out rows where both X and Y are zero
+#             df_aruco = df_aruco[(df_aruco['X'] != 0) | (df_aruco['Y'] != 0)]
+    
+#             # Map points using homography matrix
+#             curr_H = H_mats[curr_cam]
+#             xy_array = df_aruco[['X', 'Y']].to_numpy()
+#             mapped_points = map_points(xy_array, curr_H)
+            
+#             # Update DataFrame with mapped points
+#             df_aruco[['X', 'Y']] = mapped_points
+    
+#             # Append to the list for final concatenation
+#             total_aruco_data.append(df_aruco)
+
+#         # Concatenate all DataFrames at once
+#         total_df_aruco = pd.concat(total_aruco_data, ignore_index=True)
+#         output_file = f"{output_file_name[:-4]}_{ind:03d}.pkl"
+#         convert_to_pickle(output_folder_path, output_file,total_df_aruco)
+        
+
+def combine_aruco(H_mats, curr_aruco_dir, output_folder_path, output_file_name):
+    """
+    Combines and processes ArUco detection data from multiple pickle files, maps coordinates using
+    homography matrices, and saves the final DataFrame.
+
+    Parameters:
+        H_mats (list): List of homography matrices, one for each camera.
+        aruco_files (list): List of paths to pickle files containing `aruco_detection` dictionaries.
+        output_folder_path (str): Path to save the combined output.
+        output_file_name (str): Base name for the output files.
+    """
+    
+    pkl_files = sorted(glob.glob(os.path.join(curr_aruco_dir, '*.h5')))
+    aruco_files = [file for file in pkl_files if 'global' not in file]
 
     grouped_files = defaultdict(list)
-    for file in filtered_files:
-        # Extract the index (e.g., '003') from the filename
-        index = file.split('_')[-3].split('.')[0]
-        grouped_files[index].append(file)
+    for file in aruco_files:
+        # Extract the camera index: find the 2 numbers after the second 'cam'
+        parts = os.path.basename(file).split('cam')
+        if len(parts) > 2:
+            cam_number = parts[2][:2]  # Take the first two characters after the second 'cam'
+        else:
+            raise ValueError(f"Filename {file} does not have the required format with two 'cam' occurrences.")
         
-    # For each camera, map the points to the panorama using H_mats and load new coordinates into a DataFrame
+        grouped_files[cam_number].append(file)
+
+    #there is a naming bug here!!!
+
+    # Process files for each group
     for ind, chunk_files in enumerate(grouped_files.items()):
-        
         total_aruco_data = []  # Use a list to store DataFrames for concatenation later
         
-        for npy_file in chunk_files[1]:
+        for pkl_file in chunk_files[1]:
             # Extract camera index from the filename
-            print('Processing file:', npy_file)
-            curr_cam = int(os.path.basename(npy_file).split('_')[2][-2:]) - 1  # Adjust camera index
-    
-            # Load the tracks
-            aruco_tracks = np.load(npy_file)
-    
-            # Reshape array and create DataFrame
-            num_frames, num_arucos, num_positions = aruco_tracks.shape
-            reshaped_array = aruco_tracks.reshape((num_arucos * num_frames, num_positions))
-            df_aruco = pd.DataFrame(reshaped_array, columns=['X', 'Y'])
+            print('Processing file:', pkl_file)
+            curr_cam = int(os.path.basename(pkl_file).split('_')[1]) - 1  # Adjust camera index
+
+            # Load the ArUco detection dictionary
+            with open(pkl_file, "rb") as f:
+                aruco_detection = pickle.load(f)
+
+            # Create a DataFrame for all frames in this file
+            rows = []
+            for frame_number, detections in aruco_detection.items():
+                for aruco_id, centroid in detections.items():
+                    if len(centroid) == 2 and np.any(centroid):  # Valid (non-zero) centroid
+                        rows.append({
+                            'X': centroid[0],
+                            'Y': centroid[1],
+                            'Frame_number': frame_number,
+                            'ARUCO_number': aruco_id,
+                            'Cam': curr_cam
+                        })
             
-            # Add frame number, ARUCO number, and camera columns directly
-            df_aruco['Frame_number'] = np.repeat(np.arange(num_frames), num_arucos)
-            df_aruco['ARUCO_number'] = np.tile(np.arange(num_arucos), num_frames)
-            df_aruco['Cam'] = curr_cam
-    
-            # Filter out rows where both X and Y are zero
-            df_aruco = df_aruco[(df_aruco['X'] != 0) | (df_aruco['Y'] != 0)]
-    
-            # Map points using homography matrix
+            # Convert to DataFrame
+            df_aruco = pd.DataFrame(rows)
+
+            if df_aruco.empty:
+                continue  # Skip empty data
+
+            # Map points using the homography matrix
             curr_H = H_mats[curr_cam]
             xy_array = df_aruco[['X', 'Y']].to_numpy()
             mapped_points = map_points(xy_array, curr_H)
-            
+
             # Update DataFrame with mapped points
             df_aruco[['X', 'Y']] = mapped_points
-    
+
             # Append to the list for final concatenation
             total_aruco_data.append(df_aruco)
 
         # Concatenate all DataFrames at once
-        total_df_aruco = pd.concat(total_aruco_data, ignore_index=True)
-        output_file = f"{output_file_name[:-4]}_{ind:03d}.pkl"
-        convert_to_pickle(output_folder_path, output_file,total_df_aruco)
+        if total_aruco_data:
+            total_df_aruco = pd.concat(total_aruco_data, ignore_index=True)
+            output_file = f"{output_file_name[:-4]}_{ind:03d}.pkl"
+            convert_to_pickle(output_folder_path, output_file, total_df_aruco)
+        else:
+            print(f"No valid data found for group {ind}")
 
 
 def combine_sleap(H_mats, curr_dir,output_folder_path, output_file_name):
@@ -188,6 +268,7 @@ def combine_sleap(H_mats, curr_dir,output_folder_path, output_file_name):
 #directories 
 exp_name = '20241108_1'
 curr_dir='/home/sam/bucket/Ants/trials/' + exp_name + '/20241108_1_first_hour/data/'
+curr_aruco_dir='/home/sam/saionWork/sam/aruco_files/'
 output_folder_path = '/home/sam/bucket/sam/ant_tracking/' + exp_name + '/'
 hmats_dir = '/home/sam/bucket/sam/ant_tracking//bundle_adjustment_paras.mat'
 aruco_file_name = exp_name + '_aruco_panorama_frame.pkl'
@@ -205,7 +286,7 @@ check_calibration(xy_array.T, H_mats)
 #step 1 and 2 can be done automatically, parallelize over chunks
 
 #step1
-combine_aruco(H_mats, curr_dir,output_folder_path, aruco_file_name)
+combine_aruco(H_mats, curr_aruco_dir,output_folder_path, aruco_file_name)
 
 #step2
 combine_sleap(H_mats, curr_dir,output_folder_path, sleap_file_name)

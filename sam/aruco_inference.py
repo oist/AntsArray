@@ -131,6 +131,7 @@ def main(args):
     # Save aruco_detection to an HDF5 file
     with open(args.output_file, "wb") as f:
         pickle.dump(aruco_detection, f)
+    print('wrote file to ' + args.output_file)
 
 
     cap.release()
@@ -141,7 +142,7 @@ if __name__ == "__main__":
     parser.add_argument("--video_file", type=str, required=True, help="Path to the video file.")
     parser.add_argument("--sleap_file", type=str, required=True, help="Path to the SLEAP CSV file.")
     parser.add_argument("--model_name", type=str, required=True, help="Path to the trained model file.")
-    parser.add_argument("--output_file", type=str, required=True, help="Path to the output HDF5 file.")
+    parser.add_argument("--output_file", type=str, required=True, help="Path to the output pkl file.")
     parser.add_argument("--crop_size", type=int, default=128, help="Size of the crop around the detection.")
     parser.add_argument("--brightness_factor", type=float, default=1.2, help="Brightness adjustment factor for visualization.")
     parser.add_argument("--batch_size", type=int, default=64, help="Batch size for processing crops.")
