@@ -48,11 +48,11 @@ def main(args):
         exit()
 
     #get cam num
-    parts = os.path.basename(file).split('cam')
+    parts = os.path.basename(args.video_file).split('cam')
     if len(parts) > 2:
         cam_number = parts[2][:2]  # Take the first two characters after the second 'cam'
     else:
-        raise ValueError(f"Filename {file} does not have the required format with two 'cam' occurrences.")
+        raise ValueError("Filename does not have the required format with two 'cam' occurrences.")
         
     
     # Get video properties
