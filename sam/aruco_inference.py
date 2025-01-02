@@ -9,6 +9,7 @@ from PIL import Image
 import torch.nn as nn
 import argparse
 import pickle
+import os
 
 def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -46,13 +47,21 @@ def main(args):
         print(f"Failed to open video file: {args.video_file}")
         exit()
 
+    #get cam num
+    parts = os.path.basename(file).split('cam')
+    if len(parts) > 2:
+        cam_number = parts[2][:2]  # Take the first two characters after the second 'cam'
+    else:
+        raise ValueError(f"Filename {file} does not have the required format with two 'cam' occurrences.")
+        
+    
     # Get video properties
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-       # Initialize aruco_detection as a dictionary
-    aruco_detection = {frame_idx: {} for frame_idx in range(frame_count)}
+
+    rows = []  # To store rows for DataFrame
     
     # Process video frame by frame
     for frame_idx in tqdm(range(frame_count)):
@@ -105,15 +114,22 @@ def main(args):
                 confidence = confidence.cpu().numpy()
                 predicted_ids = predicted_ids.cpu().numpy()
     
+                # Apply confidence threshold
                 predicted_ids = np.where(confidence < args.confidence_threshold, -1, predicted_ids)
     
-                # Store all detections in the dictionary for the current frame
+                # Store detections in the dictionary and prepare rows for DataFrame
                 for (x, y), predicted_id in zip(batch_positions, predicted_ids):
-                    if predicted_id != -1:
-                        if predicted_id not in aruco_detection[frame_idx]:
-                            aruco_detection[frame_idx][predicted_id] = []
-                        aruco_detection[frame_idx][predicted_id].append((x, y))
-    
+                    if predicted_id != -1:  # Only store valid IDs
+
+                        # Append a row for DataFrame
+                        rows.append({
+                            'X': x,
+                            'Y': y,
+                            'Frame_number': frame_idx,
+                            'ARUCO_number': predicted_id,
+                            'Cam': cam_number-1
+                        })
+
         if args.visualize:
             for (x, y), predicted_id in zip(crop_positions, predicted_ids):
                 cv2.circle(disp_img, (int(x), int(y)), 20, (0, 0, 255), -1)
@@ -127,10 +143,15 @@ def main(args):
             cv2.imshow("ArUco Tag Detection", show_img)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
+            
+            
+        # Convert rows to a DataFrame
+    df_aruco = pd.DataFrame(rows)
     
-    # Save aruco_detection to an HDF5 file
-    with open(args.output_file, "wb") as f:
-        pickle.dump(aruco_detection, f)
+    # Save DataFrame as a pickle file
+    output_file = os.path.join(args.output_dir, 'aruco_detections.pkl')
+    os.makedirs(args.output_dir, exist_ok=True)
+    df_aruco.to_pickle(output_file)
     print('wrote file to ' + args.output_file)
 
 
