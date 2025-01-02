@@ -127,7 +127,7 @@ def main(args):
                             'Y': y,
                             'Frame_number': frame_idx,
                             'ARUCO_number': predicted_id,
-                            'Cam': cam_number-1
+                            'Cam': int(cam_number)-1
                         })
 
         if args.visualize:
