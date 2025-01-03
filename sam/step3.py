@@ -76,10 +76,20 @@ def align_cams(df, camera_order, col):
         Returns:
             DataFrame, DataFrame: Filtered data for reference and target cameras.
         """
+             # Filter out rows where ARUCO_number appears more than once per Frame_number
+        ref_data_filtered = ref_data[
+            ref_data.groupby(['Frame_number', 'ARUCO_number'])['ARUCO_number']
+            .transform('size') == 1
+        ]
+        target_data_filtered = target_data[
+            target_data.groupby(['Frame_number', 'ARUCO_number'])['ARUCO_number']
+            .transform('size') == 1
+        ]
+   
         # Merge on ARUCO_number and Frame_number to find matches
         merged_data = pd.merge(
-            ref_data,
-            target_data,
+            ref_data_filtered,
+            target_data_filtered,
             on=['ARUCO_number', 'Frame_number'],
             suffixes=('_ref', '_target')
         )
@@ -133,13 +143,19 @@ def align_cams(df, camera_order, col):
             return np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32)  # Return 2x3 identity matrix
     
         # Compute the similarity transform
-        transform_matrix, inliers = cv2.estimateAffinePartial2D(target_points, ref_points)
+        transform_matrix, inliers = cv2.estimateAffinePartial2D(
+    target_points,  # Source points
+    ref_points,     # Destination points
+    method=cv2.RANSAC,  # Optional: Use RANSAC for robust estimation
+    ransacReprojThreshold=3.0  # Optional: Set threshold for RANSAC
+)
         
         # If no valid transform could be computed, return identity
         if transform_matrix is None:
             print("Failed to compute similarity transform. Returning identity transform.")
             return np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32)
-    
+        
+       # transform_matrix=np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32)
         return transform_matrix
 
 

@@ -125,7 +125,7 @@ def main(args):
                         rows.append({
                             'X': x,
                             'Y': y,
-                            'Frame_number': frame_idx,
+                            'Frame': frame_idx,
                             'ARUCO_number': predicted_id,
                             'Cam': int(cam_number)-1
                         })

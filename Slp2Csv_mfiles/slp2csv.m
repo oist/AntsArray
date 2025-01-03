@@ -95,7 +95,8 @@ function flattenedData = flattenData(dset)
 fileIdx = 1;
 % flatten frame_instance_xy data to 2D
 nInstances = length(dset(fileIdx).tracks.instances.frame_id);
-frameIds = dset(fileIdx).tracks.instances.frame_id + 1; % Assuming frame_id starts from 0, adjust to MATLAB's 1-based indexing
+frames_with_instances=dset(fileIdx).tracks.frames.frame_idx + 1;
+frameIds = frames_with_instances(dset(fileIdx).tracks.instances.frame_id+1);
 pointIdStarts = dset(fileIdx).tracks.instances.point_id_start + 1; % Adjust for 1-based indexing
 bodyPointIndices = repmat((1:dset(fileIdx).nNodes)', nInstances, 1);
 numRows = length(dset(fileIdx).tracks.pred_points.x);
