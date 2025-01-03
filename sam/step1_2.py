@@ -186,7 +186,7 @@ def combine_sleap(H_mats, curr_dir,output_folder_path, output_file_name):
             # Add the camera number column
             curr_cam = int(os.path.basename(csv).split('_')[2][-2:]) - 1  # Adjust camera index
             df['Cam'] = curr_cam
-    
+            df['Frame'] = df['Frame'] - 1  # Convert to 0-based indexing
             # Map points to the panorama
             curr_H = H_mats[curr_cam]
             xy_array = df[['X', 'Y']].to_numpy()

@@ -40,7 +40,10 @@ def main(args):
     df = pd.read_csv(args.sleap_file)
     df['Frame'] = df['Frame'] - 1  # Convert to 0-based indexing
     df = df.drop(['Score_node'], axis=1)
+    grouped_sleap = dict(iter(df.groupby('Frame')))
+    
 
+    
     # Open video file
     cap = cv2.VideoCapture(args.video_file)
     if not cap.isOpened():
@@ -75,8 +78,13 @@ def main(args):
             disp_img = np.clip(frame.astype(np.float32) * args.brightness_factor, 0, 255).astype(np.uint8)
     
         # Get SLEAP detections for the current frame
-        sleap_detections = df[df['Frame'] == frame_idx][['X', 'Y']].to_numpy()
-    
+      #  sleap_detections = df[df['Frame'] == frame_idx][['X', 'Y']].to_numpy()
+        if frame_idx in grouped_sleap:
+            sleap_detections = grouped_sleap[frame_idx][['X', 'Y']].to_numpy()
+        else:
+            sleap_detections = []
+
+        
         valid_crops = []
         crop_positions = []
     
