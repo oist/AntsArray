@@ -147,11 +147,7 @@ def main(args):
             
         # Convert rows to a DataFrame
     df_aruco = pd.DataFrame(rows)
-    
-    # Save DataFrame as a pickle file
-    output_file = os.path.join(args.output_dir, 'aruco_detections.pkl')
-    os.makedirs(args.output_dir, exist_ok=True)
-    df_aruco.to_pickle(output_file)
+    df_aruco.to_pickle(args.output_file)
     print('wrote file to ' + args.output_file)
 
 
