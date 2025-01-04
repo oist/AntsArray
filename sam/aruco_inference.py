@@ -79,10 +79,11 @@ def main(args):
     
         # Get SLEAP detections for the current frame
       #  sleap_detections = df[df['Frame'] == frame_idx][['X', 'Y']].to_numpy()
+     #   import pdb;pdb.set_trace()
         if frame_idx in grouped_sleap:
             sleap_detections = grouped_sleap[frame_idx][['X', 'Y']].to_numpy()
         else:
-            sleap_detections = []
+            sleap_detections = np.full((1, 2), np.nan) 
 
         
         valid_crops = []
@@ -108,35 +109,39 @@ def main(args):
             crop_positions.append((x, y))
     
         # Process crops in mini-batches
-        for start_idx in range(0, len(valid_crops), args.batch_size):
-            end_idx = start_idx + args.batch_size
-            batch_crops = valid_crops[start_idx:end_idx]
-            batch_positions = crop_positions[start_idx:end_idx]
+        if valid_crops:
+            for start_idx in range(0, len(valid_crops), args.batch_size):
+                end_idx = start_idx + args.batch_size
+                batch_crops = valid_crops[start_idx:end_idx]
+                batch_positions = crop_positions[start_idx:end_idx]
+        
+                cnn_inputs = torch.stack(batch_crops).to(device)
+                with torch.no_grad():
+                    outputs = model(cnn_inputs)
+                    probabilities = torch.softmax(outputs, dim=1)
+                    confidence, predicted_ids = torch.max(probabilities, dim=1)
+        
+                    confidence = confidence.cpu().numpy()
+                    predicted_ids = predicted_ids.cpu().numpy()
+        
+                    # Apply confidence threshold
+                    predicted_ids = np.where(confidence < args.confidence_threshold, -1, predicted_ids)
+        
+                    # Store detections in the dictionary and prepare rows for DataFrame
+                    for (x, y), predicted_id in zip(batch_positions, predicted_ids):
+                        if predicted_id != -1:  # Only store valid IDs
     
-            cnn_inputs = torch.stack(batch_crops).to(device)
-            with torch.no_grad():
-                outputs = model(cnn_inputs)
-                probabilities = torch.softmax(outputs, dim=1)
-                confidence, predicted_ids = torch.max(probabilities, dim=1)
-    
-                confidence = confidence.cpu().numpy()
-                predicted_ids = predicted_ids.cpu().numpy()
-    
-                # Apply confidence threshold
-                predicted_ids = np.where(confidence < args.confidence_threshold, -1, predicted_ids)
-    
-                # Store detections in the dictionary and prepare rows for DataFrame
-                for (x, y), predicted_id in zip(batch_positions, predicted_ids):
-                    if predicted_id != -1:  # Only store valid IDs
-
-                        # Append a row for DataFrame
-                        rows.append({
-                            'X': x,
-                            'Y': y,
-                            'Frame': frame_idx,
-                            'ARUCO_number': predicted_id,
-                            'Cam': int(cam_number)-1
-                        })
+                            # Append a row for DataFrame
+                            rows.append({
+                                'X': x,
+                                'Y': y,
+                                'Frame': frame_idx,
+                                'ARUCO_number': predicted_id,
+                                'Cam': int(cam_number)-1
+                            })
+        else:
+            # If there are no valid crops, set predicted_ids to an empty list
+            predicted_ids = []
 
         if args.visualize:
             for (x, y), predicted_id in zip(crop_positions, predicted_ids):

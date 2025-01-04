@@ -1,4 +1,4 @@
-function batch_slp2csv(slp_dir_path)
+function batch_slp2csv(slp_dir_path, outputFolder)
 if exist(slp_dir_path, 'dir') ~= 7
     error("input is not a directory. Please select a directory containing SLP files.")
 else
@@ -10,7 +10,7 @@ else
     fprintf("Processing %d slp files in %s\n\n",numel(slpFiles), slp_dir_path)
 
     for m = 1:numel(slpFiles)
-        slp2csv(slpFiles{m})
+        slp2csv(slpFiles{m}, outputFolder)
     end
 
     fprintf("\n%d slp files are converted.\n", numel(slpFiles)) 

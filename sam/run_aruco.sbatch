@@ -1,7 +1,8 @@
 #!/bin/bash
 
 # Define input arguments
-DATA_FOLDER='/bucket/ReiterU/Ants/trials/20241108_1/20241108_1_first_hour/data'
+VIDEO_FOLDER='/home/sam/bucket/Ants/trials/20241108_1/20241108_1_first_hour/data/'
+SLP_FOLDER='/home/sam/bucket/sam/ant_tracking/20241108_1/slp_files/'
 MODEL_PATH='/work/ReiterU/sam/antnet.pth'
 OUTPUT_FOLDER='/work/ReiterU/sam/'
 
@@ -9,12 +10,12 @@ OUTPUT_FOLDER='/work/ReiterU/sam/'
 mkdir -p "$OUTPUT_FOLDER"
 
 # Iterate over all video files in the data folder
-for VIDEO_FILE in "$DATA_FOLDER"/*.avi; do
+for VIDEO_FILE in "$VIDEO_FOLDER"/*.avi; do
     # Extract base name without extension
     BASE_NAME=$(basename "$VIDEO_FILE" .avi)
 
     # Define corresponding SLEAP file
-    SLEAP_FILE="$DATA_FOLDER/$BASE_NAME.csv"
+    SLEAP_FILE="$SLP_FOLDER/$BASE_NAME.csv"
 
     # Define output HDF5 file
     OUTPUT_FILE="$OUTPUT_FOLDER/$BASE_NAME.pkl"

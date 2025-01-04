@@ -1,4 +1,4 @@
-function slp2csv(filename) 
+function slp2csv(filename, outputFolder) 
 % Step 1: Import SLP file
 dset = importSLP(filename);
 
@@ -10,7 +10,7 @@ flattenedData = flattenData(dset);
 
 % Step 4: Save the Data for DataFrame Conversion
 % csv
-csvFileName = fullfile(dset.dir, dset.name+".csv");
+csvFileName = fullfile(outputFolder, dset.name+".csv");
 writetable(flattenedData, csvFileName);
 fprintf(' saved: %s\n', csvFileName);
 
