@@ -134,7 +134,7 @@ def combine_aruco(H_mats, curr_aruco_dir, output_folder_path, output_file_name):
             if df_aruco.empty:
                 print(f"No valid data in {pkl_file}, skipping...")
                 continue  # Skip empty data
-            print(df_aruco['Frame_number'].iloc[-1])
+            print(df_aruco['Frame'].iloc[-1])
             # Map points using the homography matrix
             curr_H = H_mats[curr_cam]
             xy_array = df_aruco[['X', 'Y']].to_numpy()
@@ -200,10 +200,65 @@ def combine_sleap(H_mats, curr_dir,output_folder_path, output_file_name):
         convert_to_pickle(output_folder_path, output_file,total_df)
 
 
+def combine_aruco_old(H_mats, curr_dir, output_folder_path, output_file_name):
+    # Retrieve all .npy files in the current directory if they are not frame counts
+    npy_files = glob.glob(os.path.join(curr_dir, '*.npy'))
+    npy_files = [file for file in npy_files if 'global' not in file]
+    
+    grouped_files = defaultdict(list)
+    for file in npy_files:
+        # Extract the index (e.g., '003') from the filename
+        index = file.split('_')[-1].split('.')[0]
+        grouped_files[index].append(file)
+
+    for ind, chunk_files in enumerate(grouped_files.items()):
+        
+        total_aruco_data = []  # Use a list to store DataFrames for concatenation later
+    
+        # For each camera, map the points to the panorama using H_mats and load new coordinates into a DataFrame
+        for npy_file in chunk_files[1]:
+            # Extract camera index from the filename
+            print('Processing file:', npy_file)
+            curr_cam = int(os.path.basename(npy_file).split('_')[2][-2:]) - 1  # Adjust camera index
+    
+            # Load the tracks
+            aruco_tracks = np.load(npy_file)
+    
+            # Reshape array and create DataFrame
+            num_frames, num_arucos, num_positions = aruco_tracks.shape
+            reshaped_array = aruco_tracks.reshape((num_arucos * num_frames, num_positions))
+            df_aruco = pd.DataFrame(reshaped_array, columns=['X', 'Y'])
+            
+            # Add frame number, ARUCO number, and camera columns directly
+            df_aruco['Frame_number'] = np.repeat(np.arange(num_frames), num_arucos)
+            df_aruco['ARUCO_number'] = np.tile(np.arange(num_arucos), num_frames)
+            df_aruco['Cam'] = curr_cam
+    
+            # Filter out rows where both X and Y are zero
+            df_aruco = df_aruco[(df_aruco['X'] != 0) | (df_aruco['Y'] != 0)]
+    
+            # Map points using homography matrix
+            curr_H = H_mats[curr_cam]
+            xy_array = df_aruco[['X', 'Y']].to_numpy()
+            mapped_points = map_points(xy_array, curr_H)
+            
+            # Update DataFrame with mapped points
+            df_aruco[['X', 'Y']] = mapped_points
+    
+            # Append to the list for final concatenation
+            total_aruco_data.append(df_aruco)
+    
+        # Concatenate all DataFrames at once
+        total_df_aruco = pd.concat(total_aruco_data, ignore_index=True)
+        output_file = f"{output_file_name[:-4]}_{ind:03d}.pkl"
+        convert_to_pickle(output_folder_path, output_file,total_df_aruco)
+    
+
 #directories 
 exp_name = '20241108_1'
-curr_dir='/home/sam/bucket/Ants/trials/' + exp_name + '/20241108_1_first_hour/data/'
+curr_slp_dir='/home/sam/bucket/sam/ant_tracking/20241108_1/slp_files/'
 curr_aruco_dir='/home/sam/saionWork/sam/aruco_files/'
+#curr_aruco_dir='/home/sam/bucket/Ants/trials/20241108_1/20241108_1_first_hour/data/'
 output_folder_path = '/home/sam/bucket/sam/ant_tracking/' + exp_name + '/'
 hmats_dir = '/home/sam/bucket/sam/ant_tracking//bundle_adjustment_paras.mat'
 aruco_file_name = exp_name + '_aruco_panorama_frame.pkl'
@@ -225,7 +280,7 @@ check_calibration(xy_array.T, H_mats)
 combine_aruco(H_mats, curr_aruco_dir,output_folder_path, aruco_file_name)
 
 #step2
-combine_sleap(H_mats, curr_dir,output_folder_path, sleap_file_name)
+combine_sleap(H_mats, curr_slp_dir,output_folder_path, sleap_file_name)
 
 
 

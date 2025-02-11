@@ -109,6 +109,9 @@ train_transforms = transforms.Compose([
 
 # 2) Load Dataset
 dataset = datasets.ImageFolder(root=data_path)
+class_names = dataset.classes
+np.save(output + '_classnames.npy',class_names)
+
 train_percentage = 0.8
 train_size = int(train_percentage * len(dataset))
 val_size = len(dataset) - train_size
@@ -213,7 +216,9 @@ num_epochs = 50
 best_val_acc = 0.0
 
 # 4) Loss Function and Optimizer
+# Use the weights in the loss function
 criterion = nn.CrossEntropyLoss()
+
 optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
 scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
 

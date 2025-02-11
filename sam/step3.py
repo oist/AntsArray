@@ -78,11 +78,11 @@ def align_cams(df, camera_order, col):
         """
              # Filter out rows where ARUCO_number appears more than once per Frame_number
         ref_data_filtered = ref_data[
-            ref_data.groupby(['Frame_number', 'ARUCO_number'])['ARUCO_number']
+            ref_data.groupby(['Frame', 'ARUCO_number'])['ARUCO_number']
             .transform('size') == 1
         ]
         target_data_filtered = target_data[
-            target_data.groupby(['Frame_number', 'ARUCO_number'])['ARUCO_number']
+            target_data.groupby(['Frame', 'ARUCO_number'])['ARUCO_number']
             .transform('size') == 1
         ]
    
@@ -90,7 +90,7 @@ def align_cams(df, camera_order, col):
         merged_data = pd.merge(
             ref_data_filtered,
             target_data_filtered,
-            on=['ARUCO_number', 'Frame_number'],
+            on=['ARUCO_number', 'Frame'],
             suffixes=('_ref', '_target')
         )
         
@@ -264,7 +264,7 @@ exp_name = '20241108_1'
 curr_dir='/home/sam/bucket/Ants/trials/' + exp_name + '/20241108_1_first_hour/data/'
 output_folder_path = '/home/sam/bucket/sam/ant_tracking/' + exp_name + '/'
 hmats_dir = '/home/sam/bucket/sam/ant_tracking//bundle_adjustment_paras.mat'
-aruco_file_name = exp_name + '_aruco_panorama_frame.pkl'
+aruco_file_name = exp_name + '_aruco_panorama_frame_old.pkl'
 sleap_file_name = exp_name + '_sleap_panorama_frame.pkl'
 colony_split_pixel=2000
 col_1, col_2 = 9, 11

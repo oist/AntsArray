@@ -19,7 +19,7 @@ import numpy as np
 import pandas as pd
 from scipy.spatial.distance import cdist
 from scipy.optimize import linear_sum_assignment
-
+import pickle
 
 
 def interpolate_missing_positions(merged_all_pos):
@@ -55,12 +55,14 @@ def interpolate_missing_positions(merged_all_pos):
 
 
 
-video_file='/home/sam/bucket/Ants/trials/20241108_1/20241108_1_first_hour/cam5_2024-11-07-23-40-43_cam06_first_hour.avi'
-aruco_file='/home/sam/bucket/Ants/trials/20241108_1/20241108_1_first_hour/data/cam5_2024-11-07-23-40-43_cam06_first_hour_000.aviaruco_tracks_.npy'
-sleap_file='/home/sam/bucket/Ants/trials/20241108_1/20241108_1_first_hour/data/cam5_2024-11-07-23-40-43_cam06_first_hour_000.csv'
+video_file='/home/sam/bucket/Ants/basler/20250123_1/data/cam5_2025-01-23-11-15-11_cam06_000.avi'
+aruco_file='/home/sam/bucket/Ants/basler/20250123_1/data/tracks_aruco/cam5_2025-01-23-11-15-11_cam06_000.pkl'
+sleap_file='/home/sam/bucket/Ants/basler/20250123_1/data/cam5_2025-01-23-11-15-11_cam06_000.csv'
 
 #aruco
-aruco_tracks = np.load(aruco_file)
+with open(aruco_file, "rb") as f:
+    aruco_detection = pickle.load(f)
+    
 num_frames, num_arucos, num_positions = aruco_tracks.shape
 reshaped_array = aruco_tracks.reshape((num_arucos * num_frames, num_positions))
 

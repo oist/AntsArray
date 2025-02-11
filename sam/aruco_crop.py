@@ -7,10 +7,10 @@ import uuid
 import shutil
 
 # Parameters
-INPUT_DIR = "/home/sam/bucket/Ants/trials/20241108_1/"
+INPUT_DIR = "/home/sam/bucket/Ants/basler/20250123_1/"
 OUTPUT_DIR = "/home/sam/bucket/sam/ant_tracking/aruco_imgs/train_dataset"
 CROP_SIZE = 128  # Fixed crop size. Needs to be 224 for resnet, watch image aug
-FRAMES_PER_VIDEO = 500  # Number of random frames to extract from each video
+FRAMES_PER_VIDEO = 50  # Number of random frames to extract from each video
 
 aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_1000)
 detectParams = aruco.DetectorParameters()
@@ -126,3 +126,38 @@ def process_video_directory(input_dir, output_dir, crop_size, frames_per_video):
 process_video_directory(INPUT_DIR, OUTPUT_DIR, CROP_SIZE, FRAMES_PER_VIDEO)
 
 remove_small_folders(OUTPUT_DIR,50)
+
+# SUBSET_DIR = os.path.join(OUTPUT_DIR, "SUBSET")
+
+# # Create the subset directory if it doesn't exist
+# os.makedirs(SUBSET_DIR, exist_ok=True)
+
+# # Get all subdirectories in OUTPUT_DIR
+# subdirs = [d for d in os.listdir(OUTPUT_DIR) if os.path.isdir(os.path.join(OUTPUT_DIR, d))]
+
+# # Find the minimum number of files in any subdirectory
+# min_files = float('inf')
+# for subdir in subdirs:
+#     subdir_path = os.path.join(OUTPUT_DIR, subdir)
+#     num_files = len([f for f in os.listdir(subdir_path) if os.path.isfile(os.path.join(subdir_path, f))])
+#     min_files = min(min_files, num_files)
+
+# print(f"Minimum number of elements in a folder: {min_files}")
+
+# # Create the SUBSET folder with balanced data
+# for subdir in subdirs:
+#     subdir_path = os.path.join(OUTPUT_DIR, subdir)
+#     subset_subdir_path = os.path.join(SUBSET_DIR, subdir)
+#     os.makedirs(subset_subdir_path, exist_ok=True)
+
+#     # Get all files in the current subdirectory
+#     files = [f for f in os.listdir(subdir_path) if os.path.isfile(os.path.join(subdir_path, f))]
+
+#     # Take only the minimum number of files
+#     selected_files = files[:min_files]
+#     for file in selected_files:
+#         src_file = os.path.join(subdir_path, file)
+#         dst_file = os.path.join(subset_subdir_path, file)
+#         shutil.copy2(src_file, dst_file)
+
+# print(f"Balanced dataset created in {SUBSET_DIR} with {min_files} instances per class.")

@@ -19,6 +19,7 @@ import os
 #import h5py
 import matplotlib.cm as cm
 from collections import defaultdict
+import pickle as pkl
 
 def get_Hmats(curr_dir):
 
@@ -90,8 +91,8 @@ def check_calibration(xy_arra, H_mats):
 
 def combine_aruco(H_mats, curr_dir,output_folder_path, output_file_name):
     # Retrieve all .npy files in the current directory if they are not frame counts
-    npy_files = sorted(glob.glob(os.path.join(curr_dir, '*.npy')))
-    filtered_files = [file for file in npy_files if 'global' not in file]
+    pkl_files = sorted(glob.glob(os.path.join(curr_dir, '*.pkl')))
+    filtered_files = [file for file in pkl_files if 'global' not in file]
 
     grouped_files = defaultdict(list)
     for file in filtered_files:
@@ -104,24 +105,25 @@ def combine_aruco(H_mats, curr_dir,output_folder_path, output_file_name):
         
         total_aruco_data = []  # Use a list to store DataFrames for concatenation later
         
-        for npy_file in chunk_files[1]:
+        for pkl_file in chunk_files[1]:
             # Extract camera index from the filename
-            print('Processing file:', npy_file)
-            curr_cam = int(os.path.basename(npy_file).split('_')[2][-2:]) - 1  # Adjust camera index
+            print('Processing file:', pkl_file)
+            curr_cam = int(os.path.basename(pkl_file).split('_')[2][-2:]) - 1  # Adjust camera index
     
             # Load the tracks
-            aruco_tracks = np.load(npy_file)
-    
+            with open(pkl_file, "rb") as f:
+                df_aruco = pickle.load(f)
             # Reshape array and create DataFrame
-            num_frames, num_arucos, num_positions = aruco_tracks.shape
-            reshaped_array = aruco_tracks.reshape((num_arucos * num_frames, num_positions))
-            df_aruco = pd.DataFrame(reshaped_array, columns=['X', 'Y'])
+           # num_frames, num_arucos, num_positions = aruco_tracks.shape
+           # reshaped_array = aruco_tracks.reshape((num_arucos * num_frames, num_positions))
+           
+            #df_aruco = pd.DataFrame(reshaped_array, columns=['X', 'Y'])
             
             # Add frame number, ARUCO number, and camera columns directly
-            df_aruco['Frame_number'] = np.repeat(np.arange(num_frames), num_arucos)
-            df_aruco['ARUCO_number'] = np.tile(np.arange(num_arucos), num_frames)
-            df_aruco['Cam'] = curr_cam
-    
+           # df_aruco['Frame_number'] = np.repeat(np.arange(num_frames), num_arucos)
+           # df_aruco['ARUCO_number'] = np.tile(np.arange(num_arucos), num_frames)
+           # df_aruco['Cam'] = curr_cam
+    #
             # Filter out rows where both X and Y are zero
             df_aruco = df_aruco[(df_aruco['X'] != 0) | (df_aruco['Y'] != 0)]
     
@@ -186,9 +188,10 @@ def combine_sleap(H_mats, curr_dir,output_folder_path, output_file_name):
 
 
 #directories 
-exp_name = '20241108_1'
-curr_dir='/home/sam/bucket/Ants/trials/' + exp_name + '/data/'
-output_folder_path = '/home/sam/bucket/sam/ant_tracking/' + exp_name + '/'
+exp_name = '20250123_1'
+curr_sleap_dir='/home/sam/bucket/Ants/basler/' + exp_name + '/data/'
+curr_aruco_dir='/home/sam/bucket/Ants/basler/' + exp_name + '/data/tracks_aruco/'
+output_folder_path = curr_aruco_dir
 hmats_dir = '/home/sam/bucket/sam/ant_tracking//bundle_adjustment_paras.mat'
 aruco_file_name = exp_name + '_aruco_panorama_frame.pkl'
 sleap_file_name = exp_name + '_sleap_panorama_frame.pkl'
@@ -203,7 +206,7 @@ xy_array = np.array([x, y]).T
 check_calibration(xy_array.T, H_mats)
 
 #step1
-combine_aruco(H_mats, curr_dir,output_folder_path, aruco_file_name)
+combine_aruco(H_mats, curr_aruco_dir,output_folder_path, aruco_file_name)
 
 #step2
 combine_sleap(H_mats, curr_dir,output_folder_path, sleap_file_name)
