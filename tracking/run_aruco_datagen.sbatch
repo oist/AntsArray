@@ -1,0 +1,51 @@
+#!/bin/bash
+
+# Define input arguments
+VIDEO_FOLDER='/home/sam/bucket/Ants/basler/20250123_1/data/'
+OUTPUT_FOLDER='/work/ReiterU/sam/'
+
+# Ensure output folder exists
+mkdir -p "$OUTPUT_FOLDER"
+
+# Iterate over all video files in the data folder
+for VIDEO_FILE in "$VIDEO_FOLDER"/*.avi; do
+    # Extract base name without extension
+    BASE_NAME=$(basename "$VIDEO_FILE" .avi)
+
+    # Define corresponding SLEAP file
+    SLEAP_FILE="$SLP_FOLDER/$BASE_NAME.h5"
+    
+    # Define corresponding aruco file
+    ARUCO_FILE="$SLP_FOLDER/$BASE_NAME.aviaruco_tracks.npy"
+  
+    # Create a temporary SLURM script for the job
+    SLURM_SCRIPT=$(mktemp)
+
+    cat <<EOF > "$SLURM_SCRIPT"
+#!/bin/bash -l
+#SBATCH -t 0-24
+#SBATCH -c 32
+#SBATCH --partition=compute
+#SBATCH --mem=64G
+#SBATCH --job-name=$BASE_NAME
+#SBATCH --output=$OUTPUT_FOLDER/${BASE_NAME}_%j.out
+
+# Activate the Python environment
+source /opt/conda/etc/profile.d/conda.sh
+conda activate torch
+
+# Run the Python script
+python /home/s/samuel-reiter/AntsArray/sam/aruco_datagen.py \\
+  --video_name "$VIDEO_FILE" \\
+  --sleap_file_name "$SLEAP_FILE" \\
+  --aruco_name "$ARUCO_FILE" \\
+  --output_path "$OUTPUT_FOLDER" \\
+ 
+EOF
+
+    # Submit the SLURM job
+    sbatch "$SLURM_SCRIPT"
+
+    # Clean up temporary SLURM script
+    rm "$SLURM_SCRIPT"
+done
