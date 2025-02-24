@@ -70,7 +70,8 @@ def main():
         args.video_name,
         False,           # set to True/False as needed
         harvest_crops=True,
-        crops_output_dir=args.output_path
+        harvest_interval=25,
+        crops_output_dir=args.output_path 
     )
 
 

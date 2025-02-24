@@ -157,7 +157,7 @@ model.to(device)
 # ---------- 7) Define Loss and Optimizer ----------
 criterion = nn.CrossEntropyLoss()
 optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
-num_epochs = 50
+num_epochs = 100
 scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
 
 # ---------- 8) Training and Validation Functions ----------

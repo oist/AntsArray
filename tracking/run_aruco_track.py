@@ -49,7 +49,7 @@ pos_col2, idx_col2 = get_complete_tracks(output_path, aruco_detection_col2, slea
 #it should work on single videos as well
 
 aruco_file_name_col2='/home/sam/saionWork/sam/cam5_2025-01-23-11-15-11_cam06_000.pkl'
-sleap_file_name_col2='/home/sam/bucket/Ants/basler/20250123_1/data/data_tmp/tracks_opencv_sleap_old/cam5_2025-01-23-11-15-11_cam06_000.csv'
+sleap_file_name='/home/sam/bucket/Ants/basler/20250123_1/data/cam5_2025-01-23-11-15-11_cam06_000.h5'
 video_name='/home/sam/bucket/Ants/basler/20250123_1/data/cam5_2025-01-23-11-15-11_cam06_000.avi'
 
 with open(aruco_file_name_col2, 'rb') as f:
@@ -61,6 +61,14 @@ sleap_detection = pd.read_csv(sleap_file_name_col2)
 sleap_detection['Frame'] = sleap_detection['Frame'] - 1  # zero-based frames
 sleap_detection = sleap_detection.drop(['Score_node'], axis=1)
 sleap_detection['Instance'] = sleap_detection.groupby('Frame').cumcount() - 1
+
+
+sleap_File = h5py.File(sleap_file_name,'r')
+sleap_detection=pd.DataFrame({
+    'X': np.squeeze(sleap_File['X'][:]),
+    'Y': np.squeeze(sleap_File['Y'][:]),
+    'Frame': np.squeeze(sleap_File['Frame'][:]) })
+
 
 
 #trying one more time aruco opencv

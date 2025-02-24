@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # Define input arguments
-VIDEO_FOLDER='/home/sam/bucket/Ants/basler/20250123_1/data/'
-OUTPUT_FOLDER='/work/ReiterU/sam/'
+VIDEO_FOLDER='/bucket/ReiterU/Ants/basler/20250123_1/data/'
+OUTPUT_FOLDER='/flash/ReiterU/sam/aruco/'
 
 # Ensure output folder exists
 mkdir -p "$OUTPUT_FOLDER"
@@ -13,10 +13,10 @@ for VIDEO_FILE in "$VIDEO_FOLDER"/*.avi; do
     BASE_NAME=$(basename "$VIDEO_FILE" .avi)
 
     # Define corresponding SLEAP file
-    SLEAP_FILE="$SLP_FOLDER/$BASE_NAME.h5"
+    SLEAP_FILE="$VIDEO_FOLDER/$BASE_NAME.h5"
     
     # Define corresponding aruco file
-    ARUCO_FILE="$SLP_FOLDER/$BASE_NAME.aviaruco_tracks.npy"
+    ARUCO_FILE="$VIDEO_FOLDER/$BASE_NAME.aviaruco_tracks_.npy"
   
     # Create a temporary SLURM script for the job
     SLURM_SCRIPT=$(mktemp)
@@ -35,7 +35,7 @@ source /opt/conda/etc/profile.d/conda.sh
 conda activate torch
 
 # Run the Python script
-python /home/s/samuel-reiter/AntsArray/sam/aruco_datagen.py \\
+python /home/s/samuel-reiter/AntsArray/tracking/aruco_datagen.py \\
   --video_name "$VIDEO_FILE" \\
   --sleap_file_name "$SLEAP_FILE" \\
   --aruco_name "$ARUCO_FILE" \\

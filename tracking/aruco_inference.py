@@ -10,6 +10,7 @@ import torch.nn as nn
 import argparse
 import pickle
 import os
+import h5py
 
 def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -17,17 +18,23 @@ def main(args):
     # Load the model
     model = models.resnet50(weights='ResNet50_Weights.DEFAULT')
 
+    # Load the trained weights
+    state_dict = torch.load(args.model_name, map_location=device)
+    
+    # Extract the number of output classes from the saved model weights
+    num_classes = state_dict['fc.1.weight'].shape[0]  # Get the number of output classes from the last layer
+    
     # Replace the final fully connected layer to match training setup
     model.fc = nn.Sequential(
         nn.Dropout(0.5),
-        nn.Linear(model.fc.in_features, args.num_tags)
+        nn.Linear(model.fc.in_features, num_classes)
     )
-
+    
     # Send the model to the device
     model = model.to(device)
-
-    # Load the trained weights
-    model.load_state_dict(torch.load(args.model_name, map_location=device))
+    
+    # Load the trained weights into the model
+    model.load_state_dict(state_dict)
     model.eval()
 
     # Preprocessing transform for the input
@@ -36,12 +43,15 @@ def main(args):
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
 
-    # Load SLEAP detections
-    df = pd.read_csv(args.sleap_file)
-    df['Frame'] = df['Frame'] - 1  # Convert to 0-based indexing
-    df = df.drop(['Score_node'], axis=1)
-    grouped_sleap = dict(iter(df.groupby('Frame')))
-    
+   
+    # --- Load SLEAP detections ---
+    with h5py.File(args.sleap_file, 'r') as sleap_File:
+        sleap_detection = pd.DataFrame({
+            'X':     np.squeeze(sleap_File['X'][:]),
+            'Y':     np.squeeze(sleap_File['Y'][:]),
+            'Frame': np.squeeze(sleap_File['Frame'][:])
+        })
+    grouped_sleap = dict(iter(sleap_detection.groupby('Frame')))
 
     
     # Open video file
@@ -176,7 +186,6 @@ if __name__ == "__main__":
     parser.add_argument("--crop_size", type=int, default=128, help="Size of the crop around the detection.")
     parser.add_argument("--brightness_factor", type=float, default=1.2, help="Brightness adjustment factor for visualization.")
     parser.add_argument("--batch_size", type=int, default=64, help="Batch size for processing crops.")
-    parser.add_argument("--num_tags", type=int, default=111, help="Number of tags (classes) for the model.")
     parser.add_argument("--confidence_threshold", type=float, default=0.99, help="Confidence threshold for predictions.")
     parser.add_argument("--visualize", type=int, default=0, help="Enable visualization (1 for yes, 0 for no).")
 
