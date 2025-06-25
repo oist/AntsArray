@@ -1,9 +1,9 @@
 #!/bin/bash
 
 # Define input arguments
-VIDEO_FOLDER='/home/sam/bucket/Ants/trials/20241108_1/20241108_1_first_hour/data/'
-SLP_FOLDER='/home/sam/bucket/sam/ant_tracking/20241108_1/slp_files/'
-MODEL_PATH='/work/ReiterU/sam/antnet.pth'
+VIDEO_FOLDER='/bucket/ReiterU/Ants/basler/20250123_1/data/'
+SLP_FOLDER='/bucket/ReiterU/Ants/basler/20250123_1/data/'
+MODEL_PATH='/work/ReiterU/sam/antnet2.pth'
 OUTPUT_FOLDER='/work/ReiterU/sam/'
 
 # Ensure output folder exists
@@ -15,7 +15,7 @@ for VIDEO_FILE in "$VIDEO_FOLDER"/*.avi; do
     BASE_NAME=$(basename "$VIDEO_FILE" .avi)
 
     # Define corresponding SLEAP file
-    SLEAP_FILE="$SLP_FOLDER/$BASE_NAME.csv"
+    SLEAP_FILE="$SLP_FOLDER/$BASE_NAME.h5"
 
     # Define output HDF5 file
     OUTPUT_FILE="$OUTPUT_FOLDER/$BASE_NAME.pkl"
@@ -38,7 +38,7 @@ source /opt/conda/etc/profile.d/conda.sh
 conda activate torch
 
 # Run the Python script
-python /home/s/samuel-reiter/AntsArray/sam/aruco_inference.py \\
+python /home/s/samuel-reiter/AntsArray/tracking/aruco_inference.py \\
   --video_file "$VIDEO_FILE" \\
   --sleap_file "$SLEAP_FILE" \\
   --model_name "$MODEL_PATH" \\
@@ -46,7 +46,6 @@ python /home/s/samuel-reiter/AntsArray/sam/aruco_inference.py \\
   --crop_size 128 \\
   --brightness_factor 1.2 \\
   --batch_size 64 \\
-  --num_tags 111 \\
   --confidence_threshold 0.99 \\
   --visualize 0
 EOF
