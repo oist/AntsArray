@@ -49,8 +49,8 @@ base_folder=$(basename "$DIR")
 data_folder=$DIR/data
 output_folder=/flash/ReiterU/ant_tmp/${base_folder}
 deigo_folder=/deigo_flash/ReiterU/ant_tmp/${base_folder}
-sleap_model1=/bucket/ReiterU/Ants/SLEAP_files/topdown/IR/231223_113827.centroid.n=82/training_config.json
-sleap_model2=/bucket/ReiterU/Ants/SLEAP_files/topdown/IR/231223_142806.centered_instance.n=82/training_config.json
+sleap_model1=/bucket/ReiterU/Ants/SLEAP_files/Simple_skeleton/20250408_models_LATESTWORKINGMODEL/250408_141245.centroid/training_config.json
+sleap_model2=/bucket/ReiterU/Ants/SLEAP_files/Simple_skeleton/20250408_models_LATESTWORKINGMODEL/250408_141245.centered_instance/training_config.json
 
 mkdir -p ~/output/jobs
 mkdir -p $data_folder
@@ -154,68 +154,67 @@ EOF
 #SBATCH --output=./output/jobs/%x_%j.out
 #SBATCH --error=./output/jobs/%x_%j.err
 
-# Submit the job to the Saion system
-ssh saion sbatch "${deigo_folder}/job3-$video_name.sh"
+# # Submit the job to the Saion system
+# ssh saion sbatch "${deigo_folder}/job3-$video_name.sh"
 
-# This wrapper script will count the number of files you want to process, apply a maximum cap if necessary, and then submit the job to SLURM with the appropriate --array parameter.
-# Path to the text file containing the file names
-FILE_LIST=${output_folder}/${video_name}_frame_counts.csv
+# # This wrapper script will count the number of files you want to process, apply a maximum cap if necessary, and then submit the job to SLURM with the appropriate --array parameter.
+# # Path to the text file containing the file names
+# FILE_LIST=${output_folder}/${video_name}_frame_counts.csv
 
-# Count the number of non-empty lines in the file
-NUM_FILES=\$(grep -cve '^\s*\$' "\${FILE_LIST}")
+# # Count the number of non-empty lines in the file
+# NUM_FILES=\$(grep -cve '^\s*\$' "\${FILE_LIST}")
 
-# Define the maximum cap for the array jobs
-MAX_CAP=100
+# # Define the maximum cap for the array jobs
+# MAX_CAP=100
 
-# Create a chain job script (job5) on the Deigo system (run_aruco.py)
-cat > "${output_folder}/job5-$video_name.sh" <<EOJ
-#!/bin/bash -l
-#SBATCH -t 0-48
-#SBATCH -c 4
-#SBATCH --partition=compute
-#SBATCH --mem=0
-#SBATCH --job-name=aruco-${video_name}
-#SBATCH --array=1-10
-#SBATCH --output=./output/jobs/%x_%A_%a.out
-#SBATCH --error=./output/jobs/%x_%A_%a.err
-#SBATCH --mail-type=FAIL
-#SBATCH --mail-user=$emailurl
+# # Create a chain job script (job5) on the Deigo system (run_aruco.py)
+# cat > "${output_folder}/job5-$video_name.sh" <<EOJ
+# #!/bin/bash -l
+# #SBATCH -t 0-48
+# #SBATCH -c 4
+# #SBATCH --partition=compute
+# #SBATCH --mem=0
+# #SBATCH --job-name=aruco-${video_name}
+# #SBATCH --array=1-10
+# #SBATCH --output=./output/jobs/%x_%A_%a.out
+# #SBATCH --error=./output/jobs/%x_%A_%a.err
+# #SBATCH --mail-type=FAIL
+# #SBATCH --mail-user=$emailurl
+# 
+# # Load the required modules
+# ml use /apps/unit/ReiterU/.modulefiles
+# ml load opencv/4.9.0
+# 
+# # Read the first column from the CSV into an array
+# mapfile -t video_files < <(cut -d',' -f1 "${output_folder}/${video_name}_frame_counts.csv")
+# 
+# # Calculate the array index
+# index=\\\$((\\\${SLURM_ARRAY_TASK_ID} - 1))
+# echo "SLURM_ARRAY_TASK_ID: \\\${SLURM_ARRAY_TASK_ID}"
+# 
+# # Execute the Python script for the current video file
+# python /apps/unit/ReiterU/ant_tracking/run_aruco.py --video-file ${output_folder}/\\\${video_files[\\\$index]} --output-path ${output_folder}/
+# 
+# # Transfer the output file to the Saion system
+# scp $output_folder/\\\${video_files[\\\$index]}aruco_tracks_.npy saion:/work/ReiterU/ant_tmp/${base_folder}/
+# rm $output_folder/\\\${video_files[\\\$index]}aruco_tracks_.npy
+# 
+# echo "Processed: \\\${video_files[\\\$index]}"
+# EOJ
+# 
+# # Submit job5 to deigo with the calculated array size
+# if [ "\$NUM_FILES" -gt 1 ]; then
+#   sbatch --array=1-\$NUM_FILES%\$MAX_CAP ${output_folder}/job5-$video_name.sh
+# else
+#   sbatch --array=1 ${output_folder}/job5-$video_name.sh
+# fi
 
-# Load the required modules
-ml use /apps/unit/ReiterU/.modulefiles
-ml load opencv/4.9.0
-
-# Read the first column from the CSV into an array
-mapfile -t video_files < <(cut -d',' -f1 "${output_folder}/${video_name}_frame_counts.csv")
-
-# Calculate the array index
-index=\\\$((\\\${SLURM_ARRAY_TASK_ID} - 1))
-echo "SLURM_ARRAY_TASK_ID: \\\${SLURM_ARRAY_TASK_ID}"
-
-# Execute the Python script for the current video file
-python /apps/unit/ReiterU/ant_tracking/run_aruco.py --video-file ${output_folder}/\\\${video_files[\\\$index]} --output-path ${output_folder}/
-
-# Transfer the output file to the Saion system
-scp $output_folder/\\\${video_files[\\\$index]}aruco_tracks_.npy saion:/work/ReiterU/ant_tmp/${base_folder}/
-rm $output_folder/\\\${video_files[\\\$index]}aruco_tracks_.npy
-
-echo "Processed: \\\${video_files[\\\$index]}"
-EOJ
-
-# Submit job5 to deigo with the calculated array size
-if [ "\$NUM_FILES" -gt 1 ]; then
-  sbatch --array=1-\$NUM_FILES%\$MAX_CAP ${output_folder}/job5-$video_name.sh
-else
-  sbatch --array=1 ${output_folder}/job5-$video_name.sh
-fi
-EOF
-
-    # Create the follow-up job script on the Saion system
-    cat > "${output_folder}/job3-$video_name.sh" <<EOF
-#!/bin/bash -l
-#SBATCH -t 0-1
-#SBATCH -c 1
-#SBATCH --partition=test-gpu
+#     # Create the follow-up job script on the Saion system
+#     cat > "${output_folder}/job3-$video_name.sh" <<EOF
+# #!/bin/bash -l
+# #SBATCH -t 0-1
+# #SBATCH -c 1
+# #SBATCH --partition=test-gpu
 #SBATCH --mem=32G
 #SBATCH --job-name=list_submit-${video_name}
 #SBATCH --output=./output/jobs/%x_%j.out
