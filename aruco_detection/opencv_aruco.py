@@ -210,15 +210,15 @@ tracks=get_aruco_tracks(args.video_file,100) #size of aruco dict
 np.save(args.output_path + 'sleap_tracks_1.npy', tracks)  
 
 filtered_tracks=filter_arcuo_tracks(tracks)
-refined_tracks=link_to_sleap(filtered_tracks, args.sleap_file, args.d_thresh)
+#refined_tracks=link_to_sleap(filtered_tracks, args.sleap_file, args.d_thresh)
            
-np.save(args.output_path + 'sleap_tracks.npy', tracks, filtered_tracks, refined_tracks)   
+np.save(args.output_path + 'sleap_tracks.npy', tracks, filtered_tracks)#, refined_tracks)   
 
 
 if args.plot_output:
 
-    frame_num=refined_tracks.shape[3]
-    instance_num=refined_tracks.shape[0]
+    frame_num=filtered_tracks.shape[3]
+    instance_num=filtered_tracks.shape[0]
     # Number of rows and columns in the subplot grid
     num_rows = int(np.ceil(np.sqrt(instance_num)))
     num_cols = int(np.ceil(np.sqrt(instance_num)))
@@ -231,7 +231,7 @@ if args.plot_output:
         for j in range(num_cols):
      
           #  axes[i, j].plot(id_tracks[tally,0:11000,0],id_tracks[tally,0:11000,1])
-            axes[i, j].scatter(refined_tracks[tally,0,8,0:frame_num],refined_tracks[tally,1,8,0:frame_num], c=range(0,frame_num), cmap=cm.viridis, marker='o', alpha=0.8)
+            axes[i, j].scatter(filtered_tracks[tally,0,8,0:frame_num],filtered_tracks[tally,1,8,0:frame_num], c=range(0,frame_num), cmap=cm.viridis, marker='o', alpha=0.8)
             axes[i, j].invert_yaxis()
             axes[i, j].set_title('instance' + str(tally))
           

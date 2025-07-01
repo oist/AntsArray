@@ -7,7 +7,7 @@ INPUT_DIR="${1:-}"
 OUTPUT_DIR="${2:-}"
 
 if [[ -z "$INPUT_DIR" || -z "$OUTPUT_DIR" ]]; then
-  echo "Usage: $0 <input_slp_folder> <output_csv_folder>"
+  echo "Usage: $0 <input_slp_folder> <output_h5_folder>"
   exit 1
 fi
 
@@ -18,7 +18,7 @@ mkdir -p "$OUTPUT_DIR"
 shopt -s nullglob
 for slp in "$INPUT_DIR"/*.slp; do
   echo "Processing: $(basename "$slp")"
-  python sleap2csv.py "$slp" "$OUTPUT_DIR"
+  python sleap2h5.py "$slp" "$OUTPUT_DIR"
 done
 shopt -u nullglob
 

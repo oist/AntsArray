@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Define input arguments
-VIDEO_FOLDER='/bucket/ReiterU/Ants/basler/20250321_2_test/'
+VIDEO_FOLDER='/bucket/ReiterU/Ants/basler/20250321_2_test/data'
 OUTPUT_FOLDER='/flash/ReiterU/sam/aruco/'
 
 # Ensure output folder exists
@@ -31,11 +31,11 @@ for VIDEO_FILE in "$VIDEO_FOLDER"/*.avi; do
 #SBATCH --output=$OUTPUT_FOLDER/${BASE_NAME}_%j.out
 
 # Activate the Python environment
-source /opt/conda/etc/profile.d/conda.sh
+source ~/mambaforge/etc/profile.d/conda.sh
 conda activate torch
 
 # Run the Python script
-python /home/s/samuel-reiter/AntsArray/aruco_detection/aruco_datagen.py \\
+python aruco_datagen.py \\
   --video_name "$VIDEO_FILE" \\
   --sleap_file_name "$SLEAP_FILE" \\
   --aruco_name "$ARUCO_FILE" \\

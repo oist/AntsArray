@@ -210,19 +210,33 @@ def slp2csv(filename: str | pathlib.Path, output_folder: str | pathlib.Path) -> 
     print(f" saved: {csv_path}")
     return csv_path
 
+def slp2h5(filename: str | pathlib.Path, output_folder: str | pathlib.Path) -> pathlib.Path:
+    """
+    Read, flatten, and save the result as a flat HDF5 (one dataset per column).
+    """
+    filename = pathlib.Path(filename)
+    output_folder = pathlib.Path(output_folder)
+    output_folder.mkdir(parents=True, exist_ok=True)
 
-# ────────────────────────── CLI entry ───────────────────────────
-def _cli() -> None:
-    p = argparse.ArgumentParser(description="Convert SLEAP .slp to flattened CSV")
-    p.add_argument("slp_file", type=pathlib.Path, help="Input .slp file")
-    p.add_argument(
-        "output_folder",
-        type=pathlib.Path,
-        help="Where to place the CSV (folder will be created if absent)",
-    )
-    args = p.parse_args()
-    slp2csv(args.slp_file, args.output_folder)
+    dset = import_slp(filename)
+    flat = flatten_data(dset)
+
+    h5_path = output_folder / f"{dset['name']}.h5"
+    with h5py.File(h5_path, "w") as f:
+        # Save each column as its own dataset
+        for col in flat.columns:
+            # cast pandas Series to numpy array
+            arr = flat[col].to_numpy()
+            f.create_dataset(col, data=arr, compression="gzip")
+    print(f" saved: {h5_path}")
+    return h5_path
 
 
 if __name__ == "__main__":
-    _cli()
+    import argparse
+
+    p = argparse.ArgumentParser(description="Convert SLEAP .slp → flat HDF5")
+    p.add_argument("slp_file", type=pathlib.Path, help="Input .slp file")
+    p.add_argument("output_folder", type=pathlib.Path, help="Where to place the .h5")
+    args = p.parse_args()
+    slp2h5(args.slp_file, args.output_folder)
