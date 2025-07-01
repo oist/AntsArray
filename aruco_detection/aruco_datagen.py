@@ -5,7 +5,7 @@ import os
 import numpy as np
 import pandas as pd
 import h5py
-from aruco_track import *
+
 
 
 def main():

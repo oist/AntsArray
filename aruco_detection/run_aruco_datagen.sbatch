@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Define input arguments
-VIDEO_FOLDER='/bucket/ReiterU/Ants/basler/20250123_1/data/'
+VIDEO_FOLDER='/bucket/ReiterU/Ants/basler/20250321_2_test/'
 OUTPUT_FOLDER='/flash/ReiterU/sam/aruco/'
 
 # Ensure output folder exists
@@ -35,7 +35,7 @@ source /opt/conda/etc/profile.d/conda.sh
 conda activate torch
 
 # Run the Python script
-python /home/s/samuel-reiter/AntsArray/tracking/aruco_datagen.py \\
+python /home/s/samuel-reiter/AntsArray/aruco_detection/aruco_datagen.py \\
   --video_name "$VIDEO_FILE" \\
   --sleap_file_name "$SLEAP_FILE" \\
   --aruco_name "$ARUCO_FILE" \\
