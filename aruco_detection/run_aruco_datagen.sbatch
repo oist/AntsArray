@@ -35,12 +35,10 @@ source ~/mambaforge/etc/profile.d/conda.sh
 conda activate torch
 
 # Run the Python script
-python aruco_datagen.py \\
-  --video_name "$VIDEO_FILE" \\
-  --sleap_file_name "$SLEAP_FILE" \\
-  --aruco_name "$ARUCO_FILE" \\
-  --output_path "$OUTPUT_FOLDER" \\
- 
+python aruco_datagen.py \
+  --video_name "$VIDEO_FILE" \
+  --output_path "$OUTPUT_FOLDER" 
+
 EOF
 
     # Submit the SLURM job

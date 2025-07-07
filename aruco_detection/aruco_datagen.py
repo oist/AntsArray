@@ -5,6 +5,11 @@ import os
 import numpy as np
 import pandas as pd
 import h5py
+import sys
+
+# Add the parent directory to the path to import from tracking module
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from tracking.tracking_utils import get_complete_tracks
 
 
 
@@ -13,65 +18,51 @@ def main():
         description="Combine SLEAP and ArUco detections into complete tracks."
     )
     parser.add_argument(
-        "--sleap_file_name",
-        type=str,
-        required=True,
-        help="Path to SLEAP file (e.g., .h5)."
-    )
-    parser.add_argument(
         "--video_name",
         type=str,
         required=True,
         help="Path to the video file (e.g., .avi)."
     )
     parser.add_argument(
-        "--aruco_name",
-        type=str,
-        required=True,
-        help="Path to the ArUco .npy detection file."
-    )
-    parser.add_argument(
         "--output_path",
         type=str,
+
         required=True,
         help="Path to the output folder."
     )
     args = parser.parse_args()
 
+    # --- Infer SLEAP and ArUco file paths ---
+    base_name = os.path.splitext(os.path.basename(args.video_name))[0]
+    data_folder = os.path.dirname(args.video_name)
+    sleap_file_name = os.path.join(data_folder, base_name + "_sleap_data.h5")
+    aruco_name = os.path.join(data_folder, base_name + "_aruco.csv")
+
     # --- Load SLEAP detections ---
-    with h5py.File(args.sleap_file_name, 'r') as sleap_File:
+    with h5py.File(sleap_file_name, 'r') as sleap_File:
         sleap_detection = pd.DataFrame({
             'X':     np.squeeze(sleap_File['X'][:]),
             'Y':     np.squeeze(sleap_File['Y'][:]),
-            'Frame': np.squeeze(sleap_File['Frame'][:])
-        })
+            'Frame': np.squeeze(sleap_File['Frame'][:]),
+            'Instance': np.squeeze(sleap_File['Instance'][:]),
+            'Bodypoint': np.squeeze(sleap_File['Bodypoint'][:]),
+            'Score_node': np.squeeze(sleap_File['Score_node'][:])
+                    })
+        sleap_detection = sleap_detection.dropna()
+     #   sleap_detection = sleap_detection[sleap_detection['Bodypoint'] == 0] #just the aruco tag for now
 
     # --- Load ArUco detections ---
-    aruco_opencv = np.load(args.aruco_name)
-    nFrames, nIDs, _ = aruco_opencv.shape
+    aruco_detection = pd.read_csv(aruco_name)
 
-    # Create the ArUco DataFrame
-    df = pd.DataFrame({
-        'X':            aruco_opencv[:, :, 0].flatten(),
-        'Y':            aruco_opencv[:, :, 1].flatten(),
-        'Frame':        np.repeat(np.arange(nFrames), nIDs),
-        'ARUCO_number': np.tile(np.arange(nIDs), nFrames),
-    })
-
-    # Filter out zero-coordinates (assumed invalid)
-    aruco_detection = df[(df['X'] != 0) | (df['Y'] != 0)]
-
-    # --- Combine the data using your custom function ---
-    # Ensure get_complete_tracks2 is correctly imported or defined.
-    all_pos = get_complete_tracks2(
-        args.output_path,
-        aruco_detection,
-        sleap_detection,
-        args.video_name,
-        False,           # set to True/False as needed
-        harvest_crops=True,
-        harvest_interval=25,
-        crops_output_dir=args.output_path 
+    tracks = get_complete_tracks(
+        output_path=args.output_path,   # pickled dataframe
+        aruco_detection=aruco_detection,
+        sleap_detection=sleap_detection,
+        video_file=args.video_name,
+        #harvest_crops=True,
+        #crops_output_dir=args.output_path+'aruco_crops'
+        visualize=True,
+        video_out_path=args.output_path+'/tracking_video.avi'
     )
 
 
