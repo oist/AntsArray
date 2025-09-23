@@ -1,279 +1,345 @@
 #!/bin/bash -l
 # ------------------------------------------------------------
-#  video_saion_pipeline.sh
+#  video_saion_pipeline.sh  — split → parallel encode → Saion
 # ------------------------------------------------------------
-#  * job1-<video>   : split *.avi into 20-min chunks      (deigo/compute)
-#  * job2-<video>   : copy chunks to saion & spawn jobs   (deigo/short)
-#  * job3-<segment> : SLEAP-track + slp2csv              (saion/$SAION_NODE)
-#  * monitor-<video>: move .avi/.csv/.npy/.slp back home  (deigo/compute)
+#  * job1-<video>   : lossless split into _raw_ chunks     (compute/shortish)
+#  * job2-<video>   : spawn encoders (job2a per chunk)     (compute)
+#      - throttled: max 200 concurrent enc-* jobs (per user)
+#      - skip if output segment already exists
+#  * job3-<video>   : wait enc, rsync reencoded+CSV → Saion, submit sleap
+#      - skip sleap per segment if .slp or .csv already exists
+#  * monitor        : move local outputs, collect from Saion
 # ------------------------------------------------------------
 set -euo pipefail
+shopt -s nullglob
 
-# ──────────────── CLI parsing ───────────────────────────────
+# ─────────────── CLI parsing ───────────────────────────────
 DIR=""
-SAION_NODE="largegpu"          # saion partition
-usage() { echo "Usage: $0 --dir <folder> [--node <saion-partition>]"; exit 1; }
-
+SAION_NODE="largegpu"
+usage(){ echo "Usage: $0 --dir <folder> [--node <saion-partition>]"; exit 1; }
 while [[ $# -gt 0 ]]; do
-  case $1 in
+  case "$1" in
     --dir)  DIR="$2"; shift 2 ;;
     --node) SAION_NODE="$2"; shift 2 ;;
     *) usage ;;
   esac
 done
-DIR=${DIR%/}; [[ -z $DIR ]] && usage
+DIR=${DIR%/}; [[ -z "${DIR:-}" || ! -d "$DIR" ]] && usage
 
-echo "Input dir : $DIR"
-echo "Saion node : $SAION_NODE"
-
-# ─────────────── constants & folders ────────────────────────
+# ─────────────── constants & folders ───────────────────────
 email="samuel.reiter@oist.jp"
-[[ $SAION_NODE == gpu ]] && gputype="gpu:V100:1" || gputype="gpu:1"
-
-base_folder=$(basename "$DIR")
-data_folder="$DIR/data"
-flash_folder="/flash/ReiterU/ant_tmp/$base_folder"
-deigo_folder="/deigo_flash/ReiterU/ant_tmp/$base_folder"
-saion_work="/work/ReiterU/ant_tmp/$base_folder"
-
-
 model1="/bucket/ReiterU/Ants/SLEAP_files/Simple_skeleton/20250408_models_LATESTWORKINGMODEL/250408_141245.centroid/training_config.json"
 model2="/bucket/ReiterU/Ants/SLEAP_files/Simple_skeleton/20250408_models_LATESTWORKINGMODEL/250408_141245.centered_instance/training_config.json"
 
-mkdir -p "$HOME/output/jobs" "$data_folder" "$flash_folder" 
-chmod 2775 "$data_folder" "$flash_folder" 
+SEG_SEC="${SEG_SEC:-1200}"      # 20 min segments by default
+ENC_CAP="${ENC_CAP:-100}"       # max concurrent enc-* jobs per user
 
-# ─────────────── iterate over videos ────────────────────────
+base_folder="$(basename "$DIR")"
+data_folder="$DIR/data"
+flash_folder="/flash/ReiterU/ant_tmp/$base_folder"
+saion_work="/work/ReiterU/ant_tmp/$base_folder"    # remote target path (created on Saion)
+JOBS_DIR="$HOME/output/jobs/$base_folder"
+
+mkdir -p "$JOBS_DIR" "$data_folder" "$flash_folder"
+chmod 2775 "$JOBS_DIR" "$data_folder" "$flash_folder"
+
+command -v ffmpeg >/dev/null || { echo "[ERR] ffmpeg missing"; exit 2; }
+command -v ffprobe >/dev/null || { echo "[ERR] ffprobe missing"; exit 2; }
+command -v squeue  >/dev/null || echo "[WARN] squeue not found locally; throttling may fail here"
+
+# ─────────────── per-video jobs ────────────────────────────
 for video in "$DIR"/*.avi; do
-  [[ $video =~ (^\.|_renc\.avi$|_nvenc\.avi$) ]] && continue
-  vname=$(basename "$video" .avi)
+  b="$(basename "$video")"
+  [[ "$b" =~ ^\. ]] && continue
+  [[ "$b" =~ _renc\.avi$ || "$b" =~ _nvenc\.avi$ ]] && continue
+  vname="${b%.avi}"
 
-  # ---------- job1 : segmentation on deigo ------------------
-  job1="$flash_folder/job1-$vname.sh"
+  # ---------- job1 : lossless split -------------------------
+  job1="$JOBS_DIR/job1-$vname.sh"
   cat > "$job1" <<EOF1
 #!/bin/bash -l
-#SBATCH -t 0-72
-#SBATCH -c 32
+#SBATCH -t 0-6
+#SBATCH -c 4
 #SBATCH --partition=compute
-#SBATCH --mem=32G
-#SBATCH -J seg-$vname
-#SBATCH -o /flash/ReiterU/ant_tmp/$base_folder/%x_%j.out
-#SBATCH -e /flash/ReiterU/ant_tmp/$base_folder/%x_%j.err
-#SBATCH --mail-type=FAIL
-#SBATCH --mail-user=$email
+#SBATCH --mem=8G
+#SBATCH -J split-$vname
+#SBATCH -o $JOBS_DIR/split-${vname}_%j.out
+#SBATCH -e $JOBS_DIR/split-${vname}_%j.err
 set -euo pipefail
+shopt -s nullglob
 
 video="$video"
 flash="$flash_folder"
+seg_sec=$SEG_SEC
+mkdir -p "\$flash"
+base="\$(basename "\${video%.avi}")"
 
-# Skip everything if at least the first segment already exists
-if [[ -f "$flash_folder/${vname}_000.avi" ]]; then
-    echo "[INFO] $flash_folder/${vname}_000.avi already present – skipping transcoding."
-    exit 0
+# Skip splitting if first chunk exists
+if [[ -f "\$flash/\${base}_raw_000.avi" ]]; then
+  echo "[SKIP] raw chunks already present for \$video"
+  exit 0
 fi
 
-fps=\$(ffprobe -v 0 -select_streams v:0 -show_entries stream=r_frame_rate \
-       -of csv=p=0 "$video" | awk -F/ '{print \$1/\$2}')
-frames=\$(ffprobe -v 0 -count_frames -select_streams v:0 \
-          -show_entries stream=nb_read_frames -of csv=p=0 "$video")
+ffmpeg -hide_banner -y -i "\$video" \
+  -c copy -map 0:v:0 -f segment -segment_time "\$seg_sec" \
+  -reset_timestamps 1 "\$flash/\${base}_raw_%03d.avi"
 
-seg_sec=1200
-seg_frames=\$(printf "%.0f" "\$(echo \$fps*\$seg_sec | bc -l)")
-
-points=()
-for ((p=seg_frames; p<frames; p+=seg_frames)); do points+=(\$p); done
-IFS=,; SPLIT="\${points[*]}"; unset IFS
-[[ -z \$SPLIT ]] && SPLIT=\$seg_frames
-
-csv="\$flash/${vname}_frame_counts.csv"
-tmp="\${csv%.csv}_tmp.csv"
-rm -f "\$csv" "\$tmp"
-
-ffmpeg -fflags +genpts -y -i "\$video" -threads 32 -c:v libx264 \
-  -pix_fmt yuv420p -preset slow -crf 23 -f segment -reset_timestamps 1 \
-  -segment_list "\$csv" -segment_frames "\$SPLIT" \
-  -break_non_keyframes 1 -force_key_frames "expr:gte(t,n_forced*\$seg_sec)" \
-  "\$flash/${vname}_%03d.avi"
-
-while IFS=, read -r seg s e; do
-  nb=\$(ffprobe -v 0 -select_streams v:0 -show_entries stream=nb_frames \
-       -of csv=p=0 "\$flash/\$seg")
-  echo "\$seg,\$s,\$e,\$nb" >> "\$tmp"
-done < "\$csv"
-mv "\$tmp" "\$csv"
+echo "[INFO] Split done for \$video → \$flash"
 EOF1
   chmod +x "$job1"
 
-  # ---------- job2 : create & submit saion jobs -------------
-  job2="$flash_folder/job2-$vname.sh"
-  cat > "$job2" <<EOF2
+  # ---------- job2 : spawn encoders (job2a per raw chunk) ---
+  job2="$JOBS_DIR/job2-$vname.sh"
+  cat > "$job2" <<'EOF2'
 #!/bin/bash -l
 #SBATCH -t 0-2
 #SBATCH -c 2
-#SBATCH --partition=short
+#SBATCH --partition=compute
+#SBATCH --mem=8G
+#SBATCH -J encstage-__VNAME__
+#SBATCH -o __JDIR__/encstage-__VNAME___%j.out
+#SBATCH -e __JDIR__/encstage-__VNAME___%j.err
+set -euo pipefail
+shopt -s nullglob
+
+JDIR="__JDIR__"
+EM="__EMAIL__"
+flash="__FLASH__"
+base="__VNAME__"
+frame_csv="$flash/${base}_frame_counts_tmp.csv"
+: > "$frame_csv"
+
+USER_NAME="$(id -un)"
+
+throttle() {
+  # Limit concurrent enc-* jobs to __ENC_CAP__
+  while true; do
+    # squeue may not be in PATH on some nodes; fallback to no throttle
+    if ! command -v squeue >/dev/null 2>&1; then
+      break
+    fi
+    cnt="$(squeue -h -u "$USER_NAME" -o %j | grep -c '^enc-' || true)"
+    if [[ "$cnt" -lt "__ENC_CAP__" ]]; then
+      break
+    fi
+    sleep 10
+  done
+}
+
+for raw in "$flash/${base}_raw_"*.avi; do
+  [[ -e "$raw" ]] || continue
+  seg="${raw/_raw_/}"
+  segbase="$(basename "${seg%.avi}")"
+  segfile="$(basename "$seg")"
+
+  # Skip if output segment already exists
+  if [[ -f "$seg" ]]; then
+    echo "[SKIP] already encoded: $seg"
+    continue
+  fi
+
+  job2a="$JDIR/job2a-$segbase.sh"
+
+  # Template with placeholders; NO runtime vars used (safe with set -u)
+  cat > "$job2a" <<'EOJ'
+#!/bin/bash -l
+#SBATCH -t 0-12
+#SBATCH -c 8
+#SBATCH --partition=compute
+#SBATCH --mem=16G
+#SBATCH -J enc-SEGBASE
+#SBATCH -o JOBS_DIR_P/enc-SEGBASE_%j.out
+#SBATCH -e JOBS_DIR_P/enc-SEGBASE_%j.err
+#SBATCH --mail-type=FAIL
+#SBATCH --mail-user=EMAIL_P
+set -euo pipefail
+
+# Re-encode
+ffmpeg -hide_banner -y -i "RAWFILE" -c:v libx264 -pix_fmt yuv420p \
+  -preset fast -crf 23 -threads 8 "OUTFILE"
+
+# Remove raw chunk
+rm -f "RAWFILE"
+
+# Frame count and append CSV
+nb=$(ffprobe -v error -select_streams v:0 -show_entries stream=nb_frames \
+     -of default=nk=1:nw=1 "OUTFILE" || echo 0)
+echo "SEGFILE,$nb" >> "FRAMECSV"
+EOJ
+
+  # Substitute placeholders
+  sed -i \
+    -e "s#RAWFILE#${raw}#g" \
+    -e "s#OUTFILE#${seg}#g" \
+    -e "s#FRAMECSV#${frame_csv}#g" \
+    -e "s#JOBS_DIR_P#${JDIR}#g" \
+    -e "s#EMAIL_P#${EM}#g" \
+    -e "s#SEGBASE#${segbase}#g" \
+    -e "s#SEGFILE#${segfile}#g" \
+    "$job2a"
+
+  chmod +x "$job2a"
+  throttle
+  sbatch "$job2a"
+done
+EOF2
+  # Bake values in job2
+  sed -i \
+    -e "s#__VNAME__#$vname#g" \
+    -e "s#__JDIR__#$JOBS_DIR#g" \
+    -e "s#__EMAIL__#$email#g" \
+    -e "s#__FLASH__#$flash_folder#g" \
+    -e "s#__ENC_CAP__#$ENC_CAP#g" \
+    "$job2"
+  chmod +x "$job2"
+
+  # ---------- job3 : wait enc, rsync, submit sleap on Saion --
+  job3="$JOBS_DIR/job3-$vname.sh"
+  cat > "$job3" <<EOF3
+#!/bin/bash -l
+#SBATCH -t 0-4
+#SBATCH -c 2
+#SBATCH --partition=compute
 #SBATCH --mem=8G
 #SBATCH -J stage-$vname
-#SBATCH -o /flash/ReiterU/ant_tmp/$base_folder/%x_%j.out
-#SBATCH -e /flash/ReiterU/ant_tmp/$base_folder/%x_%j.err
+#SBATCH -o $JOBS_DIR/stage-${vname}_%j.out
+#SBATCH -e $JOBS_DIR/stage-${vname}_%j.err
 set -euo pipefail
+shopt -s nullglob
 
-flash="$flash_folder"; deigo="$deigo_folder"
-scp_target="saion:$saion_work"
+# Wait until all enc-\$vname_* jobs finish on this cluster
+while true; do
+  if command -v squeue >/dev/null 2>&1; then
+    left=\$(squeue -h -o "%j" -u "\$(id -un)" | grep -c "^enc-${vname}_" || true)
+    [[ \$left -eq 0 ]] && break
+  else
+    break
+  fi
+  sleep 30
+done
+
+flash="$flash_folder"
+csv_tmp="\$flash/${vname}_frame_counts_tmp.csv"
 csv="\$flash/${vname}_frame_counts.csv"
+[[ -f "\$csv" ]] || { [[ -f "\$csv_tmp" ]] && mv "\$csv_tmp" "\$csv" || true; }
 
-# copy segments & csv to saion
-rsync -ah "\$flash/${vname}"_*.avi "\$scp_target/"
-#rsync -ah "\$flash/${vname}"_*.avi "\$csv" "\$scp_target/"
+# copy only reencoded segments + CSV to Saion (skip existing on remote)
+scp_target="saion:$saion_work"
+rsync -ah --ignore-existing "\$flash/${vname}_"[0-9][0-9][0-9].avi "\$csv" "\$scp_target/"
 
-# generate & submit job3 for each segment (on saion)
-ssh saion bash -ls <<'EOSA'
+# Remote submit sleap jobs per segment; skip if outputs exist
+ssh saion bash -lc "
 set -euo pipefail
-SAION_NODE="__SAION_NODE__"
-gputype="__GPUTYPE__"
-email="__EMAIL__"
-model1="__MODEL1__"; model2="__MODEL2__"
-work="__WORK__"; vname="__VNAME__"
-#csv="\$work/\${vname}_frame_counts.csv"
+SAION_NODE='$SAION_NODE'
+email='$email'
+model1='$model1'
+model2='$model2'
+saion_work='$saion_work'
+vname='$vname'
 
-mkdir -p "\$work"
+case \"\$SAION_NODE\" in
+  gpu)      gputype='gpu:V100:1' ;;
+  largegpu) gputype='gpu:1'      ;;
+  *)        gputype='gpu:1'      ;;
+esac
+
+mkdir -p \"\$saion_work\"
 source ~/mambaforge/etc/profile.d/conda.sh
 conda activate sleap2
 
-# Find all segments for this video and submit jobs
-for seg in "\$work/\${vname}"_*.avi; do
-  [[ -e "\$seg" ]] || continue
+for seg in \"\$saion_work/\${vname}_\"[0-9][0-9][0-9].avi; do
+  [ -e \"\$seg\" ] || continue
   base=\${seg##*/}; base=\${base%.avi}
-  [[ \$base =~ ^\${vname}_[0-9]{3}$ ]] || continue
 
-  # Get frame count for this segment
-  frames=\$(ffprobe -v 0 -select_streams v:0 -show_entries stream=nb_frames \
-       -of csv=p=0 "\$seg")
+  # Skip sleap if outputs already exist
+  if [[ -f \"\$saion_work/\$base.slp\" || -f \"\$saion_work/\$base.csv\" ]]; then
+    echo \"[SKIP] sleap outputs present for \$base\"
+    continue
+  fi
 
-  j3="\$work/job3-\${base}.sh"
-  cat > "\$j3" <<EOJ
+  j3a=\"\$saion_work/job3a-\$base.sh\"
+  node=\"\$SAION_NODE\"; gres=\"\$gputype\"; logdir=\"\$saion_work\"; em=\"\$email\"; m1=\"\$model1\"; m2=\"\$model2\"; work=\"\$saion_work\"
+
+  cat > \"\$j3a\" <<EOJ
 #!/bin/bash -l
 #SBATCH -t 0-24
 #SBATCH -c 32
-#SBATCH --partition=\$SAION_NODE
+#SBATCH --partition=\$node
 #SBATCH --mem=128G
-#SBATCH --gres=\$gputype
-#SBATCH -J sleap-\${base}
-#SBATCH -o /work/ReiterU/ant_tmp/$base_folder/%x_%j.out
-#SBATCH -e /work/ReiterU/ant_tmp/$base_folder/%x_%j.err
+#SBATCH --gres=\$gres
+#SBATCH -J sleap-\$base
+#SBATCH -o \$logdir/%x_%j.out
+#SBATCH -e \$logdir/%x_%j.err
 #SBATCH --mail-type=FAIL
-#SBATCH --mail-user=\$email
+#SBATCH --mail-user=\$em
 set -euo pipefail
 
 source ~/mambaforge/etc/profile.d/conda.sh
 conda activate sleap2
 
-frames=\$frames
-#sleap-track "\$work/\${base}.avi" --batch_size 1 --frames 0-\$((frames-1)) \
-  -m \$model1 -m \$model2 --tracking.tracker none \
-  -o "\$work/\${base}.slp" --verbosity json --no-empty-frames
+sleap-track \"\$work/\$base.avi\" -m \$m1 -m \$m2 --tracking.tracker none \\
+  -o \"\$work/\$base.slp\" --verbosity json --no-empty-frames
 
-# Convert SLEAP file to CSV
-python3 /home/sam-reiter/saionHome/AntsArray/sleap2csv.py "\$work/\${base}.slp"
+python3 /home/sam-reiter/saionHome/AntsArray/sleap2csv.py \"\$work/\$base.slp\"
 EOJ
-  chmod +x "\$j3"; sbatch "\$j3"
+
+  chmod +x \"\$j3a\"
+  sbatch \"\$j3a\"
 done
-EOSA
-EOF2
-  sed -i -e "s#__SAION_NODE__#$SAION_NODE#g" \
-         -e "s#__GPUTYPE__#$gputype#g" \
-         -e "s#__EMAIL__#$email#g" \
-         -e "s#__MODEL1__#$model1#g" \
-         -e "s#__MODEL2__#$model2#g" \
-         -e "s#__WORK__#$saion_work#g" \
-         -e "s#__VNAME__#$vname#g" \
-         "$job2"
-  chmod +x "$job2"
+"
+EOF3
+  chmod +x "$job3"
 
-# ---------- submit chain ----------------------------------
-id1=$(sbatch "$job1" | awk '{print $4}')
-id2=$(sbatch --dependency=afterok:$id1 "$job2" | awk '{print $4}')
-echo "Submitted job chain for $vname: job1=$id1, job2=$id2"
-
+  # submit chain: job1 → job2 → job3
+  id1=$(sbatch "$job1" | awk '{print $4}')
+  id2=$(sbatch --dependency=afterok:$id1 "$job2" | awk '{print $4}')
+  id3=$(sbatch --dependency=afterok:$id2 "$job3" | awk '{print $4}')
+  echo "Submitted chain for $vname: job1=$id1, job2=$id2, job3=$id3"
 done
 
-##############################################################################
-#  Now wait for all jobs to complete and move files to bucket
-##############################################################################
-echo "All job chains submitted. Now monitoring for completion..."
+# ─────────────── Monitor and collect ───────────────────────
+echo "Monitoring and collecting…"
 
 for video in "$DIR"/*.avi; do
-  [[ $video =~ (^\.|_renc\.avi$|_nvenc\.avi$) ]] && continue
-  vname=$(basename "$video" .avi)
+  b="$(basename "$video")"
+  [[ "$b" =~ ^\. ]] && continue
+  [[ "$b" =~ _renc\.avi$ || "$b" =~ _nvenc\.avi$ ]] && continue
+  vname="${b%.avi}"
 
-  # ───── wait for job1 (segmentation) ──────────────────────────────────────
-  echo "Waiting for job1-$vname to complete..."
-  job1_out=$(ls -t "/flash/ReiterU/ant_tmp/$base_folder/seg-${vname}_"*.out 2>/dev/null | head -1)
-  if [[ -z "$job1_out" ]]; then
-      echo "Warning: could not find job1 output file for $vname"
-      continue
+  # Wait for stage-$vname to finish
+  job3_out=$(ls -t "$JOBS_DIR/stage-${vname}_"*.out 2>/dev/null | head -1 || true)
+  if [[ -n "${job3_out:-}" ]]; then
+    job3_id=$(basename "$job3_out" .out | sed 's/.*_//')
+    while squeue -j "$job3_id" -h 1>/dev/null 2>&1; do sleep 30; done
   fi
-  job1_id=$(basename "$job1_out" .out | sed 's/.*_//')
-  while squeue -j "$job1_id" -h 1>/dev/null 2>&1; do sleep 30; done
 
-  state=$(sacct -j "$job1_id" -X -n -o State 2>/dev/null | head -1 | tr -d '[:space:]')
-  if [[ "$state" != "COMPLETED" ]]; then
-      echo "Warning: job1-$vname ended with state $state"
-      continue
+  # Move local reencoded segments + CSV to data_folder (safe)
+mkdir -p "$data_folder"
+rsync -ah --remove-source-files \
+  --include="${vname}_[0-9][0-9][0-9].avi" \
+  --include="${vname}_frame_counts.csv" \
+  --exclude="*" \
+  "$flash_folder/" "$data_folder/"
+
+# Collect Saion outputs until sleap-* for this video are done
+while true; do
+  mapfile -t remote_files < <(
+    ssh saion bash -l -c "ls -1 ${saion_work}/${vname}_*.slp ${saion_work}/${vname}_*.npy ${saion_work}/${vname}_*.csv 2>/dev/null" || true
+  )
+
+  if [[ ${#remote_files[@]} -eq 0 ]]; then
+    jobs_left=$(ssh saion bash -l -c "squeue -h -o %j | grep -c '^sleap-${vname}_[0-9]\\{3\\}\$' || true")
+    [[ $jobs_left -eq 0 ]] && break
+    echo "  … No files yet, still $jobs_left jobs for $vname on Saion. Sleeping 60s."
+    sleep 60
+    continue
   fi
-  echo "job1-$vname completed."
 
-  # ───── move AVIs from flash → bucket ────────────────────────────────────
-  echo "Moving AVIs for $vname to $data_folder ..."
-  mkdir -p "$data_folder"
-  mv "$flash_folder/${vname}"_*.avi "$data_folder/" 2>/dev/null \
-      && echo "  ✓ AVIs moved." \
-      || echo "  ⚠  No AVIs found (maybe already moved)."
-
+  for rf in "${remote_files[@]}"; do
+    echo "  ↪ Rsyncing $(basename "$rf") ..."
+    rsync -ah --remove-source-files "saion:$rf" "$data_folder/" || true
+  done
+  sleep 30
 done
 
-for video in "$DIR"/*.avi; do
-    [[ $video =~ (^\.|_renc\.avi$|_nvenc\.avi$) ]] && continue
-    vname=$(basename "$video" .avi)
-
-    # ───── wait for job2 (rsync to Saion & remote submits) ───────────────────
-    echo "Waiting for job2-$vname to complete..."
-    job2_out=$(ls -t "/flash/ReiterU/ant_tmp/$base_folder/stage-${vname}_"*.out 2>/dev/null | head -1)
-    if [[ -n "$job2_out" ]]; then
-        job2_id=$(basename "$job2_out" .out | sed 's/.*_//')
-        while squeue -j "$job2_id" -h 1>/dev/null 2>&1; do sleep 30; done
-        echo "job2-$vname completed."
-    else
-        echo "Warning: could not find job2 output file for $vname"
-    fi
-
-    # ───── collect processed files from Saion → bucket ──────────────────────
-    echo "Collecting processed files for $vname from Saion ..."
-    while true; do
-        mapfile -t remote_files < <(
-            ssh saion "ls -1 ${saion_work}/${vname}_*.{slp,npy} 2>/dev/null"
-        )
-
-        if [[ ${#remote_files[@]} -eq 0 ]]; then
-            # Check if any Saion SLURM jobs with this name are still running
-            jobs_left=$(ssh saion "squeue -h -o '%j' | grep -c '^${vname}' || true")
-            if [[ $jobs_left -eq 0 ]]; then
-                echo "  ✓ All processed files collected for $vname."
-                break
-            fi
-            echo "  … No files yet, Saion jobs still running ($jobs_left). Sleeping 60 s."
-            sleep 60
-            continue
-        fi
-
-        for rf in "${remote_files[@]}"; do
-            base=$(basename "$rf")
-            echo "  ↪  Rsyncing $base ..."
-            rsync -ah --remove-source-files saion:"$rf" "$data_folder/" \
-                && echo "     ✓ transferred."
-        done
-        echo "  Waiting 60 s for more files ..."
-        sleep 60
-    done
-done
-
-echo "✓ All AVIs and processed files are now in $data_folder."
+echo "✓ Collected SLEAP outputs for $vname"

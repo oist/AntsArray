@@ -81,6 +81,27 @@ def rigid_transform(src: np.ndarray, dst: np.ndarray) -> Tuple[np.ndarray, np.nd
     return R, t
 
 
+def extract_rigid_from_homography(H: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Extract rigid-body transform (R, t) from 3x3 homography matrix.
+    """
+    if H is None or H.shape != (3, 3):
+        return np.eye(2), np.zeros(2)
+    
+    # Extract 2x2 rotation and 2x1 translation
+    R = H[:2, :2]
+    t = H[:2, 2]
+    
+    # Normalize rotation matrix to ensure it's proper
+    U, _, Vt = np.linalg.svd(R)
+    R_proper = U @ Vt
+    if np.linalg.det(R_proper) < 0:
+        Vt[1] *= -1
+        R_proper = U @ Vt
+    
+    return R_proper, t
+
+
 # ────────────────── build pairwise matches for neighbour cams ───────────── #
 def pairwise_matches(
         df: pd.DataFrame,
@@ -173,11 +194,13 @@ def main():
     ap.add_argument("--panorama_pkl", required=True,
                     help="e.g. EXP_aruco_panorama.pkl")
     ap.add_argument("--hmats_init", required=True,
-                    help=".mat with `paras` OR .npz with key `H` (zero-based)")
+                    help=".mat with `paras` OR .npz with key `H` OR Python similarity_panorama.py output")
     ap.add_argument("--outdir", default=".")
     ap.add_argument("--ref_cam", type=int, default=12,
                     help="Camera anchored to identity")
     ap.add_argument("--max_iter", type=int, default=200)
+    ap.add_argument("--use_python_hmats", action="store_true",
+                    help="Use homographies from similarity_panorama.py (initial_H_mats.npz)")
     args = ap.parse_args()
 
     outdir = Path(args.outdir); outdir.mkdir(exist_ok=True, parents=True)
@@ -189,7 +212,13 @@ def main():
 
     # load initial per-camera H list (identity if none)
     init_file = Path(args.hmats_init)
-    if init_file.suffix == ".npz":
+    if init_file.name == "initial_H_mats.npz":
+        # Load homographies from similarity_panorama.py
+        print(f"Loading Python homographies from: {init_file}")
+        init_H = list(np.load(init_file)["H"])
+        print(f"Loaded {len(init_H)} homography matrices")
+    elif init_file.suffix == ".npz":
+        # Load refined homographies from previous run
         init_H = list(np.load(init_file)["H"])
     else:                                  # MATLAB
         paras = np.squeeze(scipy.io.loadmat(init_file)["paras"])
@@ -215,8 +244,23 @@ def main():
     n_cam   = 25
     residual, idx_map = build_residual_fun(matches, args.ref_cam, n_cam)
 
-    theta0 = np.concatenate([RT_to_param(np.eye(2), np.zeros(2))
-                         for c in range(n_cam) if c != args.ref_cam])
+    # Initialize optimization parameters
+    if args.use_python_hmats or init_file.name == "initial_H_mats.npz":
+        # Use loaded homographies as initial estimates
+        print("Using loaded homographies as initial estimates for optimization...")
+        theta0 = []
+        for c in range(n_cam):
+            if c == args.ref_cam:
+                continue
+            # Extract R and t from the loaded homography
+            H = init_H[c]
+            R, t = extract_rigid_from_homography(H)
+            theta0.append(RT_to_param(R, t))
+        theta0 = np.concatenate(theta0)
+    else:
+        # Use identity transforms as initial estimates
+        theta0 = np.concatenate([RT_to_param(np.eye(2), np.zeros(2))
+                             for c in range(n_cam) if c != args.ref_cam])
 
     print(f"\nOptimising {len(theta0)} parameters "
           f"over {len(matches)} neighbour pairs …")

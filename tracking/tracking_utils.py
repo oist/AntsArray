@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
+
+
 from __future__ import annotations
+
 import uuid
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
@@ -9,16 +12,17 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
+__all__ = ["get_complete_tracks"]
 
 def get_complete_tracks(
     output_path: str | Path | None,
     aruco_detection: pd.DataFrame,
     sleap_detection: pd.DataFrame,
-    video_file: str | Path,
+    video_file: str | Path | None = None,
     *,
-    anchor_bodypoint: int = 0,               # body-point used for linking
+    anchor_bodypoint: int = 0,               # body‑point used for linking
     visualize: bool = False,
-    video_out_path: str | Path | None = None,   
+    video_out_path: str | Path | None = None,
     harvest_crops: bool = False,
     crops_output_dir: str | Path | None = None,
     crop_size: int = 128,
@@ -27,47 +31,49 @@ def get_complete_tracks(
     start_frame: int = 0,
     harvest_interval: int = 5,
 ) -> List[Dict[int, Dict[int, Tuple[float, float]]]]:
-    """
-    Track objects across frames using ArUco detections as hard IDs and SLEAP
-    skeletons for positions. One track == one ArUco tag == one SLEAP instance.
-
-    Parameters
-    ----------
-    aruco_detection
-        DataFrame with at least ``['Frame', 'Instance', 'X', 'Y']``.
-        *Instance* is the tag number.
-    sleap_detection
-        DataFrame with at least
-        ``['Frame', 'Instance', 'Bodypoint', 'X', 'Y']`` —
-        one row per body-point per instance.
-    anchor_bodypoint
-        Body-point index that will be matched to the ArUco tag.
-    video_out_path
-        If a path is given, the visualised preview is written out as MP4.
-    ...
-    Returns
-    -------
-    list[dict[int, dict[int, (float,float)]]]
-        ``all_pos[frame_idx][track_id][bodypoint] -> (x, y)``
-    """
+   
 
     if aruco_sleap_max_distance is None:
         aruco_sleap_max_distance = max_distance
 
-    # --------------------------------------------------------- I/O prep
+    use_video = video_file is not None
+
+    # --------------------------------------------------------- sanity checks
+    if not use_video and (visualize or harvest_crops or video_out_path is not None):
+        raise ValueError(
+            "`video_file` must be provided when `visualize`, `harvest_crops`, or "
+            "`video_out_path` are enabled."
+        )
+
+    # --------------------------------------------------------- I/O prep – group detections
     grouped_aruco = {f: g for f, g in aruco_detection.groupby("Frame")}
     grouped_sleap = {f: g for f, g in sleap_detection.groupby("Frame")}
 
-    cap = cv2.VideoCapture(str(video_file))
-    if not cap.isOpened():
-        raise FileNotFoundError(f"Could not open video: {video_file}")
-    num_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-   
-    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+    # --------------------------------------------------------- obtain frame count & video capture
+    cap: Optional[cv2.VideoCapture]
+    if use_video:
+        cap = cv2.VideoCapture(str(video_file))
+        if not cap.isOpened():
+            raise FileNotFoundError(f"Could not open video: {video_file}")
+        num_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+    else:
+        # derive from detections; +1 because frames are assumed 0‑based
+        if sleap_detection.empty and aruco_detection.empty:
+            raise ValueError("Detection DataFrames are empty – cannot infer frame count.")
+        num_frames = (
+            max(
+                sleap_detection["Frame"].max() if not sleap_detection.empty else -1,
+                aruco_detection["Frame"].max() if not aruco_detection.empty else -1,
+            )
+            + 1
+        )
+ 
+        cap = None
 
-    # ---- optional writer
+    # --------------------------------------------------------- optional writer
     writer: Optional[cv2.VideoWriter] = None
-    if video_out_path is not None:
+    if use_video and video_out_path is not None:
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -79,7 +85,7 @@ def get_complete_tracks(
     ]
     tracked_anchor_xy: Dict[int, List[Tuple[int, Tuple[float, float]]]] = {}
 
-    if harvest_crops and crops_output_dir is not None:
+    if harvest_crops and crops_output_dir is not None and use_video:
         Path(crops_output_dir).mkdir(parents=True, exist_ok=True)
 
     # --------------------------------------------------------- colour util
@@ -90,12 +96,16 @@ def get_complete_tracks(
 
     # ======================================================== main loop
     for frame_idx in tqdm(range(start_frame, num_frames), unit="frame"):
-        ok, frame = cap.read()
-        if not ok:
-            break
-        img = frame.copy()
+        # -------------------------------- load frame (if available)
+        if use_video:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            img = frame.copy()
+        else:
+            img = None  # placeholder; used only if crops/visualisation requested
 
-        # ---------------- detections
+        # ---------------- detections for this frame
         a_df = grouped_aruco.get(frame_idx, pd.DataFrame())
         s_df = grouped_sleap.get(frame_idx, pd.DataFrame())
 
@@ -120,7 +130,7 @@ def get_complete_tracks(
         used_tag: set[int] = set()
         used_inst: set[int] = set()
 
-        # ---------------- update existing
+        # ---------------- update existing tracks
         if frame_idx > start_frame:
             for tid, prev_nodes in all_pos[frame_idx - 1].items():
                 prev_xy = prev_nodes[anchor_bodypoint]
@@ -149,7 +159,7 @@ def get_complete_tracks(
                         (frame_idx, node_dict[anchor_bodypoint])
                     )
 
-        # ---------------- spawn from unused ArUco
+        # ---------------- spawn new tracks from unused ArUco
         for i, (tag_id, ax, ay) in enumerate(aruco_arr):
             if i in used_tag:
                 continue
@@ -157,7 +167,7 @@ def get_complete_tracks(
             if len(sleap_anchor) == 0:
                 continue
             dists = np.linalg.norm(sleap_anchor[:, 1:3] - (ax, ay), axis=1)
-            j = np.argmin(dists)
+            j = int(np.argmin(dists))
             if dists[j] > aruco_sleap_max_distance:
                 continue
 
@@ -181,6 +191,7 @@ def get_complete_tracks(
         if (
             harvest_crops
             and crops_output_dir is not None
+            and use_video
             and frame_idx % harvest_interval == 0
         ):
             half = crop_size // 2
@@ -198,7 +209,7 @@ def get_complete_tracks(
                 cv2.imwrite(str(out_dir / f"{frame_idx}_{uuid.uuid4().hex}.png"), crop)
 
         # ---------------- visualisation
-        if visualize or writer is not None:
+        if use_video and (visualize or writer is not None):
             disp = img.copy()
             for tid, nodes in all_pos[frame_idx].items():
                 colour = _id2bgr(tid)
@@ -232,11 +243,12 @@ def get_complete_tracks(
                 writer.write(disp)
 
     # ======================================================== cleanup
-    cap.release()
-    if visualize:
-        cv2.destroyAllWindows()
-    if writer is not None:
-        writer.release()
+    if use_video:
+        cap.release()
+        if visualize:
+            cv2.destroyAllWindows()
+        if writer is not None:
+            writer.release()
 
     # ---------------- save tracks
     if output_path is not None:
