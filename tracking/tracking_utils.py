@@ -118,7 +118,7 @@ def get_complete_tracks(
         else:
             s_anchor = s_df[s_df["Bodypoint"] == anchor_bodypoint]
             sleap_anchor = s_anchor[["Instance", "X", "Y"]].to_numpy(float)
-
+   
         # ------- ArUco too far from any anchor → drop
         if len(aruco_arr) and len(sleap_anchor):
             diff = sleap_anchor[:, 1:3][None, :, :] - aruco_arr[:, 1:3][:, None, :]
@@ -211,29 +211,32 @@ def get_complete_tracks(
         # ---------------- visualisation
         if use_video and (visualize or writer is not None):
             disp = img.copy()
+       
             for tid, nodes in all_pos[frame_idx].items():
                 colour = _id2bgr(tid)
                 for (x, y) in nodes.values():
-                    cv2.circle(disp, (int(x), int(y)), 8, colour, -1)
+                    if not np.isnan(x) and not np.isnan(y):
+                     cv2.circle(disp, (int(x), int(y)), 8, colour, -1)
                 ax, ay = nodes[anchor_bodypoint]
+                if not np.isnan(ax) and not np.isnan(ay):
+                    cv2.putText(
+                        disp,
+                        str(tid),
+                        (int(ax) + 8, int(ay) + 8),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        3,
+                        colour,
+                        3,
+                    )
                 cv2.putText(
                     disp,
-                    str(tid),
-                    (int(ax) + 8, int(ay) + 8),
+                    f"Frame {frame_idx}",
+                    (10, 25),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     3,
-                    colour,
+                    (255, 255, 255),
                     3,
                 )
-            cv2.putText(
-                disp,
-                f"Frame {frame_idx}",
-                (10, 25),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                3,
-                (255, 255, 255),
-                3,
-            )
 
             if visualize:
                 cv2.imshow("Tracking", cv2.resize(disp, (1080, 720)))

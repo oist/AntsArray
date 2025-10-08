@@ -125,7 +125,7 @@ def main():
     
     # Print summary
     if not df.empty:
-        print(f"Detected {df['Marker_ID'].nunique()} unique markers")
+        print(f"Detected {df['Instance'].nunique()} unique markers")
         print(f"Total detections: {len(df)}")
     else:
         print("No ArUco markers detected")
