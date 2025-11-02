@@ -31,15 +31,21 @@ import pandas as pd
 from tqdm import tqdm
 import h5py
 
+import re
+from pathlib import Path
+from collections import defaultdict
+from typing import Dict
+
+
 # -----------------------------------------------------------------------------#
 #                                CONFIGURATION                                 #
 # -----------------------------------------------------------------------------#
 
 CONFIG = dict(
     # Homographies exported by refine_homographies.py → contains array "H"
-    hmats_npz="/home/sam-reiter/bucket/ReiterU/sam/ant_tracking/frame_1/initial_H_mats.npz",
-    data_dir="/home/sam-reiter/bucket/ReiterU/Ants/basler/20250321_2_test/data",
-    output_dir="/home/sam-reiter/bucket/ReiterU/Ants/basler/20250321_2_test/",
+    hmats_npz="/home/sam-reiter/bucket/ReiterU/Ants/basler/2025_Sep_no_pertubation/calibration_dataset/set0_patterns_elevated_by_2mm/initial_H_mats.npz",
+    data_dir="/home/sam-reiter/bucket/ReiterU/Ants/basler/20251020_1_30min_vibration/data",
+    output_dir="/home/sam-reiter/bucket/ReiterU/Ants/basler/20251020_1_30min_vibration/",
 )
 
 # Split threshold along X‑axis in panorama coordinate system
@@ -89,23 +95,24 @@ def split_and_write(df: pd.DataFrame, chunk_dir: Path, base_name: str) -> None:
 # -----------------------------------------------------------------------------#
 #                      FILE DISCOVERY & GROUPING BY CHUNK                      #
 # -----------------------------------------------------------------------------#
-
-
 def group_files_by_chunk(
     root: Path,
-    pattern: str,
+    pattern,
     ignore_substr: str = "global",
 ) -> Dict[str, Dict[int, Path]]:
-    """Walk *root* and return ``{chunk: {cam: file}}``.
-
-    *pattern* must contain two capture groups:
+    """
+    Walk *root* and return {chunk: {cam: file}}.
+    *pattern* must have two capture groups:
       1) camera index, 2) chunk index.
+    Accepts compiled regex or string.
     """
     groups: Dict[str, Dict[int, Path]] = defaultdict(dict)
+    is_compiled = hasattr(pattern, "search")
+
     for path in root.glob("**/*"):
         if path.is_dir() or ignore_substr in path.name:
             continue
-        m = re.search(pattern, path.name)
+        m = pattern.search(path.name) if is_compiled else re.search(pattern, path.name)
         if not m:
             continue
         cam = int(m.group(1))
@@ -113,16 +120,22 @@ def group_files_by_chunk(
         groups[chunk][cam] = path
 
     # ensure deterministic ordering
-    return {ck: dict(sorted(cams.items())) for ck, cams in sorted(groups.items(), key=lambda x: int(x[0]))}
+    return {
+        ck: dict(sorted(cams.items()))
+        for ck, cams in sorted(groups.items(), key=lambda x: int(x[0]))
+    }
+
 
 # -----------------------------------------------------------------------------#
 #                         CHUNK‑WISE COMBINATION ROUTINES                      #
 # -----------------------------------------------------------------------------#
 
 def process_aruco_chunks(hmats: List[np.ndarray], aruco_dir: Path, out_dir: Path, exp: str):
-    patt = r"cam(\d{2})_cam\d+_[A-Za-z0-9_-]+_(\d{3})_aruco\.csv$"
-    chunk_map = group_files_by_chunk(aruco_dir, patt)
+    patt = re.compile(
+    r"^cam(\d+)_cam\d+_\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}_(\d{3})(?:_aruco_detections)?\.csv$"
+)
 
+    chunk_map = group_files_by_chunk(aruco_dir, patt)
     for chunk, cam_files in tqdm(chunk_map.items(), desc="ArUco chunks"):
         dfs = []
         for cam_idx, file in cam_files.items():
@@ -147,20 +160,16 @@ def process_aruco_chunks(hmats: List[np.ndarray], aruco_dir: Path, out_dir: Path
 
 
 def process_sleap_chunks(hmats: List[np.ndarray], sleap_dir: Path, out_dir: Path, exp: str):
-    patt = r"cam(\d{2})_cam\d+_[A-Za-z0-9_-]+_(\d{3})_sleap_data\.h5$"
+    patt = re.compile(
+    r"^cam(\d+)_cam\d+_\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}_(\d{3})(?:_sleap_data)?\.csv$"
+)
+
     chunk_map = group_files_by_chunk(sleap_dir, patt)
 
     for chunk, cam_files in tqdm(chunk_map.items(), desc="SLEAP chunks"):
         dfs = []
         for cam_idx, file in cam_files.items():
-            with h5py.File(file, "r") as f:
-                df = pd.DataFrame({
-                    "Frame": f["Frame"][:],
-                    "Instance": f["Instance"][:],
-                    "Bodypoint": f["Bodypoint"][:],
-                    "X": f["X"][:],
-                    "Y": f["Y"][:],
-                })
+            df = pd.read_csv(file)
             if df.empty:
                 continue
             xy = df[["X", "Y"]].to_numpy(float)
@@ -183,13 +192,18 @@ def process_sleap_chunks(hmats: List[np.ndarray], sleap_dir: Path, out_dir: Path
 #                                   CLI                                        #
 # -----------------------------------------------------------------------------#
 
-def infer_experiment_name(data_dir: Path) -> str:
-    for file in data_dir.iterdir():
-        m = re.match(r"cam\d+_cam\d+_(.+?)_\d{3}(?:_aruco)?\.csv$", file.name)
-        if m:
-            return m.group(1)
-    raise RuntimeError("Could not infer experiment name from files in data_dir.")
+def infer_experiment_name(data_dir: Path) -> tuple[str, str]:
 
+    pattern = re.compile(
+    r"^cam(\d+)_cam\d+_\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}_(\d{3})(?:_aruco_detections)?\.csv$"
+)
+
+    for file in data_dir.iterdir():
+        m = pattern.match(file.name)
+        if m:
+            exp_time, trial_num = m.groups()
+            return exp_time, trial_num
+    raise RuntimeError("Could not infer experiment name from files in data_dir.")
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Map & concatenate ArUco/SLEAP per chunk (requires .npz homographies)")
@@ -204,7 +218,8 @@ def main() -> None:
     hmats = load_homographies(args.hmats)
 
     data_dir = Path(args.data_dir)
-    exp = infer_experiment_name(data_dir)
+    exp_time, trial = infer_experiment_name(data_dir)
+    exp = f"{exp_time}_{trial}"
 
     process_aruco_chunks(hmats, data_dir, out_dir, exp)
     process_sleap_chunks(hmats, data_dir, out_dir, exp)

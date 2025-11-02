@@ -33,7 +33,7 @@ import matplotlib.pyplot as plt
 # CONFIG                                                                      #
 ###############################################################################
 
-IM_PATH = "/home/sam-reiter/bucket/ReiterU/sam/ant_tracking/frame_1"  # folder with camXX*.tiff
+IM_PATH = "/home/sam-reiter/bucket/ReiterU/Ants/basler/2025_Sep_no_pertubation/calibration_dataset/set0_patterns_elevated_by_2mm"  # folder with camXX*.tiff
 ARRAY_SIZE = (5, 5)          # camera grid (rows, cols)
 MATCH_THRESHOLD = 20          # discard edges with fewer inliers
 DEBUG = True                 # write debug artefacts
@@ -45,7 +45,7 @@ DEBUG = True                 # write debug artefacts
 def list_images(path: str) -> Tuple[List[Path], List[np.ndarray]]:
     """Return sorted filenames + grayscale images."""
     p = Path(path)
-    files = [f for f in p.glob("*.tiff") if not f.name.startswith(".")]
+    files = [f for f in p.glob("*.png") if not f.name.startswith(".")]
     cam_re = re.compile(r"cam(\d{2})")
 
     def key(file: Path):
@@ -55,7 +55,7 @@ def list_images(path: str) -> Tuple[List[Path], List[np.ndarray]]:
     files.sort(key=key)
     imgs = [cv2.imread(str(f), cv2.IMREAD_GRAYSCALE) for f in files]
     if any(i is None for i in imgs):
-        raise IOError("Some TIFFs failed to load – check paths/permissions.")
+        raise IOError("Some PNGs failed to load – check paths/permissions.")
     return files, imgs
 
 

@@ -10,7 +10,7 @@ import pandas as pd
 import argparse
 from pathlib import Path
 from tqdm import tqdm
-import os
+
 
 def detect_aruco_in_video(video_file, dictionary_size=1000, max_gap=100, min_fraction=0.125):
     """
@@ -120,7 +120,7 @@ def main():
     
     # Save results
     output_csv = output_dir / f"{video_name}_aruco_detections.csv"
-    df.to_csv(output_csv, index=False)
+    df.to_csv(output_csv, index=False, float_format="%.1f")
     print(f"Saved ArUco detections to: {output_csv}")
     
     # Print summary

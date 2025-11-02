@@ -31,7 +31,7 @@ DIR=${DIR%/}; [[ -z "${DIR:-}" || ! -d "$DIR" ]] && usage
 # ─────────────── constants & folders ───────────────────────
 email="samuel.reiter@oist.jp"
 
-SEG_SEC="${SEG_SEC:-20}"      # 20 min segments by default
+SEG_SEC="${SEG_SEC:-3600}"      # 120 min segments by default
 ENC_CAP="${ENC_CAP:-100000}"       # max concurrent enc-* jobs per user
 
 base_folder="$(basename "$DIR")"
@@ -168,7 +168,6 @@ EOJ
       -e "s#OUTFILE#${seg}#g" \
       -e "s#FRAMECSV#${frame_csv}#g" \
       -e "s#JOBS_DIR_P#${JDIR}#g" \
-      -e "s#EMAIL_P#${EM}#g" \
       -e "s#SEGBASE#${segbase}#g" \
       -e "s#SEGFILE#${segfile}#g" \
       -e "s#__DATA__#${DATA}#g" \
@@ -181,6 +180,15 @@ EOJ
   fi
 
   # ---------- sleap submission (on saion) ----------
+
+  ready_flag="$DATA/.collect_done-$base"
+
+  # Wait until monitor/collect has finished copying this video to bucket
+  until [[ -f "$ready_flag" ]]; do
+    echo "[WAIT] monitor not finished for $base. Sleeping 60s…"
+    sleep 60
+  done
+
   if ssh -x saion "test -f $(printf %q "$slp")"; then
   echo "[SKIP] sleap output already exists for $segbase in $saion_work"
   continue
@@ -199,8 +207,6 @@ EOJ
 #SBATCH -J sleap-__BASE__
 #SBATCH -o __WORK__/__BASE___%j.out
 #SBATCH -e __WORK__/__BASE___%j.err
-#SBATCH --mail-type=FAIL
-#SBATCH --mail-user=__EMAIL__
 set -euo pipefail
 
 source ~/.bashrc
@@ -208,7 +214,7 @@ conda activate sleap
 
 sleap-track "__DATA__/__BASE__.avi" -m __MODEL1__ -m __MODEL2__ \
   --tracking.tracker none -o "__WORK__/__BASE__.slp" \
-  --verbosity json --no-empty-frames
+  --verbosity json --no-empty-frames --batch_size 2
 
 python3 /home/sam-reiter/saionHome/AntsArray/sleap2h5.py "__WORK__/__BASE__.slp"
 EOJ2
@@ -220,7 +226,6 @@ EOJ2
     ssh -x saion "sed -i \
       -e s#__BASE__#$segbase#g \
       -e s#__WORK__#$saion_work#g \
-      -e s#__EMAIL__#$EM#g \
       -e s#__MODEL1__#$model1#g \
       -e s#__MODEL2__#$model2#g \
       -e s#__DATA__#$DATA#g \
@@ -251,9 +256,10 @@ chmod +x "$job2"
   echo "Submitted chain for $vname: job1=$id1, job2=$id2"
 done   # closes per-video loop
 
+
+
 # ─────────────── Monitor and collect ───────────────────────
 echo "Monitoring and collecting…"
-
 for video in "$DIR"/*.avi; do
   b="$(basename "$video")"
   [[ "$b" =~ ^\. ]] && continue
@@ -266,18 +272,153 @@ for video in "$DIR"/*.avi; do
   echo "[DEBUG] data_folder=$data_folder"
   echo "[DEBUG] vname=$vname"
 
-  # Copy encoded files + CSVs from local flash to permanent data folder
+  # Wait until all job2a-* encoders for this video are finished
+  echo "Waiting for all 'enc*' jobs..."
+while :; do
+  running=$(
+    # list only your jobs, only active states, print just the job name
+    squeue -u "$(id -un)" -h -t R,PD -o "%j" \
+      | awk '/^enc/ {c++} END {print c+0}'   # count names starting with "enc"
+  )
+  (( running == 0 )) && break
+  echo "  $running enc* jobs still running..."
+  sleep 60
+done
+
+  echo "All job2a encoders finished for $vname. Collecting outputs..."
+
   rsync -ah \
     --include="${vname}_[0-9]*.avi" \
     --include="${vname}_frame_counts.csv" \
     --exclude="*" \
     "$flash_folder/" "$data_folder/"
 
-  # If desired, you can also rsync Saion-produced sleap outputs back here.
-  # Example (uncomment to enable):
-  # rsync -ah "saion:/bucket/ReiterU/ant_tmp/$vname/"*.{slp,csv,npy} "$data_folder/" || true
-
+  touch "$data_folder/.collect_done-$vname"
   echo "✓ Collected outputs for $vname"
-done   # closes monitor loop
+
+done
+
+# ─────────────── ArUco detection stage ───────────────────────
+echo "Submitting ArUco detection jobs..."
+
+DATA_FOLDER="$data_folder"
+OUTPUT_FOLDER="$flash_folder/aruco"
+SCRIPT_PATH="$HOME/AntsArray/aruco_detection/opencv_aruco.py"
+
+
+mkdir -p "$OUTPUT_FOLDER"
+mkdir -p "$DATA_FOLDER"
+
+shopt -s nullglob  # prevents literal patterns when no matches
+
+for video_file in "$DATA_FOLDER"/*.{mp4,avi,mov}; do
+  filename=$(basename -- "$video_file")
+  base_name="${filename%.*}"
+
+  marker_file="$OUTPUT_FOLDER/${base_name}_aruco_detections.csv"
+
+  if [[ -f "$marker_file" ]]; then
+    echo "[SKIP] $base_name already processed ($marker_file exists)"
+    continue
+  fi
+
+  sbatch_script="$OUTPUT_FOLDER/run_${base_name}.sh"
+  cat <<EOF > "$sbatch_script"
+#!/bin/bash -l
+#SBATCH -t 0-24
+#SBATCH -c 4
+#SBATCH --partition=compute
+#SBATCH --mem=4G
+#SBATCH -J aruco-$base_name
+#SBATCH -o $OUTPUT_FOLDER/%x_%j.out
+#SBATCH -e $OUTPUT_FOLDER/%x_%j.err
+
+set -euo pipefail
+source ~/.bashrc
+conda activate aruco_env
+
+python3 "$SCRIPT_PATH" \\
+  --video-file "$video_file" \\
+  --output-path "$OUTPUT_FOLDER" \\
+  --dictionary-size 1000 \\
+  --max-gap 100 \\
+  --min-fraction 0.125
+EOF
+
+  sbatch "$sbatch_script"
+  echo "[SUBMIT] ArUco detection for $base_name"
+done
+
+# ─────────────── Wait for ArUco jobs and rsync results ───────────────────────
+echo "Waiting for all ArUco detection jobs to finish..."
+sleep 60
+while true; do
+  running=$(squeue -u "$(id -un)" -h -n "aruco-" | wc -l)
+  if (( running == 0 )); then
+    break
+  fi
+  echo "  $running ArUco jobs still running..."
+  sleep 60
+done
+
+echo "All ArUco jobs finished. Syncing results to bucket..."
+
+rsync -ah \
+  --include="*_aruco_detections.csv" \
+  --exclude="*" \
+  "$OUTPUT_FOLDER/" "$DATA_FOLDER/"
+
+echo "✓ All ArUco outputs synced to bucket."
+
+
+# ─────────────── Wait for Saion SLEAP outputs & rsync back ───────────────
+for video in "$DIR"/*.avi; do
+  b="$(basename "$video")"
+  [[ "$b" =~ ^\. ]] && continue
+  [[ "$b" =~ _renc\.avi$ || "$b" =~ _nvenc\.avi$ ]] && continue
+  vname="${b%.avi}"
+
+  echo "Waiting for SLEAP outputs on Saion for $vname…"
+
+  # Build the list of expected segment bases from the encoded segments we just collected
+  shopt -s nullglob
+  seg_avs=( "$data_folder/${vname}_"*.avi )
+  if (( ${#seg_avs[@]} == 0 )); then
+    echo "[WARN] No encoded segments found for $vname in $data_folder; skipping SLEAP wait/sync."
+  else
+    # If we’ve already fetched all .slp files for these segments, skip the wait
+    existing_slp=( "$data_folder/${vname}_"*.slp )
+    if (( ${#existing_slp[@]} >= ${#seg_avs[@]} )); then
+      echo "[SKIP] All SLEAP .slp files for $vname appear to be present locally."
+    else
+      # Wait for each expected .slp to materialize on Saion
+      for f in "${seg_avs[@]}"; do
+        segbase="$(basename "${f%.*}")"                # e.g., name_003
+        remote_slp="$saion_work_remote/${segbase}.slp" # /work/.../name_003.slp
+
+        # Poll until remote .slp exists and has nonzero size
+        until ssh -x saion "[ -s $(printf %q "$remote_slp") ]"; do
+          # Optional: show whether the SLURM job with this base is still queued/running
+          # (best-effort; not required for correctness)
+          ssh -x saion "squeue -u $(id -un) -h -n sleap-${segbase} -o '%T %j' || true" 2>/dev/null || true
+          echo "[WAIT] $segbase.slp not ready on Saion. Sleeping 60s…"
+          sleep 60
+        done
+        echo "[READY] ${segbase}.slp is present on Saion."
+      done
+
+      # Fetch .slp (and any .h5 created by sleap2h5.py) for this video
+      echo "Syncing SLEAP outputs for $vname → $data_folder …"
+      rsync -ah \
+        --include="${vname}_[0-9]*.slp" \
+        --include="${vname}_[0-9]*.h5" \
+        --exclude="*" \
+        "saion:$saion_work_remote/" "$data_folder/"
+
+      touch "$data_folder/.sleap_collect_done-$vname"
+      echo "✓ Retrieved SLEAP outputs for $vname"
+    fi
+  fi
+done
 
 

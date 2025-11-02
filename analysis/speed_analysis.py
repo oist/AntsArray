@@ -1,9 +1,68 @@
-#%%
 
+#%%
+%matplotlib qt
 import matplotlib.pyplot as plt
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+
+
+def get_event_trig_avg(sig, event_inds, backlag, forwardlag):
+    """
+    Calculate the event-triggered average.
+
+    Parameters:
+    - sig (numpy.ndarray): Input signal.
+    - event_inds (numpy.ndarray): Indices of events.
+    - backlag (int): Backward time lag.
+    - forwardlag (int): Forward time lag.
+
+    Returns:
+    - ev_avg (numpy.ndarray): Event-triggered average.
+    - ev_mat (numpy.ndarray): Event-triggered matrix.
+
+    """
+    event_inds = np.round(event_inds).astype(int) 
+    if sig.ndim==1:
+        sig=np.expand_dims(sig,0)
+        
+    min_nevents = 1  # minimum number of events where we will even compute a triggered avg
+
+    orig_size = sig.shape
+
+    lags = np.arange(-backlag, forwardlag + 1)
+
+    # get rid of events that happen within the lag-range of the end points
+    bad_ids = np.where(event_inds <= backlag)[0]
+    if len(bad_ids) > 0:
+        print(f'Dropping {len(bad_ids)} early events')
+        event_inds = np.delete(event_inds, bad_ids)
+
+    bad_ids = np.where(event_inds >= (orig_size[1] - forwardlag))[0]
+    if len(bad_ids) > 0:
+        print(f'Dropping {len(bad_ids)} late events')
+        event_inds = np.delete(event_inds, bad_ids)
+
+    n_events = len(event_inds)
+
+    # check that we have at least the minimum number of events to work with
+    if n_events < min_nevents:
+        ev_avg = np.full((orig_size[0], len(lags)), np.nan)
+        ev_mat = np.nan
+        return ev_avg, ev_mat
+
+    ev_avg = np.zeros((orig_size[0], len(lags)))
+    ev_mat = np.zeros((n_events, orig_size[0], len(lags)))
+
+    for i in range(n_events):
+        cur_ids = np.arange(event_inds[i] - backlag, event_inds[i] + forwardlag + 1)
+        temp_sig = sig[:, cur_ids]
+        ev_avg += temp_sig
+        ev_mat[i,:, :] = temp_sig
+
+    ev_avg /= n_events
+
+    return np.squeeze(ev_avg), np.squeeze(ev_mat)
 
 def plot_ant_posture(df, track_id, frame, color='k', annotate=True):
     """
@@ -57,56 +116,81 @@ def plot_ant_posture(df, track_id, frame, color='k', annotate=True):
     plt.grid(True, linestyle='--', alpha=0.3)
     plt.show()
 
+#%%
+import matplotlib.pyplot as plt
+import pandas as pd
+import numpy as np
+from scipy.ndimage import gaussian_filter1d
 
-df = pd.read_pickle("/home/sam-reiter/bucket/ReiterU/Ants/basler/20250321_2_test/chunk000/final_trackedright.pkl")
+# Load data
+df = pd.read_pickle("/home/sam-reiter/bucket/ReiterU/Ants/basler/20251020_1_30min_vibration/chunk000/chunk000_right.pkl")
 
+# Check for required columns
 REQUIRED = {"Frame", "TrackID", "Bodypoint", "X", "Y"}
-assert REQUIRED.issubset(df.columns), "DataFrame is missing required columns."
+assert REQUIRED.issubset(df.columns), f"DataFrame missing required columns: {REQUIRED - set(df.columns)}"
 
-#%%
+# Filter only bodypoint == 0
+df = df[df["Bodypoint"] == 0].copy()
 
-plot_ant_posture(df, 63, 301)
-#%%
-###############################################################################
-# 1.  SPEED ESTIMATION  (pixel → mm conversion optional)
-###############################################################################
-FPS               = 30                      # frames · s⁻¹  ← change if needed
-POS_BP            = 0                        # bodypoint that best tracks the COM
-PIXEL_TO_MM       = 10                      # multiply if you have calibration
+# Compute frame-to-frame displacement for consecutive detections per track
+df = df.sort_values(["TrackID", "Frame"])
+df["FrameDiff"] = df.groupby("TrackID")["Frame"].diff()
+df["dX"] = df.groupby("TrackID")["X"].diff()
+df["dY"] = df.groupby("TrackID")["Y"].diff()
 
-pos = (df.sort_values(["TrackID", "Frame"])
-         .set_index(["TrackID", "Frame"]))
+# Speed = displacement per frame (set to NaN if frames not consecutive)
+df["Speed"] = np.where(
+    df["FrameDiff"] == 1,
+    np.sqrt(df["dX"]**2 + df["dY"]**2),
+    np.nan
+)
 
-# finite differences within each TrackID
-dxy      = pos.groupby(level=0)[["X","Y"]].diff()
-speed_px = np.hypot(dxy["X"], dxy["Y"])          # px / frame
-N_BODYPOINTS = df["Bodypoint"].nunique()
-speed_mm_s = speed_px * FPS * PIXEL_TO_MM / N_BODYPOINTS  # mm / s (if calibration given)
+# Mean speed per frame across all tracks
+speed_over_time = df.groupby("Frame")["Speed"].mean()
 
-pos["speed_mm_s"] = speed_mm_s
+# Apply Gaussian smoothing
+sigma = 5
+smoothed_speed = gaussian_filter1d(speed_over_time.values, sigma=sigma)
 
-###############################################################################
-# 1A.  PLOT DISTRIBUTION OF SPEEDS
-###############################################################################
-# ----- overall histogram ----------------------------------------------------
-# Extract nonzero, non-NaN speeds
-speeds = pos["speed_mm_s"].dropna()
-speeds = speeds[speeds > 0]  # log bins cannot include 0
-
-# Define log-spaced bins
-min_speed = speeds.min()
-max_speed = speeds.max()
-bins = np.logspace(np.log10(min_speed), np.log10(max_speed), num=50)  # e.g. 50 bins
-
-# Plot histogram
-plt.figure()
-plt.hist(speeds, bins=bins, density=True)
-plt.xscale("log")
-plt.xlabel("Speed (mm · s⁻¹)")
-plt.ylabel("Probability density")
-plt.title("All ants (log-binned speeds)")
-#plt.grid(True, which='both', axis='x', linestyle='--', linewidth=0.5)
+# Plot
+plt.figure(figsize=(10, 5))
+plt.plot(speed_over_time.index, smoothed_speed, label="Smoothed speed (Bodypoint 0)")
+plt.xlabel("Frame")
+plt.ylabel("Mean speed (pixels/frame)")
+plt.legend()
+plt.tight_layout()
 plt.show()
+
+
+# Plot
+plt.figure(figsize=(8, 4))
+#plt.plot(speed_over_time.index, speed_over_time.values, color='gray', alpha=0.4, label='Raw mean speed')
+plt.plot(speed_over_time.index, smoothed_speed, color='steelblue', lw=2, label=f'Gaussian smoothed (σ={sigma})')
+plt.xlabel("Frame")
+plt.ylabel("Mean Speed (px/frame)")
+plt.title("Mean Speed Over Time (averaged over visible TrackIDs)")
+plt.legend()
+plt.grid(True, linestyle='--', alpha=0.4)
+plt.tight_layout()
+plt.show()
+
+#%%
+stim_times= [28020,35340,42660,49980,57300,64620]
+backlag=500
+forlag=2000
+ev_avg,ev_mat=get_event_trig_avg(smoothed_speed, stim_times, backlag, forlag)
+
+plt.figure(figsize=(8,4))
+plt.plot(np.arange(len(ev_avg))/25-backlag, ev_avg, color='darkorange', lw=2)
+plt.xlabel('Time relative to stimulus (s)')
+
+plt.figure(figsize=(8,4))
+plt.imshow(ev_mat, aspect='auto', cmap='viridis', interpolation='nearest')
+plt.colorbar(label='Mean Speed (px/frame)')
+plt.xlabel('Frames relative to stimulus')
+
+
+
 
 
 

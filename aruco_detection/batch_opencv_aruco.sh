@@ -1,7 +1,7 @@
 #!/bin/bash
 
-DATA_FOLDER="/bucket/ReiterU/Ants/basler/2025_Sep_no_pertubation/20250908_09/data"
-OUTPUT_FOLDER="/flash/ReiterU/ant_tmp/20250908_09/aruco"
+DATA_FOLDER="/bucket/ReiterU/Ants/basler/20251008_1_30min_vibration/data"
+OUTPUT_FOLDER="/flash/ReiterU/ant_tmp/20251008_1_30min_vibration/aruco"
 SCRIPT_PATH="$HOME/AntsArray/aruco_detection/opencv_aruco.py"
 
 mkdir -p "$OUTPUT_FOLDER"
@@ -23,9 +23,9 @@ for video_file in "$DATA_FOLDER"/*.{mp4,avi,mov}; do
     cat <<EOF > "$sbatch_script"
 #!/bin/bash -l
 #SBATCH -t 0-24
-#SBATCH -c 16
+#SBATCH -c 4
 #SBATCH --partition=compute
-#SBATCH --mem=32G
+#SBATCH --mem=4G
 #SBATCH -J seg-$base_name
 #SBATCH -o $OUTPUT_FOLDER/%x_%j.out
 #SBATCH -e $OUTPUT_FOLDER/%x_%j.err

@@ -59,7 +59,7 @@ for slp in "$INPUT_DIR"/*.slp; do
 set -euo pipefail
 shopt -s nullglob
 
-source ~/.bashrc 
+source ~/.bashrc
 conda activate sleap
 
 slp_file="__SLP_FILE__"
@@ -114,6 +114,21 @@ shopt -u nullglob
 echo "Submitted: ${submitted}  Skipped: ${skipped}"
 echo "Logs: ${JOBS_DIR}"
 echo "Outputs: ${OUTPUT_DIR}"
+
+# ---------- wait for slp2csv jobs (login node) ----------
+# Wait for any active jobs whose name starts with 'slp2csv-'.
+# Counts only your jobs, in active states. Safe under set -o pipefail.
+echo "Waiting for all 'slp2csv-*' jobs to finish..."
+while :; do
+  running=$(
+    squeue -u "$(id -un)" -h -t R,PD,CF,CG -o "%j" \
+      | awk '/^slp2csv-/{c++} END {print c+0}'
+  )
+  (( running == 0 )) && break
+  echo "  $running slp2csv jobs still running..."
+  sleep 60
+done
+echo "All slp2csv jobs finished."
 
 # ---------- final move step (login node) ----------
 # Move any CSVs currently in OUTPUT_DIR back into INPUT_DIR.
