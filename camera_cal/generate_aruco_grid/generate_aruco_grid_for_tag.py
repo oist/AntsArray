@@ -18,8 +18,8 @@ def generate_aruco_grid(dictionary_name, rows, cols, tag_size=100, margin=10, ou
     for r in range(rows):
         for c in range(cols):
             tag_id = r * cols + c
-            # Generate the tag image
-            tag_image = aruco.generateImageMarker(aruco_dict, tag_id, tag_size)
+            # Generate the tag image using drawMarker (available in OpenCV 4.5+; generateImageMarker requires 4.7+)
+            tag_image = aruco.drawMarker(aruco_dict, tag_id, tag_size)
             
             # Define where the tag should be placed on the grid
             start_x = c * tag_size + (c + 1) * margin
