@@ -660,7 +660,7 @@ SAION
 
 "${SSH_CMD[@]}" saion "cat > '$remote_root/sleap_collect.sh'" <<'SAION'
 #!/bin/bash -l
-#SBATCH -t 7-00:00:00
+#SBATCH -t 4-00:00:00
 #SBATCH -c 2
 #SBATCH --partition=__SAION_COLLECT_PARTITION__
 #SBATCH --mem=16G
@@ -732,7 +732,7 @@ EOS
 	# --- Stage Script: Cleanup sentinels and storage ---
 	cat > "$cleanup_script" <<'EOS'
 #!/bin/bash -l
-#SBATCH -t 7-00:00:00
+#SBATCH -t 4-00:00:00
 #SBATCH -c 2
 #SBATCH --partition=compute
 #SBATCH --mem=8G
