@@ -660,7 +660,7 @@ SAION
 
 "${SSH_CMD[@]}" saion "cat > '$remote_root/sleap_collect.sh'" <<'SAION'
 #!/bin/bash -l
-#SBATCH -t 4-00:00:00
+#SBATCH -t 1-00:00:00
 #SBATCH -c 2
 #SBATCH --partition=__SAION_COLLECT_PARTITION__
 #SBATCH --mem=16G
