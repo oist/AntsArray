@@ -1,4 +1,11 @@
 #!/bin/bash -l
+#SBATCH -t 7-00:00:00
+#SBATCH -c 1
+#SBATCH --mem=4G
+#SBATCH --partition=compute
+#SBATCH -J orchestrator
+#SBATCH -o orchestrator_%j.out
+#SBATCH -e orchestrator_%j.err
 
 # ------------------------------------------------------------
 #  transcode_sleap_aruco.sh — Deigo↔Saion orchestration
@@ -20,7 +27,9 @@ IFS=$'\n\t'
 
 usage() {
 	cat <<'EOT'
-Usage: transcode_sleap_aruco.sh --dir <folder> [--node <saion-partition>] [--seg-sec <seconds>]
+Usage: 
+  Interactive: bash transcode_sleap_aruco.sh --dir <folder> ...
+  Batch:       sbatch transcode_sleap_aruco.sh --dir <folder> ...
 Environment:
 	ENC_CONCURRENCY    Max concurrent encoder tasks (default 8)
 	ARUCO_CONCURRENCY  Max concurrent ArUco tasks (default 12)
@@ -244,9 +253,28 @@ echo "[INFO] Saion bucket host: $SAION_BUCKET_HOST" >&2
 videos=( "$DIR"/*.avi )
 (( ${#videos[@]} > 0 )) || { echo "[WARN] No .avi videos found in $DIR" >&2; exit 0; }
 
+# --- Section: Job Rate Limiting ---
+
+MAX_SUBMITTED_JOBS="${MAX_SUBMITTED_JOBS:-2000}"
+
+get_job_count() {
+	squeue -u "$USER" -h | wc -l
+}
+
 # --- Section: Per-video pipeline orchestration ---
 
 for video in "${videos[@]}"; do
+	# Check job limit
+	while true; do
+		current_jobs=$(get_job_count)
+		# We submit roughly 7 jobs per video. Buffer by 10 to be safe.
+		if (( current_jobs + 10 < MAX_SUBMITTED_JOBS )); then
+			break
+		fi
+		echo "[INFO] Job limit reached ($current_jobs/$MAX_SUBMITTED_JOBS). Waiting 60s..."
+		sleep 60
+	done
+
 	b="$(basename "$video")"
 	[[ "$b" =~ ^\. ]] && continue
 	[[ "$b" =~ _renc\.avi$ || "$b" =~ _nvenc\.avi$ ]] && continue
