@@ -1,4 +1,11 @@
 #!/bin/bash -l
+#SBATCH -t 4-00:00:00
+#SBATCH -c 1
+#SBATCH --mem=4G
+#SBATCH --partition=compute
+#SBATCH -J orchestrator
+#SBATCH -o orchestrator_%j.out
+#SBATCH -e orchestrator_%j.err
 
 # ------------------------------------------------------------
 #  transcode_sleap_aruco.sh — Deigo↔Saion orchestration
@@ -16,11 +23,16 @@ set -eo pipefail
 shopt -s nullglob
 IFS=$'\n\t'
 
+# Resolve script directory for relative path usage
+SCRIPT_DIR="$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+
 # --- Section: Helper utilities ---
 
 usage() {
 	cat <<'EOT'
-Usage: transcode_sleap_aruco.sh --dir <folder> [--node <saion-partition>] [--seg-sec <seconds>]
+Usage: 
+  Interactive: bash transcode_sleap_aruco.sh --dir <folder> ...
+  Batch:       sbatch transcode_sleap_aruco.sh --dir <folder> ...
 Environment:
 	ENC_CONCURRENCY    Max concurrent encoder tasks (default 8)
 	ARUCO_CONCURRENCY  Max concurrent ArUco tasks (default 12)
@@ -170,12 +182,18 @@ ENC_CONCURRENCY="${ENC_CONCURRENCY:-16}"
 ARUCO_CONCURRENCY="${ARUCO_CONCURRENCY:-16}"
 SLEAP_CONCURRENCY="${SLEAP_CONCURRENCY:-8}"
 CHUNK_BUFFER="${CHUNK_BUFFER:-2}"
+BATCH_SIZE="${BATCH_SIZE:-}"
+MAX_ARRAY_TASKS="${MAX_ARRAY_TASKS:-2000}"
 SENTINEL_TIMEOUT="${SENTINEL_TIMEOUT:-86400}"
 
-for var in ENC_CONCURRENCY ARUCO_CONCURRENCY SLEAP_CONCURRENCY CHUNK_BUFFER SENTINEL_TIMEOUT; do
+for var in ENC_CONCURRENCY ARUCO_CONCURRENCY SLEAP_CONCURRENCY CHUNK_BUFFER MAX_ARRAY_TASKS SENTINEL_TIMEOUT; do
 	[[ "${!var}" =~ ^[0-9]+$ ]] || { echo "[ERR] $var must be numeric" >&2; exit 2; }
-
 done
+
+if [[ -n "$BATCH_SIZE" && ! "$BATCH_SIZE" =~ ^[0-9]+$ ]]; then
+	echo "[ERR] BATCH_SIZE must be numeric" >&2
+	exit 2
+fi
 
 case "$SAION_NODE" in
 	gpu) saion_gres="gpu:v100:1" ;;
@@ -214,11 +232,11 @@ require_cmd python3
 
 SLEAP_MODEL_CENTROID="${SLEAP_MODEL_CENTROID:-/bucket/ReiterU/Ants/SLEAP_files/Simple_skeleton/20250408_models_LATESTWORKINGMODEL/250408_141245.centroid/training_config.json}"
 SLEAP_MODEL_INSTANCE="${SLEAP_MODEL_INSTANCE:-/bucket/ReiterU/Ants/SLEAP_files/Simple_skeleton/20250408_models_LATESTWORKINGMODEL/250408_141245.centered_instance/training_config.json}"
-SLEAP2H5_SCRIPT="${SLEAP2H5_SCRIPT:-/apps/unit/ReiterU/ant_tracking/sleap2h5.py}"
-SLEAP2CSV_SCRIPT="${SLEAP2CSV_SCRIPT:-/apps/unit/ReiterU/ant_tracking/sleap2csv.py}"
+SLEAP2H5_SCRIPT="${SLEAP2H5_SCRIPT:-$SCRIPT_DIR/sleap2h5.py}"
+SLEAP2CSV_SCRIPT="${SLEAP2CSV_SCRIPT:-$SCRIPT_DIR/sleap2csv.py}"
 SLEAP_MODULE="${SLEAP_MODULE:-sleap/1.4.1}"
 SAION_COLLECT_PARTITION="${SAION_COLLECT_PARTITION:-test-gpu}"
-ARUCO_SCRIPT="${ARUCO_SCRIPT:-/apps/unit/ReiterU/ant_tracking/opencv_aruco.py}"
+ARUCO_SCRIPT="${ARUCO_SCRIPT:-$SCRIPT_DIR/run_aruco.py}"
 ARUCO_ENV_ACTIVATE="${ARUCO_ENV_ACTIVATE:-module load opencv}"
 RSYNC_FLAGS="--chmod=Du=rwx,Dg=rwx,Fu=rw,Fg=rw"
 BUCKET_WRITE_HOST_CANDIDATES="${BUCKET_WRITE_HOST_CANDIDATES:-datacp,deigo-login1,deigo-login2,deigo-login3}"
@@ -244,9 +262,29 @@ echo "[INFO] Saion bucket host: $SAION_BUCKET_HOST" >&2
 videos=( "$DIR"/*.avi )
 (( ${#videos[@]} > 0 )) || { echo "[WARN] No .avi videos found in $DIR" >&2; exit 0; }
 
+# --- Section: Job Rate Limiting ---
+
+MAX_SUBMITTED_JOBS="${MAX_SUBMITTED_JOBS:-1500}"
+
+get_job_count() {
+	squeue -u "$USER" -h -r | wc -l
+}
+
 # --- Section: Per-video pipeline orchestration ---
 
 for video in "${videos[@]}"; do
+	# Check job limit (Simplified for staged submission: only counting split jobs)
+	# Since we only submit 1 job per video initially, we can use a simpler check or rely on SLURM's internal queuing.
+	# However, to avoid flooding the queue with thousands of split jobs, we keep a loose check.
+	while true; do
+		current_jobs=$(get_job_count)
+		if (( current_jobs < MAX_SUBMITTED_JOBS )); then
+			break
+		fi
+		echo "[INFO] Job limit reached ($current_jobs/$MAX_SUBMITTED_JOBS). Waiting 60s..."
+		sleep 60
+	done
+
 	b="$(basename "$video")"
 	[[ "$b" =~ ^\. ]] && continue
 	[[ "$b" =~ _renc\.avi$ || "$b" =~ _nvenc\.avi$ ]] && continue
@@ -255,10 +293,26 @@ for video in "${videos[@]}"; do
 	chunk_count=$(calc_chunk_count "$video" "$SEG_SEC")
 	[[ "$chunk_count" =~ ^[0-9]+$ ]] || chunk_count=1
 	(( chunk_count >= 1 )) || chunk_count=1
-	array_upper=$(( chunk_count - 1 ))
-	if (( CHUNK_BUFFER > 0 )); then
-		array_upper=$(( array_upper + CHUNK_BUFFER - 1 ))
+	(( chunk_count >= 1 )) || chunk_count=1
+	
+	# Add buffer to chunk count before batching
+	chunk_count_buffered=$(( chunk_count + CHUNK_BUFFER ))
+	
+	if [[ -n "$BATCH_SIZE" ]]; then
+		b_size="$BATCH_SIZE"
+	else
+		if (( chunk_count_buffered > MAX_ARRAY_TASKS )); then
+			# Auto-scale batch size to keep tasks within limit
+			b_size=$(( (chunk_count_buffered + MAX_ARRAY_TASKS - 1) / MAX_ARRAY_TASKS ))
+		else
+			b_size=1
+		fi
 	fi
+
+	# Ceiling division for array count
+	array_count=$(( (chunk_count_buffered + b_size - 1) / b_size ))
+	array_upper=$(( array_count - 1 ))
+	
 	(( array_upper >= 0 )) || array_upper=0
 
 	video_flash_dir="$flash_root/$vname"
@@ -309,9 +363,9 @@ for video in "${videos[@]}"; do
 	# --- Stage Script: Split raw segments ---
 	cat > "$split_script" <<'EOS'
 #!/bin/bash -l
-#SBATCH -t 0-6
+#SBATCH -t 0-2
 #SBATCH -c 4
-#SBATCH --partition=compute
+#SBATCH --partition=short
 #SBATCH --mem=8G
 #SBATCH -J split-__BASE__
 #SBATCH -o __JOBDIR__/split-__BASE___%j.out
@@ -342,6 +396,11 @@ else
 	: > "$manifest"
 fi
 chmod 664 "$manifest"
+# Submit next stage: Encode Array & Sync
+jid_enc=$(sbatch --parsable "__ENCODE_SCRIPT__")
+echo "Submitted Encode Array: $jid_enc"
+sbatch --dependency=afterok:$jid_enc "__ENC_FINALIZE_SCRIPT__"
+echo "Submitted Encode Sync (dep: $jid_enc)"
 EOS
 
 	# --- Stage Script: Encode segments ---
@@ -364,33 +423,40 @@ frame_dir="$flash_dir/frame_counts"
 mkdir -p "$frame_dir"
 chmod 2775 "$frame_dir"
 
-idx=$(printf "%03d" "$SLURM_ARRAY_TASK_ID")
-raw="$flash_dir/__BASE___raw_${idx}.avi"
-out="$flash_dir/__BASE___${idx}.avi"
+batch_size=__BATCH_SIZE__
+start_idx=$(( SLURM_ARRAY_TASK_ID * batch_size ))
+end_idx=$(( start_idx + batch_size ))
 
-if [[ ! -s "$raw" ]]; then
-	echo "[SKIP] no raw chunk $raw"
-	exit 0
-fi
+for (( i=start_idx; i<end_idx; i++ )); do
+	idx=$(printf "%03d" "$i")
+	raw="$flash_dir/__BASE___raw_${idx}.avi"
+	out="$flash_dir/__BASE___${idx}.avi"
 
-ffmpeg -hide_banner -y -i "$raw" -c:v libx264 -pix_fmt yuv420p \
-	-preset fast -crf 23 -threads 8 "$out"
+	if [[ ! -s "$raw" ]]; then
+		echo "[SKIP] no raw chunk $raw"
+		continue
+	fi
 
-nb=$(ffprobe -v error -select_streams v:0 -show_entries stream=nb_frames \
-		-of default=nk=1:nw=1 "$out" 2>/dev/null || echo 0)
+	ffmpeg -hide_banner -y -i "$raw" -c:v libx264 -pix_fmt yuv420p \
+		-preset fast -crf 23 -threads 8 "$out"
 
-tmp_csv="$frame_dir/${idx}.csv"
-printf "%s,%s\n" "__BASE___${idx}.avi" "$nb" > "$tmp_csv"
-chmod 664 "$tmp_csv"
-touch "$flash_dir/__BASE___raw_${idx}.encoded.ok"
+	nb=$(ffprobe -v error -select_streams v:0 -show_entries stream=nb_frames \
+			-of default=nk=1:nw=1 "$out" 2>/dev/null || echo 0)
+
+	tmp_csv="$frame_dir/${idx}.csv"
+	printf "%s,%s\n" "__BASE___${idx}.avi" "$nb" > "$tmp_csv"
+	chmod 664 "$tmp_csv"
+	touch "$flash_dir/__BASE___raw_${idx}.encoded.ok"
+	rm -f "$raw"
+done
 EOS
 
 	# --- Stage Script: Finalize encoding outputs ---
 	cat > "$enc_finalize_script" <<'EOS'
 #!/bin/bash -l
-#SBATCH -t 0-6
+#SBATCH -t 0-2
 #SBATCH -c 2
-#SBATCH --partition=compute
+#SBATCH --partition=short
 #SBATCH --mem=8G
 #SBATCH -J encfin-__BASE__
 #SBATCH -o __JOBDIR__/encfin-__BASE___%j.out
@@ -468,6 +534,19 @@ fi
 rm -f "$copy_script"
 
 rm -f "$frame_csv"
+
+# Submit next stages: Bridge, ArUco, Cleanup
+jid_bridge=$(sbatch --parsable "__BRIDGE_SCRIPT__")
+echo "Submitted Bridge: $jid_bridge"
+
+jid_aruco=$(sbatch --parsable "__ARUCO_SCRIPT_PATH__")
+echo "Submitted ArUco Array: $jid_aruco"
+
+jid_aruco_sync=$(sbatch --parsable --dependency=afterok:$jid_aruco "__ARUCO_FINALIZE_SCRIPT__")
+echo "Submitted ArUco Sync: $jid_aruco_sync"
+
+sbatch --dependency=afterok:$jid_bridge:$jid_aruco_sync "__CLEANUP_SCRIPT__"
+echo "Submitted Cleanup (dep: $jid_bridge, $jid_aruco_sync)"
 EOS
 
 	# --- Stage Script: Run ArUco detection ---
@@ -488,32 +567,36 @@ set -eo pipefail
 mkdir -p "$output_dir"
 chmod 2775 "$output_dir"
 
-idx=$(printf "%03d" "$SLURM_ARRAY_TASK_ID")
+batch_size=__BATCH_SIZE__
+start_idx=$(( SLURM_ARRAY_TASK_ID * batch_size ))
+end_idx=$(( start_idx + batch_size ))
+
+for (( i=start_idx; i<end_idx; i++ )); do
+	idx=$(printf "%03d" "$i")
 	video_path="$segment_dir/__BASE___${idx}.avi"
-if [[ ! -s "$video_path" ]]; then
-	echo "[SKIP] missing encoded segment $video_path"
-	exit 0
-fi
+	if [[ ! -s "$video_path" ]]; then
+		echo "[SKIP] missing encoded segment $video_path"
+		continue
+	fi
 
-source ~/.bashrc
-__ARUCO_ENV_ACTIVATE__
+	python3 "__ARUCO_SCRIPT__" \
+		--video-file "$video_path" \
+		--output-path "$output_dir/"
 
-python3 "__ARUCO_SCRIPT__" \
-	--video-file "$video_path" \
-	--output-path "$output_dir" \
-	--dictionary-size 1000 \
-	--max-gap 100 \
-	--min-fraction 0.125
+	rsync -avh __RSYNC_FLAGS__ \
+		"$output_dir/__BASE___${idx}aruco_tracks_.h5" \
+		"__ARUCO_BUCKET_DIR__/"
 
-touch "$output_dir/__BASE___${idx}.aruco.ok"
+	touch "$output_dir/__BASE___${idx}.aruco.ok"
+done
 EOS
 
 	# --- Stage Script: Sync ArUco outputs ---
 	cat > "$aruco_finalize_script" <<'EOS'
 #!/bin/bash -l
-#SBATCH -t 0-4
+#SBATCH -t 0-2
 #SBATCH -c 2
-#SBATCH --partition=compute
+#SBATCH --partition=short
 #SBATCH --mem=4G
 #SBATCH -J arucofin-__BASE__
 #SBATCH -o __JOBDIR__/arucofin-__BASE__%j.out
@@ -541,7 +624,7 @@ aruco_ok="__ARUCO_OK__"
 
 mkdir -p "$bucket_dir"
 rsync -avh __RSYNC_FLAGS__ \
-	--include="__BASE___*_aruco_detections.csv" \
+	--include="__BASE___*aruco_tracks_.h5" \
 	--exclude="*" "$flash_dir/" "$bucket_dir/"
 mkdir -p "$aruco_ok_dir"
 : > "$aruco_ok"
@@ -559,15 +642,15 @@ fi
 rm -f "$copy_script"
 
 rm -f "$flash_dir"/__BASE___*.aruco.ok
-rm -f "$flash_dir"/__BASE___*_aruco_detections.csv
+rm -f "$flash_dir"/__BASE___*aruco_tracks_.h5
 EOS
 
 	# --- Stage Script: Bridge to Saion ---
 	cat > "$bridge_script" <<'EOS'
 #!/bin/bash -l
-#SBATCH -t 0-6
+#SBATCH -t 0-2
 #SBATCH -c 2
-#SBATCH --partition=compute
+#SBATCH --partition=short
 #SBATCH --mem=8G
 #SBATCH -J bridge-__BASE__
 #SBATCH -o __JOBDIR__/bridge-__BASE__%j.out
@@ -594,6 +677,7 @@ rsync_flags="__RSYNC_FLAGS__"
 chunk_max=__ARRAY_MAX__
 expected_chunks=__CHUNK_COUNT__
 sleap_concurrency=__SLEAP_CONCURRENCY__
+batch_size=__BATCH_SIZE__
 summary_file="__SUMMARY_FILE__"
 copy_partition="__DATA_COPY_PARTITION__"
 job_tmp_dir="__JOBDIR__"
@@ -632,30 +716,36 @@ input_dir="__REMOTE_INPUT__"
 output_dir="__REMOTE_OUTPUT__"
 bucket_dir="__DATA_DIR__"
 bucket_host="__SAION_BUCKET_HOST__"
+batch_size=__BATCH_SIZE__
 
-idx=$(printf "%03d" "$SLURM_ARRAY_TASK_ID")
-input="$input_dir/${base}_${idx}.avi"
-if [[ ! -s "$input" ]]; then
-	echo "[SKIP] missing input $input"
-	exit 0
-fi
+start_idx=$(( SLURM_ARRAY_TASK_ID * batch_size ))
+end_idx=$(( start_idx + batch_size ))
 
-out_slp="$output_dir/${base}_${idx}.slp"
-out_h5="$output_dir/${base}_${idx}_sleap_data.h5"
-out_csv="$output_dir/${base}_${idx}_sleap_data.csv"
+for (( i=start_idx; i<end_idx; i++ )); do
+	idx=$(printf "%03d" "$i")
+	input="$input_dir/${base}_${idx}.avi"
+	if [[ ! -s "$input" ]]; then
+		echo "[SKIP] missing input $input"
+		continue
+	fi
 
-sleap-track "$input" -m "__MODEL1__" -m "__MODEL2__" \
-	--tracking.tracker none -o "$out_slp" \
-	--verbosity json --no-empty-frames --batch_size 2
+	out_slp="$output_dir/${base}_${idx}.slp"
+	out_h5="$output_dir/${base}_${idx}_sleap_data.h5"
+	out_csv="$output_dir/${base}_${idx}_sleap_data.csv"
 
-python3 "__SLEAP2H5__" "$out_slp" "$output_dir"
-python3 "__SLEAP2CSV__" "$out_slp" "$output_dir"
+	sleap-track "$input" -m "__MODEL1__" -m "__MODEL2__" \
+		--tracking.tracker none -o "$out_slp" \
+		--verbosity json --no-empty-frames --batch_size 2
 
-"${SSH_CMD[@]}" "$bucket_host" "mkdir -p '$bucket_dir'"
+	python3 "__SLEAP2H5__" "$out_slp" "$output_dir"
+	python3 "__SLEAP2CSV__" "$out_slp" "$output_dir"
 
-rsync -avh --chmod=Du=rwx,Dg=rwx,Fu=rw,Fg=rw \
-	"$out_slp" "$out_h5" "$out_csv" \
-	"$bucket_host:$bucket_dir/"
+	"${SSH_CMD[@]}" "$bucket_host" "mkdir -p '$bucket_dir'"
+
+	rsync -avh --chmod=Du=rwx,Dg=rwx,Fu=rw,Fg=rw \
+		"$out_slp" "$out_h5" "$out_csv" \
+		"$bucket_host:$bucket_dir/"
+done
 SAION
 
 "${SSH_CMD[@]}" saion "cat > '$remote_root/sleap_collect.sh'" <<'SAION'
@@ -673,6 +763,7 @@ SSH_CMD=(ssh -x -oBatchMode=yes -oStrictHostKeyChecking=no -oUserKnownHostsFile=
 export RSYNC_RSH="${SSH_CMD[*]}"
 
 source ~/.bashrc
+remote_root="__REMOTE_ROOT__"
 output_dir="__REMOTE_OUTPUT__"
 bucket_dir="__DATA_DIR__"
 sleap_done="__SLEAP_DONE_OK__"
@@ -689,7 +780,8 @@ rsync -avh --chmod=Du=rwx,Dg=rwx,Fu=rw,Fg=rw \
 
 "${SSH_CMD[@]}" "$bucket_host" "bash -lc 'umask 0002 && mkdir -p \"$sleap_done_dir\" && : > \"$sleap_done\"'"
 
-rm -rf "$output_dir"/*
+# Local cleanup on Saion
+rm -rf "$remote_root"
 SAION
 
 "${SSH_CMD[@]}" saion "chmod +x '$remote_root/sleap_array.sh' '$remote_root/sleap_collect.sh'"
@@ -732,9 +824,9 @@ EOS
 	# --- Stage Script: Cleanup sentinels and storage ---
 	cat > "$cleanup_script" <<'EOS'
 #!/bin/bash -l
-#SBATCH -t 4-00:00:00
+#SBATCH -t 0-2
 #SBATCH -c 2
-#SBATCH --partition=compute
+#SBATCH --partition=short
 #SBATCH --mem=8G
 #SBATCH -J cleanup-__BASE__
 #SBATCH -o __JOBDIR__/cleanup-__BASE__%j.out
@@ -773,16 +865,14 @@ wait_for_file() {
 }
 
 wait_for_file "$aruco_ok" "ArUco completion marker"
-wait_for_file "$sleap_done" "SLEAP completion marker"
+# Note: We do not wait for SLEAP completion here anymore.
+# Saion cleanup is handled locally on Saion.
 
 echo "[INFO] removing flash directory $flash_dir"
 rm -rf "$flash_dir"
 
 echo "[INFO] removing ArUco flash directory $aruco_flash_dir"
 rm -rf "$aruco_flash_dir"
-
-echo "[INFO] removing Saion workspace $remote_root"
-"${SSH_CMD[@]}" saion "rm -rf '$remote_root'"
 
 if [[ -d "$aruco_flash_root" ]]; then
 	rmdir "$aruco_flash_root" 2>/dev/null || true
@@ -791,8 +881,6 @@ fi
 if [[ -d "$flash_root" ]]; then
 	rmdir "$flash_root" 2>/dev/null || true
 fi
-
-"${SSH_CMD[@]}" saion "rmdir '$saion_root' >/dev/null 2>&1 || true"
 
 copy_script=$(mktemp -p "$job_tmp_dir" "__BASE___cleanup_mark_XXXXXX.sh")
 cat > "$copy_script" <<'COPY'
@@ -828,23 +916,35 @@ EOS
 # --- Stage: Parameterize templates ---
 
 	replace_placeholders "$split_script" \
-		BASE "$vname" JOBDIR "$video_job_dir" VIDEO "$video" FLASH_DIR "$video_flash_dir" \
-		MANIFEST "$manifest_path" SEG_SEC "$SEG_SEC"
+		BASE "$vname" JOBDIR "$video_job_dir" VIDEO "$video" \
+		SEG_SEC "$SEG_SEC" FLASH_DIR "$video_flash_dir" \
+		ENCODE_SCRIPT "$encode_script" \
+		ENC_FINALIZE_SCRIPT "$enc_finalize_script" \
+		MANIFEST "$manifest_path" \
+		STAGED_SUBMISSION "$STAGED_SUBMISSION"
 
 	replace_placeholders "$encode_script" \
 		BASE "$vname" JOBDIR "$video_job_dir" ARRAY_MAX "$array_upper" \
-		ENC_CONCURRENCY "$ENC_CONCURRENCY" FLASH_DIR "$video_flash_dir"
+		ENC_CONCURRENCY "$ENC_CONCURRENCY" FLASH_DIR "$video_flash_dir" \
+		BATCH_SIZE "$b_size"
 
 	replace_placeholders "$enc_finalize_script" \
 		BASE "$vname" JOBDIR "$video_job_dir" FLASH_DIR "$video_flash_dir" \
-		DATA_DIR "$data_folder" ENC_OK "$enc_ok" ENC_OK_DIR "$enc_ok_dir" \
-		RSYNC_FLAGS "$RSYNC_FLAGS" MANIFEST "$manifest_path" DATA_COPY_PARTITION "$DATA_COPY_PARTITION"
+		BUCKET_DIR "$bucket_dir" BUCKET_HOST "$BUCKET_WRITE_HOST" \
+		BRIDGE_SCRIPT "$bridge_script" \
+		ARUCO_SCRIPT_PATH "$aruco_script_path" \
+		ARUCO_FINALIZE_SCRIPT "$aruco_finalize_script" \
+		CLEANUP_SCRIPT "$cleanup_script" ENC_OK_DIR "$enc_ok_dir" \
+		RSYNC_FLAGS "$RSYNC_FLAGS" MANIFEST "$manifest_path" DATA_COPY_PARTITION "$DATA_COPY_PARTITION" \
+		STAGED_SUBMISSION "$STAGED_SUBMISSION"
 
 	replace_placeholders "$aruco_script_path" \
 		BASE "$vname" JOBDIR "$video_job_dir" ARRAY_MAX "$array_upper" \
 		ARUCO_CONCURRENCY "$ARUCO_CONCURRENCY" FLASH_DIR "$video_flash_dir" \
 		ARUCO_FLASH_DIR "$aruco_flash_dir" ARUCO_SCRIPT "$ARUCO_SCRIPT" \
-		ARUCO_ENV_ACTIVATE "$ARUCO_ENV_ACTIVATE"
+		ARUCO_ENV_ACTIVATE "$ARUCO_ENV_ACTIVATE" \
+		BATCH_SIZE "$b_size" RSYNC_FLAGS "$RSYNC_FLAGS" \
+		ARUCO_BUCKET_DIR "$aruco_bucket_root"
 
 	replace_placeholders "$aruco_finalize_script" \
 		BASE "$vname" JOBDIR "$video_job_dir" ARUCO_FLASH_DIR "$aruco_flash_dir" \
@@ -863,7 +963,8 @@ EOS
 		SLEAP_CONCURRENCY "$SLEAP_CONCURRENCY" SUMMARY_FILE "$summary_file" \
 		DATA_COPY_PARTITION "$DATA_COPY_PARTITION" SAION_BUCKET_HOST "$SAION_BUCKET_HOST" \
 		SAION_GRES "$saion_gres" \
-		SAION_COLLECT_PARTITION "$SAION_COLLECT_PARTITION"
+		SAION_COLLECT_PARTITION "$SAION_COLLECT_PARTITION" \
+		BATCH_SIZE "$b_size"
 
 	replace_placeholders "$cleanup_script" \
 		BASE "$vname" JOBDIR "$video_job_dir" SLEAP_DONE_OK "$sleap_done" \
@@ -886,39 +987,16 @@ EOS
 		printf '%-16s %s\n' "$stage" "$job_id" >> "$summary_file"
 	}
 
-# --- Stage: Submit pipeline ---
-
-	split_id=$(sbatch --parsable "$split_script")
-	log_stage "split" "$split_id"
-
-	encode_id=$(sbatch --parsable --dependency=afterok:"$split_id" "$encode_script")
-	log_stage "enc-array" "$encode_id"
-
-	encfin_id=$(sbatch --parsable --dependency=afterok:"$encode_id" "$enc_finalize_script")
-	log_stage "enc-sync" "$encfin_id"
-
-	bridge_id=$(sbatch --parsable --dependency=afterok:"$encfin_id" "$bridge_script")
-	log_stage "bridge" "$bridge_id"
-
-	aruco_id=$(sbatch --parsable --dependency=afterok:"$encfin_id" "$aruco_script_path")
-	log_stage "aruco-array" "$aruco_id"
-
-	arucofin_id=$(sbatch --parsable --dependency=afterok:"$aruco_id" "$aruco_finalize_script")
-	log_stage "aruco-sync" "$arucofin_id"
-
-	cleanup_dep="afterok:${arucofin_id}:${bridge_id}"
-	cleanup_id=$(sbatch --parsable --dependency="$cleanup_dep" "$cleanup_script")
-	log_stage "cleanup" "$cleanup_id"
-
+# --- Stage:	# --- Submission ---
+	
+	# Only submit the first stage (Split)
+	jid_split=$(sbatch --parsable "$split_script")
+	
 	echo "Submitted pipeline for $vname (chunks: $chunk_count, array 0-$array_upper)"
-	printf '  %-12s %s\n' split "$split_id"
-	printf '  %-12s %s\n' enc-array "$encode_id"
-	printf '  %-12s %s\n' enc-sync "$encfin_id"
-	printf '  %-12s %s\n' bridge "$bridge_id"
-	printf '  %-12s %s\n' aruco-array "$aruco_id"
-	printf '  %-12s %s\n' aruco-sync "$arucofin_id"
-	printf '  %-12s %s\n' cleanup "$cleanup_id"
-	echo "  Sentinels: $enc_ok, $aruco_ok, $sleap_done, $cleanup_ok"
+	echo "  split        $jid_split"
+	
+	# Append to summary
+	echo "split: $jid_split" >> "$summary_file"
 done
 
 echo "Pipelines scheduled. Monitor via: squeue -u $(id -un) and consult per-video summary files under $jobs_root/<video>/pipeline.jobs."
