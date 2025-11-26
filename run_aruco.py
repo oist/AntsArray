@@ -55,10 +55,7 @@ p.add_argument('--video-file')
 p.add_argument('--output-path')  
 
 args = p.parse_args()
-p.add_argument('--video-file')  
-p.add_argument('--output-path')  
 
-args = p.parse_args()
 
 basename=os.path.basename(args.video_file)
 #load aruco detector
