@@ -237,7 +237,7 @@ SLEAP2CSV_SCRIPT="${SLEAP2CSV_SCRIPT:-$SCRIPT_DIR/sleap2csv.py}"
 SLEAP_MODULE="${SLEAP_MODULE:-sleap/1.4.1}"
 SAION_COLLECT_PARTITION="${SAION_COLLECT_PARTITION:-test-gpu}"
 ARUCO_SCRIPT="${ARUCO_SCRIPT:-$SCRIPT_DIR/run_aruco.py}"
-ARUCO_ENV_ACTIVATE="${ARUCO_ENV_ACTIVATE:-module load opencv}"
+ARUCO_ENV_ACTIVATE="${ARUCO_ENV_ACTIVATE:-module load opencv/4.9.0}"
 RSYNC_FLAGS="--chmod=Du=rwx,Dg=rwx,Fu=rw,Fg=rw"
 BUCKET_WRITE_HOST_CANDIDATES="${BUCKET_WRITE_HOST_CANDIDATES:-datacp,deigo-login1,deigo-login2,deigo-login3}"
 SAION_BUCKET_HOST_CANDIDATES="${SAION_BUCKET_HOST_CANDIDATES:-saion-login1,saion-login2,saion-login3}"
@@ -561,6 +561,8 @@ EOS
 #SBATCH -e __JOBDIR__/aruco-__BASE___%A_%a.err
 #SBATCH --array=0-__ARRAY_MAX__%__ARUCO_CONCURRENCY__
 set -eo pipefail
+
+	__ARUCO_ENV_ACTIVATE__
 
 	segment_dir="__FLASH_DIR__"
 	output_dir="__ARUCO_FLASH_DIR__"
@@ -931,6 +933,7 @@ EOS
 	replace_placeholders "$enc_finalize_script" \
 		BASE "$vname" JOBDIR "$video_job_dir" FLASH_DIR "$video_flash_dir" \
 		BUCKET_DIR "$bucket_dir" BUCKET_HOST "$BUCKET_WRITE_HOST" \
+		DATA_DIR "$data_folder" ENC_OK "$enc_ok" \
 		BRIDGE_SCRIPT "$bridge_script" \
 		ARUCO_SCRIPT_PATH "$aruco_script_path" \
 		ARUCO_FINALIZE_SCRIPT "$aruco_finalize_script" \
