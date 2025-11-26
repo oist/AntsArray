@@ -17,7 +17,7 @@
 #    4. bridge        -> stage to Saion + submit SLEAP array/collect
 #    5. aruco array   -> detect ArUco markers on Deigo
 #    6. aruco sync    -> collate outputs, mark aruco.ok
-#    7. cleanup       -> wait for sleap.ok, clean /flash and /work
+#    7. sleap sync    -> collate outputs, mark sleap.ok
 # ------------------------------------------------------------
 set -eo pipefail
 shopt -s nullglob
@@ -242,6 +242,21 @@ RSYNC_FLAGS="--chmod=Du=rwx,Dg=rwx,Fu=rw,Fg=rw"
 BUCKET_WRITE_HOST_CANDIDATES="${BUCKET_WRITE_HOST_CANDIDATES:-datacp,deigo-login1,deigo-login2,deigo-login3}"
 SAION_BUCKET_HOST_CANDIDATES="${SAION_BUCKET_HOST_CANDIDATES:-saion-login1,saion-login2,saion-login3}"
 DATA_COPY_PARTITION="${DATA_COPY_PARTITION:-datacp}"
+
+# Determine time limits based on partition
+case "$SAION_NODE" in
+	test-gpu) sleap_time="0-08:00:00" ;;
+	largegpu) sleap_time="1-00:00:00" ;;
+	gpu)      sleap_time="2-00:00:00" ;;
+	*)        sleap_time="0-08:00:00" ;;
+esac
+
+case "$SAION_COLLECT_PARTITION" in
+	test-gpu) collect_time="0-08:00:00" ;;
+	largegpu) collect_time="1-00:00:00" ;;
+	gpu)      collect_time="2-00:00:00" ;;
+	*)        collect_time="0-08:00:00" ;;
+esac
 
 bucket_host_source="${BUCKET_WRITE_HOST:-}"
 [[ -n "$bucket_host_source" ]] || bucket_host_source="$BUCKET_WRITE_HOST_CANDIDATES"
@@ -697,7 +712,7 @@ rsync -avh $rsync_flags \
 
 "${SSH_CMD[@]}" saion "cat > '$remote_root/sleap_array.sh'" <<'SAION'
 #!/bin/bash -l
-#SBATCH -t 0-24
+#SBATCH -t __SLEAP_TIME__
 #SBATCH -c 8
 #SBATCH --partition=__SAION_NODE__
 #SBATCH --mem=128G
@@ -752,7 +767,7 @@ SAION
 
 "${SSH_CMD[@]}" saion "cat > '$remote_root/sleap_collect.sh'" <<'SAION'
 #!/bin/bash -l
-#SBATCH -t 1-00:00:00
+#SBATCH -t __COLLECT_TIME__
 #SBATCH -c 2
 #SBATCH --partition=__SAION_COLLECT_PARTITION__
 #SBATCH --mem=16G
@@ -967,7 +982,8 @@ EOS
 		DATA_COPY_PARTITION "$DATA_COPY_PARTITION" SAION_BUCKET_HOST "$SAION_BUCKET_HOST" \
 		SAION_GRES "$saion_gres" \
 		SAION_COLLECT_PARTITION "$SAION_COLLECT_PARTITION" \
-		BATCH_SIZE "$b_size"
+		BATCH_SIZE "$b_size" \
+		SLEAP_TIME "$sleap_time" COLLECT_TIME "$collect_time"
 
 	replace_placeholders "$cleanup_script" \
 		BASE "$vname" JOBDIR "$video_job_dir" SLEAP_DONE_OK "$sleap_done" \
