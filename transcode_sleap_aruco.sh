@@ -600,10 +600,6 @@ for (( i=start_idx; i<end_idx; i++ )); do
 		--video-file "$video_path" \
 		--output-path "$output_dir/"
 
-	rsync -avh __RSYNC_FLAGS__ \
-		"$output_dir/__BASE___${idx}aruco_tracks_.h5" \
-		"__ARUCO_BUCKET_DIR__/"
-
 	touch "$output_dir/__BASE___${idx}.aruco.ok"
 done
 EOS
@@ -641,7 +637,7 @@ aruco_ok="__ARUCO_OK__"
 
 mkdir -p "$bucket_dir"
 rsync -avh __RSYNC_FLAGS__ \
-	--include="__BASE___*aruco_tracks_.h5" \
+	--include="__BASE___*_aruco_tracks_.h5" \
 	--exclude="*" "$flash_dir/" "$bucket_dir/"
 mkdir -p "$aruco_ok_dir"
 : > "$aruco_ok"
@@ -659,7 +655,7 @@ fi
 rm -f "$copy_script"
 
 rm -f "$flash_dir"/__BASE___*.aruco.ok
-rm -f "$flash_dir"/__BASE___*aruco_tracks_.h5
+rm -f "$flash_dir"/__BASE___*_aruco_tracks_.h5
 EOS
 
 	# --- Stage Script: Bridge to Saion ---

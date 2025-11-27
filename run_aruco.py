@@ -58,6 +58,7 @@ args = p.parse_args()
 
 
 basename=os.path.basename(args.video_file)
+name_no_ext = os.path.splitext(basename)[0]
 #load aruco detector
 aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_1000)
 detectParams=aruco.DetectorParameters()
@@ -72,7 +73,7 @@ detector=aruco.ArucoDetector(aruco_dict,detectParams)
 
 tracks=get_aruco_tracks(args.video_file,300) #size of aruco dict
 # Save data in HDF5 format
-hdf5_path = args.output_path + basename + 'aruco_tracks_.h5'
+hdf5_path = os.path.join(args.output_path, name_no_ext + '_aruco_tracks_.h5')
 with h5py.File(hdf5_path, 'w') as hdf:
     hdf.create_dataset('aruco_tracks', data=tracks)
 # np.save(args.output_path + basename + 'aruco_tracks_.npy', tracks)  
