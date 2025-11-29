@@ -91,8 +91,8 @@ for VIDEO in "${VIDEOS[@]}"; do
     JOB_NAME="bench_${VIDEO_NAME}_${VERSION}"
     SCRIPT_PATH="$JOBS_DIR/${JOB_NAME}.sh"
     LOG_PATH="$JOBS_DIR/${JOB_NAME}_%j.log"
-    OUTPUT_SLP="$WORK_DIR/${VIDEO_NAME}.${VERSION}.slp"
-    RESULT_CSV="$WORK_DIR/${VIDEO_NAME}.${VERSION}.csv"
+    OUTPUT_SLP="$WORK_DIR/${VIDEO_NAME}.${VERSION}.${NODE}.slp"
+    RESULT_CSV="$WORK_DIR/${VIDEO_NAME}.${VERSION}.${NODE}.csv"
 
     cat <<EOF | tr -d '\r' > "$SCRIPT_PATH"
 #!/bin/bash -l
@@ -186,4 +186,4 @@ done
 echo "All jobs submitted."
 echo "Results will be saved as individual CSV files in $WORK_DIR"
 echo "To combine them later, run:"
-echo "  awk '(NR == 1) || (FNR > 1)' $WORK_DIR/*.${VERSION}.csv > $DIR/inference_results_${VERSION}_${NODE}.csv"
+echo "  ./combine_results.sh $WORK_DIR"
