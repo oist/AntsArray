@@ -58,11 +58,11 @@ VERBOSITY_FLAG="--verbosity json"
 TRACK_CMD="sleap-track"
 
 if [[ "$VERSION" == "sleap-nn" ]]; then
-    MODULE_CMD="module load sleap-nn"
+    MODULE_CMD="module load python/3.12.9 sleap-nn"
     VERBOSITY_FLAG=""
     TRACK_CMD="sleap-nn track"
 elif [[ "$VERSION" =~ ^1\.[5-9] ]] || [[ "$VERSION" =~ ^[2-9] ]]; then
-    MODULE_CMD="module load sleap/$VERSION"
+    MODULE_CMD="module load python/3.12.9 sleap/$VERSION"
     VERBOSITY_FLAG="" # 1.5+ doesn't support --verbosity
     TRACK_CMD="sleap-nn-track"
 fi
