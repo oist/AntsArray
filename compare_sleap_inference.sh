@@ -115,13 +115,12 @@ START_TIME=\$(date +%s)
 echo "Start Time: \$START_TIME"
 
 # Run SLEAP
-if [[ "$VERSION" == "sleap-nn" ]] || [[ "$VERSION" =~ ^1\.[5-9] ]] || [[ "$VERSION" =~ ^[2-9] ]]; then
+if [[ "$VERSION" == "sleap-nn" ]] || [[ "$VERSION" =~ ^1\.[5-9] ]] || [[ "$VERSION" =~ ^[0-9] ]]; then
     # SLEAP 1.5.2 syntax
     $TRACK_CMD \
         -i "$VIDEO" \
         -m "$MODEL_CENTROID" \
         -m "$MODEL_INSTANCE" \
-        --no_empty_frames \
         -o "$OUTPUT_SLP"
 else
     # SLEAP 1.4.1 syntax
@@ -152,15 +151,42 @@ start_time = int(sys.argv[5])
 end_time = int(sys.argv[6])
 csv_path = sys.argv[7]
 hostname = sys.argv[8]
+
+# Default duration from shell timer
 duration = end_time - start_time
 fps = None
 
 if os.path.exists(log_path):
     with open(log_path, "r") as f:
         content = f.read()
-        match = re.search(r"Inference: ([\d\.]+) FPS", content)
-        if match:
-            fps = float(match.group(1))
+        
+        # Try to parse exact runtime from SLEAP logs
+        # "Total runtime: 15084.98106265068 secs"
+        match_runtime = re.search(r"Total runtime: ([\d\.]+) secs", content)
+        if match_runtime:
+            duration = float(match_runtime.group(1))
+
+        # Parse FPS
+        match_fps = re.search(r"Inference: ([\d\.]+) FPS", content)
+        if match_fps:
+            fps = float(match_fps.group(1))
+        else:
+            # Try parsing SLEAP 1.5.2 progress bar format: "... 3.2 FPS"
+            match_fps_bar = re.search(r" ([\d\.]+) FPS", content)
+            if match_fps_bar:
+                fps = float(match_fps_bar.group(1))
+            
+            # Fallback: Calculate from Total runtime if available
+            if fps is None and match_runtime:
+                # We need frame count. Try to find "Predicting... 100% N/N" or "Predicted frames: N/N"
+                match_frames = re.search(r"Predicting\.\.\..*?(\d+)/(\d+)", content)
+                if not match_frames:
+                     match_frames = re.search(r"Predicted frames: (\d+)/(\d+)", content)
+                
+                if match_frames:
+                    num_frames = int(match_frames.group(2))
+                    if duration > 0:
+                        fps = num_frames / duration
 
 df = pd.DataFrame([{
     "Video": video_name,
