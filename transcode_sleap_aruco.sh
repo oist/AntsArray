@@ -274,8 +274,8 @@ echo "[INFO] Saion bucket host: $SAION_BUCKET_HOST" >&2
 
 # --- Section: Source video scan ---
 
-videos=( "$DIR"/*.avi )
-(( ${#videos[@]} > 0 )) || { echo "[WARN] No .avi videos found in $DIR" >&2; exit 0; }
+videos=( "$DIR"/*.avi "$DIR"/*.mkv )
+(( ${#videos[@]} > 0 )) || { echo "[WARN] No .avi or .mkv videos found in $DIR" >&2; exit 0; }
 
 # --- Section: Job Rate Limiting ---
 
@@ -302,8 +302,9 @@ for video in "${videos[@]}"; do
 
 	b="$(basename "$video")"
 	[[ "$b" =~ ^\. ]] && continue
-	[[ "$b" =~ _renc\.avi$ || "$b" =~ _nvenc\.avi$ ]] && continue
-	vname="${b%.avi}"
+	[[ "$b" =~ _renc\.(avi|mkv)$ || "$b" =~ _nvenc\.(avi|mkv)$ ]] && continue
+	[[ "$b" =~ ^global_cam ]] && continue
+	vname="${b%.*}"
 
 	chunk_count=$(calc_chunk_count "$video" "$SEG_SEC")
 	[[ "$chunk_count" =~ ^[0-9]+$ ]] || chunk_count=1
@@ -387,6 +388,7 @@ for video in "${videos[@]}"; do
 #SBATCH -e __JOBDIR__/split-__BASE___%j.err
 set -eo pipefail
 shopt -s nullglob
+module load ffmpeg/7.1	
 
 video="__VIDEO__"
 flash_dir="__FLASH_DIR__"
@@ -432,6 +434,7 @@ EOS
 set -eo pipefail
 
 source ~/.bashrc
+module load ffmpeg/7.1
 
 flash_dir="__FLASH_DIR__"
 frame_dir="$flash_dir/frame_counts"
