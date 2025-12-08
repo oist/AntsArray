@@ -402,7 +402,7 @@ if compgen -G "$flash_dir/__BASE___raw_*.avi" > /dev/null; then
 	echo "[SKIP] raw chunks already present for $video"
 else
 	ffmpeg -hide_banner -y -i "$video" \
-		-c copy -map 0:v:0 -f segment -segment_time "$seg_sec" \
+		-c copy -bsf:v h264_mp4toannexb -map 0:v:0 -f segment -segment_time "$seg_sec" \
 		-reset_timestamps 1 "$flash_dir/__BASE___raw_%03d.avi"
 	fi
 
