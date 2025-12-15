@@ -33,6 +33,12 @@ usage() {
 Usage: 
   Interactive: bash transcode_sleap_aruco.sh --dir <folder> ...
   Batch:       sbatch transcode_sleap_aruco.sh --dir <folder> ...
+Options:
+	--dir PATH                   (required) Directory containing .avi/.mkv videos to process
+	--node PARTITION             Saion GPU partition: gpu, largegpu, test-gpu (default: largegpu)
+	--seg-sec SECONDS            Segment duration in seconds for splitting (default: 3600)
+	--sleap-model-centroid PATH  Path to SLEAP centroid model training_config.json
+	--sleap-model-instance PATH  Path to SLEAP instance model training_config.json
 Environment:
 	ENC_CONCURRENCY    Max concurrent encoder tasks (default 8)
 	ARUCO_CONCURRENCY  Max concurrent ArUco tasks (default 12)
@@ -162,12 +168,16 @@ select_resolvable_host() {
 DIR=""
 SAION_NODE="${SAION_NODE:-largegpu}"
 SEG_SEC="${SEG_SEC:-3600}"
+CLI_SLEAP_MODEL_CENTROID=""
+CLI_SLEAP_MODEL_INSTANCE=""
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 		--dir) DIR="$2"; shift 2 ;;
 		--node) SAION_NODE="$2"; shift 2 ;;
 		--seg-sec) SEG_SEC="$2"; shift 2 ;;
+		--sleap-model-centroid) CLI_SLEAP_MODEL_CENTROID="$2"; shift 2 ;;
+		--sleap-model-instance) CLI_SLEAP_MODEL_INSTANCE="$2"; shift 2 ;;
 		*) usage ;;
 	esac
 done
@@ -230,8 +240,17 @@ require_cmd sbatch
 require_cmd rsync
 require_cmd python3
 
-SLEAP_MODEL_CENTROID="${SLEAP_MODEL_CENTROID:-/bucket/ReiterU/Ants/SLEAP_files/Simple_skeleton/20250408_models_LATESTWORKINGMODEL/250408_141245.centroid/training_config.json}"
-SLEAP_MODEL_INSTANCE="${SLEAP_MODEL_INSTANCE:-/bucket/ReiterU/Ants/SLEAP_files/Simple_skeleton/20250408_models_LATESTWORKINGMODEL/250408_141245.centered_instance/training_config.json}"
+# CLI flags take precedence over environment variables
+if [[ -n "$CLI_SLEAP_MODEL_CENTROID" ]]; then
+	SLEAP_MODEL_CENTROID="$CLI_SLEAP_MODEL_CENTROID"
+else
+	SLEAP_MODEL_CENTROID="${SLEAP_MODEL_CENTROID:-/bucket/ReiterU/Ants/SLEAP_files/Simple_skeleton/20250408_models_LATESTWORKINGMODEL/250408_141245.centroid/training_config.json}"
+fi
+if [[ -n "$CLI_SLEAP_MODEL_INSTANCE" ]]; then
+	SLEAP_MODEL_INSTANCE="$CLI_SLEAP_MODEL_INSTANCE"
+else
+	SLEAP_MODEL_INSTANCE="${SLEAP_MODEL_INSTANCE:-/bucket/ReiterU/Ants/SLEAP_files/Simple_skeleton/20250408_models_LATESTWORKINGMODEL/250408_141245.centered_instance/training_config.json}"
+fi
 SLEAP2H5_SCRIPT="${SLEAP2H5_SCRIPT:-$SCRIPT_DIR/sleap2h5.py}"
 SLEAP2CSV_SCRIPT="${SLEAP2CSV_SCRIPT:-$SCRIPT_DIR/sleap2csv.py}"
 SLEAP_MODULE="${SLEAP_MODULE:-sleap/1.4.1}"
