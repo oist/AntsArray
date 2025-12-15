@@ -37,6 +37,7 @@ Options:
 	--dir PATH                   (required) Directory containing .avi/.mkv videos to process
 	--node PARTITION             Saion GPU partition: gpu, largegpu, test-gpu (default: largegpu)
 	--seg-sec SECONDS            Segment duration in seconds for splitting (default: 3600)
+	--sleap-version VERSION      SLEAP version: 1.4.1 or 1.5.2 (default: 1.4.1)
 	--sleap-model-centroid PATH  Path to SLEAP centroid model training_config.json
 	--sleap-model-instance PATH  Path to SLEAP instance model training_config.json
 Environment:
@@ -168,6 +169,7 @@ select_resolvable_host() {
 DIR=""
 SAION_NODE="${SAION_NODE:-largegpu}"
 SEG_SEC="${SEG_SEC:-3600}"
+CLI_SLEAP_VERSION=""
 CLI_SLEAP_MODEL_CENTROID=""
 CLI_SLEAP_MODEL_INSTANCE=""
 
@@ -176,6 +178,7 @@ while [[ $# -gt 0 ]]; do
 		--dir) DIR="$2"; shift 2 ;;
 		--node) SAION_NODE="$2"; shift 2 ;;
 		--seg-sec) SEG_SEC="$2"; shift 2 ;;
+		--sleap-version) CLI_SLEAP_VERSION="$2"; shift 2 ;;
 		--sleap-model-centroid) CLI_SLEAP_MODEL_CENTROID="$2"; shift 2 ;;
 		--sleap-model-instance) CLI_SLEAP_MODEL_INSTANCE="$2"; shift 2 ;;
 		*) usage ;;
@@ -253,7 +256,18 @@ else
 fi
 SLEAP2H5_SCRIPT="${SLEAP2H5_SCRIPT:-$SCRIPT_DIR/sleap2h5.py}"
 SLEAP2CSV_SCRIPT="${SLEAP2CSV_SCRIPT:-$SCRIPT_DIR/sleap2csv.py}"
-SLEAP_MODULE="${SLEAP_MODULE:-sleap/1.4.1}"
+
+# Determine SLEAP module load command based on version
+# sleap/1.5.2 requires loading python module first
+# sleap/1.4.1 has python included in the module
+SLEAP_VERSION="${CLI_SLEAP_VERSION:-${SLEAP_VERSION:-1.4.1}}"
+case "$SLEAP_VERSION" in
+	1.5.2) SLEAP_MODULE_CMD="module load python sleap/1.5.2" ;;
+	1.4.1) SLEAP_MODULE_CMD="module load sleap/1.4.1" ;;
+	*) echo "[ERR] Unsupported SLEAP version: $SLEAP_VERSION (supported: 1.4.1, 1.5.2)" >&2; exit 2 ;;
+esac
+echo "[INFO] Using SLEAP version: $SLEAP_VERSION" >&2
+
 SAION_COLLECT_PARTITION="${SAION_COLLECT_PARTITION:-test-gpu}"
 ARUCO_SCRIPT="${ARUCO_SCRIPT:-$SCRIPT_DIR/run_aruco.py}"
 ARUCO_ENV_ACTIVATE="${ARUCO_ENV_ACTIVATE:-module load opencv/4.9.0}"
@@ -700,7 +714,6 @@ remote_input="__REMOTE_INPUT__"
 remote_output="__REMOTE_OUTPUT__"
 remote_logs="__REMOTE_LOGS__"
 saion_node="__SAION_NODE__"
-sleap_module="__SLEAP_MODULE__"
 model1="__MODEL1__"
 model2="__MODEL2__"
 sleap2h5="__SLEAP2H5__"
@@ -745,7 +758,7 @@ SSH_CMD=(ssh -x -oBatchMode=yes -oStrictHostKeyChecking=no -oUserKnownHostsFile=
 export RSYNC_RSH="${SSH_CMD[*]}"
 
 source ~/.bashrc
-module load __SLEAP_MODULE__
+__SLEAP_MODULE_CMD__
 base="__BASE__"
 input_dir="__REMOTE_INPUT__"
 output_dir="__REMOTE_OUTPUT__"
@@ -990,7 +1003,7 @@ EOS
 	replace_placeholders "$bridge_script" \
 		BASE "$vname" JOBDIR "$video_job_dir" DATA_DIR "$data_folder" FLASH_DIR "$video_flash_dir" \
 		REMOTE_ROOT "$remote_root" REMOTE_INPUT "$remote_input" REMOTE_OUTPUT "$remote_output" \
-		REMOTE_LOGS "$remote_logs" SAION_NODE "$SAION_NODE" SLEAP_MODULE "$SLEAP_MODULE" \
+		REMOTE_LOGS "$remote_logs" SAION_NODE "$SAION_NODE" SLEAP_MODULE_CMD "$SLEAP_MODULE_CMD" \
 		MODEL1 "$SLEAP_MODEL_CENTROID" MODEL2 "$SLEAP_MODEL_INSTANCE" \
 		SLEAP2H5 "$SLEAP2H5_SCRIPT" SLEAP2CSV "$SLEAP2CSV_SCRIPT" \
 		SLEAP_SUBMIT_OK "$sleap_submit_ok" SLEAP_SUBMIT_OK_DIR "$sleap_submit_ok_dir" \
