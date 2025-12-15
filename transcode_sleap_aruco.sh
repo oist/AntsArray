@@ -262,8 +262,16 @@ SLEAP2CSV_SCRIPT="${SLEAP2CSV_SCRIPT:-$SCRIPT_DIR/sleap2csv.py}"
 # sleap/1.4.1 has python included in the module
 SLEAP_VERSION="${CLI_SLEAP_VERSION:-${SLEAP_VERSION:-1.4.1}}"
 case "$SLEAP_VERSION" in
-	1.5.2) SLEAP_MODULE_CMD="module load python sleap/1.5.2" ;;
-	1.4.1) SLEAP_MODULE_CMD="module load sleap/1.4.1" ;;
+	1.5.2)
+		SLEAP_MODULE_CMD="module load python sleap/1.5.2"
+		# sleap-nn-track uses -i for input, underscore notation, no verbosity flag
+		SLEAP_TRACK_CMD='sleap-nn-track -i "$input" -m "__MODEL1__" -m "__MODEL2__" -o "$out_slp" --no_empty_frames'
+		;;
+	1.4.1)
+		SLEAP_MODULE_CMD="module load sleap/1.4.1"
+		# sleap-track uses positional input, dot notation
+		SLEAP_TRACK_CMD='sleap-track "$input" -m "__MODEL1__" -m "__MODEL2__" --tracking.tracker none -o "$out_slp" --verbosity json --no-empty-frames'
+		;;
 	*) echo "[ERR] Unsupported SLEAP version: $SLEAP_VERSION (supported: 1.4.1, 1.5.2)" >&2; exit 2 ;;
 esac
 echo "[INFO] Using SLEAP version: $SLEAP_VERSION" >&2
@@ -781,9 +789,7 @@ for (( i=start_idx; i<end_idx; i++ )); do
 	out_h5="$output_dir/${base}_${idx}_sleap_data.h5"
 	out_csv="$output_dir/${base}_${idx}_sleap_data.csv"
 
-	sleap-track "$input" -m "__MODEL1__" -m "__MODEL2__" \
-		--tracking.tracker none -o "$out_slp" \
-		--verbosity json --no-empty-frames --batch_size 2
+	__SLEAP_TRACK_CMD__
 
 	python3 "__SLEAP2H5__" "$out_slp" "$output_dir"
 	python3 "__SLEAP2CSV__" "$out_slp" "$output_dir"
@@ -1005,6 +1011,7 @@ EOS
 		REMOTE_ROOT "$remote_root" REMOTE_INPUT "$remote_input" REMOTE_OUTPUT "$remote_output" \
 		REMOTE_LOGS "$remote_logs" SAION_NODE "$SAION_NODE" SLEAP_MODULE_CMD "$SLEAP_MODULE_CMD" \
 		MODEL1 "$SLEAP_MODEL_CENTROID" MODEL2 "$SLEAP_MODEL_INSTANCE" \
+		SLEAP_TRACK_CMD "$SLEAP_TRACK_CMD" \
 		SLEAP2H5 "$SLEAP2H5_SCRIPT" SLEAP2CSV "$SLEAP2CSV_SCRIPT" \
 		SLEAP_SUBMIT_OK "$sleap_submit_ok" SLEAP_SUBMIT_OK_DIR "$sleap_submit_ok_dir" \
 		SLEAP_DONE_OK "$sleap_done" SLEAP_DONE_OK_DIR "$sleap_done_dir" \
