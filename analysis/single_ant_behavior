@@ -1,0 +1,1011 @@
+#%%
+import numpy as np
+import pandas as pd
+
+
+def nan_aware_speed_from_df(df: pd.DataFrame, bodypoint: int = 0) -> np.ndarray:
+    """
+    Nan-aware per-frame displacement (px/frame), computed from an in-memory
+    SLEAP dataframe.
+
+    Required columns: Frame, Bodypoint, X, Y
+
+    Returns:
+      speed array of length (max_frame + 1), indexed by absolute frame number.
+      speed[f] is displacement from f-1 -> f when both frames have finite XY.
+      speed[0] is NaN.
+    """
+    if df.empty:
+        return np.array([], dtype=float)
+
+    # Filter to the bodypoint used for locomotion
+    d0 = df[df["Bodypoint"] == bodypoint].copy()
+    if d0.empty:
+        return np.array([], dtype=float)
+
+    # Coerce numeric
+    d0["Frame"] = pd.to_numeric(d0["Frame"], errors="coerce")
+    d0["X"] = pd.to_numeric(d0["X"], errors="coerce")
+    d0["Y"] = pd.to_numeric(d0["Y"], errors="coerce")
+
+    d0 = (
+        d0.dropna(subset=["Frame"])
+          .sort_values("Frame", kind="mergesort")
+          .drop_duplicates(subset=["Frame"], keep="first")
+    )
+
+    frames = d0["Frame"].astype(int).to_numpy()
+    x = d0["X"].to_numpy(float)
+    y = d0["Y"].to_numpy(float)
+
+    if frames.size == 0:
+        return np.array([], dtype=float)
+
+    max_f = int(frames.max())
+    x_full = np.full(max_f + 1, np.nan, dtype=float)
+    y_full = np.full(max_f + 1, np.nan, dtype=float)
+    x_full[frames] = x
+    y_full[frames] = y
+
+    dx = np.diff(x_full)
+    dy = np.diff(y_full)
+
+    valid = (
+        np.isfinite(x_full[1:]) & np.isfinite(x_full[:-1]) &
+        np.isfinite(y_full[1:]) & np.isfinite(y_full[:-1])
+    )
+
+    speed = np.full_like(x_full, np.nan, dtype=float)
+    speed[1:][valid] = np.sqrt(dx[valid] ** 2 + dy[valid] ** 2)
+    return speed
+
+
+import numpy as np
+import pandas as pd
+from typing import Iterable, Optional
+
+
+def angle_between(v1: np.ndarray, v2: np.ndarray) -> np.ndarray:
+    ang1 = np.arctan2(v1[:, 1], v1[:, 0])
+    ang2 = np.arctan2(v2[:, 1], v2[:, 0])
+    ddeg = (np.degrees(ang2 - ang1) + 360.0) % 360.0
+
+    l1 = np.linalg.norm(v1, axis=1)
+    l2 = np.linalg.norm(v2, axis=1)
+    bad = (l1 == 0) | (l2 == 0) | np.isnan(ang1) | np.isnan(ang2)
+    ddeg[bad] = np.nan
+    return ddeg
+
+
+def classify_sleep_wake_from_sleap(
+    sleap_df: pd.DataFrame,
+    *,
+    fps: float,
+    track_ids: Optional[Iterable[int]] = None,
+    instance: Optional[int] = None,
+    speed_bodypoint: int = 0,
+    # thresholds
+    thr_inL: float = 90.0,
+    thr_inR: float = 90.0,
+    thr_outL: float = 100.0,
+    thr_outR: float = 100.0,
+    thr_speed_pix_s: float = 22.17,
+    # duplicates handling for (Frame,Bodypoint)
+    duplicate_agg: str = "mean",  # "mean", "median", "first"
+) -> pd.DataFrame:
+    """
+    Frame-level sleep/wake classification from SLEAP-like data.
+
+    Required columns: Frame, Bodypoint, X, Y
+    TrackID optional (defaults to 0).
+
+    Speed is computed using nan_aware_speed_from_df(sleap_df, bodypoint=speed_bodypoint)
+    (px/frame -> px/s), then joined by Frame.
+
+    Returns columns:
+      TrackID, Frame,
+      angle_InL_deg, angle_OutL_deg, angle_InR_deg, angle_OutR_deg,
+      speed_pix_s, is_sleep, is_wake
+    """
+    df = sleap_df.copy()
+
+    # Ensure TrackID exists
+    if "TrackID" not in df.columns:
+        df["TrackID"] = 0
+
+    required = {"Frame", "TrackID", "Bodypoint", "X", "Y"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing required columns: {sorted(missing)}")
+
+    if track_ids is not None:
+        df = df[df["TrackID"].isin(list(track_ids))]
+
+    if instance is not None and "Instance" in df.columns:
+        df = df[df["Instance"] == instance]
+
+    if duplicate_agg not in {"mean", "median", "first"}:
+        raise ValueError("duplicate_agg must be one of: 'mean', 'median', 'first'")
+
+    # ---------- speed (nan-aware; px/frame -> px/s), keyed by Frame ----------
+    sp_pf = nan_aware_speed_from_df(df, bodypoint=speed_bodypoint)  # px/frame
+    sp_ps = sp_pf * float(fps)  # px/s
+    speed_by_frame = pd.Series(sp_ps, index=pd.RangeIndex(len(sp_ps)), name="speed_pix_s")
+
+    # ---------- helpers ----------
+    def col_or_nan(wide: pd.DataFrame, xy: str, bp: int) -> pd.Series:
+        if (xy, bp) in wide.columns:
+            return wide[(xy, bp)]
+        return pd.Series(np.nan, index=wide.index)
+
+    def get_vec(wide: pd.DataFrame, bp_from: int, bp_to: int) -> np.ndarray:
+        dx = col_or_nan(wide, "X", bp_to) - col_or_nan(wide, "X", bp_from)
+        dy = col_or_nan(wide, "Y", bp_to) - col_or_nan(wide, "Y", bp_from)
+        return np.column_stack([dx.to_numpy(), dy.to_numpy()])
+
+    # ---------- angles ----------
+    rows = []
+    for tid, g in df.groupby("TrackID", sort=False):
+        g = g.sort_values("Frame", kind="mergesort")
+
+        # Resolve duplicates when pivoting
+        if duplicate_agg == "first":
+            gg = (
+                g.sort_values(["Frame", "Bodypoint"], kind="mergesort")
+                 .drop_duplicates(subset=["Frame", "Bodypoint"], keep="first")
+            )
+            wide = gg.pivot(index="Frame", columns="Bodypoint", values=["X", "Y"]).sort_index()
+        else:
+            wide = (
+                g.pivot_table(
+                    index="Frame",
+                    columns="Bodypoint",
+                    values=["X", "Y"],
+                    aggfunc=duplicate_agg,
+                    dropna=False,
+                )
+                .sort_index()
+            )
+
+        wide.columns = pd.MultiIndex.from_arrays(
+            [wide.columns.get_level_values(0),
+             wide.columns.get_level_values(1).astype(int)]
+        )
+
+        v_5_4 = get_vec(wide, 5, 4)
+        v_5_6 = get_vec(wide, 5, 6)
+        v_4_1 = get_vec(wide, 4, 1)
+        v_4_5 = get_vec(wide, 4, 5)
+        v_8_7 = get_vec(wide, 8, 7)
+        v_8_9 = get_vec(wide, 8, 9)
+        v_7_1 = get_vec(wide, 7, 1)
+        v_7_8 = get_vec(wide, 7, 8)
+
+        angles = pd.DataFrame({
+            "TrackID": tid,
+            "Frame": wide.index.astype(int),
+            "angle_InL_deg": 360.0 - angle_between(v_5_4, v_5_6),
+            "angle_OutL_deg": angle_between(v_4_1, v_4_5),
+            "angle_InR_deg":  angle_between(v_8_7, v_8_9),
+            "angle_OutR_deg": 360.0 - angle_between(v_7_1, v_7_8),
+        })
+
+        # attach speed by Frame (same for all TrackIDs unless you pre-filtered)
+        angles = angles.join(speed_by_frame, on="Frame")
+
+        rows.append(angles)
+
+    out = pd.concat(rows, ignore_index=True)
+    out = out.sort_values(["TrackID", "Frame"], kind="mergesort").reset_index(drop=True)
+
+    # ---------- sleep rule ----------
+    is_sleep = (
+        (out["angle_InL_deg"]  < thr_inL) &
+        (out["angle_InR_deg"]  < thr_inR) &
+        (out["angle_OutL_deg"] < thr_outL) &
+        (out["angle_OutR_deg"] < thr_outR) &
+        (out["speed_pix_s"]    < thr_speed_pix_s)
+    )
+
+    out["is_sleep"] = is_sleep.fillna(False)
+    out["is_wake"] = ~out["is_sleep"]
+
+    return out
+
+
+#%%
+%matplotlib qt
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+csv_path = Path("/home/sam-reiter/bucket/ReiterU/Ants/basler/single_ants/test_1/20251211-104517/cam24/cam24_Arena00.csv")
+df = pd.read_csv(csv_path)
+
+sleep_out=classify_sleep_wake_from_sleap(df, fps=25.0)
+
+#%%
+from pathlib import Path
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# ---- choose x-axis: continuous if present, else per-file frame ----
+if "global_time_s" in sleep_out.columns:
+    x = sleep_out["global_time_s"].to_numpy()
+    xlabel = "Time (s)"
+elif "global_frame" in sleep_out.columns:
+    x = sleep_out["global_frame"].to_numpy()
+    xlabel = "Global Frame"
+else:
+    x = sleep_out["Frame"].to_numpy()
+    xlabel = "Frame"
+
+# ---- debug plot: speed + sleep overlay ----
+fig, ax1 = plt.subplots(figsize=(12, 3))
+
+ax1.plot(x, sleep_out["speed_pix_s"].to_numpy(), linewidth=0.6)
+ax1.set_xlabel(xlabel)
+ax1.set_ylabel("Speed (px/s)")
+
+ax2 = ax1.twinx()
+ax2.plot(x, sleep_out["is_sleep"].astype(int).to_numpy(), linewidth=1.0, alpha=0.7)
+ax2.set_ylabel("Is Sleep (0/1)")
+ax2.set_yticks([0, 1])
+
+plt.title("Arena00: Speed and Sleep/Wake Classification (debug overlay)")
+plt.tight_layout()
+plt.show()
+
+# ---- quick numeric sanity checks ----
+print("\nSpeed summary (px/s):")
+print(sleep_out["speed_pix_s"].describe())
+print("\nSleep fraction:", float(sleep_out["is_sleep"].mean()))
+print("NaN speed fraction:", float(sleep_out["speed_pix_s"].isna().mean()))
+
+
+
+#%%
+%matplotlib qt
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+csv_path = Path("/home/sam-reiter/bucket/ReiterU/Ants/basler/single_ants//test_1/20251211-104517/cam24/cam24_Arena00.csv")
+
+df = pd.read_csv(csv_path)
+if df.empty:
+    raise RuntimeError("CSV is empty")
+
+# ---- find node/bodypoint column ----
+possible_node_cols = ["node", "Bodypoint", "bodypoint", "point", "part"]
+node_col = next((c for c in possible_node_cols if c in df.columns), None)
+if node_col is None:
+    raise RuntimeError(f"No bodypoint/node column found. Columns: {df.columns.tolist()}")
+
+# ---- filter bodypoint 0 ----
+df = df[df[node_col] == 0].copy()
+if df.empty:
+    raise RuntimeError("No rows found for bodypoint 0")
+
+# ---- infer frame/x/y columns ----
+frame_col = next((c for c in ["frame", "Frame", "frame_idx"] if c in df.columns), None)
+xcol = next((c for c in ["x", "X", "x_px"] if c in df.columns), None)
+ycol = next((c for c in ["y", "Y", "y_px"] if c in df.columns), None)
+if frame_col is None or xcol is None or ycol is None:
+    raise RuntimeError(f"Could not infer frame/x/y columns. Columns: {df.columns.tolist()}")
+
+# ---- numeric + sort + one row per frame ----
+df[frame_col] = pd.to_numeric(df[frame_col], errors="coerce")
+df[xcol] = pd.to_numeric(df[xcol], errors="coerce")
+df[ycol] = pd.to_numeric(df[ycol], errors="coerce")
+df = (
+    df.dropna(subset=[frame_col])
+      .sort_values(frame_col)
+      .drop_duplicates(subset=[frame_col], keep="first")
+)
+
+frames = df[frame_col].astype(int).to_numpy()
+x = df[xcol].to_numpy(float)
+y = df[ycol].to_numpy(float)
+
+# =========================================================
+# NaN-aware speed calculation
+# =========================================================
+dx = np.diff(x)
+dy = np.diff(y)
+
+valid = (
+    np.isfinite(x[1:]) & np.isfinite(x[:-1]) &
+    np.isfinite(y[1:]) & np.isfinite(y[:-1])
+)
+
+speed = np.full_like(x, np.nan, dtype=float)
+speed[1:][valid] = np.sqrt(dx[valid]**2 + dy[valid]**2)
+
+# =========================================================
+# NaN-aware smoothing of speed
+# =========================================================
+window = 501  # odd; ~1 s at 25 fps
+if window % 2 == 0:
+    raise ValueError("window must be odd")
+
+mask = np.isfinite(speed)
+speed_filled = np.where(mask, speed, 0.0)
+
+kernel = np.ones(window, dtype=float)
+num = np.convolve(speed_filled, kernel, mode="same")
+den = np.convolve(mask.astype(float), kernel, mode="same")
+
+speed_smooth = num / den
+speed_smooth[den == 0] = np.nan
+
+# =========================================================
+# Plot
+# =========================================================
+plt.figure(figsize=(10, 3))
+plt.plot(frames, speed_smooth, linewidth=1)
+plt.xlabel("Frame")
+plt.ylabel("Speed (px/frame, NaN-aware)")
+plt.tight_layout()
+plt.show()
+
+
+
+#%%
+import re
+from pathlib import Path
+from collections import defaultdict
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+
+# ----------------------------
+# Inputs
+# ----------------------------
+folders = [
+    "/home/sam-reiter/bucket/ReiterU/Ants/basler/single_ants/test_1/20251210-171826",
+    "/home/sam-reiter/bucket/ReiterU/Ants/basler/single_ants/test_1/20251211-104517",
+    "/home/sam-reiter/bucket/ReiterU/Ants/basler/single_ants/test_1/20251212-100458",
+    "/home/sam-reiter/bucket/ReiterU/Ants/basler/single_ants/test_1/20251212-171721",
+    "/home/sam-reiter/bucket/ReiterU/Ants/basler/single_ants/test_1/20251213-141418",
+]
+
+
+
+
+bodypoint = 0
+cam_regex = r"^cam\d+$"
+arena_csv_regex = r"^cam\d+_Arena\d+\.csv$"
+
+# ----------------------------
+# Helpers
+# ----------------------------
+def find_node_col(df: pd.DataFrame) -> str:
+    for c in ["node", "Bodypoint", "bodypoint", "point", "part"]:
+        if c in df.columns:
+            return c
+    raise RuntimeError(f"No bodypoint/node column found. Columns: {df.columns.tolist()}")
+
+def infer_frame_xy_cols(df: pd.DataFrame):
+    frame_col = next((c for c in ["frame", "Frame", "frame_idx"] if c in df.columns), None)
+    xcol = next((c for c in ["x", "X", "x_px"] if c in df.columns), None)
+    ycol = next((c for c in ["y", "Y", "y_px"] if c in df.columns), None)
+    if frame_col is None or xcol is None or ycol is None:
+        raise RuntimeError(f"Could not infer frame/x/y columns. Columns: {df.columns.tolist()}")
+    return frame_col, xcol, ycol
+
+def nan_aware_speed_from_csv(csv_path: Path, bodypoint=0) -> np.ndarray:
+    df = pd.read_csv(csv_path)
+    if df.empty:
+        return np.array([], dtype=float)
+
+    node_col = find_node_col(df)
+    df = df[df[node_col] == bodypoint].copy()
+    if df.empty:
+        return np.array([], dtype=float)
+
+    frame_col, xcol, ycol = infer_frame_xy_cols(df)
+
+    df[frame_col] = pd.to_numeric(df[frame_col], errors="coerce")
+    df[xcol] = pd.to_numeric(df[xcol], errors="coerce")
+    df[ycol] = pd.to_numeric(df[ycol], errors="coerce")
+    df = (
+        df.dropna(subset=[frame_col])
+          .sort_values(frame_col)
+          .drop_duplicates(subset=[frame_col], keep="first")
+    )
+
+    frames = df[frame_col].astype(int).to_numpy()
+    x = df[xcol].to_numpy(float)
+    y = df[ycol].to_numpy(float)
+
+    if frames.size == 0:
+        return np.array([], dtype=float)
+
+    max_f = int(frames.max())
+    x_full = np.full(max_f + 1, np.nan, dtype=float)
+    y_full = np.full(max_f + 1, np.nan, dtype=float)
+    x_full[frames] = x
+    y_full[frames] = y
+
+    dx = np.diff(x_full)
+    dy = np.diff(y_full)
+    valid = (
+        np.isfinite(x_full[1:]) & np.isfinite(x_full[:-1]) &
+        np.isfinite(y_full[1:]) & np.isfinite(y_full[:-1])
+    )
+
+    speed = np.full_like(x_full, np.nan, dtype=float)
+    speed[1:][valid] = np.sqrt(dx[valid]**2 + dy[valid]**2)
+    return speed
+
+# ----------------------------
+# Main with tqdm
+# ----------------------------
+cam_rx = re.compile(cam_regex)
+arena_rx = re.compile(arena_csv_regex)
+
+segments = defaultdict(list)
+
+for folder in tqdm(list(map(Path, folders)), desc="Folders"):
+    if not folder.is_dir():
+        raise FileNotFoundError(f"Folder not found: {folder}")
+
+    cam_dirs = sorted(p for p in folder.iterdir() if p.is_dir() and cam_rx.match(p.name))
+    if not cam_dirs:
+        raise RuntimeError(f"No cam dirs found in {folder}")
+
+    for cam_dir in tqdm(cam_dirs, desc=f"{folder.name} cams", leave=False):
+        csvs = sorted(p for p in cam_dir.glob("*.csv") if arena_rx.match(p.name))
+        if not csvs:
+            continue
+
+        for csv_path in tqdm(csvs, desc=f"{cam_dir.name} CSVs", leave=False):
+            m = re.match(r"^(cam\d+)_(Arena\d+)\.csv$", csv_path.name)
+            if not m:
+                continue
+
+            cam_name, arena_name = m.group(1), m.group(2)
+
+            sp = nan_aware_speed_from_csv(csv_path, bodypoint=bodypoint)
+            if sp.size == 0:
+                continue
+
+            segments[(cam_name, arena_name)].append(sp)
+
+# ----------------------------
+# Build concatenated matrix
+# ----------------------------
+row_keys = sorted(segments.keys())
+row_labels = [f"{cam}/{arena}" for cam, arena in row_keys]
+
+row_series = [np.concatenate(segments[k], axis=0) for k in row_keys]
+
+max_len = max(arr.size for arr in row_series)
+mat = np.full((len(row_series), max_len), np.nan, dtype=float)
+
+for i, arr in enumerate(row_series):
+    mat[i, :arr.size] = arr
+
+print("Matrix shape (n_cam_arena, total_time):", mat.shape)
+print("Example rows:", row_labels[:5])
+
+
+
+#%%
+out_dir = Path("/home/sam-reiter/bucket/ReiterU/Ants/basler/single_ants/single_ant_speed_analysis")
+out_dir.mkdir(parents=True, exist_ok=True)
+
+# ---- save raw matrix ----
+np.save(out_dir / "antxspeed_concat.npy", mat)
+
+
+# ---- save row labels ----
+pd.DataFrame(
+    {
+        "row": np.arange(len(row_labels)),
+        "label": row_labels,
+    }
+).to_csv(out_dir / "antxspeed_concat_rows.csv", index=False)
+
+print("Saved:")
+print(" ", out_dir / "antxspeed_concat.npy")
+print(" ", out_dir / "antxspeed_concat_rows.csv")
+
+
+# %%
+%matplotlib qt
+import numpy as np
+import matplotlib.pyplot as plt
+
+mat=np.load('/home/sam-reiter/bucket/ReiterU/Ants/basler/single_ants/single_ant_speed_analysis/antxspeed_concat.npy')
+
+# ----------------------------
+# NaN-aware smoothing (row-wise over time)
+# ----------------------------
+window = 501   # odd; ~2 s at 25 fps
+if window % 2 == 0:
+    raise ValueError("window must be odd")
+
+mask = np.isfinite(mat)
+mat_filled = np.where(mask, mat, 0.0)
+
+kernel = np.ones(window, dtype=float)
+
+num = np.apply_along_axis(
+    lambda x: np.convolve(x, kernel, mode="same"),
+    axis=1,
+    arr=mat_filled,
+)
+
+den = np.apply_along_axis(
+    lambda x: np.convolve(x, kernel, mode="same"),
+    axis=1,
+    arr=mask.astype(float),
+)
+
+mat_smooth = num / den
+mat_smooth[den == 0] = np.nan
+
+#%%
+# ----------------------------
+# Plot
+# ----------------------------
+plt.figure(figsize=(12, 6))
+im = plt.imshow(
+    mat_smooth[4:10 , 0:6000000],  # zoom in on a few rows
+    aspect="auto",
+    interpolation="nearest",
+    cmap="viridis",
+    vmax=50.0,
+)
+
+plt.colorbar(im, label="Speed (px/frame, smoothed)")
+plt.xlabel("Time (frames, concatenated)")
+plt.ylabel("Cam / Arena")
+plt.title("NaN-aware smoothed speed matrix")
+
+plt.tight_layout()
+plt.show()
+
+# %%
+import numpy as np
+import matplotlib.pyplot as plt
+
+fps = 25
+row = 9
+
+y = mat_smooth[row, :]
+n_frames = y.size
+
+# time axis in hours
+t_hours = np.arange(n_frames) / fps / 3600.0
+
+plt.figure(figsize=(12, 6))
+plt.plot(t_hours, y, linewidth=1)
+
+plt.xlabel("Time (hours)")
+plt.ylabel("Speed")
+plt.title(f"Row {row}")
+
+# ---- ticks every 12 hours ----
+max_hours = t_hours[-1]
+ticks = np.arange(0, max_hours + 12, 12)
+
+plt.xticks(ticks)
+
+plt.tight_layout()
+plt.show()
+
+
+
+#%%
+
+import numpy as np
+import matplotlib.pyplot as plt
+from hmmlearn.hmm import GaussianHMM
+from scipy.optimize import curve_fit
+
+# ----------------------------
+# USER SETTINGS
+# ----------------------------
+row = 9
+fps = 25
+
+# HMM
+use_log = True
+eps = 1e-6
+
+# Long-timescale inactive from HMM states (bin + threshold)
+bin_minutes = 60
+inactive_frac_thr = 0.20  # bin is "inactive" if frac_inactive >= this
+
+# Cosinor
+period_h = 24.0
+
+# ----------------------------
+# 0) Data
+# ----------------------------
+speed = mat_smooth[row, :].astype(float)
+n_frames = speed.size
+t_hours = np.arange(n_frames) / fps / 3600.0
+
+# ----------------------------
+# 1) Fit 2-state HMM on speed
+# ----------------------------
+valid = np.isfinite(speed)
+speed_valid = speed[valid]
+if speed_valid.size < 200:
+    raise RuntimeError("Not enough valid samples for HMM.")
+
+X = (np.log(speed_valid + eps) if use_log else speed_valid).reshape(-1, 1)
+
+hmm = GaussianHMM(
+    n_components=2,
+    covariance_type="diag",
+    n_iter=500,
+    random_state=0,
+)
+hmm.fit(X)
+states = hmm.predict(X)
+
+means = hmm.means_.flatten()
+inactive_state = int(np.argmin(means))
+active_state = int(np.argmax(means))
+
+state_full = np.full(n_frames, np.nan)
+state_full[valid] = states
+
+print("HMM means:", means, "(log-space)" if use_log else "(speed-space)")
+print("inactive_state:", inactive_state, "active_state:", active_state)
+print("transmat:\n", hmm.transmat_)
+
+# ----------------------------
+# 2) Long-timescale inactive label via bin_threshold on HMM states
+# ----------------------------
+bin_size = int(bin_minutes * 60 * fps)
+n_bins = n_frames // bin_size
+
+bin_centers = np.empty(n_bins, dtype=float)
+frac_active = np.full(n_bins, np.nan, dtype=float)
+frac_inactive = np.full(n_bins, np.nan, dtype=float)
+long_inactive_bin = np.full(n_bins, np.nan, dtype=float)  # per-bin macro label (0/1)
+
+for b in range(n_bins):
+    i0 = b * bin_size
+    i1 = i0 + bin_size
+    bin_centers[b] = np.mean(t_hours[i0:i1])
+
+    st = state_full[i0:i1]
+    vv = st[np.isfinite(st)]
+    if vv.size == 0:
+        continue
+
+    frac_active[b] = np.mean(vv == active_state)
+    frac_inactive[b] = np.mean(vv == inactive_state)
+    long_inactive_bin[b] = 1.0 if frac_inactive[b] >= inactive_frac_thr else 0.0
+
+# Expand per-bin macro label to per-frame (for shading)
+long_inactive_full = np.full(n_frames, np.nan, dtype=float)
+for b in range(n_bins):
+    i0 = b * bin_size
+    i1 = i0 + bin_size
+    long_inactive_full[i0:i1] = long_inactive_bin[b]
+
+# ----------------------------
+# 3) Cosinor fit on fraction active (binned)
+# ----------------------------
+def cosinor(t, M, A, phi):
+    w = 2 * np.pi / period_h
+    return M + A * np.cos(w * t + phi)
+
+fit_mask = np.isfinite(frac_active)
+t_fit = bin_centers[fit_mask]
+y_fit = frac_active[fit_mask]
+
+cos_params = None
+t_dense = None
+y_dense = None
+t_peak = None
+r2 = None
+
+if y_fit.size >= 10:
+    M0 = float(np.mean(y_fit))
+    A0 = float(0.5 * (np.percentile(y_fit, 95) - np.percentile(y_fit, 5)))
+    phi0 = 0.0
+
+    popt, _ = curve_fit(
+        cosinor,
+        t_fit,
+        y_fit,
+        p0=[M0, max(A0, 1e-3), phi0],
+        bounds=([0.0, 0.0, -2*np.pi], [1.0, 1.0, 2*np.pi]),
+        maxfev=20000,
+    )
+    cos_params = popt
+    M, A, phi = popt
+    w = 2 * np.pi / period_h
+    t_peak = (-phi / w) % period_h
+
+    y_hat = cosinor(t_fit, *popt)
+    ss_res = float(np.sum((y_fit - y_hat) ** 2))
+    ss_tot = float(np.sum((y_fit - np.mean(y_fit)) ** 2))
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else np.nan
+
+    t_dense = np.linspace(bin_centers[0], bin_centers[-1], 2000)
+    y_dense = cosinor(t_dense, *popt)
+
+    print(f"Cosinor 24h on frac_active: M={M:.3f}, A={A:.3f}, peak={t_peak:.2f}h, R^2={r2:.3f}")
+else:
+    print("Not enough bins for cosinor fit (need >= 10).")
+
+# ----------------------------
+# 4) Plot results
+#    Panel A: speed + HMM active shading + long-timescale inactive shading (hatched)
+#    Panel B: frac_active + cosinor + binary long-inactive (per bin)
+# ----------------------------
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 7), sharex=True)
+
+# Panel A: speed
+ax1.plot(t_hours, speed, linewidth=0.8, color="black", alpha=0.7, label="Speed")
+
+ymax = np.nanmax(speed)
+if np.isfinite(ymax) and ymax > 0:
+    # HMM active shading
+    ax1.fill_between(
+        t_hours, 0, ymax,
+        where=(state_full == active_state),
+        alpha=0.20,
+        label="Active (HMM)",
+    )
+    # Long-timescale inactive shading (overlays as stronger shading)
+    ax1.fill_between(
+        t_hours, 0, ymax,
+        where=(long_inactive_full == 1.0),
+        alpha=0.12,
+        label=f"Inactive (bin {bin_minutes}m, thr={inactive_frac_thr})",
+    )
+
+ax1.set_ylabel("Speed")
+ax1.set_title(f"Row {row}: HMM states + long-timescale inactive + circadian cosinor")
+ax1.legend(loc="upper right")
+
+# Panel B: circadian fraction active
+ax2.plot(bin_centers, frac_active, alpha=0.5, linewidth=1, label=f"Frac active ({bin_minutes}m bins)")
+ax2.step(bin_centers, 1.0 - long_inactive_bin, where="mid", linewidth=2,
+         label="Long active (1 - long_inactive)")
+
+if y_dense is not None:
+    ax2.plot(t_dense, y_dense, linewidth=2,
+             label=f"Cosinor 24h (peak {t_peak:.2f}h, R^2={r2:.2f})")
+
+ax2.set_ylabel("Fraction active / macro-active")
+ax2.set_xlabel("Time (hours)")
+ax2.set_ylim(-0.05, 1.05)
+
+# 24h ticks
+max_h = t_hours[-1]
+ax2.set_xticks(np.arange(0, max_h + 24, 24))
+
+ax2.legend(loc="upper right")
+plt.tight_layout()
+plt.show()
+
+#%%
+def cross_correlation(signal1, signal2, lag_max):
+    """
+    Compute the normalized cross-correlation between two signals and return corresponding lags.
+    Parameters:
+    signal1 (array_like): First input signal.
+    signal2 (array_like): Second input signal, should have the same length as signal1.
+    lag_max (int): Maximum lag for which to calculate the correlation.
+    Returns:
+    lags (array_like): Array of lags at which the correlation is computed.
+    correlation (array_like): Normalized cross-correlation of the two signals for different lags.
+    """
+    if len(signal1) != len(signal2):
+        raise ValueError("Both signals must have the same length.")
+    
+    # Normalize the signals by subtracting mean and dividing by standard deviation
+    signal1_norm = (signal1 - np.mean(signal1)) / np.std(signal1)
+    signal2_norm = (signal2 - np.mean(signal2)) / np.std(signal2)
+    
+    # Compute cross-correlation
+    correlation_full = np.correlate(signal1_norm, signal2_norm, 'full')
+    
+    # Get the length and midpoint of the full correlation
+    len_corr = len(correlation_full)
+    mid_point = len_corr // 2
+    
+    # Select the relevant part of the correlation
+    correlation = correlation_full[mid_point - lag_max : mid_point + lag_max + 1]
+    
+    # Normalize to ensure maximum correlation is 1
+    correlation /= np.max(np.abs(correlation))
+    
+    # Generate lags
+    lags = np.arange(-lag_max, lag_max + 1)
+    
+    return lags, correlation
+# %%
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ----------------------------
+# Parameters
+# ----------------------------
+fps = 25
+ds = 100                        # downsample factor
+i0, i1 = 2_200_000, 3_200_000   # window in ORIGINAL frames
+inactive_state = 0             # explicit for clarity
+
+# ----------------------------
+# Extract window
+# ----------------------------
+seg = state_full[i0:i1]
+
+# ----------------------------
+# Downsample by majority vote (NaN-aware)
+# ----------------------------
+n = len(seg) // ds
+seg_ds = np.full(n, np.nan)
+
+for k in range(n):
+    block = seg[k*ds:(k+1)*ds]
+    v = block[np.isfinite(block)]
+    if v.size == 0:
+        continue
+    seg_ds[k] = 1 if np.mean(v == active_state) >= 0.5 else 0
+
+# ----------------------------
+# Plot downsampled HMM state
+# ----------------------------
+plt.figure(figsize=(12, 3))
+plt.plot(seg_ds, linewidth=1)
+plt.xlabel("Downsampled time (×100 frames)")
+plt.ylabel("HMM state")
+plt.title("HMM state (downsampled ×100)")
+plt.tight_layout()
+plt.show()
+
+# ----------------------------
+# Cross-correlation (lags → minutes)
+# ----------------------------
+lags, correlation = cross_correlation(seg_ds, seg_ds, lag_max=2000)
+
+# Convert lags to minutes
+# each lag unit = ds frames = ds / fps seconds
+lags_minutes = lags * (ds / fps) / 60.0
+
+plt.figure(figsize=(12, 4))
+plt.plot(lags_minutes, correlation, linewidth=1)
+plt.axvline(0, color="k", linewidth=0.5)
+plt.xlabel("Lag (minutes)")
+plt.ylabel("Autocorrelation")
+plt.title("Autocorrelation of HMM state (minutes scale)")
+plt.tight_layout()
+plt.show()
+
+# ----------------------------
+# Histogram of INACTIVE bout durations (minutes)
+# ----------------------------
+inactive = (seg_ds == inactive_state)
+
+bout_lengths = []
+count = 0
+for v in inactive:
+    if v:
+        count += 1
+    elif count > 0:
+        bout_lengths.append(count)
+        count = 0
+if count > 0:
+    bout_lengths.append(count)
+
+# Convert bouts to minutes
+bout_lengths = np.asarray(bout_lengths) * (ds / fps) / 60.0
+
+plt.figure(figsize=(6, 4))
+plt.hist(bout_lengths, bins=30)
+plt.xlabel("Inactive bout duration (minutes)")
+plt.ylabel("Count")
+plt.title("Histogram of inactive-state bouts")
+plt.tight_layout()
+plt.show()
+
+
+# %%
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ----------------------------
+# Parameters
+# ----------------------------
+fps = 25
+ds = 100                        # downsample factor
+inactive_state = 0              # HMM inactive label
+lag_max = 2000                  # in downsampled units
+
+# ----------------------------
+# Restrict to macroscopic inactivity periods
+# ----------------------------
+valid = (
+    np.isfinite(state_full) &
+    np.isfinite(long_inactive_full) &
+    (long_inactive_full == 1.0)
+)
+
+state_inactive = state_full[valid]
+
+# ----------------------------
+# Downsample by majority vote (NaN-aware)
+# IMPORTANT: downsample AFTER concatenation of inactive-only data
+# ----------------------------
+n = len(state_inactive) // ds
+seg_ds = np.full(n, np.nan)
+
+for k in range(n):
+    block = state_inactive[k*ds:(k+1)*ds]
+    v = block[np.isfinite(block)]
+    if v.size == 0:
+        continue
+    seg_ds[k] = 1 if np.mean(v == active_state) >= 0.5 else 0
+
+# ----------------------------
+# Plot downsampled HMM state (inactive periods only)
+# ----------------------------
+plt.figure(figsize=(12, 3))
+plt.plot(seg_ds, linewidth=1)
+plt.xlabel("Downsampled time (×100 frames, inactive only)")
+plt.ylabel("HMM state")
+plt.title("HMM state during macroscopic inactivity")
+plt.tight_layout()
+plt.show()
+
+# ----------------------------
+# Cross-correlation (lags → minutes)
+# ----------------------------
+lags, correlation = cross_correlation(seg_ds, seg_ds, lag_max=lag_max)
+
+# Convert lags to minutes
+lags_minutes = lags * (ds / fps) / 60.0
+
+plt.figure(figsize=(12, 4))
+plt.plot(lags_minutes, correlation, linewidth=1)
+plt.axvline(0, color="k", linewidth=0.5)
+plt.xlabel("Lag (minutes)")
+plt.ylabel("Autocorrelation")
+plt.title("Autocorrelation of HMM state (inactive periods only)")
+plt.tight_layout()
+plt.show()
+
+# ----------------------------
+# Histogram of INACTIVE bout durations (minutes)
+# (within macroscopic inactivity)
+# ----------------------------
+inactive = (seg_ds == inactive_state)
+
+bout_lengths = []
+count = 0
+for v in inactive:
+    if v:
+        count += 1
+    elif count > 0:
+        bout_lengths.append(count)
+        count = 0
+if count > 0:
+    bout_lengths.append(count)
+
+bout_lengths = np.asarray(bout_lengths) * (ds / fps) / 60.0
+#%%
+plt.figure(figsize=(6, 4))
+plt.hist(bout_lengths, bins=5000)
+plt.xlabel("Inactive bout duration (minutes)")
+plt.ylabel("Count")
+plt.title("Inactive-state bouts (within macroscopic inactivity)")
+plt.tight_layout()
+plt.show()
+
+# %%

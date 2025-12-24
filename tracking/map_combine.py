@@ -44,12 +44,12 @@ from typing import Dict
 CONFIG = dict(
     # Homographies exported by refine_homographies.py → contains array "H"
     hmats_npz="/home/sam-reiter/bucket/ReiterU/Ants/basler/2025_Sep_no_pertubation/calibration_dataset/set0_patterns_elevated_by_2mm/initial_H_mats.npz",
-    data_dir="/home/sam-reiter/bucket/ReiterU/Ants/basler/20251020_1_30min_vibration/data",
-    output_dir="/home/sam-reiter/bucket/ReiterU/Ants/basler/20251020_1_30min_vibration/",
+    data_dir="/home/sam-reiter/bucket/ReiterU/Ants/basler/20251117_2_stim/data/",
+    output_dir="/home/sam-reiter/bucket/ReiterU/Ants/basler/20251117_2_stim/",
 )
 
 # Split threshold along X‑axis in panorama coordinate system
-X_THRESHOLD: float = 1000.0
+X_THRESHOLD: float = 8895.0
 
 # -----------------------------------------------------------------------------#
 #                                   HELPERS                                    #
@@ -84,13 +84,57 @@ def split_and_write(df: pd.DataFrame, chunk_dir: Path, base_name: str) -> None:
     """Split dataframe at ``X_THRESHOLD`` and write two pickle files."""
     left = df[df["X"] < X_THRESHOLD]
     right = df[df["X"] >= X_THRESHOLD]
-
+   
     if not left.empty:
         left_file = chunk_dir / f"{base_name}_x_left{int(X_THRESHOLD)}.pkl"
         left.to_pickle(left_file)
     if not right.empty:
         right_file = chunk_dir / f"{base_name}_x_right{int(X_THRESHOLD)}.pkl"
         right.to_pickle(right_file)
+
+
+def aruco_h5_to_long_df_full(
+    f,
+    ds_name: str = "aruco_tracks",
+    frame_offset: int = 0,
+) -> pd.DataFrame:
+    """
+    Full-memory conversion of (frames, instances, 2) -> long DataFrame:
+    Frame, Instance, X, Y
+
+    Skips missing detections.
+    Missing criteria:
+      - any non-finite in X or Y (NaN/Inf)
+      - optionally: (0,0)
+      - optionally: (-1,-1)
+    """
+    arr = f[ds_name][...]  # shape: (F, I, 2)
+    if arr.ndim != 3 or arr.shape[2] != 2:
+        raise ValueError(f"Expected dataset of shape (n_frames, n_instances, 2); got {arr.shape}")
+
+    # Base validity: finite x/y
+    valid = np.isfinite(arr).all(axis=2)
+
+    valid &= ~((arr[..., 0] == 0.0) & (arr[..., 1] == 0.0))
+
+    fr_idx, inst_idx = np.nonzero(valid)
+
+    if fr_idx.size == 0:
+        return pd.DataFrame(columns=["Frame", "Instance", "X", "Y"])
+
+    xs = arr[fr_idx, inst_idx, 0]
+    ys = arr[fr_idx, inst_idx, 1]
+
+    df = pd.DataFrame(
+        {
+            "Frame": (fr_idx + frame_offset).astype(np.int32, copy=False),
+            "Instance": inst_idx.astype(np.int16, copy=False),
+            "X": xs.astype(np.float64, copy=False),
+            "Y": ys.astype(np.float64, copy=False),
+        }
+    )
+    return df
+
 
 # -----------------------------------------------------------------------------#
 #                      FILE DISCOVERY & GROUPING BY CHUNK                      #
@@ -132,16 +176,25 @@ def group_files_by_chunk(
 
 def process_aruco_chunks(hmats: List[np.ndarray], aruco_dir: Path, out_dir: Path, exp: str):
     patt = re.compile(
-    r"^cam(\d+)_cam\d+_\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}_(\d{3})(?:_aruco_detections)?\.csv$"
+    r"^cam(\d+)_cam\d+_\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}_(\d{3})(?:_aruco_tracks_)?\.h5$"
 )
 
     chunk_map = group_files_by_chunk(aruco_dir, patt)
     for chunk, cam_files in tqdm(chunk_map.items(), desc="ArUco chunks"):
         dfs = []
         for cam_idx, file in cam_files.items():
-            df = pd.read_csv(file)
+            
+            with h5py.File(file, "r") as f:
+
+                df = aruco_h5_to_long_df_full(
+                    f,
+                    ds_name="aruco_tracks",
+                    frame_offset=0,
+                )
+
             if df.empty:
                 continue
+
             xy = df[["X", "Y"]].to_numpy(float)
             df[["X", "Y"]] = apply_homography(xy, hmats[cam_idx - 1])
             df["Cam"] = cam_idx - 1
@@ -157,6 +210,7 @@ def process_aruco_chunks(hmats: List[np.ndarray], aruco_dir: Path, out_dir: Path
             print(f"ArUco panorama (chunk {chunk}) → {chunk_dir}")
         else:
             print(f"No ArUco data in chunk {chunk} — skipped.")
+
 
 
 def process_sleap_chunks(hmats: List[np.ndarray], sleap_dir: Path, out_dir: Path, exp: str):
@@ -195,7 +249,7 @@ def process_sleap_chunks(hmats: List[np.ndarray], sleap_dir: Path, out_dir: Path
 def infer_experiment_name(data_dir: Path) -> tuple[str, str]:
 
     pattern = re.compile(
-    r"^cam(\d+)_cam\d+_\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}_(\d{3})(?:_aruco_detections)?\.csv$"
+    r"^cam(\d+)_cam\d+_\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}_(\d{3})(?:_aruco_tracks_)?\.h5$"
 )
 
     for file in data_dir.iterdir():
@@ -206,10 +260,34 @@ def infer_experiment_name(data_dir: Path) -> tuple[str, str]:
     raise RuntimeError("Could not infer experiment name from files in data_dir.")
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Map & concatenate ArUco/SLEAP per chunk (requires .npz homographies)")
-    p.add_argument("--hmats", default=CONFIG["hmats_npz"], help=".npz file with homography stack (key 'H')")
-    p.add_argument("--data_dir", default=CONFIG["data_dir"], help="directory with per-camera per-chunk detection files")
-    p.add_argument("--outdir", default=CONFIG["output_dir"], help="where to write output pickles")
+    p = argparse.ArgumentParser(
+        description="Map & concatenate ArUco/SLEAP per chunk (requires .npz homographies)"
+    )
+
+    p.add_argument(
+        "--hmats",
+        default=CONFIG["hmats_npz"],
+        help=".npz file with homography stack (key 'H')"
+    )
+    p.add_argument(
+        "--data_dir",
+        default=CONFIG["data_dir"],
+        help="directory with per-camera per-chunk detection files"
+    )
+    p.add_argument(
+        "--outdir",
+        default=CONFIG["output_dir"],
+        help="where to write output pickles"
+    )
+
+    # NEW: processing mode
+    p.add_argument(
+        "--mode",
+        choices=("aruco", "sleap", "both"),
+        default="both",
+        help="Which detections to process (default: both)"
+    )
+
     args = p.parse_args()
 
     out_dir = Path(args.outdir)
@@ -221,8 +299,13 @@ def main() -> None:
     exp_time, trial = infer_experiment_name(data_dir)
     exp = f"{exp_time}_{trial}"
 
-    process_aruco_chunks(hmats, data_dir, out_dir, exp)
-    process_sleap_chunks(hmats, data_dir, out_dir, exp)
+    # Dispatch based on mode
+    if args.mode in ("aruco", "both"):
+        process_aruco_chunks(hmats, data_dir, out_dir, exp)
+
+    if args.mode in ("sleap", "both"):
+        process_sleap_chunks(hmats, data_dir, out_dir, exp)
+
 
 
 if __name__ == "__main__":

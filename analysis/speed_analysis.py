@@ -1,5 +1,6 @@
 
 #%%
+
 %matplotlib qt
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -181,7 +182,7 @@ forlag=2000
 ev_avg,ev_mat=get_event_trig_avg(smoothed_speed, stim_times, backlag, forlag)
 
 plt.figure(figsize=(8,4))
-plt.plot(np.arange(len(ev_avg))/25-backlag, ev_avg, color='darkorange', lw=2)
+plt.plot(np.arange(len(ev_avg))/25-backlag/25, ev_avg, color='darkorange', lw=2)
 plt.xlabel('Time relative to stimulus (s)')
 
 plt.figure(figsize=(8,4))

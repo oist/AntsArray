@@ -101,42 +101,20 @@ sed -i "s#__JOBS_DIR__#$JOBS_DIR#g" "$job1"
 
 
 # ---------- job2 : spawn encoders (job2a per raw chunk) ---
-job2="$JOBS_DIR/job2-$vname.sh"
-cat > "$job2" <<'EOF2'
-#!/bin/bash -l
-#SBATCH -t 0-24
-#SBATCH -c 2
-#SBATCH --partition=compute
-#SBATCH --mem=8G
-#SBATCH -J encstage-__VNAME__
-#SBATCH -o __JDIR__/encstage-__VNAME___%j.out
-#SBATCH -e __JDIR__/encstage-__VNAME___%j.err
-set -euo pipefail
-shopt -s nullglob
-
-JDIR="__JDIR__"
-EM="__EMAIL__"
-flash="__FLASH__"
-DATA="__DATA__"
-base="__VNAME__"
-frame_csv="$flash/${base}_frame_counts_tmp.csv"
-: > "$frame_csv"
-
-USER_NAME="$(id -un)"
-saion_work="__SAION_WORK__"
+# ---------- phase 1: spawn all encoders ----------
+seg_list=()
 
 for raw in "$flash/${base}_raw_"*.avi; do
   [[ -e "$raw" ]] || continue
+
   seg="${raw/_raw/}"
-  segbase="$(basename "${seg%.avi}")"
+  segbase="$(basename "${seg%.avi}")"   # e.g., <video>_003
   segfile="$(basename "$seg")"
   slp="$saion_work/${segbase}.slp"
   csv="$saion_work/${segbase}.csv"
-  echo "[DEBUG] segbase=$segbase"
-  echo "[DEBUG] saion_work=$saion_work"
-  echo "[DEBUG] slp=$slp"
-  echo "[DEBUG] csv=$csv"
-  # ---------- encoder submission ----------
+
+  seg_list+=("$segbase")
+
   if [[ ! -f "$seg" ]]; then
     job2a="$JDIR/job2a-$segbase.sh"
     cat > "$job2a" <<'EOJ'
@@ -157,6 +135,7 @@ ffmpeg -hide_banner -y -i "RAWFILE" -c:v libx264 -pix_fmt yuv420p \
 
 nb=$(ffprobe -v error -select_streams v:0 -show_entries stream=nb_frames \
      -of default=nk=1:nw=1 "OUTFILE" || echo 0)
+# Append safely (atomic append on POSIX fs is fine for short lines)
 echo "SEGFILE,$nb" >> "FRAMECSV"
 
 rsync -ah "OUTFILE" "__DATA__/"
@@ -174,30 +153,41 @@ EOJ
       "$job2a"
 
     chmod +x "$job2a"
+
+    # Optional throttle using ENC_CAP (was defined but unused)
+    while :; do
+      active=$(squeue -u "$USER_NAME" -h -t R,PD -o "%j" | grep -c '^enc-')
+      (( active < __ENC_CAP__ )) && break
+      echo "[THROTTLE] $active enc-* jobs ≥ __ENC_CAP__; sleeping 15s…"
+      sleep 15
+    done
+
     sbatch "$job2a"
   else
     echo "[SKIP] already encoded: $seg"
   fi
+done
 
-  # ---------- sleap submission (on saion) ----------
+# ---------- phase 2: wait once for monitor flag for this video ----------
+ready_flag="$DATA/.collect_done-$base"
+until [[ -f "$ready_flag" ]]; do
+  echo "[WAIT] monitor not finished for $base. Sleeping 60s…"
+  sleep 60
+done
 
-  ready_flag="$DATA/.collect_done-$base"
-
-  # Wait until monitor/collect has finished copying this video to bucket
-  until [[ -f "$ready_flag" ]]; do
-    echo "[WAIT] monitor not finished for $base. Sleeping 60s…"
-    sleep 60
-  done
+# ---------- phase 3: SLEAP submissions on Saion ----------
+for segbase in "${seg_list[@]}"; do
+  slp="$saion_work/${segbase}.slp"
+  csv="$saion_work/${segbase}.csv"
 
   if ssh -x saion "test -f $(printf %q "$slp")"; then
-  echo "[SKIP] sleap output already exists for $segbase in $saion_work"
-  continue
+    echo "[SKIP] sleap output already exists for $segbase in $saion_work"
+    continue
   fi
-    # ensure remote workdir exists
-    ssh -x saion "mkdir -p '$saion_work'"
 
-    # write remote job3a with placeholders
-    ssh -x saion "cat > '$saion_work/job3a-$segbase.sh'" <<'EOJ2'
+  ssh -x saion "mkdir -p '$saion_work'"
+
+  ssh -x saion "cat > '$saion_work/job3a-$segbase.sh'" <<'EOJ2'
 #!/bin/bash -l
 #SBATCH -t 0-24
 #SBATCH -c 8
@@ -219,21 +209,20 @@ sleap-track "__DATA__/__BASE__.avi" -m __MODEL1__ -m __MODEL2__ \
 python3 /home/sam-reiter/saionHome/AntsArray/sleap2h5.py "__WORK__/__BASE__.slp"
 EOJ2
 
-    # substitute placeholders on remote
-    model1="/bucket/ReiterU/Ants/SLEAP_files/Simple_skeleton/20250408_models_LATESTWORKINGMODEL/250408_141245.centroid/training_config.json"
-    model2="/bucket/ReiterU/Ants/SLEAP_files/Simple_skeleton/20250408_models_LATESTWORKINGMODEL/250408_141245.centered_instance/training_config.json"
+  model1="/bucket/ReiterU/Ants/SLEAP_files/Simple_skeleton/20250408_models_LATESTWORKINGMODEL/250408_141245.centroid/training_config.json"
+  model2="/bucket/ReiterU/Ants/SLEAP_files/Simple_skeleton/20250408_models_LATESTWORKINGMODEL/250408_141245.centered_instance/training_config.json"
 
-    ssh -x saion "sed -i \
-      -e s#__BASE__#$segbase#g \
-      -e s#__WORK__#$saion_work#g \
-      -e s#__MODEL1__#$model1#g \
-      -e s#__MODEL2__#$model2#g \
-      -e s#__DATA__#$DATA#g \
-      '$saion_work/job3a-$segbase.sh'"
+  ssh -x saion "sed -i \
+    -e s#__BASE__#$segbase#g \
+    -e s#__WORK__#$saion_work#g \
+    -e s#__MODEL1__#$model1#g \
+    -e s#__MODEL2__#$model2#g \
+    -e s#__DATA__#$DATA#g \
+    '$saion_work/job3a-$segbase.sh'"
 
-    ssh -x saion "bash -lc 'chmod +x $saion_work/job3a-$segbase.sh && sbatch $saion_work/job3a-$segbase.sh'"
-    
-  done
+  ssh -x saion "bash -lc 'chmod +x $saion_work/job3a-$segbase.sh && sbatch $saion_work/job3a-$segbase.sh'"
+done
+ 
 EOF2
 
 sed -i \

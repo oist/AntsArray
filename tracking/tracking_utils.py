@@ -265,3 +265,7 @@ def get_complete_tracks(
         df.to_pickle(output_path)
 
     return all_pos
+
+
+
+# %%

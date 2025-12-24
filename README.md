@@ -3,6 +3,11 @@
 
 #testing the pipeline for real. 
 
-aruco work, sleap works, sleap to csv works. Need to add the aruco and sleap2csv to the pipeline, and add file return to bucket
+
+the saion job isn't correctly waiting for file to exist and copy before running. Might be working now
+
+doing sync back for slp jobs. Need to add slp 2 csv after that
+
+
 
 

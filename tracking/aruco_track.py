@@ -43,8 +43,8 @@ def find_unique(pattern: str) -> Path | None:
 
 def process_chunk(chunk_dir: Path, output_root: Path) -> None:
     """Process one chunk directory, writing outputs to *output_root/chunk_dir.name*."""
-    out_dir = output_root / chunk_dir.name
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = output_root 
+  #  out_dir.mkdir(parents=True, exist_ok=True)
 
     for side in SIDES:
         sleap_pat = chunk_dir / f"*sleap_panorama_x_{side}*.pkl"
