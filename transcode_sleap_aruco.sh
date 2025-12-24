@@ -33,6 +33,13 @@ usage() {
 Usage: 
   Interactive: bash transcode_sleap_aruco.sh --dir <folder> ...
   Batch:       sbatch transcode_sleap_aruco.sh --dir <folder> ...
+Options:
+	--dir PATH                   (required) Directory containing .avi/.mkv videos to process
+	--node PARTITION             Saion GPU partition: gpu, largegpu, test-gpu (default: largegpu)
+	--seg-sec SECONDS            Segment duration in seconds for splitting (default: 3600)
+	--sleap-version VERSION      SLEAP version: 1.4.1 or 1.5.2 (default: 1.4.1)
+	--sleap-model-centroid PATH  Path to SLEAP centroid model training_config.json
+	--sleap-model-instance PATH  Path to SLEAP instance model training_config.json
 Environment:
 	ENC_CONCURRENCY    Max concurrent encoder tasks (default 8)
 	ARUCO_CONCURRENCY  Max concurrent ArUco tasks (default 12)
@@ -162,12 +169,18 @@ select_resolvable_host() {
 DIR=""
 SAION_NODE="${SAION_NODE:-largegpu}"
 SEG_SEC="${SEG_SEC:-3600}"
+CLI_SLEAP_VERSION=""
+CLI_SLEAP_MODEL_CENTROID=""
+CLI_SLEAP_MODEL_INSTANCE=""
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 		--dir) DIR="$2"; shift 2 ;;
 		--node) SAION_NODE="$2"; shift 2 ;;
 		--seg-sec) SEG_SEC="$2"; shift 2 ;;
+		--sleap-version) CLI_SLEAP_VERSION="$2"; shift 2 ;;
+		--sleap-model-centroid) CLI_SLEAP_MODEL_CENTROID="$2"; shift 2 ;;
+		--sleap-model-instance) CLI_SLEAP_MODEL_INSTANCE="$2"; shift 2 ;;
 		*) usage ;;
 	esac
 done
@@ -230,11 +243,39 @@ require_cmd sbatch
 require_cmd rsync
 require_cmd python3
 
-SLEAP_MODEL_CENTROID="${SLEAP_MODEL_CENTROID:-/bucket/ReiterU/Ants/SLEAP_files/Simple_skeleton/20250408_models_LATESTWORKINGMODEL/250408_141245.centroid/training_config.json}"
-SLEAP_MODEL_INSTANCE="${SLEAP_MODEL_INSTANCE:-/bucket/ReiterU/Ants/SLEAP_files/Simple_skeleton/20250408_models_LATESTWORKINGMODEL/250408_141245.centered_instance/training_config.json}"
+# CLI flags take precedence over environment variables
+if [[ -n "$CLI_SLEAP_MODEL_CENTROID" ]]; then
+	SLEAP_MODEL_CENTROID="$CLI_SLEAP_MODEL_CENTROID"
+else
+	SLEAP_MODEL_CENTROID="${SLEAP_MODEL_CENTROID:-/bucket/ReiterU/Ants/SLEAP_files/Simple_skeleton/20250408_models_LATESTWORKINGMODEL/250408_141245.centroid/training_config.json}"
+fi
+if [[ -n "$CLI_SLEAP_MODEL_INSTANCE" ]]; then
+	SLEAP_MODEL_INSTANCE="$CLI_SLEAP_MODEL_INSTANCE"
+else
+	SLEAP_MODEL_INSTANCE="${SLEAP_MODEL_INSTANCE:-/bucket/ReiterU/Ants/SLEAP_files/Simple_skeleton/20250408_models_LATESTWORKINGMODEL/250408_141245.centered_instance/training_config.json}"
+fi
 SLEAP2H5_SCRIPT="${SLEAP2H5_SCRIPT:-$SCRIPT_DIR/sleap2h5.py}"
 SLEAP2CSV_SCRIPT="${SLEAP2CSV_SCRIPT:-$SCRIPT_DIR/sleap2csv.py}"
-SLEAP_MODULE="${SLEAP_MODULE:-sleap/1.4.1}"
+
+# Determine SLEAP module load command based on version
+# sleap/1.5.2 requires loading python module first
+# sleap/1.4.1 has python included in the module
+SLEAP_VERSION="${CLI_SLEAP_VERSION:-${SLEAP_VERSION:-1.4.1}}"
+case "$SLEAP_VERSION" in
+	1.5.2)
+		SLEAP_MODULE_CMD="module load python sleap/1.5.2"
+		# sleap-nn-track uses -i for input, underscore notation, no verbosity flag
+		SLEAP_TRACK_CMD='sleap-nn-track -i "$input" -m "__MODEL1__" -m "__MODEL2__" -o "$out_slp" --no_empty_frames'
+		;;
+	1.4.1)
+		SLEAP_MODULE_CMD="module load sleap/1.4.1"
+		# sleap-track uses positional input, dot notation
+		SLEAP_TRACK_CMD='sleap-track "$input" -m "__MODEL1__" -m "__MODEL2__" --tracking.tracker none -o "$out_slp" --verbosity json --no-empty-frames'
+		;;
+	*) echo "[ERR] Unsupported SLEAP version: $SLEAP_VERSION (supported: 1.4.1, 1.5.2)" >&2; exit 2 ;;
+esac
+echo "[INFO] Using SLEAP version: $SLEAP_VERSION" >&2
+
 SAION_COLLECT_PARTITION="${SAION_COLLECT_PARTITION:-test-gpu}"
 ARUCO_SCRIPT="${ARUCO_SCRIPT:-$SCRIPT_DIR/run_aruco.py}"
 ARUCO_ENV_ACTIVATE="${ARUCO_ENV_ACTIVATE:-module load opencv/4.9.0}"
@@ -246,14 +287,14 @@ DATA_COPY_PARTITION="${DATA_COPY_PARTITION:-datacp}"
 # Determine time limits based on partition
 case "$SAION_NODE" in
 	test-gpu) sleap_time="0-08:00:00" ;;
-	largegpu) sleap_time="1-00:00:00" ;;
+	largegpu) sleap_time="0-12:00:00" ;;
 	gpu)      sleap_time="2-00:00:00" ;;
 	*)        sleap_time="0-08:00:00" ;;
 esac
 
 case "$SAION_COLLECT_PARTITION" in
 	test-gpu) collect_time="0-08:00:00" ;;
-	largegpu) collect_time="1-00:00:00" ;;
+	largegpu) collect_time="0-12:00:00" ;;
 	gpu)      collect_time="2-00:00:00" ;;
 	*)        collect_time="0-08:00:00" ;;
 esac
@@ -274,8 +315,8 @@ echo "[INFO] Saion bucket host: $SAION_BUCKET_HOST" >&2
 
 # --- Section: Source video scan ---
 
-videos=( "$DIR"/*.avi )
-(( ${#videos[@]} > 0 )) || { echo "[WARN] No .avi videos found in $DIR" >&2; exit 0; }
+videos=( "$DIR"/*.avi "$DIR"/*.mkv )
+(( ${#videos[@]} > 0 )) || { echo "[WARN] No .avi or .mkv videos found in $DIR" >&2; exit 0; }
 
 # --- Section: Job Rate Limiting ---
 
@@ -302,8 +343,9 @@ for video in "${videos[@]}"; do
 
 	b="$(basename "$video")"
 	[[ "$b" =~ ^\. ]] && continue
-	[[ "$b" =~ _renc\.avi$ || "$b" =~ _nvenc\.avi$ ]] && continue
-	vname="${b%.avi}"
+	[[ "$b" =~ _renc\.(avi|mkv)$ || "$b" =~ _nvenc\.(avi|mkv)$ ]] && continue
+	[[ "$b" =~ ^global_cam ]] && continue
+	vname="${b%.*}"
 
 	chunk_count=$(calc_chunk_count "$video" "$SEG_SEC")
 	[[ "$chunk_count" =~ ^[0-9]+$ ]] || chunk_count=1
@@ -387,6 +429,7 @@ for video in "${videos[@]}"; do
 #SBATCH -e __JOBDIR__/split-__BASE___%j.err
 set -eo pipefail
 shopt -s nullglob
+module load ffmpeg/7.1	
 
 video="__VIDEO__"
 flash_dir="__FLASH_DIR__"
@@ -400,7 +443,7 @@ if compgen -G "$flash_dir/__BASE___raw_*.avi" > /dev/null; then
 	echo "[SKIP] raw chunks already present for $video"
 else
 	ffmpeg -hide_banner -y -i "$video" \
-		-c copy -map 0:v:0 -f segment -segment_time "$seg_sec" \
+		-c copy -bsf:v h264_mp4toannexb -map 0:v:0 -f segment -segment_time "$seg_sec" \
 		-reset_timestamps 1 "$flash_dir/__BASE___raw_%03d.avi"
 	fi
 
@@ -432,6 +475,7 @@ EOS
 set -eo pipefail
 
 source ~/.bashrc
+module load ffmpeg/7.1
 
 flash_dir="__FLASH_DIR__"
 frame_dir="$flash_dir/frame_counts"
@@ -600,10 +644,6 @@ for (( i=start_idx; i<end_idx; i++ )); do
 		--video-file "$video_path" \
 		--output-path "$output_dir/"
 
-	rsync -avh __RSYNC_FLAGS__ \
-		"$output_dir/__BASE___${idx}aruco_tracks_.h5" \
-		"__ARUCO_BUCKET_DIR__/"
-
 	touch "$output_dir/__BASE___${idx}.aruco.ok"
 done
 EOS
@@ -641,7 +681,7 @@ aruco_ok="__ARUCO_OK__"
 
 mkdir -p "$bucket_dir"
 rsync -avh __RSYNC_FLAGS__ \
-	--include="__BASE___*aruco_tracks_.h5" \
+	--include="__BASE___*_aruco_tracks_.h5" \
 	--exclude="*" "$flash_dir/" "$bucket_dir/"
 mkdir -p "$aruco_ok_dir"
 : > "$aruco_ok"
@@ -659,7 +699,7 @@ fi
 rm -f "$copy_script"
 
 rm -f "$flash_dir"/__BASE___*.aruco.ok
-rm -f "$flash_dir"/__BASE___*aruco_tracks_.h5
+rm -f "$flash_dir"/__BASE___*_aruco_tracks_.h5
 EOS
 
 	# --- Stage Script: Bridge to Saion ---
@@ -682,7 +722,6 @@ remote_input="__REMOTE_INPUT__"
 remote_output="__REMOTE_OUTPUT__"
 remote_logs="__REMOTE_LOGS__"
 saion_node="__SAION_NODE__"
-sleap_module="__SLEAP_MODULE__"
 model1="__MODEL1__"
 model2="__MODEL2__"
 sleap2h5="__SLEAP2H5__"
@@ -727,7 +766,7 @@ SSH_CMD=(ssh -x -oBatchMode=yes -oStrictHostKeyChecking=no -oUserKnownHostsFile=
 export RSYNC_RSH="${SSH_CMD[*]}"
 
 source ~/.bashrc
-module load __SLEAP_MODULE__
+__SLEAP_MODULE_CMD__
 base="__BASE__"
 input_dir="__REMOTE_INPUT__"
 output_dir="__REMOTE_OUTPUT__"
@@ -750,9 +789,7 @@ for (( i=start_idx; i<end_idx; i++ )); do
 	out_h5="$output_dir/${base}_${idx}_sleap_data.h5"
 	out_csv="$output_dir/${base}_${idx}_sleap_data.csv"
 
-	sleap-track "$input" -m "__MODEL1__" -m "__MODEL2__" \
-		--tracking.tracker none -o "$out_slp" \
-		--verbosity json --no-empty-frames --batch_size 2
+	__SLEAP_TRACK_CMD__
 
 	python3 "__SLEAP2H5__" "$out_slp" "$output_dir"
 	python3 "__SLEAP2CSV__" "$out_slp" "$output_dir"
@@ -972,7 +1009,8 @@ EOS
 	replace_placeholders "$bridge_script" \
 		BASE "$vname" JOBDIR "$video_job_dir" DATA_DIR "$data_folder" FLASH_DIR "$video_flash_dir" \
 		REMOTE_ROOT "$remote_root" REMOTE_INPUT "$remote_input" REMOTE_OUTPUT "$remote_output" \
-		REMOTE_LOGS "$remote_logs" SAION_NODE "$SAION_NODE" SLEAP_MODULE "$SLEAP_MODULE" \
+		REMOTE_LOGS "$remote_logs" SAION_NODE "$SAION_NODE" SLEAP_MODULE_CMD "$SLEAP_MODULE_CMD" \
+		SLEAP_TRACK_CMD "$SLEAP_TRACK_CMD" \
 		MODEL1 "$SLEAP_MODEL_CENTROID" MODEL2 "$SLEAP_MODEL_INSTANCE" \
 		SLEAP2H5 "$SLEAP2H5_SCRIPT" SLEAP2CSV "$SLEAP2CSV_SCRIPT" \
 		SLEAP_SUBMIT_OK "$sleap_submit_ok" SLEAP_SUBMIT_OK_DIR "$sleap_submit_ok_dir" \
