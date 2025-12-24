@@ -287,14 +287,14 @@ DATA_COPY_PARTITION="${DATA_COPY_PARTITION:-datacp}"
 # Determine time limits based on partition
 case "$SAION_NODE" in
 	test-gpu) sleap_time="0-08:00:00" ;;
-	largegpu) sleap_time="1-00:00:00" ;;
+	largegpu) sleap_time="0-12:00:00" ;;
 	gpu)      sleap_time="2-00:00:00" ;;
 	*)        sleap_time="0-08:00:00" ;;
 esac
 
 case "$SAION_COLLECT_PARTITION" in
 	test-gpu) collect_time="0-08:00:00" ;;
-	largegpu) collect_time="1-00:00:00" ;;
+	largegpu) collect_time="0-12:00:00" ;;
 	gpu)      collect_time="2-00:00:00" ;;
 	*)        collect_time="0-08:00:00" ;;
 esac
@@ -1010,8 +1010,8 @@ EOS
 		BASE "$vname" JOBDIR "$video_job_dir" DATA_DIR "$data_folder" FLASH_DIR "$video_flash_dir" \
 		REMOTE_ROOT "$remote_root" REMOTE_INPUT "$remote_input" REMOTE_OUTPUT "$remote_output" \
 		REMOTE_LOGS "$remote_logs" SAION_NODE "$SAION_NODE" SLEAP_MODULE_CMD "$SLEAP_MODULE_CMD" \
-		MODEL1 "$SLEAP_MODEL_CENTROID" MODEL2 "$SLEAP_MODEL_INSTANCE" \
 		SLEAP_TRACK_CMD "$SLEAP_TRACK_CMD" \
+		MODEL1 "$SLEAP_MODEL_CENTROID" MODEL2 "$SLEAP_MODEL_INSTANCE" \
 		SLEAP2H5 "$SLEAP2H5_SCRIPT" SLEAP2CSV "$SLEAP2CSV_SCRIPT" \
 		SLEAP_SUBMIT_OK "$sleap_submit_ok" SLEAP_SUBMIT_OK_DIR "$sleap_submit_ok_dir" \
 		SLEAP_DONE_OK "$sleap_done" SLEAP_DONE_OK_DIR "$sleap_done_dir" \
