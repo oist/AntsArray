@@ -1,3 +1,5 @@
 
 *.ai
 *.asv
+.venv/
+__pycache__/
