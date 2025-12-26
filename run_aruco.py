@@ -109,8 +109,8 @@ def main():
         p.add_argument('--output-path', required=True, help='Directory for output files')
         p.add_argument('--dictionary-size', type=int, default=300, 
                        help='Maximum marker ID to track (default: 300)')
-        p.add_argument('--output-format', choices=['csv', 'h5', 'both'], default='both',
-                       help='Output format for DataFrame: csv, h5, or both (default: both)')
+        p.add_argument('--output-format', choices=['csv', 'h5', 'both', 'none'], default='none',
+                       help='Output format for DataFrame: csv, h5, both, or none (default: none)')
         
         args = p.parse_args()
         
@@ -143,34 +143,35 @@ def main():
         try:
             with h5py.File(hdf5_path, 'w') as hdf:
                 hdf.create_dataset('aruco_tracks', data=tracks)
-                hdf.create_dataset('aruco_confidences', data=confidences)
+
             print(f"[INFO] Saved raw arrays to: {hdf5_path}", flush=True)
         except Exception as e:
             print(f"[ERR] Failed to save raw HDF5: {e}", flush=True)
             raise
 
-        # Convert to DataFrame
-        print("[INFO] Converting to DataFrame...", flush=True)
-        df = tracks_to_dataframe(tracks, confidences)
-        print(f"[INFO] Created DataFrame with {len(df)} detections", flush=True)
-        
-        # Save DataFrame in requested format(s)
-        if args.output_format in ('csv', 'both'):
-            csv_path = os.path.join(args.output_path, f"{name_no_ext}_aruco_detections.csv")
-            df.to_csv(csv_path, index=False, float_format="%.1f")
-            print(f"[INFO] Saved CSV to: {csv_path}", flush=True)
-        
-        if args.output_format in ('h5', 'both'):
-            try:
-                import tables  # Check availability
-                df_h5_path = os.path.join(args.output_path, f"{name_no_ext}_aruco_detections.h5")
-                df.to_hdf(df_h5_path, key='detections', mode='w', format='table')
-                print(f"[INFO] Saved DataFrame H5 to: {df_h5_path}", flush=True)
-            except ImportError:
-                print("[WARN] 'tables' module not found. Skipping HDF5 DataFrame export.", flush=True)
-            except Exception as e:
-                print(f"[ERR] Failed to save DataFrame H5: {e}", flush=True)
-                raise
+        if args.output_format != 'none':
+            # Convert to DataFrame
+            print("[INFO] Converting to DataFrame...", flush=True)
+            df = tracks_to_dataframe(tracks, confidences)
+            print(f"[INFO] Created DataFrame with {len(df)} detections", flush=True)
+            
+            # Save DataFrame in requested format(s)
+            if args.output_format in ('csv', 'both'):
+                csv_path = os.path.join(args.output_path, f"{name_no_ext}_aruco_detections.csv")
+                df.to_csv(csv_path, index=False, float_format="%.1f")
+                print(f"[INFO] Saved CSV to: {csv_path}", flush=True)
+            
+            if args.output_format in ('h5', 'both'):
+                try:
+                    import tables  # Check availability
+                    df_h5_path = os.path.join(args.output_path, f"{name_no_ext}_aruco_detections.h5")
+                    df.to_hdf(df_h5_path, key='detections', mode='w', format='table')
+                    print(f"[INFO] Saved DataFrame H5 to: {df_h5_path}", flush=True)
+                except ImportError:
+                    print("[WARN] 'tables' module not found. Skipping HDF5 DataFrame export.", flush=True)
+                except Exception as e:
+                    print(f"[ERR] Failed to save DataFrame H5: {e}", flush=True)
+                    raise
 
     except Exception as e:
         import traceback
