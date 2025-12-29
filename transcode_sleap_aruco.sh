@@ -572,12 +572,14 @@ enc_ok_dir="__ENC_OK_DIR__"
 enc_ok="__ENC_OK__"
 
 mkdir -p "$data_dir"
+chmod 2775 "$data_dir"
 rsync -avh __RSYNC_FLAGS__ \
 	--exclude="__BASE___raw_*.avi" \
 	--include="__BASE___*.avi" \
 	--include="__BASE___frame_counts.csv" \
 	--exclude="*" "$flash_dir/" "$data_dir/"
 mkdir -p "$enc_ok_dir"
+chmod 2775 "$enc_ok_dir"
 : > "$enc_ok"
 COPY
 chmod +x "$copy_script"
@@ -680,10 +682,12 @@ aruco_ok_dir="__ARUCO_OK_DIR__"
 aruco_ok="__ARUCO_OK__"
 
 mkdir -p "$bucket_dir"
+chmod 2775 "$bucket_dir"
 rsync -avh __RSYNC_FLAGS__ \
 	--include="__BASE___*_aruco_tracks_.h5" \
 	--exclude="*" "$flash_dir/" "$bucket_dir/"
 mkdir -p "$aruco_ok_dir"
+chmod 2775 "$aruco_ok_dir"
 : > "$aruco_ok"
 COPY
 chmod +x "$copy_script"
@@ -741,7 +745,7 @@ job_tmp_dir="__JOBDIR__"
 SSH_CMD=(ssh -x -oBatchMode=yes -oStrictHostKeyChecking=no -oUserKnownHostsFile=/dev/null)
 export RSYNC_RSH="${SSH_CMD[*]}"
 
-"${SSH_CMD[@]}" saion "mkdir -p '$remote_input' '$remote_output' '$remote_logs'"
+"${SSH_CMD[@]}" saion "mkdir -p '$remote_input' '$remote_output' '$remote_logs' && chmod 2775 '$remote_input' '$remote_output' '$remote_logs'"
 
 echo "[INFO] staging encoded segments to Saion: $remote_input"
 rsync -avh $rsync_flags \
@@ -794,7 +798,7 @@ for (( i=start_idx; i<end_idx; i++ )); do
 	python3 "__SLEAP2H5__" "$out_slp" "$output_dir"
 	python3 "__SLEAP2CSV__" "$out_slp" "$output_dir"
 
-	"${SSH_CMD[@]}" "$bucket_host" "mkdir -p '$bucket_dir'"
+	"${SSH_CMD[@]}" "$bucket_host" "mkdir -p '$bucket_dir' && chmod 2775 '$bucket_dir'"
 
 	rsync -avh --chmod=Du=rwx,Dg=rwx,Fu=rw,Fg=rw \
 		"$out_slp" "$out_h5" "$out_csv" \
@@ -824,7 +828,7 @@ sleap_done="__SLEAP_DONE_OK__"
 sleap_done_dir="__SLEAP_DONE_OK_DIR__"
 bucket_host="__SAION_BUCKET_HOST__"
 
-"${SSH_CMD[@]}" "$bucket_host" "mkdir -p '$bucket_dir'"
+"${SSH_CMD[@]}" "$bucket_host" "mkdir -p '$bucket_dir' && chmod 2775 '$bucket_dir'"
 
 rsync -avh --chmod=Du=rwx,Dg=rwx,Fu=rw,Fg=rw \
 	--include="__BASE___*.slp" \
@@ -858,6 +862,7 @@ set -eo pipefail
 umask 0002
 
 mkdir -p "__SLEAP_SUBMIT_OK_DIR__"
+chmod 2775 "__SLEAP_SUBMIT_OK_DIR__"
 : > "__SLEAP_SUBMIT_OK__"
 COPY
 chmod +x "$copy_script"
@@ -943,6 +948,7 @@ set -eo pipefail
 umask 0002
 
 mkdir -p "__CLEANUP_OK_DIR__"
+chmod 2775 "__CLEANUP_OK_DIR__"
 : > "__CLEANUP_OK__"
 COPY
 chmod +x "$copy_script"
