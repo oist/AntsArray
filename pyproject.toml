@@ -1,0 +1,27 @@
+[project]
+name = "antsarray"
+version = "0.1.0"
+description = "AntsArray analysis and tracking pipeline"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy",
+    "pandas",
+    "matplotlib",
+    "scipy",
+    "tqdm",
+    "h5py",
+    "opencv-python",
+    "pillow",
+    "torch",
+    "torchvision",
+    "segmentation-models-pytorch",
+    "sleap-io",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+package = false
