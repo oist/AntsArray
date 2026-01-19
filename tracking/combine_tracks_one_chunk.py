@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import argparse
-import glob
 import logging
 import re
 import sys
@@ -11,80 +10,147 @@ import pandas as pd
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 from tracking.tracking_utils import get_complete_tracks  # noqa: E402
 
+# Example filename:
+#   20251118_121514_chunk000_aruco_panorama_x_left1740.pkl
+# Key should be:
+#   20251118_121514_chunk000
+KEY_RE = re.compile(r"^(.+_chunk[0-9]{3})", re.IGNORECASE)
 SIDES = ("left", "right")
-TS_RE = re.compile(r"^\d{8}-\d{6}$")          # 20251211-104517
-CHUNK_RE = re.compile(r"^chunk\d+$", re.I)    # chunk000, chunk12, etc.
 
 
-def find_unique(pattern: str) -> Path | None:
-    matches = glob.glob(pattern)
-    if len(matches) == 1:
-        return Path(matches[0])
-    if len(matches) > 1:
-        logging.warning("Multiple files match %s → skipping", pattern)
+from pathlib import Path
+import pandas as pd
+
+def load_sleap_pkl(path: Path) -> pd.DataFrame:
+    # SLEAP outputs are DataFrame pickles
+    df = pd.read_pickle(path)
+    if not isinstance(df, pd.DataFrame):
+        raise TypeError(f"SLEAP PKL did not contain a DataFrame: {path} (type={type(df)})")
+    return df
+
+def load_aruco_pkl(path: Path) -> tuple[pd.DataFrame, int]:
+    # ArUco outputs are dict payloads: {"detections": DataFrame, "num_frames": int}
+    payload = pd.read_pickle(path)
+    if not isinstance(payload, dict) or "detections" not in payload:
+        raise TypeError(f"ARUCO PKL did not contain expected dict payload: {path} (type={type(payload)})")
+
+    det = payload["detections"]
+    if not isinstance(det, pd.DataFrame):
+        raise TypeError(f"ARUCO payload['detections'] is not a DataFrame: {path} (type={type(det)})")
+
+    num_frames = int(payload.get("num_frames", -1))
+    return det, num_frames
+
+
+def extract_key(filename: str) -> str | None:
+    m = KEY_RE.match(filename)
+    return m.group(1) if m else None
+
+
+def infer_side(filename: str) -> str | None:
+    fn = filename.lower()
+    for s in SIDES:
+        if f"_x_{s}" in fn or f"_{s}" in fn:
+            return s
     return None
 
 
-def _dataset_id_from_chunk_dir(chunk_dir: Path) -> str:
-    """
-    Derive datasetID from the nearest parent directory named like a timestamp (YYYYMMDD-HHMMSS).
-    Falls back to chunk_dir.parent.name if no timestamp parent exists.
-    """
-    for p in [chunk_dir] + list(chunk_dir.parents):
-        if TS_RE.match(p.name):
-            return p.name
-    return chunk_dir.parent.name
+def pick_one(matches: list[Path], label: str) -> Path | None:
+    """Pick lexicographically first to match submit script behavior."""
+    if not matches:
+        return None
+    matches_sorted = sorted(matches, key=lambda p: p.name)
+    if len(matches_sorted) > 1:
+        logging.warning(
+            "%s has %d matching files; using: %s",
+            label,
+            len(matches_sorted),
+            matches_sorted[0].name,
+        )
+    return matches_sorted[0]
 
 
-def _chunk_id_from_chunk_dir(chunk_dir: Path) -> str:
+def process_one(input_file: Path, output_root: Path) -> None:
     """
-    Use chunk_dir.name if it looks like chunk###; otherwise use chunk_dir.name as-is.
+    Flat-folder behavior:
+      - derive key (<dataset>_chunkNNN) from input_file basename
+      - derive side from filename
+      - locate matching sleap+aruco PKLs for that key+side in input_file.parent
+      - write output to output_root/<key>_<side>.parquet
     """
-    name = chunk_dir.name
-    if CHUNK_RE.match(name):
-        return name
-    return name
+    if not input_file.is_file():
+        raise FileNotFoundError(f"input_file does not exist: {input_file}")
 
-
-def process_chunk(chunk_dir: Path, output_root: Path) -> None:
-    """
-    Writes flat outputs into output_root with naming:
-      <datasetID>-<chunkID>_<groupSuffix>.parquet
-
-    groupSuffix here is simply "left" or "right".
-    """
     output_root.mkdir(parents=True, exist_ok=True)
 
-    dataset_id = _dataset_id_from_chunk_dir(chunk_dir)
-    chunk_id = _chunk_id_from_chunk_dir(chunk_dir)
+    bn = input_file.name
+    key = extract_key(bn)
+    if key is None:
+        raise ValueError(f"Could not extract <dataset>_chunkNNN key from filename: {bn}")
 
-    for side in SIDES:
-        sleap_file = find_unique(str(chunk_dir / f"*sleap_panorama_x_{side}*.pkl"))
-        aruco_file = find_unique(str(chunk_dir / f"*aruco_panorama_x_{side}*.pkl"))
-        if sleap_file is None or aruco_file is None:
-            logging.warning("%s: missing %s view files — skipping", chunk_dir.name, side)
-            continue
+    side = infer_side(bn)
+    if side is None:
+        raise ValueError(f"Could not infer side (left/right) from filename: {bn}")
 
-        sleap_det = pd.read_pickle(sleap_file).dropna()
-        aruco_det = pd.read_pickle(aruco_file)
+    in_dir = input_file.parent
 
-        out_parquet = output_root / f"{dataset_id}-{chunk_id}_{side}.parquet"
-        get_complete_tracks(
-            output_path=str(out_parquet),
-            aruco_detection=aruco_det,
-            sleap_detection=sleap_det,
+    # Match only within the same key and side.
+    # We look for detector-specific patterns so we don't confuse aruco vs sleap.
+    sleap_matches = list(in_dir.glob(f"{key}*sleap_panorama_x*{side}*.pkl"))
+    aruco_matches = list(in_dir.glob(f"{key}*aruco_panorama_x*{side}*.pkl"))
+
+    sleap_file = pick_one(sleap_matches, label=f"{key} side={side} sleap")
+    aruco_file = pick_one(aruco_matches, label=f"{key} side={side} aruco")
+
+    if sleap_file is None or aruco_file is None:
+        logging.error(
+            "Missing required files for key=%s side=%s in %s (sleap=%d, aruco=%d)",
+            key,
+            side,
+            in_dir,
+            len(sleap_matches),
+            len(aruco_matches),
         )
-        logging.info("Wrote %s", out_parquet)
+        # Fail the job so SLURM shows it clearly (instead of silently skipping).
+        raise SystemExit(2)
+
+    logging.info("Key: %s", key)
+    logging.info("Side: %s", side)
+    logging.info("SLEAP: %s", sleap_file.name)
+    logging.info("ARUCO: %s", aruco_file.name)
+
+    sleap_det = load_sleap_pkl(sleap_file).dropna()
+    aruco_det, num_frames = load_aruco_pkl(aruco_file)
+
+
+    out_parquet = output_root / f"{key}_{side}.parquet"
+    get_complete_tracks(
+        output_path=str(out_parquet),
+        aruco_detection=aruco_det,
+        sleap_detection=sleap_det,
+        num_frames=num_frames
+    )
+    logging.info("Wrote %s", out_parquet)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--chunk_dir", required=True, type=Path, help="Directory for one chunk (contains pkl files).")
-    parser.add_argument("--output_path", required=True, type=Path, help="Flat output directory.")
+    parser.add_argument(
+        "--input_file",
+        required=True,
+        type=Path,
+        help="Representative PKL file (used to derive key and side).",
+    )
+    parser.add_argument(
+        "--output_path",
+        required=True,
+        type=Path,
+        help="Flat output directory.",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-    process_chunk(args.chunk_dir, args.output_path)
+    process_one(args.input_file, args.output_path)
 
 
 if __name__ == "__main__":

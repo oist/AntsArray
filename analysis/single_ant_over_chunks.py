@@ -7,6 +7,9 @@ CHANGE:
 - FIX: robust to missing TrackID column in parquet (pyarrow-safe).
 - CHANGE: ALL outputs are written into ONE directory: <out_dir>/per_track
           (no per-suffix subfolders).
+- NEW: Frame stitching is time-faithful across files using FPS and file timestamps.
+       If filenames include YYYYMMDD-HHMMSS (e.g. 20251218-163512_cam02_Arena00.parquet),
+       global frames incorporate real gaps between files.
 """
 
 from __future__ import annotations
@@ -15,7 +18,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -28,6 +31,8 @@ from tqdm import tqdm
 # -----------------------
 CHUNK_KEY_RE = re.compile(r"^chunk(\d+)$")
 TS_KEY_RE = re.compile(r"^\d{8}-\d{6}$")
+TS_ANYWHERE_RE = re.compile(r"(\d{8}-\d{6})")  # first occurrence anywhere in stem
+CHUNK_TOKEN_IN_SUFFIX_RE = re.compile(r"(?:^|_)(chunk\d+)(?:_|$)")
 
 
 def safe_label(s: str) -> str:
@@ -52,7 +57,12 @@ def parse_parquet_name(fp: Path) -> ParsedName:
     else:
         iter_key = stem
         group_suffix = ""
+
+    # NEW: collapse chunked suffixes into one logical group
+    group_suffix = normalize_group_suffix(group_suffix)
+
     return ParsedName(iter_key=iter_key, group_suffix=group_suffix, raw_name=fp.name)
+
 
 
 def iter_key_sort_value(iter_key: str) -> Tuple[int, object]:
@@ -64,19 +74,38 @@ def iter_key_sort_value(iter_key: str) -> Tuple[int, object]:
     return (2, iter_key)
 
 
+def parse_start_datetime_from_filename(fp: Path) -> Optional[datetime]:
+    """
+    Extract the first YYYYMMDD-HHMMSS occurrence from the filename stem and parse it.
+    Returns None if no timestamp is present.
+    """
+    m = TS_ANYWHERE_RE.search(fp.stem)
+    if not m:
+        return None
+    ts = m.group(1)
+    try:
+        return datetime.strptime(ts, "%Y%m%d-%H%M%S")
+    except ValueError:
+        return None
+
+
 # -----------------------
 # TrackID handling
 # -----------------------
 def ensure_trackid(df: pd.DataFrame, track_col: str) -> pd.DataFrame:
     if track_col not in df.columns:
         df[track_col] = 0
-    else:
-        df[track_col] = (
-            pd.to_numeric(df[track_col], errors="coerce")
-            .fillna(0)
-            .astype(np.int64)
-        )
+        return df
+
+    df = df.loc[:, ~df.columns.duplicated(keep="first")]
+
+    df[track_col] = (
+        pd.to_numeric(df[track_col], errors="coerce")
+        .fillna(0)
+        .astype(np.int64)
+    )
     return df
+
 
 
 def parquet_columns(fp: Path) -> set[str]:
@@ -91,6 +120,7 @@ def stitch_group(
     group_suffix: str,
     per_track_dir: Path,
     columns: List[str],
+    fps: float = 24.0,
     frame_col: str = "Frame",
     track_col: str = "TrackID",
     engine: str = "pyarrow",
@@ -109,7 +139,16 @@ def stitch_group(
     track_ids = sorted(first[track_col].unique().tolist())
 
     parts_by_track: Dict[int, List[pd.DataFrame]] = {tid: [] for tid in track_ids}
-    frame_offset = 0
+
+    # ---- precompute start times and reference start time (per group)
+    start_dt_by_fp: Dict[Path, Optional[datetime]] = {
+        fp: parse_start_datetime_from_filename(fp) for fp in files_sorted
+    }
+    dts = [dt for dt in start_dt_by_fp.values() if dt is not None]
+    ref_dt: Optional[datetime] = min(dts) if dts else None
+
+    # ---- fallback running offset for files with no timestamps
+    running_frame_offset = 0
 
     pbar = tqdm(files_sorted, desc=f"Chunks [{suffix_tag}]", unit="file", leave=False)
 
@@ -118,28 +157,46 @@ def stitch_group(
         if frame_col not in cols_in_file:
             continue
 
+        # Read frame column to determine local span and allow fallback running offset updates.
         frame_df = pd.read_parquet(fp, columns=[frame_col], engine=engine)
         frame_df[frame_col] = pd.to_numeric(frame_df[frame_col], errors="coerce")
-        if frame_df[frame_col].dropna().empty:
+        frame_df = frame_df.dropna(subset=[frame_col])
+        if frame_df.empty:
             continue
 
-        chunk_len = int(frame_df[frame_col].max()) + 1
+        local_min = int(frame_df[frame_col].min())
+        local_max = int(frame_df[frame_col].max())
+        local_len = (local_max - local_min) + 1
+
+        # Determine time-faithful offset (if timestamp available); else fall back.
+        dt = start_dt_by_fp.get(fp)
+        if (ref_dt is not None) and (dt is not None):
+            # Absolute frame index for the start of this file relative to the group's first timestamp.
+            # Round for stability when fps is non-integer or time deltas are not exact multiples.
+            frame_offset = int(round((dt - ref_dt).total_seconds() * float(fps)))
+        else:
+            frame_offset = running_frame_offset
 
         requested = list(dict.fromkeys(list(columns) + [track_col]))
         existing = [c for c in requested if c in cols_in_file]
         df = pd.read_parquet(fp, columns=existing, engine=engine)
         if df.empty:
-            frame_offset += chunk_len
+            if (ref_dt is None) or (dt is None):
+                running_frame_offset += local_len
             continue
 
         df[frame_col] = pd.to_numeric(df[frame_col], errors="coerce")
         df = df.dropna(subset=[frame_col])
         if df.empty:
-            frame_offset += chunk_len
+            if (ref_dt is None) or (dt is None):
+                running_frame_offset += local_len
             continue
-
+        
         df = ensure_trackid(df, track_col)
-        df[frame_col] = df[frame_col].astype(np.int64) + frame_offset
+
+        # Re-base local frames to start at 0, then add the chosen offset.
+        df[frame_col] = (df[frame_col].astype(np.int64) - local_min) + frame_offset
+
         df[track_col] = df[track_col].astype(int)
         df["source_file"] = fp.name
 
@@ -147,7 +204,9 @@ def stitch_group(
             if tid in parts_by_track:
                 parts_by_track[tid].append(g)
 
-        frame_offset += chunk_len
+        # Only advance running offset for timestamp-less mode.
+        if (ref_dt is None) or (dt is None):
+            running_frame_offset += local_len
 
     # ---- write outputs (ALL into one directory)
     for tid, parts in parts_by_track.items():
@@ -158,8 +217,27 @@ def stitch_group(
         out.to_parquet(out_path, index=False, engine=engine, compression=compression)
 
 
-def main(input_dir: Path, out_dir: Path, columns: List[str]) -> None:
-    files = sorted(Path(input_dir).glob("*.parquet"))
+def normalize_group_suffix(group_suffix: str) -> str:
+    """
+    If group_suffix contains a chunk token like chunk000, remove it so that all
+    chunks for the same logical recording group together.
+
+    Example:
+      "121514_chunk000_left" -> "121514_left"
+      "foo_chunk12_bar"      -> "foo_bar"
+    """
+    if "chunk" not in group_suffix:
+        return group_suffix
+
+    # Replace the chunk token with a single underscore separator, then clean up.
+    s = CHUNK_TOKEN_IN_SUFFIX_RE.sub("_", group_suffix)
+    s = re.sub(r"__+", "_", s).strip("_")
+    return s
+
+
+
+def main(input_dir: Path, out_dir: Path, columns: List[str], fps: float, string: str) -> None:
+    files = sorted(Path(input_dir).glob(f"*{string}"))
     if not files:
         raise RuntimeError("No parquet files found")
 
@@ -169,19 +247,20 @@ def main(input_dir: Path, out_dir: Path, columns: List[str]) -> None:
 
     groups: Dict[str, List[Path]] = {}
     parsed: Dict[Path, ParsedName] = {}
-
+    
     for fp in files:
         pn = parse_parquet_name(fp)
         parsed[fp] = pn
         groups.setdefault(pn.group_suffix, []).append(fp)
 
-    for group_suffix, fps in groups.items():
-        fps_sorted = sorted(fps, key=lambda p: iter_key_sort_value(parsed[p].iter_key))
+    for group_suffix, fps_list in groups.items():
+        fps_sorted = sorted(fps_list, key=lambda p: iter_key_sort_value(parsed[p].iter_key))
         stitch_group(
             fps_sorted,
             group_suffix,
             per_track_dir,
             columns,
+            fps=fps,
         )
 
 
@@ -191,6 +270,8 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--input_dir", type=Path, required=True)
     ap.add_argument("--out_dir", type=Path, required=True)
+    ap.add_argument("--fps", type=float, default=24.0)
+    ap.add_argument("--string", type=str, default='.parquet')
     ap.add_argument(
         "--columns",
         nargs="+",
@@ -198,4 +279,4 @@ if __name__ == "__main__":
     )
     args = ap.parse_args()
 
-    main(args.input_dir, args.out_dir, args.columns)
+    main(args.input_dir, args.out_dir, args.columns, fps=args.fps, string=args.string)

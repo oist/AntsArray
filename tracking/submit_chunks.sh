@@ -117,9 +117,10 @@ submit_side() {
   echo "Side=${side}: Found ${N} candidate PKL files."
 
   # Choose one representative file per key (<dataset>_chunkNNN) for this side.
-  # If there are multiple matches for a key+side, we warn and pick the first lexicographically.
+  # Prefer ArUco so the job input is stable, and do not treat (aruco+sleap) as "duplicates".
   declare -A chosen=()
-  declare -A dupcount=()
+  declare -A aruco_count=()
+  declare -A sleap_count=()
 
   for fp in "${FILES[@]}"; do
     bn="$(basename "${fp}")"
@@ -128,13 +129,32 @@ submit_side() {
       echo "WARN: Could not extract <dataset>_chunkNNN key from filename, skipping: ${bn}" >&2
       continue
     fi
-    if [[ -z "${chosen[$key]+x}" ]]; then
-      chosen["$key"]="$fp"
-      dupcount["$key"]=1
+
+    # Count by detector type
+    if [[ "${bn}" == *"aruco_panorama_x"* ]]; then
+      aruco_count["$key"]=$(( ${aruco_count["$key"]:-0} + 1 ))
+      # Prefer the first lexicographically (FILES is already sorted)
+      if [[ -z "${chosen[$key]+x}" ]]; then
+        chosen["$key"]="$fp"
+      else
+        # If chosen is currently sleap and we found aruco, upgrade to aruco
+        if [[ "$(basename "${chosen[$key]}")" != *"aruco_panorama_x"* ]]; then
+          chosen["$key"]="$fp"
+        fi
+      fi
+    elif [[ "${bn}" == *"sleap_panorama_x"* ]]; then
+      sleap_count["$key"]=$(( ${sleap_count["$key"]:-0} + 1 ))
+      # Only choose sleap if we haven't chosen anything yet
+      if [[ -z "${chosen[$key]+x}" ]]; then
+        chosen["$key"]="$fp"
+      fi
     else
-      dupcount["$key"]=$((dupcount["$key"] + 1))
+      # Shouldn't happen because FILES already matches *_x_${side}*.pkl, but keep safe.
+      echo "WARN: Unrecognized detector type, skipping: ${bn}" >&2
+      continue
     fi
   done
+
 
   local keys=("${!chosen[@]}")
   IFS=$'\n' keys=($(sort <<<"${keys[*]}"))
@@ -157,9 +177,13 @@ submit_side() {
     fp="${chosen[$key]}"
     bn="$(basename "${fp}")"
 
-    if [[ "${dupcount[$key]}" -gt 1 ]]; then
-      echo "WARN: ${key} side=${side} has ${dupcount[$key]} matching files; using: ${bn}" >&2
+        # Warn only for true duplicates (multiple aruco or multiple sleap), not the normal aruco+sleap pair.
+    if [[ ${aruco_count[$key]:-0} -gt 1 ]]; then
+      echo "WARN: ${key} side=${side} has ${aruco_count[$key]} ArUco files; using: ${bn}" >&2
+    elif [[ ${aruco_count[$key]:-0} -eq 0 && ${sleap_count[$key]:-0} -gt 1 ]]; then
+      echo "WARN: ${key} side=${side} has ${sleap_count[$key]} SLEAP files (no ArUco found); using: ${bn}" >&2
     fi
+
 
     # per-job script
     jobfile="$(mktemp "${LOGS_DIR}/sbatch_${JOB_NAME}_${key}_${side}_XXXXXX.sh")"

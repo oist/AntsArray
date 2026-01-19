@@ -1,61 +1,73 @@
 #!/usr/bin/env python3
 """
-Combine SLEAP CSVs into per-arena track files across ALL chunks (no exp arg).
+Combine SLEAP CSVs into per-arena track files across ALL chunks, using ArUco HDF5
+to define TRUE chunk lengths and prevent frame drift.
 
-Behavior
---------
-- Discovers SLEAP CSVs in --sleap_dir using the chunk token in the filename.
-- For each CSV, loads the matching per-camera segmentation PNG (by name).
-- Builds arena labels from *all non-zero colors* in that seg image.
-- Assigns each SLEAP row (X,Y) -> ArenaLabel by sampling seg pixel at (X,Y).
-- Accumulates across ALL chunks and writes:
-    out_dir/
-      per_arena/
-        Arena00.csv, Arena01.csv, ...
-      per_arena_tracks/
-        Arena00_track-<Track>.csv, ...
+Folder layout
+-------------
+Given --input_folder ROOT, we iterate over immediate subfolders whose names match
+YYYYMMDD-HHMMSS:
 
-Notes
------
-- No transforms/homographies.
-- “Non-zero color” means any channel is non-zero (BGR != (0,0,0)).
-- If Track column is missing, it will still write per-arena files (no per-track split).
-- Seg images must be in the same pixel coordinate system as X,Y.
+  ROOT/20251211-104517/data/
+    - camX_###_sleap_data.csv
+    - camX_###_aruco_tracks_.h5
 
-Install
+Segmentation images are searched under:
+  ROOT/seg_arena/
+and can have any name after the initial camXX, e.g.
+  cam05_cam4_2025-12-18-16-35-12.png
+
+Key correctness guarantee
+-------------------------
+Frame offsets across chunks are computed from the ArUco HDF5:
+  f["aruco_tracks"].shape[0]  == true number of frames in that video chunk
+
+This is independent of SLEAP detection sparsity and cannot drift.
+
+Diagnostics
+-----------
+For each (run, camera), prints a per-chunk table:
+  - chunk id
+  - true video frame count
+  - min / max / unique SLEAP frames
+  - global frame span assigned to that chunk
+
+Outputs
 -------
-pip install numpy pandas opencv-python tqdm
+Flat Parquet files in --out_dir:
+  <timestamp>_<cam>_<arena>.parquet
+  <timestamp>_<cam>_<arena>_track-<Track>.parquet
+
+Segmentation fallback
+---------------------
+If no seg file is found for a camera, assume a single arena ("Arena00") covering
+all pixels, and assign all detections to that arena.
 """
 
 from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Dict, Tuple, List, Optional, Iterable
+from typing import Dict, Tuple, List, Optional
 
 import cv2
+import h5py
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-# -----------------------------
-# Naming / discovery (deduped)
-# -----------------------------
-import re
-from pathlib import Path
-from typing import Dict, List, Tuple
-
-
+# -----------------------------------------------------------------------------
+# Regex / naming
+# -----------------------------------------------------------------------------
 CAM_RE = re.compile(r"(?:^|_)cam(\d+)(?:_|$)")
 CHUNK_RE = re.compile(r"_(\d{3})(?:_sleap_data)?\.csv$")
+TS_RE = re.compile(r"^\d{8}-\d{6}$")  # YYYYMMDD-HHMMSS
 
 
+# -----------------------------------------------------------------------------
+# CSV discovery
+# -----------------------------------------------------------------------------
 def parse_cam_and_chunk(csv_path: Path) -> Tuple[str, int]:
-    """
-    Returns:
-      cam_id: e.g. 'cam1' or 'cam02' (preserves zero-padding)
-      chunk_id: int from the trailing _### token
-    """
     name = csv_path.name
 
     m_cam = CAM_RE.search(name)
@@ -65,21 +77,17 @@ def parse_cam_and_chunk(csv_path: Path) -> Tuple[str, int]:
 
     m_chunk = CHUNK_RE.search(name)
     if not m_chunk:
-        raise ValueError(f"Could not extract 3-digit chunk from filename: {name}")
+        raise ValueError(f"Could not extract chunk id from filename: {name}")
     chunk_id = int(m_chunk.group(1))
 
     return cam_id, chunk_id
 
 
 def list_csvs_grouped_by_cam(sleap_dir: Path) -> Dict[str, List[Path]]:
-    """
-    Returns {cam_id: [csv_paths_sorted_by_chunk]}.
-    Only includes files that contain both camN and a trailing _###(optional _sleap_data).csv chunk token.
-    """
     cam_map: Dict[str, List[Path]] = {}
     for p in sleap_dir.glob("*.csv"):
         try:
-            cam_id, _chunk = parse_cam_and_chunk(p)
+            cam_id, _ = parse_cam_and_chunk(p)
         except ValueError:
             continue
         cam_map.setdefault(cam_id, []).append(p)
@@ -90,21 +98,19 @@ def list_csvs_grouped_by_cam(sleap_dir: Path) -> Dict[str, List[Path]]:
     return dict(sorted(cam_map.items()))
 
 
-def seg_path_for_sleap_csv(csv_path: Path, seg_dir: Path) -> Path:
-    """
-    Seg image is chosen by camera only:
-      cam1_*_001.csv  -> seg_dir/cam1_seg.png
-      cam02_*_123.csv -> seg_dir/cam02_seg.png
-    """
-    cam_id, _chunk = parse_cam_and_chunk(csv_path)
-    return seg_dir / f"{cam_id}_seg.png"
+# -----------------------------------------------------------------------------
+# ArUco frame counts (ground truth)
+# -----------------------------------------------------------------------------
+def aruco_n_frames(h5_path: Path, ds_name: str = "aruco_tracks") -> int:
+    with h5py.File(h5_path, "r") as f:
+        return int(f[ds_name].shape[0])
 
 
-# -----------------------------
-# Seg / color labeling
-# -----------------------------
+# -----------------------------------------------------------------------------
+# Segmentation helpers
+# -----------------------------------------------------------------------------
 def read_seg_bgr(seg_path: Path) -> np.ndarray:
-    seg = cv2.imread(str(seg_path), cv2.IMREAD_COLOR)  # BGR
+    seg = cv2.imread(str(seg_path), cv2.IMREAD_COLOR)
     if seg is None:
         raise FileNotFoundError(f"Could not read seg image: {seg_path}")
     return seg
@@ -113,237 +119,339 @@ def read_seg_bgr(seg_path: Path) -> np.ndarray:
 def unique_nonzero_colors(seg_bgr: np.ndarray) -> List[Tuple[int, int, int]]:
     flat = seg_bgr.reshape(-1, 3)
     colors = np.unique(flat, axis=0)
-    out: List[Tuple[int, int, int]] = []
-    for c in colors:
-        b, g, r = int(c[0]), int(c[1]), int(c[2])
-        if (b, g, r) != (0, 0, 0):
-            out.append((b, g, r))
-    out.sort()  # deterministic
-    return out
+    return sorted(
+        [(int(b), int(g), int(r)) for b, g, r in colors if (b, g, r) != (0, 0, 0)]
+    )
 
 
-def build_color_to_label(colors_bgr: List[Tuple[int, int, int]], prefix: str = "Arena") -> Dict[Tuple[int, int, int], str]:
-    return {c: f"{prefix}{i:02d}" for i, c in enumerate(colors_bgr)}
+def build_color_to_label(colors: List[Tuple[int, int, int]]) -> Dict[Tuple[int, int, int], str]:
+    return {c: f"Arena{i:02d}" for i, c in enumerate(colors)}
 
 
 def sample_label_at_xy(
-    seg_bgr: np.ndarray,
+    seg: np.ndarray,
     x: float,
     y: float,
     color_to_label: Dict[Tuple[int, int, int], str],
-    unknown_label: str = "UNKNOWN",
-    background_label: str = "BACKGROUND",
 ) -> str:
-    h, w = seg_bgr.shape[:2]
-    xi = int(round(x))
-    yi = int(round(y))
+    h, w = seg.shape[:2]
+    xi, yi = int(round(x)), int(round(y))
     if xi < 0 or xi >= w or yi < 0 or yi >= h:
-        return unknown_label
-    b, g, r = map(int, seg_bgr[yi, xi])
+        return "UNKNOWN"
+    b, g, r = map(int, seg[yi, xi])
     if (b, g, r) == (0, 0, 0):
-        return background_label
-    return color_to_label.get((b, g, r), unknown_label)
+        return "BACKGROUND"
+    return color_to_label.get((b, g, r), "UNKNOWN")
 
 
 def assign_arenas(
     df: pd.DataFrame,
-    seg_bgr: np.ndarray,
+    seg: np.ndarray,
     color_to_label: Dict[Tuple[int, int, int], str],
-    xcol: str = "X",
-    ycol: str = "Y",
-    out_col: str = "ArenaLabel",
+    xcol: str,
+    ycol: str,
 ) -> pd.DataFrame:
-    if xcol not in df.columns or ycol not in df.columns:
-        raise ValueError(f"Missing required columns {xcol},{ycol}. Found: {list(df.columns)}")
-    df = df.dropna(subset=[xcol, ycol]).copy() #drop rows with NaN X or Y
-    xy = df[[xcol, ycol]].to_numpy(float)
-    labels = [sample_label_at_xy(seg_bgr, float(x), float(y), color_to_label) for x, y in xy]
-    out = df.copy()
-    out[out_col] = labels
+    df = df.dropna(subset=[xcol, ycol]).copy()
+    labels = [
+        sample_label_at_xy(seg, float(x), float(y), color_to_label)
+        for x, y in df[[xcol, ycol]].to_numpy(float)
+    ]
+    df["ArenaLabel"] = labels
+    return df
+
+
+def find_seg_file_for_cam(seg_dir: Path, cam_id: str) -> Optional[Path]:
+    """
+    Find a segmentation image for a camera in seg_dir.
+
+    Requirements:
+      - seg_dir is ROOT/seg_arena (ROOT is --input_folder)
+      - filenames start with camXX, but can have any suffix, e.g.
+          cam05_cam4_2025-12-18-16-35-12.png
+
+    Selection rule:
+      - If multiple matches exist, pick the most recently modified file.
+      - If none exist, return None.
+    """
+    if not seg_dir.exists() or not seg_dir.is_dir():
+        return None
+
+    matches = list(seg_dir.glob(f"{cam_id}*.png"))
+    if not matches:
+        return None
+
+    return max(matches, key=lambda p: p.stat().st_mtime)
+
+
+def get_segmentation_or_default(
+    seg_path: Optional[Path],
+) -> Tuple[Optional[np.ndarray], Dict[Tuple[int, int, int], str], List[str]]:
+    """
+    Returns (seg_image_or_None, color_to_label, arenas).
+
+    If seg_path is None, does not exist, OR contains no nonzero colors, fall back to a single arena:
+      arenas = ["Arena00"]
+      seg = None
+      color_to_label = {}
+    """
+    if seg_path is None or not seg_path.exists():
+        return None, {}, ["Arena00"]
+
+    seg = read_seg_bgr(seg_path)
+    colors = unique_nonzero_colors(seg)
+
+    if len(colors) == 0:
+        return None, {}, ["Arena00"]
+
+    color_to_label = build_color_to_label(colors)
+    arenas = sorted(color_to_label.values())
+    return seg, color_to_label, arenas
+
+
+def assign_arenas_with_fallback(
+    df: pd.DataFrame,
+    seg: Optional[np.ndarray],
+    color_to_label: Dict[Tuple[int, int, int], str],
+    xcol: str,
+    ycol: str,
+    fallback_label: str = "Arena00",
+) -> pd.DataFrame:
+    """
+    If seg is None (or color_to_label is empty), assign every row to fallback_label.
+    Otherwise, sample seg colors at (x, y) to assign ArenaLabel.
+
+    Note: preserves existing behavior of dropping rows missing X/Y.
+    """
+    df = df.dropna(subset=[xcol, ycol]).copy()
+
+    if seg is None or not color_to_label:
+        df["ArenaLabel"] = fallback_label
+        return df
+
+    labels = [
+        sample_label_at_xy(seg, float(x), float(y), color_to_label)
+        for x, y in df[[xcol, ycol]].to_numpy(float)
+    ]
+    df["ArenaLabel"] = labels
+    return df
+
+
+# -----------------------------------------------------------------------------
+# Frame offsetting using ArUco + diagnostics
+# -----------------------------------------------------------------------------
+def apply_frame_offsets_using_aruco(
+    dfs: List[pd.DataFrame],
+    chunk_ids: List[int],
+    chunk_frame_counts: List[int],
+    frame_col: str,
+    label: str,
+) -> List[pd.DataFrame]:
+    if not (len(dfs) == len(chunk_ids) == len(chunk_frame_counts)):
+        raise ValueError("dfs, chunk_ids, chunk_frame_counts must have same length")
+
+    offset = 0
+    out: List[pd.DataFrame] = []
+
+    print("\n" + "=" * 100)
+    print(f"FRAME OFFSET DIAGNOSTICS {label}".strip())
+    print("=" * 100)
+    print(
+        "chunk | video_frames | sleap_min | sleap_max | sleap_unique | global_start | global_end"
+    )
+    print("-" * 100)
+
+    for df, cid, n_frames in zip(dfs, chunk_ids, chunk_frame_counts):
+        if df.empty or frame_col not in df.columns:
+            print(
+                f"{cid:>5} | {n_frames:>12} |"
+                f" {'NA':>9} | {'NA':>9} | {'0':>12} |"
+                f" {offset:>12} | {offset + n_frames - 1:>10}"
+            )
+            offset += n_frames
+            out.append(df)
+            continue
+
+        d = df.copy()
+        fr = pd.to_numeric(d[frame_col], errors="coerce").dropna().astype("int64")
+
+        sleap_min = int(fr.min()) if not fr.empty else None
+        sleap_max = int(fr.max()) if not fr.empty else None
+        sleap_unique = int(fr.nunique())
+
+        d.loc[fr.index, frame_col] = fr + offset
+
+        global_start = offset
+        global_end = offset + n_frames - 1
+
+        print(
+            f"{cid:>5} | {n_frames:>12} |"
+            f" {str(sleap_min):>9} | {str(sleap_max):>9} | {sleap_unique:>12} |"
+            f" {global_start:>12} | {global_end:>10}"
+        )
+
+        out.append(d)
+        offset += n_frames
+
+    print("=" * 100)
+    print("video_frames = authoritative chunk length from ArUco HDF5")
+    print("global_*     = assigned frame span (no overlap, no drift)")
+    print("=" * 100 + "\n")
+
     return out
 
 
-# -----------------------------
+# -----------------------------------------------------------------------------
 # Output helpers
-# -----------------------------
+# -----------------------------------------------------------------------------
 def safe_label(s: object) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(s)).strip("_") or "NA"
 
 
-def cam_id_from_csv(csv_path: Path) -> str:
-    m = _CAM_PATT.search(csv_path.name)
-    if not m:
-        raise ValueError(f"Could not extract cam number from filename: {csv_path.name}")
-    return f"cam{m.group(1)}"  # preserves zero-padding
-
-
-def write_cam_arena_outputs(
-    df_assigned: pd.DataFrame,
+def write_outputs_parquet(
+    df: pd.DataFrame,
     out_dir: Path,
+    timestamp: str,
     cam_id: str,
-    color_to_label: Dict[Tuple[int, int, int], str],
-    arena_col: str = "ArenaLabel",
-    track_col: str = "Track",
-    drop_cols: Optional[List[str]] = None,
+    arenas: List[str],
+    track_col: str,
 ) -> None:
-    """
-    Writes per-(cam,arena) and per-(cam,arena,track) CSVs, dropping annotation columns.
-    File names encode cam + arena id.
-    """
     out_dir.mkdir(parents=True, exist_ok=True)
-    per_cam_dir = out_dir / cam_id
-    per_cam_dir.mkdir(exist_ok=True)
 
-    if drop_cols is None:
-        drop_cols = [arena_col, "SegImage", "SourceCSV"]  # safe even if absent
-
-    # Determine stable arena id mapping (Arena00, Arena01, ...) from this camera's palette
-    # (Already deterministic in build_color_to_label, but we keep this explicit)
-    known_arenas = sorted(set(color_to_label.values()))
-
-    # Write per arena (all tracks)
-    for arena_label in known_arenas:
-        g = df_assigned[df_assigned[arena_col] == arena_label]
+    for arena in arenas:
+        g = df[df["ArenaLabel"] == arena]
         if g.empty:
             continue
-        out = g.drop(columns=[c for c in drop_cols if c in g.columns], errors="ignore")
-        out.to_csv(per_cam_dir / f"{cam_id}_{arena_label}.csv", index=False)
+        g.drop(columns=["ArenaLabel"], errors="ignore").to_parquet(
+            out_dir / f"{timestamp}_{cam_id}_{arena}.parquet",
+            index=False,
+        )
 
-    # Write per arena per track (if Track exists)
-    if track_col in df_assigned.columns:
-        per_track_dir = per_cam_dir / "tracks"
-        per_track_dir.mkdir(exist_ok=True)
-
-        for (arena_label, track), g in df_assigned.groupby([arena_col, track_col], sort=True, dropna=False):
-            if arena_label not in known_arenas or g.empty:
+    if track_col in df.columns:
+        for (arena, track), g in df.groupby(["ArenaLabel", track_col], dropna=False):
+            if arena not in arenas or g.empty:
                 continue
-            out = g.drop(columns=[c for c in drop_cols if c in g.columns], errors="ignore")
-            out.to_csv(
-                per_track_dir / f"{cam_id}_{arena_label}_track-{safe_label(track)}.csv",
+            g.drop(columns=["ArenaLabel"], errors="ignore").to_parquet(
+                out_dir / f"{timestamp}_{cam_id}_{arena}_track-{safe_label(track)}.parquet",
                 index=False,
             )
 
 
-def apply_frame_offsets_in_place(
-    dfs_in_chunk_order: List[pd.DataFrame],
-    frame_col: str = "Frame",
-) -> List[pd.DataFrame]:
-    """
-    For a single camera, given chunk-ordered dfs:
-      - chunk0 frames remain as-is
-      - chunk1 frames += (max_frame(chunk0) + 1)
-      - chunk2 frames += (max_frame(chunk0..1) + 1)
-    Works even if frames are missing/NaN or df is empty.
-    """
-    offset = 0
-    out: List[pd.DataFrame] = []
-
-    for df in dfs_in_chunk_order:
-        if df.empty:
-            out.append(df)
-            continue
-
-        if frame_col not in df.columns:
-            raise ValueError(f"Expected frame column '{frame_col}' in SLEAP CSV. Columns: {list(df.columns)}")
-
-        d = df.copy()
-
-        # Coerce frame to numeric; drop NaNs later only if you want.
-        fr = pd.to_numeric(d[frame_col], errors="coerce")
-
-        # Apply offset to finite frames only
-        mask = fr.notna()
-        d.loc[mask, frame_col] = fr.loc[mask].astype(np.int64) + offset
-
-        # Update offset using max finite frame AFTER shift
-        if mask.any():
-            offset = int(d.loc[mask, frame_col].max()) + 1
-
-        out.append(d)
-
-    return out
-
-
-# -----------------------------
-# Main combine
-# -----------------------------
-def combine_all_chunks_into_per_arena_tracks(
-    sleap_dir: Path,
-    seg_dir: Path,
+# -----------------------------------------------------------------------------
+# Per-run processing
+# -----------------------------------------------------------------------------
+def process_run(
+    run_dir: Path,
+    input_folder: Path,
     out_dir: Path,
-    xcol: str = "X",
-    ycol: str = "Y",
-    track_col: str = "Track",
-    frame_col: str = "Frame",
+    xcol: str,
+    ycol: str,
+    track_col: str,
+    frame_col: str,
 ) -> None:
+    data_dir = run_dir / "data"
+    sleap_dir = data_dir
+
+    # Segmentation is global to ROOT (input_folder), not inside each run.
+    seg_dir = input_folder / "arena_seg"
+    
     cam_map = list_csvs_grouped_by_cam(sleap_dir)
     if not cam_map:
-        raise FileNotFoundError(f"No SLEAP CSVs with cam + _### chunk token found in {sleap_dir}")
+        return
 
-    out_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = run_dir.name  # already validated
 
-    for cam_id, files in tqdm(cam_map.items(), desc="Cameras"):
-        # Load seg once per camera
-        seg_path = seg_dir / f"{cam_id}_seg.png"
-        seg_bgr = read_seg_bgr(seg_path)
-        colors = unique_nonzero_colors(seg_bgr)
-        color_to_label = build_color_to_label(colors, prefix="Arena")
+    for cam_id, files in cam_map.items():
+        seg_path = find_seg_file_for_cam(seg_dir, cam_id)
 
-        # Read all chunks for this camera in order
-        dfs = []
-        for p in files:
-            df = pd.read_csv(p)
-            if df.empty:
-                dfs.append(df)
-                continue
-            dfs.append(df)
+        if seg_path is None:
+            print(f"[SEG] run={timestamp} cam={cam_id}: NO seg found → using Arena00 fallback")
+        else:
+            print(f"[SEG] run={timestamp} cam={cam_id}: using seg {seg_path.resolve()}")
 
-        # Adjust frames across chunks
-        dfs = apply_frame_offsets_in_place(dfs, frame_col=frame_col)
 
-        # Assign arenas and concatenate for this camera
-        assigned = []
-        for df in tqdm(dfs, desc=f"{cam_id} chunks", leave=False):
-            if df.empty:
-                continue
-            df_assigned = assign_arenas(df, seg_bgr, color_to_label, xcol=xcol, ycol=ycol, out_col="ArenaLabel")
-            if not df_assigned.empty:
-                assigned.append(df_assigned)
+        seg, color_to_label, arenas = get_segmentation_or_default(seg_path)
 
-        if not assigned:
+        dfs: List[pd.DataFrame] = []
+        chunk_ids: List[int] = []
+        chunk_frame_counts: List[int] = []
+
+        for csv_path in files:
+            cam, cid = parse_cam_and_chunk(csv_path)
+            h5_path = csv_path.with_name(
+                csv_path.name.replace("_sleap_data.csv", "_aruco_tracks_.h5")
+            )
+            if not h5_path.exists():
+                raise FileNotFoundError(f"Missing ArUco HDF5: {h5_path}")
+
+            dfs.append(pd.read_csv(csv_path))
+            chunk_ids.append(cid)
+            chunk_frame_counts.append(aruco_n_frames(h5_path))
+
+        dfs = apply_frame_offsets_using_aruco(
+            dfs,
+            chunk_ids,
+            chunk_frame_counts,
+            frame_col=frame_col,
+            label=f"(run={timestamp} cam={cam_id})",
+        )
+
+        parts = []
+        for df in dfs:
+            if not df.empty:
+                parts.append(assign_arenas_with_fallback(df, seg, color_to_label, xcol, ycol))
+
+        if not parts:
             continue
 
-        cam_df = pd.concat(assigned, ignore_index=True)
+        cam_df = pd.concat(parts, ignore_index=True)
 
-        # Write once per cam: per arena and per arena/track
-        write_cam_arena_outputs(
-            df_assigned=cam_df,
-            out_dir=out_dir,
-            cam_id=cam_id,
-            color_to_label=color_to_label,
-            arena_col="ArenaLabel",
-            track_col=track_col,
-            drop_cols=["ArenaLabel"],  # keep output compact
+        write_outputs_parquet(
+            cam_df,
+            out_dir,
+            timestamp,
+            cam_id,
+            arenas,
+            track_col,
         )
+
+
+# -----------------------------------------------------------------------------
+# Entry point
+# -----------------------------------------------------------------------------
+def run_on_timestamp_subfolders(
+    input_folder: Path,
+    out_dir: Path,
+    xcol: str,
+    ycol: str,
+    track_col: str,
+    frame_col: str,
+) -> None:
+    runs = [p for p in input_folder.iterdir() if p.is_dir() and TS_RE.match(p.name)]
+
+    if not runs:
+        raise FileNotFoundError(f"No timestamp-named run folders under {input_folder}")
+
+    for run_dir in tqdm(sorted(runs), desc="Runs"):
+        process_run(run_dir, input_folder, out_dir, xcol, ycol, track_col, frame_col)
 
 
 if __name__ == "__main__":
     import argparse
 
     ap = argparse.ArgumentParser()
-    ap.add_argument("--sleap_dir", type=Path, required=True)
-    ap.add_argument("--seg_dir", type=Path, required=True, help="Directory containing per-camera seg PNGs")
+    ap.add_argument("--input_folder", type=Path, required=True)
     ap.add_argument("--out_dir", type=Path, required=True)
     ap.add_argument("--xcol", type=str, default="X")
     ap.add_argument("--ycol", type=str, default="Y")
     ap.add_argument("--track_col", type=str, default="Track")
+    ap.add_argument("--frame_col", type=str, default="Frame")
     args = ap.parse_args()
 
-    combine_all_chunks_into_per_arena_tracks(
-        sleap_dir=args.sleap_dir,
-        seg_dir=args.seg_dir,
+    run_on_timestamp_subfolders(
+        input_folder=args.input_folder,
         out_dir=args.out_dir,
         xcol=args.xcol,
         ycol=args.ycol,
         track_col=args.track_col,
+        frame_col=args.frame_col,
     )
