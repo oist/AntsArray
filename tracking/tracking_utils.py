@@ -36,6 +36,8 @@ def get_complete_tracks(
     debug_show_sleap: bool = False,
     debug_show_track_output: bool = False,
     debug_show_sleap_anchor_only: bool = False,
+    debug_show_aruco_raw: bool = False,  # NEW: show pre-filter (raw) ArUco detections
+
     debug_layout: str = "stack",  # "stack" (single annotated view) or "tiles" (3-panel)
     debug_window_prefix: str = "Tracking",
     debug_resize: Tuple[int, int] = (1080, 720),
@@ -141,49 +143,48 @@ def get_complete_tracks(
         return (b, g, r)
 
     # ---------------- NEW: debug drawing helpers (purely visual)
-    def _draw_points(
-        img: np.ndarray,
-        pts_xy: np.ndarray,
-        *,
-        label: str,
-        colour: Tuple[int, int, int],
-        radius: int = 6,
-        thickness: int = -1,
-    ) -> None:
-        if pts_xy.size == 0:
+
+    def _draw_aruco_debug(img: np.ndarray, aruco_arr: np.ndarray, *, stage: str = "post-filter") -> None:
+        """
+        aruco_arr: (N,3) -> columns [Instance, X, Y]
+        stage: "raw" or "post-filter" (labeling only)
+        """
+        if aruco_arr.size == 0:
+            cv2.putText(
+                img,
+                f"ArUco {stage}: none",
+                (10, 95),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.2,
+                (200, 200, 200),
+                2,
+            )
             return
-        for x, y in pts_xy:
-            if np.isfinite(x) and np.isfinite(y):
-                cv2.circle(img, (int(round(x)), int(round(y))), radius, colour, thickness)
+
+        for tag_id, x, y in aruco_arr:
+            if not (np.isfinite(tag_id) and np.isfinite(x) and np.isfinite(y)):
+                continue
+            xi, yi = int(round(x)), int(round(y))
+            cv2.circle(img, (xi, yi), 8, (0, 255, 255), 2)
+            cv2.putText(
+                img,
+                f"tag{int(tag_id)}",
+                (xi - 10, yi - 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                2,
+                (255, 255, 255),
+                2,
+            )
+
         cv2.putText(
             img,
-            label,
-            (10, 55),
+            f"ArUco ({stage}): {aruco_arr.shape[0]}",
+            (10, 95),
             cv2.FONT_HERSHEY_SIMPLEX,
-            1.5,
-            colour,
-            3,
+            2,
+            (255, 255, 255),
+            2,
         )
-
-    def _draw_aruco_debug(img: np.ndarray, aruco_arr: np.ndarray) -> None:
-        # aruco_arr: (N,3) -> columns [Instance, X, Y]
-        if aruco_arr.size == 0:
-            cv2.putText(img, "ArUco: none", (10, 95), cv2.FONT_HERSHEY_SIMPLEX, 2, (200, 200, 200), 2)
-            return
-        pts = aruco_arr[:, 1:3]
-        for tag_id, x, y in aruco_arr:
-            if np.isfinite(x) and np.isfinite(y):
-                cv2.circle(img, (int(round(x)), int(round(y))), 8, (0, 255, 255), 2)
-                cv2.putText(
-                    img,
-                    f"tag{int(tag_id)}",
-                    (int(round(x)) + 10, int(round(y)) + 10),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    2,
-                    (0, 255, 255),
-                    2,
-                )
-        cv2.putText(img, f"ArUco (post-filter): {len(pts)}", (10, 95), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 2)
 
     def _draw_sleap_debug(img: np.ndarray, s_df: pd.DataFrame, sleap_anchor: np.ndarray) -> None:
         if s_df.empty:
@@ -246,15 +247,26 @@ def get_complete_tracks(
                         3,
                     )
 
-    def _compose_debug_tiles(base: np.ndarray, aruco_arr: np.ndarray, s_df: pd.DataFrame, sleap_anchor: np.ndarray, frame_idx: int) -> np.ndarray:
+    def _compose_debug_tiles(
+        base: np.ndarray,
+        raw_aruco_arr: np.ndarray,
+        aruco_arr: np.ndarray,
+        s_df: pd.DataFrame,
+        sleap_anchor: np.ndarray,
+        frame_idx: int,
+    ) -> np.ndarray:
+
         # Three side-by-side views: ArUco | SLEAP | Tracks
         h, w = base.shape[:2]
         a = base.copy()
         s = base.copy()
         t = base.copy()
 
+        if debug_show_aruco_raw:
+            _draw_aruco_debug(a, raw_aruco_arr, stage="raw")
         if debug_show_aruco:
-            _draw_aruco_debug(a, aruco_arr)
+            _draw_aruco_debug(a, aruco_arr, stage="post-filter")
+
         if debug_show_sleap:
             _draw_sleap_debug(s, s_df, sleap_anchor)
         if debug_show_track_output:
@@ -292,9 +304,11 @@ def get_complete_tracks(
         a_df = grouped_aruco.get(frame_idx, pd.DataFrame())
         s_df = grouped_sleap.get(frame_idx, pd.DataFrame())
 
-        aruco_arr = (
+        raw_aruco_arr = (
             a_df[["Instance", "X", "Y"]].to_numpy(float) if not a_df.empty else np.empty((0, 3))
         )
+        aruco_arr = raw_aruco_arr.copy()
+
 
         if s_df.empty:
             sleap_anchor = np.empty((0, 3))
@@ -307,8 +321,7 @@ def get_complete_tracks(
             diff = sleap_anchor[:, 1:3][None, :, :] - aruco_arr[:, 1:3][:, None, :]
             keep = np.linalg.norm(diff, axis=-1).min(axis=1) <= aruco_sleap_max_distance
             aruco_arr = aruco_arr[keep]
-        elif len(sleap_anchor) == 0:
-            aruco_arr = np.empty((0, 3))
+
 
         used_tag: set[int] = set()
         used_inst: set[int] = set()
@@ -329,7 +342,7 @@ def get_complete_tracks(
                         if int(sleap_anchor[i, 0]) not in used_inst
                     ]
                     if len(cands) == 1:
-                        i = cands[0]
+                        i = cands[int(np.argmin(dists[cands]))]
                         assigned_inst = int(sleap_anchor[i, 0])
                         used_inst.add(assigned_inst)
 
@@ -419,13 +432,17 @@ def get_complete_tracks(
                     raise ValueError("debug_layout must be 'stack' or 'tiles'")
 
                 if debug_layout == "tiles":
-                    disp = _compose_debug_tiles(base, aruco_arr, s_df, sleap_anchor, frame_idx)
+                    disp = _compose_debug_tiles(base, raw_aruco_arr, aruco_arr, s_df, sleap_anchor, frame_idx)
+
                 else:
                     # stack: single frame with multiple overlays
                     disp = base.copy()
 
+                    if debug_show_aruco_raw:
+                        _draw_aruco_debug(disp, raw_aruco_arr, stage="raw")
                     if debug_show_aruco:
-                        _draw_aruco_debug(disp, aruco_arr)
+                        _draw_aruco_debug(disp, aruco_arr, stage="post-filter")
+
                     if debug_show_sleap:
                         _draw_sleap_debug(disp, s_df, sleap_anchor)
                     if debug_show_track_output:

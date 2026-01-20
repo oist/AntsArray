@@ -1,13 +1,14 @@
 #!/bin/bash
 
-DATA_FOLDER="/bucket/ReiterU/Ants/basler/20251008_1_30min_vibration/data"
-OUTPUT_FOLDER="/flash/ReiterU/ant_tmp/20251008_1_30min_vibration/aruco"
-SCRIPT_PATH="$HOME/AntsArray/aruco_detection/opencv_aruco.py"
+DATA_FOLDER="/bucket/ReiterU/Ants/basler/20251118-121513/data/"
+OUTPUT_FOLDER="/flash/ReiterU/ant_tmp/20251118-121513/aruco/"
+SCRIPT_PATH="$HOME/AntsArray/run_aruco.py"
 
 mkdir -p "$OUTPUT_FOLDER"
 
 shopt -s nullglob  # prevents literal patterns when no matches
 for video_file in "$DATA_FOLDER"/*.{mp4,avi,mov}; do
+    echo "Processing $video_file"
     filename=$(basename -- "$video_file")
     base_name="${filename%.*}"
  
@@ -31,14 +32,12 @@ for video_file in "$DATA_FOLDER"/*.{mp4,avi,mov}; do
 #SBATCH -e $OUTPUT_FOLDER/%x_%j.err
 
 source ~/.bashrc
-conda activate torch
+conda activate aruco_env
 
 python3 "$SCRIPT_PATH" \
   --video-file "$video_file" \
   --output-path "$OUTPUT_FOLDER" \
-  --dictionary-size 1000 \
-  --max-gap 100 \
-  --min-fraction 0.125
+  --dictionary-size 1000 
 EOF
 
     sbatch "$sbatch_script"
