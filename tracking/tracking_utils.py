@@ -41,6 +41,9 @@ def get_complete_tracks(
     debug_layout: str = "stack",  # "stack" (single annotated view) or "tiles" (3-panel)
     debug_window_prefix: str = "Tracking",
     debug_resize: Tuple[int, int] = (1080, 720),
+    # ---------------- temporal ID propagation (optional, default off)
+    temporal_propagation: bool = False,
+    propagation_min_consensus: float = 0.5,
 ) -> List[Dict[int, Dict[int, Tuple[float, float]]]]:
     """
     Combine ArUco + SLEAP detections into tracks and optionally write a parquet output.
@@ -82,6 +85,17 @@ def get_complete_tracks(
         raise ValueError("aruco_detection is missing required column 'Frame'")
     if (not sleap_detection.empty) and ("Frame" not in sleap_detection.columns):
         raise ValueError("sleap_detection is missing required column 'Frame'")
+
+    # ---- optional temporal ID propagation (majority-vote along SLEAP tracklets)
+    if temporal_propagation and not aruco_detection.empty and not sleap_detection.empty:
+        from tracking.temporal_id import propagate_ids_majority
+        aruco_detection = propagate_ids_majority(
+            aruco_detection,
+            sleap_detection,
+            max_distance=max_distance,
+            anchor_bodypoint=anchor_bodypoint,
+            min_consensus=propagation_min_consensus,
+        )
 
     grouped_aruco = {f: g for f, g in aruco_detection.groupby("Frame")} if not aruco_detection.empty else {}
     grouped_sleap = {f: g for f, g in sleap_detection.groupby("Frame")} if not sleap_detection.empty else {}

@@ -3,3 +3,19 @@
 *.asv
 .venv/
 __pycache__/
+nn-aruco-detection-test/training_data*/
+nn-aruco-detection-test/models/
+nn-aruco-detection-test/results/
+nn-aruco-detection-test/corner_gt_review/
+nn-aruco-detection-test/disagreement_set
+runs/
+*.pt
+benchmark/sample_frames/
+benchmark/results_oat_*/
+benchmark/nn-aruco-detection-test/audit
+
+# AI-assistant tool state (per-machine, not shareable)
+.claude/
+.omc/
+.omx/
+feature-nn-aruco-detection-handoff.md

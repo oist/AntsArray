@@ -1,0 +1,83 @@
+# NN ArUco Detection Test Configuration
+# All outputs go to nn-aruco-detection-test/ — no files created in data dirs.
+
+# --------------------------------------------------------------------------
+# Benchmark video sets
+# --------------------------------------------------------------------------
+benchmarks:
+  single_ant:
+    description: "Single ant per camera — known ground truth ID, good for precision testing"
+    video_dir: "Z:/ReiterU/Ants/basler/QRcodes_test/ARUCO_size_comparison_15_20_25/20260331_01"
+    # Use all 19 cam videos (exclude global_cam8)
+    video_pattern: "cam*_cam*_*.avi"
+    resolution: [4024, 3036]
+    fps: 24
+    setup: "single_ant"
+
+  nest_dense:
+    description: "Dense nest area — 4 cameras from 5x5 grid, highest ant density"
+    video_dir: "Z:/ReiterU/Ants/basler/20251020_1_30min_vibration"
+    # 4 root-level videos capturing the dense nest region
+    video_pattern: "cam*_cam*_*.avi"
+    resolution: [4024, 3036]
+    fps: 24
+    setup: "multi_ant"
+    # Pre-existing OpenCV detections (silver-standard ground truth)
+    existing_detections_dir: "Z:/ReiterU/Ants/basler/20251020_1_30min_vibration/data"
+    existing_detection_pattern: "*_aruco_detections.csv"
+
+# --------------------------------------------------------------------------
+# Frame sampling for benchmarks (full videos are too long for POC)
+# --------------------------------------------------------------------------
+sampling:
+  # Number of frames to sample per video
+  n_frames: 200
+  # Strategy: "uniform" (evenly spaced) or "random"
+  strategy: "uniform"
+  # For dense nest: also sample from chunk000 (has existing detections for validation)
+  chunk_dir: "Z:/ReiterU/Ants/basler/20251020_1_30min_vibration/data"
+
+# --------------------------------------------------------------------------
+# Detectors to benchmark
+# --------------------------------------------------------------------------
+detectors:
+  opencv:
+    enabled: true
+
+  yolo:
+    enabled: false   # enable after training
+    weights: null    # set to path after training
+    classifier_weights: null
+
+  rtdetr:
+    enabled: false
+    weights: null
+    classifier_weights: null
+
+  deeparuco:
+    enabled: false
+    repo_path: null
+    detection_model: null
+    refinement_model: null
+    decoding_model: null
+
+# --------------------------------------------------------------------------
+# Hybrid online training
+# --------------------------------------------------------------------------
+hybrid:
+  # Accumulate training data across experiment sets
+  # One broad model per experiment batch (not per-video)
+  training_data_dir: "nn-aruco-detection-test/training_data"
+  model_output_dir: "nn-aruco-detection-test/models"
+
+  # Crop settings for training data harvesting
+  crop_size: 128
+  # Minimum OpenCV confidence to use as training label
+  min_confidence: 1.0
+  # Also harvest "hard negatives" — regions where SLEAP found an ant but OpenCV missed the tag
+  harvest_negatives: true
+
+# --------------------------------------------------------------------------
+# Output
+# --------------------------------------------------------------------------
+output_dir: "nn-aruco-detection-test/results"

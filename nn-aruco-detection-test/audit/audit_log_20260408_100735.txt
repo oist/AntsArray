@@ -1,0 +1,277 @@
+=== Bit-Level Audit ===
+Time: 20260408_100735
+Args: {'video': ['Z:\\ReiterU\\Ants\\basler\\QRcodes_test\\ARUCO_size_comparison_15_20_25\\20260331_01\\cam02*.avi', 'Z:\\ReiterU\\Ants\\basler\\QRcodes_test\\ARUCO_size_comparison_15_20_25\\20260331_01\\cam06*.avi', 'Z:\\ReiterU\\Ants\\basler\\QRcodes_test\\ARUCO_size_comparison_15_20_25\\20260331_01\\cam07*.avi', 'Z:\\ReiterU\\Ants\\basler\\QRcodes_test\\ARUCO_size_comparison_15_20_25\\20260331_01\\cam14*.avi', 'Z:\\ReiterU\\Ants\\basler\\QRcodes_test\\ARUCO_size_comparison_15_20_25\\20260331_01\\cam15*.avi', 'Z:\\ReiterU\\Ants\\basler\\QRcodes_test\\ARUCO_size_comparison_15_20_25\\20260331_01\\cam16*.avi', 'Z:\\ReiterU\\Ants\\basler\\QRcodes_test\\ARUCO_size_comparison_15_20_25\\20260331_01\\cam18*.avi', 'Z:\\ReiterU\\Ants\\basler\\QRcodes_test\\ARUCO_size_comparison_15_20_25\\20260331_01\\cam19*.avi', 'Z:\\ReiterU\\Ants\\basler\\QRcodes_test\\ARUCO_size_comparison_15_20_25\\20260331_01\\cam01*.avi', 'Z:\\ReiterU\\Ants\\basler\\QRcodes_test\\ARUCO_size_comparison_15_20_25\\20260331_01\\cam08*.avi'], 'n_frames': 30, 'output_dir': 'nn-aruco-detection-test/audit'}
+
+Found 10 videos
+Loading DICT_4X4_1000 canonical patterns...
+
+Session IDs: [3, 17, 25]
+
+  ID 3 canonical pattern:
+    [0, 1, 1, 0]
+    [0, 1, 1, 0]
+    [1, 0, 1, 1]
+    [1, 0, 0, 1]
+
+  ID 17 canonical pattern:
+    [1, 0, 0, 1]
+    [1, 0, 0, 1]
+    [1, 1, 1, 1]
+    [1, 1, 1, 1]
+
+  ID 25 canonical pattern:
+    [0, 1, 1, 0]
+    [1, 0, 1, 1]
+    [1, 0, 0, 0]
+    [1, 1, 1, 0]
+
+Pairwise Hamming distances (min over 4 rotations):
+  3 <-> 17: [11, 7, 5, 9] (min=5)
+  3 <-> 25: [8, 8, 10, 8] (min=8)
+  17 <-> 25: [9, 7, 7, 7] (min=7)
+
+================================================================================
+Camera: cam02  True ID: 25  Video: cam02_cam1_2026-03-31-14-32-13.avi
+================================================================================
+
+  Detections: 29
+  Correct ID (25): 0 (0.0%)
+  ID distribution:
+    ID   17:   29 (100.0%) (Hamming to true=7)
+
+  Most common wrong ID: 17 (29 times)
+  Bit analysis (wrong-ID detections):
+    Bits closer to detected ID: 29
+    Bits closer to true ID:     0
+    Equidistant:                0
+  Mirror/transpose match to true ID (Hamming <= 2):
+    flip_h: 0/29
+    flip_v: 0/29
+    transpose: 0/29
+  Global best-match (brute-force all 1000 IDs × 4 rot):
+    Best = true ID (25):     0
+    Best = detected ID:       29
+    Best = other ID:          0
+
+================================================================================
+Camera: cam06  True ID: 3  Video: cam06_cam5_2026-03-31-14-32-13.avi
+================================================================================
+
+  Detections: 23
+  Correct ID (3): 0 (0.0%)
+  ID distribution:
+    ID   25:   23 (100.0%) (Hamming to true=8)
+
+  Most common wrong ID: 25 (23 times)
+  Bit analysis (wrong-ID detections):
+    Bits closer to detected ID: 23
+    Bits closer to true ID:     0
+    Equidistant:                0
+  Mirror/transpose match to true ID (Hamming <= 2):
+    flip_h: 0/23
+    flip_v: 0/23
+    transpose: 0/23
+  Global best-match (brute-force all 1000 IDs × 4 rot):
+    Best = true ID (3):     0
+    Best = detected ID:       23
+    Best = other ID:          0
+
+================================================================================
+Camera: cam07  True ID: 17  Video: cam07_cam6_2026-03-31-14-32-13.avi
+================================================================================
+
+  Detections: 28
+  Correct ID (17): 0 (0.0%)
+  ID distribution:
+    ID   25:   27 ( 96.4%) (Hamming to true=7)
+    ID  121:    1 (  3.6%) (Hamming to true=4)
+
+  Most common wrong ID: 25 (27 times)
+  Bit analysis (wrong-ID detections):
+    Bits closer to detected ID: 28
+    Bits closer to true ID:     0
+    Equidistant:                0
+  Mirror/transpose match to true ID (Hamming <= 2):
+    flip_h: 0/28
+    flip_v: 0/28
+    transpose: 0/28
+  Global best-match (brute-force all 1000 IDs × 4 rot):
+    Best = true ID (17):     0
+    Best = detected ID:       27
+    Best = other ID:          1
+
+================================================================================
+Camera: cam14  True ID: 17  Video: cam14_cam5_2026-03-31-14-32-15.avi
+================================================================================
+
+  Detections: 31
+  Correct ID (17): 0 (0.0%)
+  ID distribution:
+    ID    3:   29 ( 93.5%) (Hamming to true=5)
+    ID  462:    1 (  3.2%) (Hamming to true=5)
+    ID  190:    1 (  3.2%) (Hamming to true=10)
+
+  Most common wrong ID: 3 (29 times)
+  Bit analysis (wrong-ID detections):
+    Bits closer to detected ID: 29
+    Bits closer to true ID:     2
+    Equidistant:                0
+  Mirror/transpose match to true ID (Hamming <= 2):
+    flip_h: 0/31
+    flip_v: 0/31
+    transpose: 0/31
+  Global best-match (brute-force all 1000 IDs × 4 rot):
+    Best = true ID (17):     0
+    Best = detected ID:       29
+    Best = other ID:          2
+
+================================================================================
+Camera: cam15  True ID: 17  Video: cam15_cam6_2026-03-31-14-32-14.avi
+================================================================================
+
+  Detections: 30
+  Correct ID (17): 0 (0.0%)
+  ID distribution:
+    ID    3:   28 ( 93.3%) (Hamming to true=5)
+    ID  973:    1 (  3.3%) (Hamming to true=5)
+    ID  396:    1 (  3.3%) (Hamming to true=2)
+
+  Most common wrong ID: 3 (28 times)
+  Bit analysis (wrong-ID detections):
+    Bits closer to detected ID: 29
+    Bits closer to true ID:     0
+    Equidistant:                1
+  Mirror/transpose match to true ID (Hamming <= 2):
+    flip_h: 0/30
+    flip_v: 0/30
+    transpose: 0/30
+  Global best-match (brute-force all 1000 IDs × 4 rot):
+    Best = true ID (17):     0
+    Best = detected ID:       28
+    Best = other ID:          2
+
+================================================================================
+Camera: cam16  True ID: 17  Video: cam16_cam7_2026-03-31-14-32-14.avi
+================================================================================
+
+  Detections: 30
+  Correct ID (17): 0 (0.0%)
+  ID distribution:
+    ID   25:   29 ( 96.7%) (Hamming to true=7)
+    ID  130:    1 (  3.3%) (Hamming to true=4)
+
+  Most common wrong ID: 25 (29 times)
+  Bit analysis (wrong-ID detections):
+    Bits closer to detected ID: 29
+    Bits closer to true ID:     0
+    Equidistant:                1
+  Mirror/transpose match to true ID (Hamming <= 2):
+    flip_h: 0/30
+    flip_v: 0/30
+    transpose: 0/30
+  Global best-match (brute-force all 1000 IDs × 4 rot):
+    Best = true ID (17):     0
+    Best = detected ID:       29
+    Best = other ID:          1
+
+================================================================================
+Camera: cam18  True ID: 25  Video: cam18_cam0_2026-03-31-14-32-14.avi
+================================================================================
+
+  Detections: 29
+  Correct ID (25): 0 (0.0%)
+  ID distribution:
+    ID   17:   29 (100.0%) (Hamming to true=7)
+
+  Most common wrong ID: 17 (29 times)
+  Bit analysis (wrong-ID detections):
+    Bits closer to detected ID: 29
+    Bits closer to true ID:     0
+    Equidistant:                0
+  Mirror/transpose match to true ID (Hamming <= 2):
+    flip_h: 0/29
+    flip_v: 0/29
+    transpose: 0/29
+  Global best-match (brute-force all 1000 IDs × 4 rot):
+    Best = true ID (25):     0
+    Best = detected ID:       29
+    Best = other ID:          0
+
+================================================================================
+Camera: cam19  True ID: 25  Video: cam19_cam1_2026-03-31-14-32-14.avi
+================================================================================
+
+  Detections: 28
+  Correct ID (25): 0 (0.0%)
+  ID distribution:
+    ID   17:   28 (100.0%) (Hamming to true=7)
+
+  Most common wrong ID: 17 (28 times)
+  Bit analysis (wrong-ID detections):
+    Bits closer to detected ID: 28
+    Bits closer to true ID:     0
+    Equidistant:                0
+  Mirror/transpose match to true ID (Hamming <= 2):
+    flip_h: 0/28
+    flip_v: 0/28
+    transpose: 0/28
+  Global best-match (brute-force all 1000 IDs × 4 rot):
+    Best = true ID (25):     0
+    Best = detected ID:       28
+    Best = other ID:          0
+
+================================================================================
+Camera: cam01  True ID: 25  Video: cam01_cam0_2026-03-31-14-32-14.avi
+================================================================================
+
+  Detections: 31
+  Correct ID (25): 27 (87.1%)
+  ID distribution:
+    ID   25:   27 ( 87.1%) <<<
+    ID  448:    2 (  6.5%) (Hamming to true=3)
+    ID  190:    1 (  3.2%) (Hamming to true=7)
+    ID  726:    1 (  3.2%) (Hamming to true=5)
+
+  Most common wrong ID: 448 (2 times)
+  Bit analysis (wrong-ID detections):
+    Bits closer to detected ID: 2
+    Bits closer to true ID:     2
+    Equidistant:                0
+  Mirror/transpose match to true ID (Hamming <= 2):
+    flip_h: 0/4
+    flip_v: 0/4
+    transpose: 0/4
+  Global best-match (brute-force all 1000 IDs × 4 rot):
+    Best = true ID (25):     0
+    Best = detected ID:       0
+    Best = other ID:          4
+
+================================================================================
+Camera: cam08  True ID: 17  Video: cam08_cam7_2026-03-31-14-32-13.avi
+================================================================================
+
+  Detections: 32
+  Correct ID (17): 29 (90.6%)
+  ID distribution:
+    ID   17:   29 ( 90.6%) <<<
+    ID  653:    1 (  3.1%) (Hamming to true=3)
+    ID  190:    1 (  3.1%) (Hamming to true=10)
+    ID  431:    1 (  3.1%) (Hamming to true=5)
+
+  Most common wrong ID: 653 (1 times)
+  Bit analysis (wrong-ID detections):
+    Bits closer to detected ID: 1
+    Bits closer to true ID:     2
+    Equidistant:                0
+  Mirror/transpose match to true ID (Hamming <= 2):
+    flip_h: 1/3
+    flip_v: 1/3
+    transpose: 1/3
+  Global best-match (brute-force all 1000 IDs × 4 rot):
+    Best = true ID (17):     1
+    Best = detected ID:       0
+    Best = other ID:          2
+
+Summary CSV saved: nn-aruco-detection-test\audit\audit_summary_20260408_100735.csv
+
+Log saved to: nn-aruco-detection-test\audit\audit_log_20260408_100735.txt

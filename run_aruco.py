@@ -64,6 +64,16 @@ def _annotate_debug_frame(frame_bgr, corners, ids, frame_idx, scale_text=0.6):
     return vis
 
 
+def load_custom_aruco_dict(npz_path):
+    """Load custom 4x4 ArUco dictionary from NPZ. Returns (aruco.Dictionary, n_markers)."""
+    data = np.load(npz_path, allow_pickle=True)
+    d = aruco.Dictionary()
+    d.bytesList = data["bytesList"]
+    d.markerSize = 4
+    d.maxCorrectionBits = int(data["max_correction_bits"])
+    return d, int(d.bytesList.shape[0])
+
+
 def tracks_to_dataframe(tracks, confidences):
     """
     Convert tracks and confidences arrays to a DataFrame using vectorization.
@@ -88,7 +98,8 @@ def tracks_to_dataframe(tracks, confidences):
 
 def detect_aruco_in_video(
     video_file,
-    dictionary_size=300,
+    aruco_dict,
+    dictionary_size,
     debug_vis=False,
     debug_every=1,
     debug_save_path=None,
@@ -112,8 +123,6 @@ def detect_aruco_in_video(
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    # ArUco detector
-    aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_1000)
     detector_params = aruco.DetectorParameters()
     detector_params.cornerRefinementMethod = aruco.CORNER_REFINE_CONTOUR
     detector_params.adaptiveThreshConstant = 3
@@ -219,7 +228,13 @@ def main():
             "--dictionary-size",
             type=int,
             default=300,
-            help="Maximum marker ID to track (default: 300)",
+            help="Maximum marker ID to track when using DICT_4X4_1000 (default: 300). Ignored when --custom-dict is provided.",
+        )
+        p.add_argument(
+            "--custom-dict",
+            type=str,
+            default=None,
+            help="Path to custom 4x4 ArUco NPZ (bytesList + max_correction_bits). Overrides DICT_4X4_1000.",
         )
         p.add_argument(
             "--output-format",
@@ -227,6 +242,25 @@ def main():
             default="both",
             help="Output format for DataFrame: csv, h5, or both (default: both)",
         )
+
+        # Detector backend
+        p.add_argument(
+            "--detector",
+            choices=["opencv", "yolo", "yolo-hybrid", "yolo-cascade", "deeparuco-pytorch", "rtdetr", "deeparuco"],
+            default="opencv",
+            help="Detection backend (default: opencv)",
+        )
+        p.add_argument("--yolo-weights", type=str, help="YOLO model weights (for --detector yolo)")
+        p.add_argument("--rtdetr-weights", type=str, help="RT-DETR model weights (for --detector rtdetr)")
+        p.add_argument("--classifier-weights", type=str, help="ResNet50 classifier weights for NN detectors")
+        p.add_argument("--class-names", type=str, help="Class names .npy file for NN detectors")
+        p.add_argument("--corner-refiner-weights", type=str, help="Corner refiner U-Net weights (for --detector deeparuco-pytorch)")
+        p.add_argument("--decoder-weights", type=str, help="Bit decoder CNN weights (for --detector deeparuco-pytorch)")
+        p.add_argument("--deeparuco-path", type=str, help="DeepArUco repo path (for --detector deeparuco)")
+        p.add_argument("--deeparuco-detection-model", type=str, help="DeepArUco detection model")
+        p.add_argument("--deeparuco-refinement-model", type=str, help="DeepArUco refinement model")
+        p.add_argument("--deeparuco-decoding-model", type=str, help="DeepArUco decoding model")
+        p.add_argument("--device", type=str, default="cuda", help="Device for NN detectors (default: cuda)")
 
         # Debug options
         p.add_argument("--debug-vis", action="store_true", help="Show debug visualization window.")
@@ -249,18 +283,88 @@ def main():
         if args.debug_save_video:
             debug_video_path = out_dir / f"{name_no_ext}_aruco_debug.mp4"
 
-        print(f"[INFO] Processing {basename}...", flush=True)
+        if args.custom_dict:
+            if args.detector != "opencv":
+                raise SystemExit(
+                    f"[ERR] --custom-dict is only supported with --detector opencv "
+                    f"(got --detector {args.detector}). NN decoders are trained on DICT_4X4_1000."
+                )
+            if not os.path.isfile(args.custom_dict):
+                raise FileNotFoundError(f"--custom-dict file not found: {args.custom_dict}")
+            aruco_dict, n_markers = load_custom_aruco_dict(args.custom_dict)
+            dict_size = n_markers
+            print(f"[INFO] Using custom dict {args.custom_dict} ({n_markers} markers)", flush=True)
+        else:
+            aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_1000)
+            dict_size = args.dictionary_size
 
-        # Run detection (returns raw arrays)
-        tracks, confidences = detect_aruco_in_video(
-            args.video_file,
-            dictionary_size=args.dictionary_size,
-            debug_vis=args.debug_vis,
-            debug_every=args.debug_every,
-            debug_save_path=debug_video_path,
-            debug_max_frames=args.debug_max_frames,
-            debug_pause=args.debug_pause,
-        )
+        print(f"[INFO] Processing {basename} with detector={args.detector}...", flush=True)
+
+        if args.detector != "opencv":
+            # Use NN detector backend via the unified interface
+            from aruco_detection.nn_detection.base import run_detector_on_video
+
+            if args.detector == "yolo":
+                from aruco_detection.nn_detection.yolo_detector import YOLOArucoDetector
+                detector = YOLOArucoDetector(
+                    yolo_weights=args.yolo_weights,
+                    classifier_weights=args.classifier_weights,
+                    class_names_path=args.class_names,
+                    device=args.device,
+                )
+            elif args.detector == "rtdetr":
+                from aruco_detection.nn_detection.rtdetr_detector import RTDETRArucoDetector
+                detector = RTDETRArucoDetector(
+                    rtdetr_weights=args.rtdetr_weights,
+                    classifier_weights=args.classifier_weights,
+                    class_names_path=args.class_names,
+                    device=args.device,
+                )
+            elif args.detector == "yolo-hybrid":
+                from aruco_detection.nn_detection.yolo_opencv_hybrid import YOLOOpenCVHybridDetector
+                detector = YOLOOpenCVHybridDetector(
+                    yolo_weights=args.yolo_weights,
+                    device=args.device,
+                )
+            elif args.detector == "yolo-cascade":
+                from aruco_detection.nn_detection.yolo_cascade_hybrid import YOLOCascadeHybridDetector
+                detector = YOLOCascadeHybridDetector(
+                    yolo_weights=args.yolo_weights,
+                    device=args.device,
+                )
+            elif args.detector == "deeparuco-pytorch":
+                from aruco_detection.nn_detection.deeparuco_pytorch import DeepArucoPytorchDetector
+                detector = DeepArucoPytorchDetector(
+                    yolo_weights=args.yolo_weights,
+                    corner_refiner_weights=args.corner_refiner_weights,
+                    decoder_weights=args.decoder_weights,
+                    device=args.device,
+                )
+            elif args.detector == "deeparuco":
+                from aruco_detection.nn_detection.deeparuco_detector import DeepArucoDetector
+                detector = DeepArucoDetector(
+                    deeparuco_path=args.deeparuco_path,
+                    detection_model=args.deeparuco_detection_model or "",
+                    refinement_model=args.deeparuco_refinement_model or "",
+                    decoding_model=args.deeparuco_decoding_model or "",
+                    device=args.device,
+                )
+
+            tracks, confidences, df = run_detector_on_video(
+                detector, args.video_file, dict_size
+            )
+        else:
+            # Original OpenCV detection path
+            tracks, confidences = detect_aruco_in_video(
+                args.video_file,
+                aruco_dict=aruco_dict,
+                dictionary_size=dict_size,
+                debug_vis=args.debug_vis,
+                debug_every=args.debug_every,
+                debug_save_path=debug_video_path,
+                debug_max_frames=args.debug_max_frames,
+                debug_pause=args.debug_pause,
+            )
 
         # Save raw arrays (HDF5)
         raw_h5_path = out_dir / f"{name_no_ext}_aruco_tracks.h5"
@@ -269,9 +373,10 @@ def main():
             hdf.create_dataset("aruco_confidences", data=confidences)
         print(f"[INFO] Saved raw arrays to: {raw_h5_path}", flush=True)
 
-        # Convert to DataFrame
-        print("[INFO] Converting to DataFrame...", flush=True)
-        df = tracks_to_dataframe(tracks, confidences)
+        # Convert to DataFrame (NN detectors already return df)
+        if args.detector == "opencv":
+            print("[INFO] Converting to DataFrame...", flush=True)
+            df = tracks_to_dataframe(tracks, confidences)
         print(f"[INFO] Created DataFrame with {len(df)} detections", flush=True)
 
         # Save DataFrame

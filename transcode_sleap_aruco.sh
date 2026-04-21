@@ -40,6 +40,7 @@ Options:
 	--sleap-version VERSION      SLEAP version: 1.4.1 or 1.5.2 (default: 1.4.1)
 	--sleap-model-centroid PATH  Path to SLEAP centroid model training_config.json
 	--sleap-model-instance PATH  Path to SLEAP instance model training_config.json
+	--custom-dict PATH           Custom 4x4 ArUco dictionary NPZ (e.g. /bucket/ReiterU/Ants/aruco_dicts/custom_4x4_A100_d4_*.npz). Falls back to DICT_4X4_1000 when omitted.
 Environment:
 	ENC_CONCURRENCY    Max concurrent encoder tasks (default 8)
 	ARUCO_CONCURRENCY  Max concurrent ArUco tasks (default 12)
@@ -172,6 +173,7 @@ SEG_SEC="${SEG_SEC:-3600}"
 CLI_SLEAP_VERSION=""
 CLI_SLEAP_MODEL_CENTROID=""
 CLI_SLEAP_MODEL_INSTANCE=""
+CLI_ARUCO_CUSTOM_DICT=""
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
@@ -181,9 +183,19 @@ while [[ $# -gt 0 ]]; do
 		--sleap-version) CLI_SLEAP_VERSION="$2"; shift 2 ;;
 		--sleap-model-centroid) CLI_SLEAP_MODEL_CENTROID="$2"; shift 2 ;;
 		--sleap-model-instance) CLI_SLEAP_MODEL_INSTANCE="$2"; shift 2 ;;
+		--custom-dict) CLI_ARUCO_CUSTOM_DICT="$2"; shift 2 ;;
 		*) usage ;;
 	esac
 done
+
+ARUCO_CUSTOM_DICT="${CLI_ARUCO_CUSTOM_DICT:-${ARUCO_CUSTOM_DICT:-}}"
+if [[ -n "$ARUCO_CUSTOM_DICT" ]]; then
+	[[ -f "$ARUCO_CUSTOM_DICT" ]] || { echo "[ERR] --custom-dict not found: $ARUCO_CUSTOM_DICT" >&2; exit 2; }
+	ARUCO_CUSTOM_DICT_ARG="--custom-dict '$ARUCO_CUSTOM_DICT'"
+	echo "[INFO] ArUco custom dict: $ARUCO_CUSTOM_DICT" >&2
+else
+	ARUCO_CUSTOM_DICT_ARG=""
+fi
 
 DIR=${DIR%/}
 [[ -n "$DIR" && -d "$DIR" ]] || usage
@@ -644,7 +656,8 @@ for (( i=start_idx; i<end_idx; i++ )); do
 
 	python3 "__ARUCO_SCRIPT__" \
 		--video-file "$video_path" \
-		--output-path "$output_dir/"
+		--output-path "$output_dir/" \
+		__ARUCO_CUSTOM_DICT_ARG__
 
 	touch "$output_dir/__BASE___${idx}.aruco.ok"
 done
@@ -1004,6 +1017,7 @@ EOS
 		ARUCO_CONCURRENCY "$ARUCO_CONCURRENCY" FLASH_DIR "$video_flash_dir" \
 		ARUCO_FLASH_DIR "$aruco_flash_dir" ARUCO_SCRIPT "$ARUCO_SCRIPT" \
 		ARUCO_ENV_ACTIVATE "$ARUCO_ENV_ACTIVATE" \
+		ARUCO_CUSTOM_DICT_ARG "$ARUCO_CUSTOM_DICT_ARG" \
 		BATCH_SIZE "$b_size" RSYNC_FLAGS "$RSYNC_FLAGS" \
 		ARUCO_BUCKET_DIR "$aruco_bucket_root"
 
