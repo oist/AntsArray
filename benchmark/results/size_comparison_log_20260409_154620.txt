@@ -1,0 +1,182 @@
+=== Tag Size Comparison ===
+Time: 20260409_154620
+Found 19 videos in Z:\ReiterU\Ants\basler\QRcodes_test\ARUCO_size_comparison_15_20_25\20260331_01
+Target IDs: {17, 3, 25}
+Dictionaries: ['4x4_1000', '4x4_250', '4x4_50']
+Processing every 24th frame
+
+
+======================================================================
+Dictionary: 4x4_1000
+======================================================================
+  cam01: ID=25, rate=90.3%, perim=275+/-28px, processed=300/148145 frames
+  cam02: ID=17, rate=97.0%, perim=325+/-42px, processed=300/148145 frames
+  cam03: ID=3, rate=99.0%, perim=355+/-23px, processed=300/148145 frames
+  cam04: ID=3, rate=95.7%, perim=214+/-12px, processed=300/148145 frames
+  cam05: ID=3, rate=99.7%, perim=362+/-21px, processed=300/148145 frames
+  cam06: ID=25, rate=94.0%, perim=216+/-11px, processed=300/148145 frames
+  cam07: ID=25, rate=96.0%, perim=359+/-23px, processed=300/148145 frames
+  cam08: ID=17, rate=95.7%, perim=218+/-17px, processed=300/148145 frames
+  cam09: ID=3, rate=98.3%, perim=288+/-9px, processed=300/148145 frames
+  cam10: ID=3, rate=88.3%, perim=217+/-9px, processed=300/148145 frames
+  cam11: ID=25, rate=93.0%, perim=349+/-36px, processed=300/148145 frames
+  cam12: ID=25, rate=87.3%, perim=219+/-9px, processed=300/148145 frames
+  cam13: ID=17, rate=100.0%, perim=222+/-0px, processed=300/148145 frames
+  cam14: ID=3, rate=99.3%, perim=216+/-13px, processed=300/148145 frames
+  cam15: ID=3, rate=91.7%, perim=279+/-25px, processed=300/148145 frames
+  cam16: ID=25, rate=98.3%, perim=281+/-26px, processed=300/148145 frames
+  cam17: ID=17, rate=101.0%, perim=287+/-16px, processed=300/148145 frames
+  cam18: ID=17, rate=99.3%, perim=355+/-20px, processed=300/148145 frames
+  cam19: ID=17, rate=91.7%, perim=274+/-23px, processed=300/148145 frames
+
+  Perimeter centroids: ['217', '281', '351']
+  Boundaries: <249 = 1.5mm, 249-316 = 2.0mm, >316 = 2.5mm
+
+  Cam      ID   Size  Det Rate     Perim (px)     Frames
+  ----------------------------------------------------------
+  cam01    25  2.0mm     90.3%     275+/- 28         300
+  cam02    17  2.5mm     97.0%     325+/- 42         300
+  cam03     3  2.5mm     99.0%     355+/- 23         300
+  cam04     3  1.5mm     95.7%     214+/- 12         300
+  cam05     3  2.5mm     99.7%     362+/- 21         300
+  cam06    25  1.5mm     94.0%     216+/- 11         300
+  cam07    25  2.5mm     96.0%     359+/- 23         300
+  cam08    17  1.5mm     95.7%     218+/- 17         300
+  cam09     3  2.0mm     98.3%     288+/-  9         300
+  cam10     3  1.5mm     88.3%     217+/-  9         300
+  cam11    25  2.5mm     93.0%     349+/- 36         300
+  cam12    25  1.5mm     87.3%     219+/-  9         300
+  cam13    17  1.5mm    100.0%     222+/-  0         300
+  cam14     3  1.5mm     99.3%     216+/- 13         300
+  cam15     3  2.0mm     91.7%     279+/- 25         300
+  cam16    25  2.0mm     98.3%     281+/- 26         300
+  cam17    17  2.0mm    101.0%     287+/- 16         300
+  cam18    17  2.5mm     99.3%     355+/- 20         300
+  cam19    17  2.0mm     91.7%     274+/- 23         300
+
+  Summary by Tag Size (4x4_1000)
+  ==================================================
+    1.5mm: n= 7, mean= 94.3%, std=  4.6%, min= 87.3%, max=100.0%
+    2.0mm: n= 6, mean= 95.2%, std=  4.1%, min= 90.3%, max=101.0%
+    2.5mm: n= 6, mean= 97.3%, std=  2.3%, min= 93.0%, max= 99.7%
+
+======================================================================
+Dictionary: 4x4_250
+======================================================================
+  cam01: ID=25, rate=94.7%, perim=273+/-28px, processed=300/148145 frames
+  cam02: ID=17, rate=99.3%, perim=323+/-47px, processed=300/148145 frames
+  cam03: ID=3, rate=99.3%, perim=354+/-24px, processed=300/148145 frames
+  cam04: ID=3, rate=96.3%, perim=213+/-12px, processed=300/148145 frames
+  cam05: ID=3, rate=99.7%, perim=362+/-21px, processed=300/148145 frames
+  cam06: ID=25, rate=95.7%, perim=216+/-12px, processed=300/148145 frames
+  cam07: ID=25, rate=97.0%, perim=358+/-24px, processed=300/148145 frames
+  cam08: ID=17, rate=108.0%, perim=215+/-22px, processed=300/148145 frames
+  cam09: ID=3, rate=98.7%, perim=288+/-11px, processed=300/148145 frames
+  cam10: ID=3, rate=88.7%, perim=216+/-9px, processed=300/148145 frames
+  cam11: ID=25, rate=94.7%, perim=348+/-37px, processed=300/148145 frames
+  cam12: ID=25, rate=88.7%, perim=219+/-11px, processed=300/148145 frames
+  cam13: ID=17, rate=102.0%, perim=222+/-10px, processed=300/148145 frames
+  cam14: ID=3, rate=99.7%, perim=216+/-13px, processed=300/148145 frames
+  cam15: ID=3, rate=91.7%, perim=279+/-25px, processed=300/148145 frames
+  cam16: ID=25, rate=99.3%, perim=281+/-26px, processed=300/148145 frames
+  cam17: ID=17, rate=112.0%, perim=281+/-48px, processed=300/148145 frames
+  cam18: ID=17, rate=100.0%, perim=354+/-26px, processed=300/148145 frames
+  cam19: ID=17, rate=93.3%, perim=273+/-32px, processed=300/148145 frames
+
+  Perimeter centroids: ['217', '279', '350']
+  Boundaries: <248 = 1.5mm, 248-315 = 2.0mm, >315 = 2.5mm
+
+  Cam      ID   Size  Det Rate     Perim (px)     Frames
+  ----------------------------------------------------------
+  cam01    25  2.0mm     94.7%     273+/- 28         300
+  cam02    17  2.5mm     99.3%     323+/- 47         300
+  cam03     3  2.5mm     99.3%     354+/- 24         300
+  cam04     3  1.5mm     96.3%     213+/- 12         300
+  cam05     3  2.5mm     99.7%     362+/- 21         300
+  cam06    25  1.5mm     95.7%     216+/- 12         300
+  cam07    25  2.5mm     97.0%     358+/- 24         300
+  cam08    17  1.5mm    108.0%     215+/- 22         300
+  cam09     3  2.0mm     98.7%     288+/- 11         300
+  cam10     3  1.5mm     88.7%     216+/-  9         300
+  cam11    25  2.5mm     94.7%     348+/- 37         300
+  cam12    25  1.5mm     88.7%     219+/- 11         300
+  cam13    17  1.5mm    102.0%     222+/- 10         300
+  cam14     3  1.5mm     99.7%     216+/- 13         300
+  cam15     3  2.0mm     91.7%     279+/- 25         300
+  cam16    25  2.0mm     99.3%     281+/- 26         300
+  cam17    17  2.0mm    112.0%     281+/- 48         300
+  cam18    17  2.5mm    100.0%     354+/- 26         300
+  cam19    17  2.0mm     93.3%     273+/- 32         300
+
+  Summary by Tag Size (4x4_250)
+  ==================================================
+    1.5mm: n= 7, mean= 97.0%, std=  6.5%, min= 88.7%, max=108.0%
+    2.0mm: n= 6, mean= 98.3%, std=  6.7%, min= 91.7%, max=112.0%
+    2.5mm: n= 6, mean= 98.3%, std=  1.9%, min= 94.7%, max=100.0%
+
+======================================================================
+Dictionary: 4x4_50
+======================================================================
+  cam01: ID=25, rate=95.3%, perim=273+/-29px, processed=300/148145 frames
+  cam02: ID=17, rate=99.7%, perim=322+/-48px, processed=300/148145 frames
+  cam03: ID=3, rate=99.3%, perim=354+/-24px, processed=300/148145 frames
+  cam04: ID=3, rate=96.7%, perim=213+/-12px, processed=300/148145 frames
+  cam05: ID=3, rate=99.7%, perim=362+/-21px, processed=300/148145 frames
+  cam06: ID=25, rate=95.7%, perim=216+/-12px, processed=300/148145 frames
+  cam07: ID=25, rate=97.0%, perim=358+/-24px, processed=300/148145 frames
+  cam08: ID=17, rate=108.7%, perim=215+/-22px, processed=300/148145 frames
+  cam09: ID=3, rate=98.7%, perim=288+/-11px, processed=300/148145 frames
+  cam10: ID=3, rate=88.7%, perim=216+/-9px, processed=300/148145 frames
+  cam11: ID=25, rate=94.7%, perim=348+/-37px, processed=300/148145 frames
+  cam12: ID=25, rate=90.3%, perim=218+/-12px, processed=300/148145 frames
+  cam13: ID=17, rate=102.0%, perim=222+/-10px, processed=300/148145 frames
+  cam14: ID=3, rate=99.7%, perim=216+/-13px, processed=300/148145 frames
+  cam15: ID=3, rate=91.7%, perim=279+/-25px, processed=300/148145 frames
+  cam16: ID=25, rate=99.3%, perim=281+/-26px, processed=300/148145 frames
+  cam17: ID=17, rate=112.0%, perim=281+/-48px, processed=300/148145 frames
+  cam18: ID=17, rate=100.3%, perim=354+/-26px, processed=300/148145 frames
+  cam19: ID=17, rate=93.7%, perim=274+/-32px, processed=300/148145 frames
+
+  Perimeter centroids: ['217', '279', '350']
+  Boundaries: <248 = 1.5mm, 248-314 = 2.0mm, >314 = 2.5mm
+
+  Cam      ID   Size  Det Rate     Perim (px)     Frames
+  ----------------------------------------------------------
+  cam01    25  2.0mm     95.3%     273+/- 29         300
+  cam02    17  2.5mm     99.7%     322+/- 48         300
+  cam03     3  2.5mm     99.3%     354+/- 24         300
+  cam04     3  1.5mm     96.7%     213+/- 12         300
+  cam05     3  2.5mm     99.7%     362+/- 21         300
+  cam06    25  1.5mm     95.7%     216+/- 12         300
+  cam07    25  2.5mm     97.0%     358+/- 24         300
+  cam08    17  1.5mm    108.7%     215+/- 22         300
+  cam09     3  2.0mm     98.7%     288+/- 11         300
+  cam10     3  1.5mm     88.7%     216+/-  9         300
+  cam11    25  2.5mm     94.7%     348+/- 37         300
+  cam12    25  1.5mm     90.3%     218+/- 12         300
+  cam13    17  1.5mm    102.0%     222+/- 10         300
+  cam14     3  1.5mm     99.7%     216+/- 13         300
+  cam15     3  2.0mm     91.7%     279+/- 25         300
+  cam16    25  2.0mm     99.3%     281+/- 26         300
+  cam17    17  2.0mm    112.0%     281+/- 48         300
+  cam18    17  2.5mm    100.3%     354+/- 26         300
+  cam19    17  2.0mm     93.7%     274+/- 32         300
+
+  Summary by Tag Size (4x4_50)
+  ==================================================
+    1.5mm: n= 7, mean= 97.4%, std=  6.4%, min= 88.7%, max=108.7%
+    2.0mm: n= 6, mean= 98.4%, std=  6.6%, min= 91.7%, max=112.0%
+    2.5mm: n= 6, mean= 98.4%, std=  2.0%, min= 94.7%, max=100.3%
+
+======================================================================
+CROSS-DICTIONARY COMPARISON
+======================================================================
+
+  Size          4x4_1000       4x4_250        4x4_50
+  --------  ------------  ------------  ------------
+  1.5mm            94.3%         97.0%         97.4%
+  2.0mm            95.2%         98.3%         98.4%
+  2.5mm            97.3%         98.3%         98.4%
+
+Results saved to: benchmark\results\size_comparison_20260409_154620.csv
+Log saved to: benchmark\results\size_comparison_log_20260409_154620.txt
