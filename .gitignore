@@ -18,4 +18,5 @@ benchmark/nn-aruco-detection-test/audit
 .claude/
 .omc/
 .omx/
+.vscode/
 feature-nn-aruco-detection-handoff.md
