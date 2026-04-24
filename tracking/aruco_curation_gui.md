@@ -24,6 +24,7 @@ Default playback is 20 FPS. Override it with `--fps` if you want a slower or fas
 - Use `Delete Selected` to remove the selected detection.
 - Use the tag navigation buttons to jump to the next or previous frame where a tag is present or missing.
 - The GUI auto-loads the corresponding `*_sleap_data.csv` sidecar in the background when it exists.
+- Turn on `Show SLEAP Skeletons` to load and overlay the full current-frame SLEAP skeleton output. This is loaded on demand, not at startup, so the first enable can take a while on large chunks.
 - Use `Bridge Tag (SLEAP NN)` to bridge the current frame for the tag in the tag box, show that filled result immediately, then keep bridging that tag during playback until `Play/Pause` is pressed again.
 - Use `Bridge All Tags (SLEAP NN)` to do the same thing for every bridgeable missing tag on the current frame and on subsequent playback frames.
 - Use `Preview All Frames` to bridge every bridgeable gap in the whole chunk without playing video.

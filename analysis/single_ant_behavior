@@ -40,9 +40,9 @@ WARN_ON_DUPLICATE_FRAMES = True
 #out_dir = Path("/home/sam-reiter/bucket/ReiterU/Ants/basler/single_ants/test_2/multi_cam_test")
 
 
-per_track_dir = Path("/home/sam-reiter/bucket/ReiterU/Ants/basler/20251118-121513/per_track_left/")
+per_track_dir = Path("/home/sam-reiter/bucket/ReiterU/Ants/basler/single_ants/test_12h_vib/per_track/")
 pattern = "TrackID_*_all_*.parquet"
-out_dir = Path("/home/sam-reiter/bucket/ReiterU/Ants/basler/20251118-121513/per_track_left/analysis/")
+out_dir = Path("/home/sam-reiter/bucket/ReiterU/Ants/basler/single_ants/test_12h_vib/per_track/analysis/")
 
 
 #%%
@@ -109,7 +109,9 @@ for fp in tqdm(files, desc="Ants (TrackIDs)", unit="ant", dynamic_ncols=True):
     thr_outL=THR_OUTL,
     thr_outR=THR_OUTR,
     thr_speed_pix_s=THR_SPEED_PIX_S,
-    sleep_median_win_sec=20
+    sleep_median_win_sec=20,
+    output_frame_index="full"
+
 )
 
     # Keep sorted for reproducible “last frame” etc.
@@ -270,7 +272,7 @@ def nan_zscore(x, axis=None, eps=1e-12):
     return (x - mean) / (std + eps)
 
 from scipy.stats import zscore
-curr_track=13
+curr_track=5
 plt.figure(figsize=(12, 6))
 plt.plot(nan_zscore(speed_tensor[curr_track]), linewidth=1)
 plt.plot(nan_zscore(sleep_tensor[curr_track]), linewidth=1)
@@ -298,7 +300,7 @@ def frame_to_hms(x, pos):
 
 
 plt.figure(figsize=(12, 6))
-plt.plot(speed_tensor[4], linewidth=1)
+plt.plot(speed_tensor[1], linewidth=1)
 plt.xlabel("Frame (concatenated)")
 plt.ylabel("Speed (pix/s)")
 plt.title("Speed time series for first ant (TrackID_0000)")
@@ -375,4 +377,5 @@ plt.show()
 # %%
 plt.figure(figsize=(12, 6))
 plt.plot(np.nanmean(speed_tensor, axis=0), linewidth=1)
+
 # %%

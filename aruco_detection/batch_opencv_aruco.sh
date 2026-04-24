@@ -1,7 +1,7 @@
 #!/bin/bash
 
-DATA_FOLDER="/bucket/ReiterU/Ants/basler/20251118-121513/data/"
-OUTPUT_FOLDER="/flash/ReiterU/ant_tmp/20251118-121513/aruco/"
+DATA_FOLDER="/bucket/ReiterU/Ants/basler/single_ants/test_12h_vib/20260122-002925/data"
+OUTPUT_FOLDER="/flash/ReiterU/ant_tmp/20260122-002925/aruco/"
 SCRIPT_PATH="$HOME/AntsArray/run_aruco.py"
 
 mkdir -p "$OUTPUT_FOLDER"
@@ -12,11 +12,15 @@ for video_file in "$DATA_FOLDER"/*.{mp4,avi,mov}; do
     filename=$(basename -- "$video_file")
     base_name="${filename%.*}"
  
-    # define the file that signals completion
-    marker_file="$OUTPUT_FOLDER/${base_name}_aruco_detections.csv"   # <-- adjust to your script’s actual output
-    echo $marker_file
-    if [ -f "$marker_file" ]; then
-        echo "Skipping $base_name (output $marker_file exists)"
+    # completion markers (adjust suffix to match your real output name)
+    marker_in_data="$DATA_FOLDER/${base_name}_aruco_tracks_.h5"
+    marker_in_out="$OUTPUT_FOLDER/${base_name}_aruco_tracks_.h5"
+
+    echo "Marker (data): $marker_in_data"
+    echo "Marker (out):  $marker_in_out"
+
+    if [ -f "$marker_in_data" ] || [ -f "$marker_in_out" ]; then
+        echo "Skipping $base_name (marker exists in data or output folder)"
         continue
     fi
 

@@ -38,6 +38,7 @@ def classify_sleep_wake_from_sleap(
     # XY smoothing for speed
     max_interp_gap: int = 5,
     xy_smooth_sigma: float = 3.0,
+    speed_nan_mode: str = "interp",
     # angle smoothing (circular)
     angle_max_interp_gap: int = 5,
     angle_smooth_sigma: float = 3.0,
@@ -52,6 +53,8 @@ def classify_sleep_wake_from_sleap(
     sleep_median_win_sec: float = 20.0,
     # duplicates handling
     duplicate_agg: str = "mean",
+    # output row index policy
+    output_frame_index: str = "observed",
 ) -> pd.DataFrame:
     """
     Returns per-frame smoothed angles + smoothed speed (+ smoothed XY used for speed) + sleep/wake classification.
@@ -61,7 +64,10 @@ def classify_sleep_wake_from_sleap(
       - Interpolate short gaps (support smoothing)
       - Smooth X/Y (Gaussian preferred)
       - Compute speed from smoothed X/Y
-      - Mask speed unless both endpoints of the step exist in RAW X/Y
+      - Mask speed by `speed_nan_mode`:
+          * "interp": endpoints must exist after limited interpolation
+          * "raw": endpoints must exist in raw XY (legacy behavior)
+          * "none": no endpoint-validity masking
 
     Angles:
       - Compute raw angles from pose geometry
@@ -72,6 +78,10 @@ def classify_sleep_wake_from_sleap(
       - Compute framewise sleep evidence from smoothed angles + smoothed speed (NaN-aware)
       - Apply a centered rolling median (majority filter) over sleep evidence (no state machine)
       - Unknown (NaN) stays unknown unless surrounding evidence supports a median value
+
+    Output frame rows:
+      - output_frame_index="observed": rows at original observed pose frames only (legacy behavior)
+      - output_frame_index="full": rows for every frame in [min_frame, max_frame]
     """
 
     # ---------- helpers ----------
@@ -144,6 +154,10 @@ def classify_sleep_wake_from_sleap(
 
     if duplicate_agg not in {"mean", "median", "first"}:
         raise ValueError("duplicate_agg must be one of: 'mean', 'median', 'first'")
+    if speed_nan_mode not in {"interp", "raw", "none"}:
+        raise ValueError("speed_nan_mode must be one of: 'interp', 'raw', 'none'")
+    if output_frame_index not in {"observed", "full"}:
+        raise ValueError("output_frame_index must be one of: 'observed', 'full'")
 
     rows = []
 
@@ -187,7 +201,6 @@ def classify_sleep_wake_from_sleap(
         y = speed_Y_raw.reindex(full_index)
 
         raw_xy_valid = np.isfinite(x.to_numpy()) & np.isfinite(y.to_numpy())
-        raw_xy_step_valid = raw_xy_valid[1:] & raw_xy_valid[:-1]
 
         lim = int(max(0, max_interp_gap))
         if lim > 0:
@@ -195,6 +208,7 @@ def classify_sleep_wake_from_sleap(
             y_fill = y.interpolate("linear", limit=lim, limit_direction="both")
         else:
             x_fill, y_fill = x, y
+        interp_xy_valid = np.isfinite(x_fill.to_numpy()) & np.isfinite(y_fill.to_numpy())
 
         if xy_smooth_sigma is not None and float(xy_smooth_sigma) > 0:
             sigma = float(xy_smooth_sigma)
@@ -215,9 +229,15 @@ def classify_sleep_wake_from_sleap(
         dy = y_s.diff()
         speed_full = np.sqrt(dx * dx + dy * dy).to_numpy(dtype=float) * float(fps)
         speed_full[0] = np.nan
-        speed_full[1:][~raw_xy_step_valid] = np.nan
+        if speed_nan_mode == "raw":
+            step_valid = raw_xy_valid[1:] & raw_xy_valid[:-1]
+        elif speed_nan_mode == "interp":
+            step_valid = interp_xy_valid[1:] & interp_xy_valid[:-1]
+        else:  # "none"
+            step_valid = np.ones(len(speed_full) - 1, dtype=bool)
+        speed_full[1:][~step_valid] = np.nan
 
-        speed_pix_s = pd.Series(speed_full, index=full_index).reindex(wide.index)
+        speed_pix_s_full = pd.Series(speed_full, index=full_index)
 
         # ---------- raw angles ----------
         v_5_4 = get_vec(wide, 5, 4)
@@ -240,7 +260,7 @@ def classify_sleep_wake_from_sleap(
         )
 
         # ---------- smooth angles (output ONLY smoothed) ----------
-        smoothed_angles = {}
+        smoothed_angles_full = {}
         for raw_col, out_col in [
             ("angle_InL_raw", "angle_InL_deg"),
             ("angle_OutL_raw", "angle_OutL_deg"),
@@ -256,16 +276,21 @@ def classify_sleep_wake_from_sleap(
                 smooth_sigma=angle_smooth_sigma,
                 smooth_window=angle_smooth_window,
             )
-            smoothed_angles[out_col] = sm.reindex(raw_angles["Frame"]).to_numpy(dtype=float)
+            smoothed_angles_full[out_col] = sm
+
+        frame_out = full_index if output_frame_index == "full" else wide.index
 
         out_track = pd.DataFrame(
             {
                 "TrackID": tid,
-                "Frame": raw_angles["Frame"].to_numpy(dtype=int),
-                **smoothed_angles,
-                "speed_pix_s": speed_pix_s.to_numpy(dtype=float),
-                "speed_X_s": x_s.reindex(wide.index).to_numpy(dtype=float),
-                "speed_Y_s": y_s.reindex(wide.index).to_numpy(dtype=float),
+                "Frame": frame_out.to_numpy(dtype=int),
+                "angle_InL_deg": smoothed_angles_full["angle_InL_deg"].reindex(frame_out).to_numpy(dtype=float),
+                "angle_OutL_deg": smoothed_angles_full["angle_OutL_deg"].reindex(frame_out).to_numpy(dtype=float),
+                "angle_InR_deg": smoothed_angles_full["angle_InR_deg"].reindex(frame_out).to_numpy(dtype=float),
+                "angle_OutR_deg": smoothed_angles_full["angle_OutR_deg"].reindex(frame_out).to_numpy(dtype=float),
+                "speed_pix_s": speed_pix_s_full.reindex(frame_out).to_numpy(dtype=float),
+                "speed_X_s": x_s.reindex(frame_out).to_numpy(dtype=float),
+                "speed_Y_s": y_s.reindex(frame_out).to_numpy(dtype=float),
             }
         )
 
@@ -309,3 +334,61 @@ def classify_sleep_wake_from_sleap(
         .reset_index(drop=True)
     )
     return out
+
+
+def get_event_trig_avg(sig, event_inds, backlag, forwardlag):
+    """
+    Calculate the event-triggered average.
+
+    Parameters:
+    - sig (numpy.ndarray): Input signal.
+    - event_inds (numpy.ndarray): Indices of events.
+    - backlag (int): Backward time lag.
+    - forwardlag (int): Forward time lag.
+
+    Returns:
+    - ev_avg (numpy.ndarray): Event-triggered average.
+    - ev_mat (numpy.ndarray): Event-triggered matrix.
+
+    """
+    event_inds = np.round(event_inds).astype(int) 
+    if sig.ndim==1:
+        sig=np.expand_dims(sig,0)
+        
+    min_nevents = 1  # minimum number of events where we will even compute a triggered avg
+
+    orig_size = sig.shape
+
+    lags = np.arange(-backlag, forwardlag + 1)
+
+    # get rid of events that happen within the lag-range of the end points
+    bad_ids = np.where(event_inds <= backlag)[0]
+    if len(bad_ids) > 0:
+        print(f'Dropping {len(bad_ids)} early events')
+        event_inds = np.delete(event_inds, bad_ids)
+
+    bad_ids = np.where(event_inds >= (orig_size[1] - forwardlag))[0]
+    if len(bad_ids) > 0:
+        print(f'Dropping {len(bad_ids)} late events')
+        event_inds = np.delete(event_inds, bad_ids)
+
+    n_events = len(event_inds)
+
+    # check that we have at least the minimum number of events to work with
+    if n_events < min_nevents:
+        ev_avg = np.full((orig_size[0], len(lags)), np.nan)
+        ev_mat = np.nan
+        return ev_avg, ev_mat
+
+    ev_avg = np.zeros((orig_size[0], len(lags)))
+    ev_mat = np.zeros((n_events, orig_size[0], len(lags)))
+
+    for i in range(n_events):
+        cur_ids = np.arange(event_inds[i] - backlag, event_inds[i] + forwardlag + 1)
+        temp_sig = sig[:, cur_ids]
+        ev_avg += temp_sig
+        ev_mat[i,:, :] = temp_sig
+
+    ev_avg /= n_events
+
+    return np.squeeze(ev_avg), np.squeeze(ev_mat)

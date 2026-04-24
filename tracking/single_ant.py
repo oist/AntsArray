@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 """
-Combine SLEAP CSVs into per-arena track files across ALL chunks, using ArUco HDF5
-to define TRUE chunk lengths and prevent frame drift.
+Combine per-frame detections into per-arena track files across ALL chunks, using
+ArUco HDF5 to define TRUE chunk lengths and prevent frame drift.
+
+Detection source modes
+----------------------
+- SLEAP mode: uses `*_sleap_data.csv` detections.
+- ArUco mode: if SLEAP CSV is missing (or mode forces ArUco), detections are read
+  directly from `aruco_tracks` HDF5 and converted to XY rows.
 
 Folder layout
 -------------
@@ -13,7 +19,7 @@ YYYYMMDD-HHMMSS:
     - camX_###_aruco_tracks_.h5
 
 Segmentation images are searched under:
-  ROOT/seg_arena/
+  ROOT/arena_seg/   (or ROOT/seg_arena/ as fallback)
 and can have any name after the initial camXX, e.g.
   cam05_cam4_2025-12-18-16-35-12.png
 
@@ -29,7 +35,7 @@ Diagnostics
 For each (run, camera), prints a per-chunk table:
   - chunk id
   - true video frame count
-  - min / max / unique SLEAP frames
+  - min / max / unique observed frames in selected detections
   - global frame span assigned to that chunk
 
 Outputs
@@ -60,14 +66,18 @@ from tqdm import tqdm
 # Regex / naming
 # -----------------------------------------------------------------------------
 CAM_RE = re.compile(r"(?:^|_)cam(\d+)(?:_|$)")
-CHUNK_RE = re.compile(r"_(\d{3})(?:_sleap_data)?\.csv$")
+SLEAP_CHUNK_RE = re.compile(r"_(\d{3})(?:_sleap_data)?\.csv$")
+ARUCO_CHUNK_RE = re.compile(
+    r"_(\d{3})(?:_aruco_tracks_?)?\.h(?:5|df5)$",
+    flags=re.IGNORECASE,
+)
 TS_RE = re.compile(r"^\d{8}-\d{6}$")  # YYYYMMDD-HHMMSS
 
 
 # -----------------------------------------------------------------------------
-# CSV discovery
+# File discovery
 # -----------------------------------------------------------------------------
-def parse_cam_and_chunk(csv_path: Path) -> Tuple[str, int]:
+def parse_cam_and_chunk_for_sleap(csv_path: Path) -> Tuple[str, int]:
     name = csv_path.name
 
     m_cam = CAM_RE.search(name)
@@ -75,7 +85,7 @@ def parse_cam_and_chunk(csv_path: Path) -> Tuple[str, int]:
         raise ValueError(f"Could not extract cam number from filename: {name}")
     cam_id = f"cam{m_cam.group(1)}"
 
-    m_chunk = CHUNK_RE.search(name)
+    m_chunk = SLEAP_CHUNK_RE.search(name)
     if not m_chunk:
         raise ValueError(f"Could not extract chunk id from filename: {name}")
     chunk_id = int(m_chunk.group(1))
@@ -83,17 +93,42 @@ def parse_cam_and_chunk(csv_path: Path) -> Tuple[str, int]:
     return cam_id, chunk_id
 
 
-def list_csvs_grouped_by_cam(sleap_dir: Path) -> Dict[str, List[Path]]:
-    cam_map: Dict[str, List[Path]] = {}
-    for p in sleap_dir.glob("*.csv"):
+def parse_cam_and_chunk_for_aruco_h5(h5_path: Path) -> Tuple[str, int]:
+    name = h5_path.name
+
+    m_cam = CAM_RE.search(name)
+    if not m_cam:
+        raise ValueError(f"Could not extract cam number from filename: {name}")
+    cam_id = f"cam{m_cam.group(1)}"
+
+    m_chunk = ARUCO_CHUNK_RE.search(name)
+    if not m_chunk:
+        raise ValueError(f"Could not extract chunk id from filename: {name}")
+    chunk_id = int(m_chunk.group(1))
+
+    return cam_id, chunk_id
+
+
+def list_sleap_csvs_grouped_by_cam_and_chunk(data_dir: Path) -> Dict[str, Dict[int, Path]]:
+    cam_map: Dict[str, Dict[int, Path]] = {}
+    for p in data_dir.glob("*.csv"):
         try:
-            cam_id, _ = parse_cam_and_chunk(p)
+            cam_id, chunk_id = parse_cam_and_chunk_for_sleap(p)
         except ValueError:
             continue
-        cam_map.setdefault(cam_id, []).append(p)
+        cam_map.setdefault(cam_id, {})[chunk_id] = p
 
-    for cam_id, files in cam_map.items():
-        cam_map[cam_id] = sorted(files, key=lambda fp: parse_cam_and_chunk(fp)[1])
+    return dict(sorted(cam_map.items()))
+
+
+def list_aruco_h5_grouped_by_cam_and_chunk(data_dir: Path) -> Dict[str, Dict[int, Path]]:
+    cam_map: Dict[str, Dict[int, Path]] = {}
+    for p in list(data_dir.glob("*.h5")) + list(data_dir.glob("*.hdf5")):
+        try:
+            cam_id, chunk_id = parse_cam_and_chunk_for_aruco_h5(p)
+        except ValueError:
+            continue
+        cam_map.setdefault(cam_id, {})[chunk_id] = p
 
     return dict(sorted(cam_map.items()))
 
@@ -104,6 +139,84 @@ def list_csvs_grouped_by_cam(sleap_dir: Path) -> Dict[str, List[Path]]:
 def aruco_n_frames(h5_path: Path, ds_name: str = "aruco_tracks") -> int:
     with h5py.File(h5_path, "r") as f:
         return int(f[ds_name].shape[0])
+
+
+def aruco_tracks_h5_to_xy_df(
+    h5_path: Path,
+    frame_col: str,
+    track_col: str,
+    xcol: str,
+    ycol: str,
+) -> pd.DataFrame:
+    """
+    Build a SINGLE-ant XY trajectory from ArUco tracks.
+
+    Behavior:
+      - Ignores ArUco marker identity for final track assignment.
+      - Uses one fixed track id (0).
+      - If multiple detections exist in a frame, picks the one nearest to the
+        previous selected XY (last frame with a detection).
+      - On the first detected frame (or after no history), picks the first valid
+        detection (deterministic ordering by marker index).
+    """
+    with h5py.File(h5_path, "r") as f:
+        if "aruco_tracks" not in f:
+            raise KeyError(f"{h5_path} is missing dataset 'aruco_tracks'")
+        arr = f["aruco_tracks"][...]
+        conf = f["aruco_confidences"][...] if "aruco_confidences" in f else None
+
+    if arr.ndim != 3 or arr.shape[2] != 2:
+        raise ValueError(
+            f"Expected aruco_tracks shape (frames, instances, 2), got {arr.shape} in {h5_path}"
+        )
+    if conf is not None:
+        if conf.ndim != 2 or conf.shape != arr.shape[:2]:
+            conf = None
+
+    valid = np.isfinite(arr).all(axis=2)
+    valid &= ~((arr[..., 0] == 0.0) & (arr[..., 1] == 0.0))
+
+    n_frames = int(arr.shape[0])
+    cols = [frame_col, track_col, xcol, ycol, "Bodypoint"]
+
+    rows: List[Dict[str, object]] = []
+    prev_xy: Optional[np.ndarray] = None
+
+    for fi in range(n_frames):
+        idx = np.nonzero(valid[fi])[0]
+        if idx.size == 0:
+            continue
+
+        pts = arr[fi, idx, :].astype(np.float64)
+        chosen_local = 0
+
+        if prev_xy is not None:
+            d2 = np.sum((pts - prev_xy[None, :]) ** 2, axis=1)
+            chosen_local = int(np.argmin(d2))
+        elif conf is not None:
+            # Deterministic first-frame tie-break: highest confidence.
+            c = np.asarray(conf[fi, idx], dtype=np.float64)
+            if c.size > 0 and np.isfinite(c).any():
+                c = np.where(np.isfinite(c), c, -np.inf)
+                chosen_local = int(np.argmax(c))
+
+        chosen_xy = pts[chosen_local]
+        prev_xy = chosen_xy
+
+        rows.append(
+            {
+                frame_col: int(fi),
+                track_col: int(0),
+                xcol: float(chosen_xy[0]),
+                ycol: float(chosen_xy[1]),
+                "Bodypoint": int(0),
+            }
+        )
+
+    if not rows:
+        return pd.DataFrame(columns=cols)
+
+    return pd.DataFrame(rows, columns=cols)
 
 
 # -----------------------------------------------------------------------------
@@ -164,19 +277,21 @@ def find_seg_file_for_cam(seg_dir: Path, cam_id: str) -> Optional[Path]:
     """
     Find a segmentation image for a camera in seg_dir.
 
-    Requirements:
-      - seg_dir is ROOT/seg_arena (ROOT is --input_folder)
-      - filenames start with camXX, but can have any suffix, e.g.
-          cam05_cam4_2025-12-18-16-35-12.png
+    Selection order:
+      1) camera-specific names: camXX*.png
+      2) generic names: *arena_seg*.png or *arunea_seg*.png
+         (includes misspelling fallback for existing files)
 
-    Selection rule:
-      - If multiple matches exist, pick the most recently modified file.
-      - If none exist, return None.
+    If multiple matches exist, picks the most recently modified file.
     """
     if not seg_dir.exists() or not seg_dir.is_dir():
         return None
 
     matches = list(seg_dir.glob(f"{cam_id}*.png"))
+    if not matches:
+        matches = list(seg_dir.glob("*arena_seg*.png")) + list(
+            seg_dir.glob("*arunea_seg*.png")
+        )
     if not matches:
         return None
 
@@ -256,7 +371,7 @@ def apply_frame_offsets_using_aruco(
     print(f"FRAME OFFSET DIAGNOSTICS {label}".strip())
     print("=" * 100)
     print(
-        "chunk | video_frames | sleap_min | sleap_max | sleap_unique | global_start | global_end"
+        "chunk | video_frames | data_min | data_max | data_unique | global_start | global_end"
     )
     print("-" * 100)
 
@@ -274,9 +389,9 @@ def apply_frame_offsets_using_aruco(
         d = df.copy()
         fr = pd.to_numeric(d[frame_col], errors="coerce").dropna().astype("int64")
 
-        sleap_min = int(fr.min()) if not fr.empty else None
-        sleap_max = int(fr.max()) if not fr.empty else None
-        sleap_unique = int(fr.nunique())
+        data_min = int(fr.min()) if not fr.empty else None
+        data_max = int(fr.max()) if not fr.empty else None
+        data_unique = int(fr.nunique())
 
         d.loc[fr.index, frame_col] = fr + offset
 
@@ -285,7 +400,7 @@ def apply_frame_offsets_using_aruco(
 
         print(
             f"{cid:>5} | {n_frames:>12} |"
-            f" {str(sleap_min):>9} | {str(sleap_max):>9} | {sleap_unique:>12} |"
+            f" {str(data_min):>8} | {str(data_max):>8} | {data_unique:>11} |"
             f" {global_start:>12} | {global_end:>10}"
         )
 
@@ -294,6 +409,7 @@ def apply_frame_offsets_using_aruco(
 
     print("=" * 100)
     print("video_frames = authoritative chunk length from ArUco HDF5")
+    print("data_*       = frame stats from selected detections (SLEAP or ArUco)")
     print("global_*     = assigned frame span (no overlap, no drift)")
     print("=" * 100 + "\n")
 
@@ -314,6 +430,7 @@ def write_outputs_parquet(
     cam_id: str,
     arenas: List[str],
     track_col: str,
+    write_track_files: bool,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -326,7 +443,7 @@ def write_outputs_parquet(
             index=False,
         )
 
-    if track_col in df.columns:
+    if write_track_files and track_col in df.columns:
         for (arena, track), g in df.groupby(["ArenaLabel", track_col], dropna=False):
             if arena not in arenas or g.empty:
                 continue
@@ -347,20 +464,41 @@ def process_run(
     ycol: str,
     track_col: str,
     frame_col: str,
+    detection_source: str,
+    write_track_files: bool,
 ) -> None:
     data_dir = run_dir / "data"
-    sleap_dir = data_dir
 
     # Segmentation is global to ROOT (input_folder), not inside each run.
     seg_dir = input_folder / "arena_seg"
-    
-    cam_map = list_csvs_grouped_by_cam(sleap_dir)
-    if not cam_map:
+    if not seg_dir.exists():
+        seg_dir_alt = input_folder / "seg_arena"
+        if seg_dir_alt.exists():
+            seg_dir = seg_dir_alt
+
+    sleap_map = list_sleap_csvs_grouped_by_cam_and_chunk(data_dir)
+    aruco_map = list_aruco_h5_grouped_by_cam_and_chunk(data_dir)
+
+    cam_ids = sorted(set(sleap_map.keys()) | set(aruco_map.keys()))
+    if not cam_ids:
         return
 
     timestamp = run_dir.name  # already validated
 
-    for cam_id, files in cam_map.items():
+    for cam_id in cam_ids:
+        sleap_chunks = sleap_map.get(cam_id, {})
+        aruco_chunks = aruco_map.get(cam_id, {})
+
+        if detection_source == "sleap":
+            chunk_ids_all = sorted(sleap_chunks.keys())
+        elif detection_source == "aruco":
+            chunk_ids_all = sorted(aruco_chunks.keys())
+        else:  # auto
+            chunk_ids_all = sorted(set(sleap_chunks.keys()) | set(aruco_chunks.keys()))
+
+        if not chunk_ids_all:
+            continue
+
         seg_path = find_seg_file_for_cam(seg_dir, cam_id)
 
         if seg_path is None:
@@ -368,24 +506,49 @@ def process_run(
         else:
             print(f"[SEG] run={timestamp} cam={cam_id}: using seg {seg_path.resolve()}")
 
-
         seg, color_to_label, arenas = get_segmentation_or_default(seg_path)
 
         dfs: List[pd.DataFrame] = []
         chunk_ids: List[int] = []
         chunk_frame_counts: List[int] = []
 
-        for csv_path in files:
-            cam, cid = parse_cam_and_chunk(csv_path)
-            h5_path = csv_path.with_name(
-                csv_path.name.replace("_sleap_data.csv", "_aruco_tracks_.h5")
-            )
-            if not h5_path.exists():
-                raise FileNotFoundError(f"Missing ArUco HDF5: {h5_path}")
+        for cid in chunk_ids_all:
+            csv_path = sleap_chunks.get(cid)
+            h5_path = aruco_chunks.get(cid)
 
-            dfs.append(pd.read_csv(csv_path))
+            if h5_path is None:
+                raise FileNotFoundError(
+                    f"Missing ArUco HDF5 for run={timestamp} cam={cam_id} chunk={cid}"
+                )
+            if not h5_path.exists():
+                raise FileNotFoundError(
+                    f"Missing ArUco HDF5 for run={timestamp} cam={cam_id} chunk={cid}"
+                )
+
+            use_sleap = (detection_source in ("auto", "sleap")) and (csv_path is not None)
+
+            if use_sleap:
+                dfs.append(pd.read_csv(csv_path))
+            elif detection_source == "sleap":
+                raise FileNotFoundError(
+                    f"Missing SLEAP CSV for run={timestamp} cam={cam_id} chunk={cid}"
+                )
+            else:
+                dfs.append(
+                    aruco_tracks_h5_to_xy_df(
+                        h5_path=h5_path,
+                        frame_col=frame_col,
+                        track_col=track_col,
+                        xcol=xcol,
+                        ycol=ycol,
+                    )
+                )
+
             chunk_ids.append(cid)
             chunk_frame_counts.append(aruco_n_frames(h5_path))
+
+        if not dfs:
+            continue
 
         dfs = apply_frame_offsets_using_aruco(
             dfs,
@@ -412,6 +575,7 @@ def process_run(
             cam_id,
             arenas,
             track_col,
+            write_track_files=write_track_files,
         )
 
 
@@ -425,14 +589,29 @@ def run_on_timestamp_subfolders(
     ycol: str,
     track_col: str,
     frame_col: str,
+    detection_source: str,
+    write_track_files: bool,
 ) -> None:
+    if detection_source not in {"auto", "sleap", "aruco"}:
+        raise ValueError("--detection_source must be one of: auto, sleap, aruco")
+
     runs = [p for p in input_folder.iterdir() if p.is_dir() and TS_RE.match(p.name)]
 
     if not runs:
         raise FileNotFoundError(f"No timestamp-named run folders under {input_folder}")
 
     for run_dir in tqdm(sorted(runs), desc="Runs"):
-        process_run(run_dir, input_folder, out_dir, xcol, ycol, track_col, frame_col)
+        process_run(
+            run_dir,
+            input_folder,
+            out_dir,
+            xcol,
+            ycol,
+            track_col,
+            frame_col,
+            detection_source=detection_source,
+            write_track_files=write_track_files,
+        )
 
 
 if __name__ == "__main__":
@@ -445,6 +624,17 @@ if __name__ == "__main__":
     ap.add_argument("--ycol", type=str, default="Y")
     ap.add_argument("--track_col", type=str, default="Track")
     ap.add_argument("--frame_col", type=str, default="Frame")
+    ap.add_argument(
+        "--detection_source",
+        choices=["auto", "sleap", "aruco"],
+        default="auto",
+        help="Detection input mode: auto (prefer SLEAP, fallback ArUco), sleap only, or aruco only.",
+    )
+    ap.add_argument(
+        "--write_track_files",
+        action="store_true",
+        help="Also write per-track files (*_track-<id>.parquet). Off by default for single-ant datasets.",
+    )
     args = ap.parse_args()
 
     run_on_timestamp_subfolders(
@@ -454,4 +644,6 @@ if __name__ == "__main__":
         ycol=args.ycol,
         track_col=args.track_col,
         frame_col=args.frame_col,
+        detection_source=args.detection_source,
+        write_track_files=args.write_track_files,
     )

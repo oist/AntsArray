@@ -53,6 +53,19 @@ SHORTCUTS_TEXT = (
     "  Ctrl+S: save curated CSV + edit log\n"
 )
 
+SLEAP_SKELETON_EDGES = (
+    (0, 1),
+    (0, 2),
+    (2, 3),
+    (0, 4),
+    (4, 5),
+    (5, 6),
+    (0, 7),
+    (7, 8),
+    (8, 9),
+)
+SLEAP_UNMATCHED_COLOR = (170, 170, 170)
+
 
 def clamp(value: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, value))
@@ -469,6 +482,63 @@ class SleapAnchorStore:
         return arr
 
 
+class SleapSkeletonStore:
+    def __init__(self, source_csv: Path):
+        self.source_csv = Path(source_csv)
+        self.frame_rows: Dict[int, np.ndarray] = {}
+        self.bodypoint_count = 0
+
+    @classmethod
+    def from_csv(
+        cls,
+        path: Path,
+        *,
+        chunksize: int = 300_000,
+    ) -> "SleapSkeletonStore":
+        path = Path(path)
+        grouped: Dict[int, List[np.ndarray]] = {}
+        wanted = {"Frame", "Instance", "Bodypoint", "X", "Y", "Score_node"}
+        max_bodypoint = -1
+
+        reader = pd.read_csv(
+            path,
+            usecols=lambda c: c in wanted,
+            chunksize=int(chunksize),
+        )
+        for chunk in reader:
+            if "Score_node" not in chunk.columns:
+                chunk["Score_node"] = 1.0
+            for col in ("Frame", "Instance", "Bodypoint", "X", "Y", "Score_node"):
+                chunk[col] = pd.to_numeric(chunk[col], errors="coerce")
+            chunk = chunk.dropna(subset=["Frame", "Instance", "Bodypoint", "X", "Y", "Score_node"])
+            if chunk.empty:
+                continue
+            chunk["Frame"] = chunk["Frame"].astype(int)
+            chunk["Instance"] = chunk["Instance"].astype(int)
+            chunk["Bodypoint"] = chunk["Bodypoint"].astype(int)
+            max_bodypoint = max(max_bodypoint, int(chunk["Bodypoint"].max()))
+            for frame, g in chunk.groupby("Frame", sort=False):
+                arr = g[["Instance", "Bodypoint", "X", "Y", "Score_node"]].to_numpy(dtype=np.float32)
+                if arr.size == 0:
+                    continue
+                grouped.setdefault(int(frame), []).append(arr)
+
+        store = cls(path)
+        store.frame_rows = {
+            int(frame): np.vstack(parts)
+            for frame, parts in grouped.items()
+            if parts
+        }
+        store.bodypoint_count = max_bodypoint + 1 if max_bodypoint >= 0 else 0
+        return store
+
+    def rows_for_frame(self, frame: int) -> np.ndarray:
+        arr = self.frame_rows.get(int(frame))
+        if arr is None:
+            return np.empty((0, 5), dtype=np.float32)
+        return arr
+
+
 def infer_detections_from_video(video_path: Path) -> Path:
     return video_path.with_name(f"{video_path.stem}_aruco_detections.csv")
 
@@ -595,6 +665,9 @@ class ArucoCurationApp:
         self.sleap_store: Optional[SleapAnchorStore] = None
         self.sleap_loading = False
         self.sleap_error: Optional[str] = None
+        self.sleap_skeleton_store: Optional[SleapSkeletonStore] = None
+        self.sleap_skeleton_loading = False
+        self.sleap_skeleton_error: Optional[str] = None
 
         self.store = ArucoDetectionStore.from_csv(self.detections_path)
         self.cap = cv2.VideoCapture(str(self.video_path))
@@ -657,6 +730,7 @@ class ArucoCurationApp:
         self.trajectory_status_var = tk.StringVar(value="Trajectory: no tag selected")
         self.default_confidence_var = tk.DoubleVar(value=1.0)
         self.sleap_status_var = tk.StringVar(value="SLEAP: not loaded")
+        self.show_sleap_overlay_var = tk.BooleanVar(value=False)
         self.bridge_max_distance_var = tk.DoubleVar(value=160.0)
         self.bridge_max_frames_var = tk.IntVar(value=250)
         self.bridge_preview_start_var = tk.IntVar(value=0)
@@ -831,6 +905,12 @@ class ArucoCurationApp:
         ttk.Label(sleap_box, textvariable=self.sleap_status_var, wraplength=320, justify=tk.LEFT).pack(
             anchor=tk.W, padx=8, pady=(8, 6)
         )
+        ttk.Checkbutton(
+            sleap_box,
+            text="Show SLEAP Skeletons",
+            variable=self.show_sleap_overlay_var,
+            command=self.on_show_sleap_overlay_changed,
+        ).pack(anchor=tk.W, padx=8, pady=(0, 6))
         bridge_params = ttk.Frame(sleap_box)
         bridge_params.pack(fill=tk.X, padx=8, pady=(0, 6))
         ttk.Label(bridge_params, text="Max Dist").pack(side=tk.LEFT)
@@ -1003,17 +1083,57 @@ class ArucoCurationApp:
         self.toggle_playback()
         return "break"
 
+    def refresh_sleap_status_label(self) -> None:
+        if self.sleap_path is None or not self.sleap_path.exists():
+            self.sleap_status_var.set("SLEAP: sidecar not found for this video")
+            return
+
+        if self.sleap_loading:
+            anchor_text = "anchors loading"
+        elif self.sleap_error is not None:
+            anchor_text = f"anchor load failed ({self.sleap_error})"
+        elif self.sleap_store is None:
+            anchor_text = "anchors not loaded"
+        else:
+            anchor_text = f"anchors ready for {len(self.sleap_store.frame_candidates)} frames"
+
+        if self.show_sleap_overlay_var.get():
+            if self.sleap_skeleton_loading:
+                overlay_text = "skeletons loading"
+            elif self.sleap_skeleton_error is not None:
+                overlay_text = f"skeleton load failed ({self.sleap_skeleton_error})"
+            elif self.sleap_skeleton_store is None:
+                overlay_text = "skeletons not loaded"
+            else:
+                overlay_text = f"skeletons ready for {len(self.sleap_skeleton_store.frame_rows)} frames"
+        else:
+            overlay_text = "skeleton overlay on" if self.sleap_skeleton_store is not None else "skeleton overlay off"
+
+        self.sleap_status_var.set(f"SLEAP: {anchor_text} | {overlay_text}")
+
+    def on_show_sleap_overlay_changed(self) -> None:
+        if self.show_sleap_overlay_var.get():
+            self.start_sleap_skeleton_load()
+            self.status_note = "SLEAP skeleton overlay enabled"
+        else:
+            self.status_note = "SLEAP skeleton overlay hidden"
+            self.refresh_sleap_status_label()
+        if not self.is_playing:
+            self.render_current_frame()
+        else:
+            self.refresh_status(force=True)
+
     def start_sleap_load(self) -> None:
         if self.sleap_loading or self.sleap_store is not None:
             return
         if self.sleap_path is None or not self.sleap_path.exists():
-            self.sleap_status_var.set("SLEAP: sidecar not found for this video")
+            self.refresh_sleap_status_label()
             self.bridge_button.configure(state=tk.DISABLED)
             return
 
         self.sleap_loading = True
         self.sleap_error = None
-        self.sleap_status_var.set(f"SLEAP: loading {self.sleap_path.name} (bodypoint 0)")
+        self.refresh_sleap_status_label()
         self.bridge_button.configure(state=tk.DISABLED)
         worker = threading.Thread(target=self._load_sleap_worker, daemon=True)
         worker.start()
@@ -1033,16 +1153,45 @@ class ArucoCurationApp:
     ) -> None:
         self.sleap_loading = False
         self.sleap_error = error
-        if error is not None:
-            self.sleap_store = None
-            self.sleap_status_var.set(f"SLEAP: load failed ({error})")
-            self.update_bridge_button()
+        self.sleap_store = None if error is not None else store
+        self.refresh_sleap_status_label()
+        self.update_bridge_button()
+
+    def start_sleap_skeleton_load(self) -> None:
+        if self.sleap_skeleton_loading or self.sleap_skeleton_store is not None:
+            self.refresh_sleap_status_label()
+            return
+        if self.sleap_path is None or not self.sleap_path.exists():
+            self.refresh_sleap_status_label()
             return
 
-        self.sleap_store = store
-        loaded_frames = len(store.frame_candidates) if store is not None else 0
-        self.sleap_status_var.set(f"SLEAP: loaded bodypoint 0 for {loaded_frames} frames")
-        self.update_bridge_button()
+        self.sleap_skeleton_loading = True
+        self.sleap_skeleton_error = None
+        self.refresh_sleap_status_label()
+        worker = threading.Thread(target=self._load_sleap_skeleton_worker, daemon=True)
+        worker.start()
+
+    def _load_sleap_skeleton_worker(self) -> None:
+        try:
+            store = SleapSkeletonStore.from_csv(self.sleap_path)
+        except Exception as exc:
+            self.root.after(0, lambda: self._finish_sleap_skeleton_load(None, str(exc)))
+            return
+        self.root.after(0, lambda: self._finish_sleap_skeleton_load(store, None))
+
+    def _finish_sleap_skeleton_load(
+        self,
+        store: Optional[SleapSkeletonStore],
+        error: Optional[str],
+    ) -> None:
+        self.sleap_skeleton_loading = False
+        self.sleap_skeleton_error = error
+        self.sleap_skeleton_store = None if error is not None else store
+        self.refresh_sleap_status_label()
+        if self.show_sleap_overlay_var.get() and not self.is_playing:
+            self.render_current_frame(full_refresh=False)
+        else:
+            self.refresh_status(force=True)
 
     def update_bridge_button(self) -> None:
         if not hasattr(self, "bridge_button"):
@@ -1297,6 +1446,133 @@ class ArucoCurationApp:
             cv2.LINE_AA,
         )
 
+    def get_sleap_overlay_assignments(
+        self,
+        instances: Dict[int, Dict[int, Tuple[float, float, float]]],
+    ) -> Dict[int, int]:
+        current_dets = self.store.get_frame_detections(self.current_frame)
+        if not current_dets or not instances:
+            return {}
+        try:
+            max_distance, _max_frames = self.get_bridge_params()
+        except Exception:
+            max_distance = 160.0
+        max_distance_sq = float(max_distance) * float(max_distance)
+        pairings: List[Tuple[float, int, int]] = []
+        for inst, nodes in instances.items():
+            anchor = nodes.get(0)
+            if anchor is None:
+                continue
+            ax, ay, _score = anchor
+            for det in current_dets:
+                d2 = (float(det.x) - float(ax)) ** 2 + (float(det.y) - float(ay)) ** 2
+                if d2 <= max_distance_sq:
+                    pairings.append((float(d2), int(inst), int(det.instance)))
+
+        assignments: Dict[int, int] = {}
+        used_instances: set[int] = set()
+        used_tags: set[int] = set()
+        for _d2, inst, tag in sorted(pairings):
+            if inst in used_instances or tag in used_tags:
+                continue
+            used_instances.add(inst)
+            used_tags.add(tag)
+            assignments[int(inst)] = int(tag)
+        return assignments
+
+    def draw_sleap_overlay(self, image: np.ndarray) -> None:
+        if not self.show_sleap_overlay_var.get():
+            return
+        if self.sleap_skeleton_loading:
+            self.draw_text_with_outline(
+                image,
+                "SLEAP skeletons: loading",
+                (10, 106),
+                (255, 120, 255),
+                scale=0.9,
+                thickness=2,
+            )
+            return
+        if self.sleap_skeleton_error is not None:
+            self.draw_text_with_outline(
+                image,
+                "SLEAP skeletons: load failed",
+                (10, 106),
+                (255, 120, 255),
+                scale=0.9,
+                thickness=2,
+            )
+            return
+        if self.sleap_skeleton_store is None:
+            self.draw_text_with_outline(
+                image,
+                "SLEAP skeletons: not loaded",
+                (10, 106),
+                (255, 120, 255),
+                scale=0.9,
+                thickness=2,
+            )
+            return
+
+        rows = self.sleap_skeleton_store.rows_for_frame(self.current_frame)
+        if rows.size == 0:
+            self.draw_text_with_outline(
+                image,
+                "SLEAP skeletons: none",
+                (10, 106),
+                (255, 120, 255),
+                scale=0.9,
+                thickness=2,
+            )
+            return
+
+        instances: Dict[int, Dict[int, Tuple[float, float, float]]] = {}
+        for inst_f, bp_f, x_f, y_f, score_f in rows:
+            inst = int(inst_f)
+            bp = int(bp_f)
+            instances.setdefault(inst, {})[bp] = (float(x_f), float(y_f), float(score_f))
+
+        assignments = self.get_sleap_overlay_assignments(instances)
+        matched_count = 0
+        for inst, nodes in instances.items():
+            assigned_tag = assignments.get(inst)
+            if assigned_tag is None:
+                color = SLEAP_UNMATCHED_COLOR
+                line_color = (110, 110, 110)
+                outline_color = (255, 0, 255)
+            else:
+                color = color_for_id(assigned_tag)
+                line_color = tuple(int(max(40, c * 0.65)) for c in color)
+                outline_color = (255, 255, 255)
+                matched_count += 1
+            for bp0, bp1 in SLEAP_SKELETON_EDGES:
+                if bp0 not in nodes or bp1 not in nodes:
+                    continue
+                x0, y0, _score0 = nodes[bp0]
+                x1, y1, _score1 = nodes[bp1]
+                cv2.line(
+                    image,
+                    (int(round(x0)), int(round(y0))),
+                    (int(round(x1)), int(round(y1))),
+                    line_color,
+                    2,
+                    cv2.LINE_AA,
+                )
+            for bp, (x, y, _score) in nodes.items():
+                radius = 6 if bp == 0 else 4
+                cv2.circle(image, (int(round(x)), int(round(y))), radius, color, -1)
+                if bp == 0:
+                    cv2.circle(image, (int(round(x)), int(round(y))), radius + 3, outline_color, 2)
+
+        self.draw_text_with_outline(
+            image,
+            f"SLEAP skeletons: {len(instances)} | matched tags: {matched_count}",
+            (10, 106),
+            (255, 120, 255),
+            scale=0.9,
+            thickness=2,
+        )
+
     def render_current_frame(self, *, full_refresh: bool = True) -> None:
         try:
             bgr = self.read_frame(self.current_frame)
@@ -1307,6 +1583,8 @@ class ArucoCurationApp:
         frame = bgr.copy()
         current_dets = self.store.get_frame_detections(self.current_frame)
         selected_instance = self.selected_detection[1] if self.selected_detection is not None else None
+
+        self.draw_sleap_overlay(frame)
 
         for det in current_dets:
             color = color_for_id(det.instance)
