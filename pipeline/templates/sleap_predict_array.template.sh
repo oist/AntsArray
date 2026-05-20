@@ -12,6 +12,9 @@ set -eo pipefail
 source ~/.bashrc
 module load __SLEAP_MODULE__
 
+# Home is shared deigo<->saion, so the rendered deigo repo path also works on saion.
+source "__HOSTS_LIB__"
+
 REMOTE_JOBS="__REMOTE_JOBS__"
 REMOTE_INPUT="__REMOTE_INPUT__"
 REMOTE_OUTPUT="__REMOTE_OUTPUT__"
@@ -22,6 +25,7 @@ SLEAP_MODEL_CENTROID="__SLEAP_MODEL_CENTROID__"
 SLEAP_MODEL_INSTANCE="__SLEAP_MODEL_INSTANCE__"
 SKIP_TRT_EXPORT=__SKIP_TRT_EXPORT__
 DEIGO_FLASH_SAION_PREFIX="__DEIGO_FLASH_SAION_PREFIX__"   # /deigo_flash/.../<exp> mount on saion
+DATA_DIR="__DATA_DIR__"                      # bucket path; reached via "saion" alias (login has write)
 SLEAP_BATCH_SIZE="${SLEAP_BATCH_SIZE:-8}"   # per-frame inference batch
 BATCH_SIZE=__BATCH_SIZE__                    # chunks per array task
 
@@ -85,4 +89,11 @@ for (( row_idx=start_idx; row_idx<end_idx; row_idx++ )); do
 	fi
 
 	echo "[OK] ${vname}_${chunk}"
+
+	# Inline upload: stream SLP to bucket via ssh saion (saion compute can't
+	# write /bucket directly). sleap_datacp at end-of-run is the safety net.
+	echo "[$(date)] uploading ${vname}_${chunk}.slp -> bucket"
+	rsync_retry -ah --chmod=Du=rwx,Dg=rwx,Fu=rw,Fg=rw \
+		"$out_slp" "saion:$DATA_DIR/" \
+		|| echo "[WARN] inline upload of ${vname}_${chunk} failed; sleap_datacp end-of-run will retry" >&2
 done

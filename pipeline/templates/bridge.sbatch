@@ -77,6 +77,8 @@ sed -e "s#__REMOTE_JOBS__#$REMOTE_JOBS#g" \
     -e "s#__SLEAP_MODULE__#$SLEAP_MODULE#g" \
     -e "s#__BATCH_SIZE__#${BATCH_SIZE:-1}#g" \
     -e "s#__DEIGO_FLASH_SAION_PREFIX__#$DEIGO_FLASH_SAION_PREFIX#g" \
+    -e "s#__DATA_DIR__#$DATA_DIR#g" \
+    -e "s#__HOSTS_LIB__#$LIB_DIR/hosts.sh#g" \
     "$TEMPLATES_DIR/sleap_predict_array.template.sh" > "$RENDERED_PREDICT"
 
 sed -e "s#__REMOTE_JOBS__#$REMOTE_JOBS#g" \

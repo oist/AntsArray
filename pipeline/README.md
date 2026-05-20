@@ -16,10 +16,12 @@ deigo-login (pipeline.sh)
   └── chunk_array (one task per grid video)
         └── chunk_finalize
               ├── aruco_array (cross-video, chunk-ordered, BATCH_SIZE chunks/task)
-              │     └── aruco_datacp (single job → bucket on datacp partition)
+              │     │     ↳ each chunk: inline rsync h5 → bucket (via ssh deigo login)
+              │     └── aruco_datacp (single safety-net job; idempotent rsync)
               ├── bridge (lazy TRT export check + ssh saion sbatch)
               │     ├── saion sleap_predict_array (largegpu; self-fetches via /deigo_flash)
-              │     │     └── saion sleap_datacp (single job → bucket via ssh saion)
+              │     │     │     ↳ each chunk: inline rsync .slp → bucket (via ssh saion login)
+              │     │     └── saion sleap_datacp (single safety-net job)
               │     └── saion cleanup (rm -rf /work)
               └── cleanup (polls bucket for all SLP files → rm -rf /flash)
 ```
@@ -28,12 +30,17 @@ Key design choices:
 - **No deigo→saion chunk rsync.** Saion compute reads chunks directly from
   `/deigo_flash` (read-only cross-mount), `cp` to its own `/work` for isolation,
   then runs predict. Lets sleap start as soon as bridge exits (seconds, not hours).
+- **Streaming bucket uploads.** Each array task ssh's its cluster's login
+  immediately after producing an output file, so results appear in `<exp>/data/`
+  as the work completes — not in one big batch at the end. The end-of-array
+  `aruco_datacp` and `sleap_datacp` jobs remain as idempotent safety nets to
+  catch any uploads that hit a transient SSH failure.
 - **Single-job datacps** (one per leg) — keeps total queued jobs under the
   `AssocGrpSubmitJobsLimit` cap on both deigo and saion `datacp`.
 - **Bucket is the cleanup sentinel.** Deigo cleanup polls `$DATA_DIR/*.slp` until
   every chunk has a result, then frees `/flash`. No cross-cluster Slurm deps needed.
-- All cross-cluster SSH (TRT export trigger, saion sbatch) uses `ssh_retry`
-  with 5 attempts + 10·n backoff — the lesson from block01's
+- All cross-cluster SSH (TRT export trigger, saion sbatch, inline uploads) uses
+  `ssh_retry` with 5 attempts + 10·n backoff — the lesson from block01's
   `kex_exchange_identification` reset wedging the whole pipeline.
 
 ## Layout

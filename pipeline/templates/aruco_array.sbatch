@@ -11,6 +11,7 @@ shopt -s nullglob
 
 JOBS_ROOT="__JOBS_ROOT__"
 source "$JOBS_ROOT/pipeline.env"
+source "$LIB_DIR/hosts.sh"
 
 module load opencv/4.9.0
 
@@ -41,10 +42,17 @@ for (( row_idx=start_idx; row_idx<end_idx; row_idx++ )); do
 	fi
 
 	out_h5="$aruco_dir/${vname}_${chunk}_aruco_tracks_.h5"
+	bucket_h5="$DATA_DIR/${vname}_${chunk}_aruco_tracks_.h5"
 	sentinel="$aruco_dir/${vname}_${chunk}.aruco.ok"
 
 	if [[ -s "$out_h5" && -f "$sentinel" ]]; then
 		echo "[SKIP] aruco already done for ${vname}_${chunk}"
+		# Upload to bucket if not already there (catches earlier inline-upload misses)
+		if [[ ! -f "$bucket_h5" ]]; then
+			rsync_retry -ah --chmod=Du=rwx,Dg=rwx,Fu=rw,Fg=rw \
+				"$out_h5" "deigo:$DATA_DIR/" \
+				|| echo "[WARN] inline upload of ${vname}_${chunk} failed; aruco_datacp end-of-run will retry" >&2
+		fi
 		continue
 	fi
 
@@ -57,4 +65,11 @@ for (( row_idx=start_idx; row_idx<end_idx; row_idx++ )); do
 
 	touch "$sentinel"
 	echo "[OK] ${vname}_${chunk}"
+
+	# Inline upload: stream this h5 to bucket via deigo login (compute can't
+	# write /bucket directly). aruco_datacp at end-of-run is the safety net.
+	echo "[$(date)] uploading $(basename "$out_h5") -> bucket"
+	rsync_retry -ah --chmod=Du=rwx,Dg=rwx,Fu=rw,Fg=rw \
+		"$out_h5" "deigo:$DATA_DIR/" \
+		|| echo "[WARN] inline upload of ${vname}_${chunk} failed; aruco_datacp end-of-run will retry" >&2
 done
