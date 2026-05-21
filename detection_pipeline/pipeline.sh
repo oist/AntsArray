@@ -6,7 +6,7 @@
 # template sources $JOBS_ROOT/pipeline.env for all configuration.
 #
 # Usage:
-#   bash pipeline/pipeline.sh --dir <experiment_dir> \
+#   bash detection_pipeline/pipeline.sh --dir <experiment_dir> \
 #        --sleap-model-centroid <dir> --sleap-model-instance <dir> [options]
 set -eo pipefail
 
@@ -74,8 +74,8 @@ SLEAP_RUNTIME=tensorrt
 SKIP_TRT_EXPORT=0
 SAION_PARTITION=largegpu
 SLEAP_MODULE="sleap-nn/0.2.0"
-ARUCO_CONCURRENCY=128
-SLEAP_CONCURRENCY=8
+ARUCO_CONCURRENCY=400   # under deigo compute cap (cpu=2000/4=500); leaves ~20% headroom
+SLEAP_CONCURRENCY=8     # bounded by saion largegpu having only 4 A100 nodes anyway
 DATACP_CONCURRENCY=4
 BATCH_SIZE=""        # "" => auto
 MAX_ARRAY_TASKS=500

@@ -1,6 +1,6 @@
-# AntsArray pipeline (v2)
+# AntsArray detection_pipeline (v2)
 
-Chunk-ordered ArUco + SLEAP pipeline for PylonRecorder2 outputs.
+Chunk-ordered ArUco + SLEAP detection/inference pipeline for PylonRecorder2 outputs.
 
 Replaces the monolithic [transcode_sleap_aruco.sh](../transcode_sleap_aruco.sh).
 Drops the re-encode stage (no longer needed: pylonrecorder2 emits clean
@@ -12,7 +12,7 @@ land in `<exp>/data/` first.
 ## Architecture
 
 ```
-deigo-login (pipeline.sh)
+deigo-login (detection_pipeline/pipeline.sh)
   └── chunk_array (one task per grid video)
         └── chunk_finalize
               ├── aruco_array (cross-video, chunk-ordered, BATCH_SIZE chunks/task)
@@ -46,7 +46,7 @@ Key design choices:
 ## Layout
 
 ```
-pipeline/
+detection_pipeline/
   pipeline.sh                      # entry point (deigo-login)
   README.md                        # this file
   lib/
@@ -71,7 +71,7 @@ pipeline/
 From `deigo-login`:
 
 ```bash
-bash pipeline/pipeline.sh \
+bash detection_pipeline/pipeline.sh \
   --dir /bucket/ReiterU/Ants/basler/20260520/block02 \
   --sleap-model-centroid  /bucket/ReiterU/Ants/SLEAP_files/Simple_skeleton/20250408_models_LATESTWORKINGMODEL/250408_141245.centroid \
   --sleap-model-instance  /bucket/ReiterU/Ants/SLEAP_files/Simple_skeleton/20250408_models_LATESTWORKINGMODEL/250408_141245.centered_instance \
@@ -93,7 +93,7 @@ Outputs land in `<exp>/data/`:
 
 ## CLI
 
-See `bash pipeline/pipeline.sh --help` for the full option list. Notable
+See `bash detection_pipeline/pipeline.sh --help` for the full option list. Notable
 defaults:
 
 | Flag | Default | Notes |
@@ -122,7 +122,7 @@ bash pipeline.sh --dir ... --only-sleap    # skip aruco array+datacp
 1. **mkv readable by sleap-nn**: on saion-gpu24, `sleap-nn predict
    <export_dir> <some_chunk.mkv> --runtime tensorrt --n-frames 100` succeeds.
 2. **TRT export of legacy `best_model.h5` models**: run
-   `pipeline/scripts/export_sleap_trt.sh --centroid <dir> --instance <dir> --out
+   `detection_pipeline/scripts/export_sleap_trt.sh --centroid <dir> --instance <dir> --out
    /tmp/exporttest --runtime tensorrt` and confirm `model.trt` is created. If
    the export errors on legacy weights, set `--skip-trt-export` and the
    `sleap_predict_array` task falls back to `sleap-nn track` (PyTorch).
@@ -133,7 +133,7 @@ bash pipeline.sh --dir ... --only-sleap    # skip aruco array+datacp
 
 ## What changed vs the old monolith
 
-| | old `transcode_sleap_aruco.sh` | new `pipeline/` |
+| | old `transcode_sleap_aruco.sh` | new `detection_pipeline/` |
 |---|---|---|
 | Re-encode step | yes (split → libx264 encode → encfin) | **dropped** — `ffmpeg -c copy` only |
 | Per-video scheduling | full pipeline submitted per `vname` | cross-video, chunk-ordered worklist |
@@ -158,6 +158,40 @@ Practical implications:
 - aruco_array at `-c 4 --mem=8G` per task → ceiling is `2000/4 = 500` concurrent tasks (cpu-bound). Default `ARUCO_CONCURRENCY=128` leaves headroom for other work; bump to ~400 if running standalone.
 - Bridge must use `compute` (rsync to saion can take hours; 2 h cap on `short` is fatal).
 - Anything multiplicative — never submit per-chunk arrays on `datacp` (20-job cap is trivial to blow). Use single jobs.
+
+### saion (Reiter unit, `stephensuni` account)
+
+| Partition  | cpu cap | gpu cap | mem cap | MaxWall | Notes |
+|---         |---      |---      |---      |---      |---|
+| `largegpu` | 128     | **8**   | 1 T     | 12 h    | A100 80GB. **8-GPU cap is the binding limit** for sleap_predict. With `-c 16 --mem=128G --gres=gpu:1` per task and 8 concurrent, all three caps are saturated exactly. |
+| `gpu`      | 72      | 8       | (none)  | 2 days  | V100/P100 mix; usable for aruco GPU detector if quality validation passes |
+| `test-gpu` | 18      | 2       | (none)  | 8 h     | small testing partition |
+
+Each `largegpu` node has 128 cpus / 2 TB RAM / **8x A100 80GB**. Four nodes total → 32 A100s in the partition, but a single user can only hold 8 of them at once (`gres/gpu=8`). So `SLEAP_CONCURRENCY=8` is the practical maximum — anything higher just queues PD against your own QOS.
+
+Each saion sleap task at `-c 16 --mem=128G --gres=gpu:1` uses 1/8 of the user quota. The TRT inference is GPU-light (~30 % average utilization per A100, bursty between forward pass and CPU postproc); the bottleneck is CPU-side postprocess (peak finding, instance assembly), which scales with the `-c` count. That's why we give each task the max 16 cores allowed by `cpu/8` math.
+
+**Gotcha — `ssh saion-gpu26 nvidia-smi` only shows ONE GPU.** Saion uses pam_slurm_adopt, so ssh sessions get wrapped in one of your running jobs' cgroup and `nvidia-smi` is filtered by `CUDA_VISIBLE_DEVICES`. To check all GPUs on a node, use either:
+```bash
+# Authoritative: how many physical GPUs Slurm sees on the node
+scontrol show node saion-gpu26 | grep -E 'Gres|CfgTRES'
+
+# Per-task GPU status — run nvidia-smi inside a specific job's allocation
+ssh saion srun --jobid=4628221_44 nvidia-smi --query-gpu=index,utilization.gpu --format=csv,noheader
+
+# All your jobs on a given node and their resource allocations
+ssh saion squeue -h -w saion-gpu26 -o '%i %u %T %c %m %G'
+```
+
+### V100 is NOT viable for sleap-nn 0.2.0 (verified 2026-05-21)
+
+We tried installing `sleap-nn/0.2.0-cu128` to extend saion sleap throughput to the V100s on `gpu` partition. Two stack-level blockers make this impossible without custom-building PyTorch:
+- PyTorch 2.11 wheels (cu128 and cu130) compiled for SM ≥ 7.5 only; V100 is SM 7.0.
+- cuDNN 9.19 (pulled transitively by torch) requires SM ≥ 7.5.
+
+`sleap-nn/0.1.2` works on V100 but has a different CLI (`sleap-nn-track`, no `sleap-nn predict`, no TRT export). Mixing versions across partitions would require split-architecture pipeline support — too much complexity for ~40 % throughput gain. **Stay A100-only for sleap.**
+
+The cu128 install is left in place at `/apps/unit/ReiterU/sleap-nn/0.2.0-cu128` in case a future PyTorch wheel relaxes the SM list.
 
 Query commands to verify on a new account:
 ```bash
