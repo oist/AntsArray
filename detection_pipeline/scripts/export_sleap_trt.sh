@@ -80,11 +80,15 @@ case "$RUNTIME" in
 	both)     fmt=both ;;
 esac
 
+MAX_BATCH="${MAX_BATCH:-16}"   # override with MAX_BATCH=N before invoking
+# Note: sleap-nn's TRT export bakes a 2x h/w margin into the max profile, so
+# the engine's activation memory scales as ~4x_resolution * batch_size.
+# At 4024x3036 / fp16 with default 2.1 GB workspace, MAX_BATCH=16 fits; 32 does not.
 sleap-nn export "$CENTROID" "$INSTANCE" \
 	-o "$OUT" \
 	-f "$fmt" \
 	--precision fp16 \
-	--max-batch-size 16 \
+	--max-batch-size "$MAX_BATCH" \
 	--device cuda
 
 echo "[OK] exported to $OUT"

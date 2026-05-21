@@ -1,6 +1,8 @@
 #!/bin/bash -l
+# saion largegpu user cap: cpu=128, gres/gpu=8, mem=1T, MaxWall=12h
+# With 8 concurrent tasks (GPU-capped), each task = 16 cpus, 128 GB, 1 GPU.
 #SBATCH -t 0-12
-#SBATCH -c 8
+#SBATCH -c 16
 #SBATCH --partition=__SAION_PARTITION__
 #SBATCH --mem=128G
 #SBATCH --gres=gpu:1
@@ -26,7 +28,7 @@ SLEAP_MODEL_INSTANCE="__SLEAP_MODEL_INSTANCE__"
 SKIP_TRT_EXPORT=__SKIP_TRT_EXPORT__
 DEIGO_FLASH_SAION_PREFIX="__DEIGO_FLASH_SAION_PREFIX__"   # /deigo_flash/.../<exp> mount on saion
 DATA_DIR="__DATA_DIR__"                      # bucket path; reached via "saion" alias (login has write)
-SLEAP_BATCH_SIZE="${SLEAP_BATCH_SIZE:-8}"   # per-frame inference batch
+SLEAP_BATCH_SIZE="${SLEAP_BATCH_SIZE:-16}"   # per-frame inference batch (engine max from export)
 BATCH_SIZE=__BATCH_SIZE__                    # chunks per array task
 
 WORKLIST="$REMOTE_JOBS/aruco_worklist.txt"

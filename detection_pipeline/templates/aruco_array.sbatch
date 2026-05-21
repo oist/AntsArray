@@ -41,18 +41,32 @@ for (( row_idx=start_idx; row_idx<end_idx; row_idx++ )); do
 		continue
 	fi
 
-	out_h5="$aruco_dir/${vname}_${chunk}_aruco_tracks_.h5"
-	bucket_h5="$DATA_DIR/${vname}_${chunk}_aruco_tracks_.h5"
+	# run_aruco.py produces TWO h5 files per chunk:
+	#   <base>_aruco_tracks.h5      raw numpy arrays
+	#   <base>_aruco_detections.h5  DataFrame (Frame, Instance, X, Y, Confidence)
+	out_tracks="$aruco_dir/${vname}_${chunk}_aruco_tracks.h5"
+	out_detect="$aruco_dir/${vname}_${chunk}_aruco_detections.h5"
 	sentinel="$aruco_dir/${vname}_${chunk}.aruco.ok"
 
-	if [[ -s "$out_h5" && -f "$sentinel" ]]; then
-		echo "[SKIP] aruco already done for ${vname}_${chunk}"
-		# Upload to bucket if not already there (catches earlier inline-upload misses)
-		if [[ ! -f "$bucket_h5" ]]; then
-			rsync_retry -ah --chmod=Du=rwx,Dg=rwx,Fu=rw,Fg=rw \
-				"$out_h5" "deigo:$DATA_DIR/" \
-				|| echo "[WARN] inline upload of ${vname}_${chunk} failed; aruco_datacp end-of-run will retry" >&2
+	upload_one() {
+		local local_path="$1"
+		[[ -s "$local_path" ]] || return 0
+		local base_name
+		base_name=$(basename "$local_path")
+		# Skip if already on bucket and same size (cheap idempotency)
+		if [[ -f "$DATA_DIR/$base_name" ]] && \
+		   [[ $(stat -c %s "$local_path") == $(stat -c %s "$DATA_DIR/$base_name" 2>/dev/null) ]]; then
+			return 0
 		fi
+		rsync_retry -ah --chmod=Du=rwx,Dg=rwx,Fu=rw,Fg=rw \
+			"$local_path" "deigo:$DATA_DIR/" \
+			|| { echo "[WARN] inline upload of $base_name failed; aruco_datacp end-of-run will retry" >&2; return 1; }
+	}
+
+	if [[ -s "$out_tracks" && -f "$sentinel" ]]; then
+		echo "[SKIP] aruco already done for ${vname}_${chunk}"
+		upload_one "$out_tracks" || true
+		upload_one "$out_detect" || true
 		continue
 	fi
 
@@ -66,10 +80,7 @@ for (( row_idx=start_idx; row_idx<end_idx; row_idx++ )); do
 	touch "$sentinel"
 	echo "[OK] ${vname}_${chunk}"
 
-	# Inline upload: stream this h5 to bucket via deigo login (compute can't
-	# write /bucket directly). aruco_datacp at end-of-run is the safety net.
-	echo "[$(date)] uploading $(basename "$out_h5") -> bucket"
-	rsync_retry -ah --chmod=Du=rwx,Dg=rwx,Fu=rw,Fg=rw \
-		"$out_h5" "deigo:$DATA_DIR/" \
-		|| echo "[WARN] inline upload of ${vname}_${chunk} failed; aruco_datacp end-of-run will retry" >&2
+	# Stream both outputs to bucket via deigo login (compute can't write /bucket).
+	upload_one "$out_tracks" || true
+	upload_one "$out_detect" || true
 done

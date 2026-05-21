@@ -1,7 +1,7 @@
 #!/bin/bash -l
-#SBATCH -t 1-0
+#SBATCH -t 0-6
 #SBATCH -c 1
-#SBATCH --partition=compute
+#SBATCH --partition=short
 #SBATCH --mem=2G
 #SBATCH -J cleanup
 #SBATCH -o __JOBS_ROOT__/cleanup_%j.out
@@ -11,11 +11,13 @@ set -eo pipefail
 JOBS_ROOT="__JOBS_ROOT__"
 source "$JOBS_ROOT/pipeline.env"
 
-# Saion compute self-fetches chunks from /deigo_flash, so deigo's /flash must
-# stay readable until saion sleap is fully done. We poll the bucket for SLP
-# files (shared FS, no ssh needed) until all chunks have landed or we time out.
+# /flash only needs to outlive the chunk-copy to saion, NOT saion's sleap
+# inference. Saion holds its own /work copies once self-fetch (or bridge rsync)
+# has happened, so /flash is safe to free as soon as all expected chunks are
+# visible on the /saion_work read-only mount.
 WORKLIST="$JOBS_ROOT/aruco_worklist.txt"
-SLEAP_TIMEOUT="${SLEAP_TIMEOUT:-86400}"   # 24h hard cap
+SAION_INPUT_DIR="/saion_work/ReiterU/$USER/$EXP_NAME/input"
+CHUNK_COPY_TIMEOUT="${CHUNK_COPY_TIMEOUT:-${SLEAP_TIMEOUT:-21600}}"   # 6h default
 POLL_SECS="${CLEANUP_POLL_SECS:-300}"     # check every 5 min
 
 if [[ ! -f "$WORKLIST" ]]; then
@@ -25,32 +27,34 @@ else
 	expected=$(wc -l < "$WORKLIST")
 fi
 
-count_slp() {
+count_chunks_on_saion() {
 	local n=0
+	[[ -d "$SAION_INPUT_DIR" ]] || { echo 0; return; }
 	while IFS=$'\t' read -r vname chunk; do
 		[[ -n "$vname" ]] || continue
-		[[ -f "$DATA_DIR/${vname}_${chunk}.slp" ]] && n=$((n+1))
+		[[ -f "$SAION_INPUT_DIR/${vname}_${chunk}.${CHUNK_EXT}" ]] && n=$((n+1))
 	done < "$WORKLIST"
 	echo "$n"
 }
 
-deadline=$(( $(date +%s) + SLEAP_TIMEOUT ))
+deadline=$(( $(date +%s) + CHUNK_COPY_TIMEOUT ))
 if (( expected > 0 )); then
-	echo "[INFO] waiting for $expected SLP files in $DATA_DIR (timeout ${SLEAP_TIMEOUT}s)"
-	actual=$(count_slp)
+	echo "[INFO] waiting for $expected chunks on saion ($SAION_INPUT_DIR, timeout ${CHUNK_COPY_TIMEOUT}s)"
+	actual=$(count_chunks_on_saion)
 	while (( actual < expected )) && (( $(date +%s) < deadline )); do
-		echo "[$(date '+%H:%M:%S')] $actual / $expected SLP files; sleeping ${POLL_SECS}s"
+		echo "[$(date '+%H:%M:%S')] $actual / $expected chunks on saion; sleeping ${POLL_SECS}s"
 		sleep "$POLL_SECS"
-		actual=$(count_slp)
+		actual=$(count_chunks_on_saion)
 	done
 
 	if (( actual < expected )); then
-		echo "[WARN] timeout: $actual / $expected SLP files present in $DATA_DIR"
+		echo "[WARN] timeout: $actual / $expected chunks on saion (path $SAION_INPUT_DIR)"
 		echo "       KEEPING $FLASH_ROOT for retry."
+		echo "       Causes: bridge rsync incomplete (OLD arch), or self-fetch slow (NEW arch)."
 		echo "       To force-delete after manual verification: rm -rf $FLASH_ROOT"
 		exit 1
 	fi
-	echo "[OK] all $actual / $expected SLP files present"
+	echo "[OK] all $actual / $expected chunks present on saion; safe to free /flash"
 fi
 
 if [[ -d "$FLASH_ROOT" ]]; then

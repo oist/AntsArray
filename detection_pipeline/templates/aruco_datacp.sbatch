@@ -26,13 +26,15 @@ missing=0
 echo "[$(date)] starting aruco datacp -> $DATA_DIR/"
 
 while IFS=$'\t' read -r vname chunk; do
-	src="$FLASH_ROOT/aruco/$vname/${vname}_${chunk}_aruco_tracks_.h5"
-	if [[ ! -s "$src" ]]; then
-		missing=$((missing+1))
-		continue
-	fi
-	rsync -ah --chmod=Du=rwx,Dg=rwx,Fu=rw,Fg=rw "$src" "$DATA_DIR/"
-	uploaded=$((uploaded+1))
+	for suffix in aruco_tracks aruco_detections; do
+		src="$FLASH_ROOT/aruco/$vname/${vname}_${chunk}_${suffix}.h5"
+		if [[ ! -s "$src" ]]; then
+			missing=$((missing+1))
+			continue
+		fi
+		rsync -ah --chmod=Du=rwx,Dg=rwx,Fu=rw,Fg=rw "$src" "$DATA_DIR/"
+		uploaded=$((uploaded+1))
+	done
 done < "$WORKLIST"
 
 echo "[$(date)] done: uploaded=$uploaded missing=$missing total_worklist=$(wc -l < "$WORKLIST")"
