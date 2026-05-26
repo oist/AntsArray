@@ -25,7 +25,7 @@ uploaded=0
 missing=0
 echo "[$(date)] starting aruco datacp -> $DATA_DIR/"
 
-while IFS=$'\t' read -r vname chunk; do
+while IFS=$'\t' read -r vname chunk _; do
 	for suffix in aruco_tracks aruco_detections; do
 		src="$FLASH_ROOT/aruco/$vname/${vname}_${chunk}_${suffix}.h5"
 		if [[ ! -s "$src" ]]; then

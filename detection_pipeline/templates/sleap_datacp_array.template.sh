@@ -37,7 +37,7 @@ uploaded=0
 missing=0
 echo "[$(date)] starting sleap datacp -> saion:$DATA_DIR/"
 
-while IFS=$'\t' read -r vname chunk; do
+while IFS=$'\t' read -r vname chunk _; do
 	src="$REMOTE_OUTPUT/${vname}_${chunk}.slp"
 	if [[ ! -s "$src" ]]; then
 		missing=$((missing+1))

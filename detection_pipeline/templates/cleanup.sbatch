@@ -30,7 +30,7 @@ fi
 count_chunks_on_saion() {
 	local n=0
 	[[ -d "$SAION_INPUT_DIR" ]] || { echo 0; return; }
-	while IFS=$'\t' read -r vname chunk; do
+	while IFS=$'\t' read -r vname chunk _; do
 		[[ -n "$vname" ]] || continue
 		[[ -f "$SAION_INPUT_DIR/${vname}_${chunk}.${CHUNK_EXT}" ]] && n=$((n+1))
 	done < "$WORKLIST"

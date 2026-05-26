@@ -15,6 +15,7 @@ WORKLIST="$JOBS_ROOT/aruco_worklist.txt"
 echo "[INFO] building worklist -> $WORKLIST"
 python3 "$LIB_DIR/worklist.py" \
 	--manifest "$JOBS_ROOT/manifest.csv" \
+	--chunk-sec "$CHUNK_SEC" \
 	--out "$WORKLIST"
 
 N=$(wc -l < "$WORKLIST")

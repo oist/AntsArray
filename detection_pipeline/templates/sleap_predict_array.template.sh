@@ -43,6 +43,11 @@ for (( row_idx=start_idx; row_idx<end_idx; row_idx++ )); do
 	[[ -n "$row" ]] || break
 	vname=$(printf '%s' "$row" | cut -f1)
 	chunk=$(printf '%s' "$row" | cut -f2)
+	# Column 3 (expected_frames) caps inference so sleap-nn 0.2 doesn't walk past
+	# the actual decodable end on _000 chunks (ffmpeg -c copy propagates the source
+	# video's full frame count into the first segment's container metadata).
+	# Empty (old 2-col worklist) = no cap.
+	n_frames=$(printf '%s' "$row" | cut -f3)
 
 	# Source: deigo's /flash visible on saion compute as /deigo_flash (read-only).
 	# We copy to /work so saion owns an isolated copy (no risk if deigo cleanup
@@ -77,9 +82,13 @@ for (( row_idx=start_idx; row_idx<end_idx; row_idx++ )); do
 			-o "$out_slp" \
 			--runtime "$SLEAP_RUNTIME" \
 			--batch-size "$SLEAP_BATCH_SIZE" \
+			${n_frames:+--n-frames "$n_frames"} \
 			--device cuda
 	else
-		# Fallback: legacy PyTorch path via raw model dirs
+		# Fallback: legacy PyTorch path via raw model dirs.
+		# Note: sleap-nn track does not accept --n-frames; on _000 chunks with
+		# inflated container metadata this path will fail with the same
+		# IndexError. Workaround there is to ffmpeg-trim the chunk first.
 		sleap-nn track \
 			-i "$input" \
 			-m "$SLEAP_MODEL_CENTROID" \
