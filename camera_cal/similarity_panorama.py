@@ -3,23 +3,24 @@
 Panorama stitching under **similarity transforms** using **SIFT key‑points**
 ===========================================================================
 This single script:
-1. Loads all `camXX*.tiff` frames in a 5 × 5 camera grid.
+1. Loads all `camXX*` still images in a 5 x 5 camera grid, or samples the first
+   frame from all `camXX*` videos in a folder.
 2. Detects SIFT features for every image.
 3. Matches only 8‑connected neighbour cameras, keeps pairs with ≥ `MATCH_THRESHOLD` RANSAC inliers.
-4. Builds an initial global pose graph, generates a **pre‑bundle‑adjustment mosaic**.
-5. Runs robust LM bundle adjustment to refine one similarity matrix per camera.
-6. Generates the **post‑BA mosaic** and writes both mosaics plus per‑pair match visualisations to `debug/`.
+4. Builds an initial global pose graph from pairwise similarities.
+5. Saves `initial_H_mats.npz`, a diagnostic mosaic, and per-pair match visualisations to `debug/`.
 
 Requires **OpenCV ≥ 4.4** compiled with non‑free modules (for SIFT), plus `numpy`, `scipy`, and `matplotlib`.
 
 ```bash
 pip install opencv-contrib-python numpy scipy matplotlib
-python similarity_panorama.py
+python camera_cal/similarity_panorama.py --input /path/to/images_or_videos
 ```
 """
 
 from __future__ import annotations
 
+import argparse
 import cv2
 import numpy as np
 from pathlib import Path
@@ -33,29 +34,102 @@ import matplotlib.pyplot as plt
 # CONFIG                                                                      #
 ###############################################################################
 
-IM_PATH = "/home/sam-reiter/bucket/ReiterU/Ants/basler/2025_Sep_no_pertubation/calibration_dataset/set0_patterns_elevated_by_2mm"  # folder with camXX*.tiff
+IM_PATH = "/home/sam-reiter/bucket/ReiterU/Ants/basler/20260414_20260417_CustomAruco/calibration_dataset/set0_patterns_elevated_by_2mm/frame0/"  # folder with camXX images or videos
 ARRAY_SIZE = (5, 5)          # camera grid (rows, cols)
 MATCH_THRESHOLD = 20          # discard edges with fewer inliers
 DEBUG = True                 # write debug artefacts
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
+VIDEO_SUFFIXES = {".avi", ".mp4", ".mov", ".mkv", ".mpeg", ".mpg", ".m4v"}
 
 ###############################################################################
 # Helper I/O                                                                  #
 ###############################################################################
 
+CAM_RE = re.compile(r"cam(\d{2})")
+
+
+def _cam_num(file: Path) -> int | None:
+    m = CAM_RE.search(file.name)
+    return int(m.group(1)) if m else None
+
+
+def _cam_sort_key(file: Path):
+    cam_num = _cam_num(file)
+    return cam_num if cam_num is not None else 1e9
+
+
+def _one_file_per_camera(files: List[Path]) -> List[Path]:
+    """Choose one input per camXX, preferring the first lexicographic file."""
+    grouped: Dict[int, List[Path]] = defaultdict(list)
+    no_cam: List[Path] = []
+    for f in files:
+        cam_num = _cam_num(f)
+        if cam_num is None:
+            no_cam.append(f)
+        else:
+            grouped[cam_num].append(f)
+
+    if not grouped:
+        return sorted(files)
+
+    chosen = []
+    for cam_num in sorted(grouped):
+        matches = sorted(grouped[cam_num])
+        if len(matches) > 1:
+            print(
+                f"cam{cam_num:02d}: found {len(matches)} inputs; using {matches[0].name}"
+            )
+        chosen.append(matches[0])
+
+    if no_cam:
+        print(f"Ignoring {len(no_cam)} files without camXX in the name.")
+    return chosen
+
+
+def _first_video_frame_gray(video_path: Path) -> np.ndarray:
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise IOError(f"Could not open video: {video_path}")
+    ok, frame = cap.read()
+    cap.release()
+    if not ok or frame is None:
+        raise IOError(f"Could not read first frame from video: {video_path}")
+    return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+
 def list_images(path: str) -> Tuple[List[Path], List[np.ndarray]]:
-    """Return sorted filenames + grayscale images."""
+    """Return sorted filenames + grayscale calibration images.
+
+    If still images are present, they are used. Otherwise, first frames are
+    extracted from videos. This avoids creating intermediate frame files.
+    """
     p = Path(path)
-    files = [f for f in p.glob("*.png") if not f.name.startswith(".")]
-    cam_re = re.compile(r"cam(\d{2})")
+    if not p.is_dir():
+        raise NotADirectoryError(p)
 
-    def key(file: Path):
-        m = cam_re.search(file.name)
-        return int(m.group(1)) if m else 1e9
+    all_files = [f for f in p.iterdir() if f.is_file() and not f.name.startswith(".")]
+    files = [f for f in all_files if f.suffix.lower() in IMAGE_SUFFIXES]
+    source = "image"
 
-    files.sort(key=key)
-    imgs = [cv2.imread(str(f), cv2.IMREAD_GRAYSCALE) for f in files]
+    if not files:
+        files = [f for f in all_files if f.suffix.lower() in VIDEO_SUFFIXES]
+        source = "video"
+
+    files = _one_file_per_camera(files)
+    files.sort(key=_cam_sort_key)
+    if not files:
+        raise RuntimeError(
+            f"No image or video files found in {p}. "
+            f"Image suffixes: {sorted(IMAGE_SUFFIXES)}; video suffixes: {sorted(VIDEO_SUFFIXES)}"
+        )
+
+    if source == "image":
+        imgs = [cv2.imread(str(f), cv2.IMREAD_GRAYSCALE) for f in files]
+    else:
+        imgs = [_first_video_frame_gray(f) for f in files]
+
     if any(i is None for i in imgs):
-        raise IOError("Some PNGs failed to load – check paths/permissions.")
+        raise IOError(f"Some {source} inputs failed to load - check paths/permissions.")
     return files, imgs
 
 
@@ -167,7 +241,7 @@ def compute_pairwise_similarities(
 
 
 ###############################################################################
-# Global transforms (pre‑BA)                                                  #
+# Global transforms                                                           #
 ###############################################################################
 
 def global_transforms(n: int, edges_H: Dict[Tuple[int, int], np.ndarray],CENTER=12):
@@ -226,9 +300,24 @@ def warp_and_blend(imgs, Hs):
 ###############################################################################
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Build initial similarity panorama transforms from camXX images or videos."
+    )
+    parser.add_argument(
+        "--input",
+        type=Path,
+        default=Path(IM_PATH),
+        help="Folder containing camXX still images or videos. Videos use their first frame.",
+    )
+    return parser.parse_args()
+
+
 def main():
     """Run the full stitching pipeline."""
-    out_root = Path(IM_PATH)
+    args = parse_args()
+    input_path = Path(args.input)
+    out_root = input_path
     debug_dir = out_root / "debug"
     if DEBUG:
         debug_dir.mkdir(exist_ok=True)
@@ -236,11 +325,11 @@ def main():
     # ---------------------------------------------------------------------
     # 1. Load images
     # ---------------------------------------------------------------------
-    files, imgs = list_images(IM_PATH)
+    files, imgs = list_images(str(input_path))
     n = len(imgs)
-    print(f"Loaded {n} images from {IM_PATH}")
+    print(f"Loaded {n} calibration images from {input_path}")
     if n == 0:
-        raise RuntimeError("No images found – check IM_PATH and file pattern.")
+        raise RuntimeError("No inputs found - check --input and file pattern.")
 
     # ---------------------------------------------------------------------
     # 2. Build neighbour graph (8‑connected grid)
@@ -264,20 +353,19 @@ def main():
         raise RuntimeError("No valid edges after SIFT matching – abort.")
 
     # ---------------------------------------------------------------------
-    # 5. Initial (pre‑bundle‑adjustment) global transforms
+    # 5. Initial global transforms from the pairwise similarity graph
     # ---------------------------------------------------------------------
-    Hs_pre = global_transforms(n, edges_H)
+    Hs_initial = global_transforms(n, edges_H)
     
     # Save homography matrices in the same format as refine_homographies.py
-    np.savez_compressed(out_root/"initial_H_mats.npz", H=np.stack(Hs_pre))
+    np.savez_compressed(out_root/"initial_H_mats.npz", H=np.stack(Hs_initial))
     print(f"Saved initial homography matrices to: {out_root/'initial_H_mats.npz'}")
     
-    mosaic_pre = warp_and_blend(imgs, Hs_pre)
+    mosaic_initial = warp_and_blend(imgs, Hs_initial)
     if DEBUG:
-        cv2.imwrite(str(debug_dir / "mosaic_pre.png"), mosaic_pre)
+        cv2.imwrite(str(debug_dir / "mosaic_initial.png"), mosaic_initial)
 
    
 
 if __name__ == "__main__":
     main()
-

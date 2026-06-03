@@ -203,7 +203,7 @@ def group_files_by_chunk(
     groups: Dict[str, Dict[int, Path]] = defaultdict(dict)
     is_compiled = hasattr(pattern, "search")
 
-    for path in root.glob("**/*"):
+    for path in sorted(root.glob("**/*")):
         if path.is_dir() or ignore_substr in path.name:
             continue
         m = pattern.search(path.name) if is_compiled else re.search(pattern, path.name)
@@ -285,9 +285,54 @@ def process_aruco_chunks(
         logging.info("ArUco panorama (chunk %s) → %s (num_frames=%s)", chunk, out_dir, num_frames)
 
 
+def _normalize_sleap_df(df: pd.DataFrame) -> pd.DataFrame:
+    required = ["Frame", "Instance", "Bodypoint", "X", "Y"]
+    missing = [col for col in required if col not in df.columns]
+    if missing:
+        raise ValueError(f"SLEAP data missing columns: {missing}")
+
+    out = df.copy()
+    for col in required:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+    if "Score_node" in out.columns:
+        out["Score_node"] = pd.to_numeric(out["Score_node"], errors="coerce")
+    out = out.dropna(subset=required)
+    out[["Frame", "Instance", "Bodypoint"]] = out[["Frame", "Instance", "Bodypoint"]].astype(int)
+    return out
+
+
+def _load_sleap_file(file: Path) -> pd.DataFrame:
+    suffix = file.suffix.lower()
+    if suffix == ".csv":
+        return _normalize_sleap_df(pd.read_csv(file))
+
+    if suffix not in {".h5", ".hdf5"}:
+        raise ValueError(f"Expected SLEAP .h5/.hdf5/.csv input, got {file}")
+
+    try:
+        return _normalize_sleap_df(pd.read_hdf(file, key="sleap_data"))
+    except Exception:
+        pass
+
+    with h5py.File(file, "r") as f:
+        if "sleap_data" in f:
+            arr = f["sleap_data"][:]
+            if getattr(arr.dtype, "names", None):
+                return _normalize_sleap_df(pd.DataFrame.from_records(arr))
+
+        required = ["Frame", "Instance", "Bodypoint", "X", "Y"]
+        missing = [name for name in required if name not in f]
+        if missing:
+            raise ValueError(f"{file} missing datasets: {missing}")
+        data = {name: np.squeeze(f[name][:]) for name in required}
+        if "Score_node" in f:
+            data["Score_node"] = np.squeeze(f["Score_node"][:])
+        return _normalize_sleap_df(pd.DataFrame(data))
+
+
 def process_sleap_chunks(hmats: List[np.ndarray], sleap_dir: Path, out_dir: Path, exp: str) -> None:
     patt = re.compile(
-        r"^cam(\d+)_cam\d+_\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}_(\d{3})(?:_sleap_data)?\.csv$"
+        r"^cam(\d+)_cam\d+_\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}_(\d{3})(?:_sleap_data)?\.(?:h5|hdf5|csv)$"
     )
 
     chunk_map = group_files_by_chunk(sleap_dir, patt)
@@ -295,7 +340,7 @@ def process_sleap_chunks(hmats: List[np.ndarray], sleap_dir: Path, out_dir: Path
     for chunk, cam_files in tqdm(chunk_map.items(), desc="SLEAP chunks"):
         dfs = []
         for cam_idx, file in cam_files.items():
-            df = pd.read_csv(file)
+            df = _load_sleap_file(file)
             if df.empty:
                 continue
             xy = df[["X", "Y"]].to_numpy(float)

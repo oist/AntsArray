@@ -5,7 +5,7 @@ Manual correction tool for `*_aruco_detections.csv` before downstream mapping an
 ## Launch
 
 ```bash
-python tracking/aruco_curation_gui.py \
+python tracking/gui/aruco_curation.py \
   --video /home/sam-reiter/bucket/ReiterU/Ants/basler/20251117_2_stim/data/cam01_cam0_2025-11-17-04-57-25_000.avi \
   --detections /home/sam-reiter/bucket/ReiterU/Ants/basler/20251117_2_stim/data/cam01_cam0_2025-11-17-04-57-25_000_aruco_detections.csv
 ```

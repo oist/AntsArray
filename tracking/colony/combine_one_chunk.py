@@ -1,76 +1,28 @@
 #!/usr/bin/env python3
 import argparse
 import logging
-import re
 import sys
 from pathlib import Path
 
-import pandas as pd
-
-sys.path.append(str(Path(__file__).resolve().parents[1]))
-from tracking.tracking_utils import get_complete_tracks  # noqa: E402
-
-# Example filename:
-#   20251118_121514_chunk000_aruco_panorama_x_left1740.pkl
-# Key should be:
-#   20251118_121514_chunk000
-KEY_RE = re.compile(r"^(.+_chunk[0-9]{3})", re.IGNORECASE)
-SIDES = ("left", "right")
+sys.path.append(str(Path(__file__).resolve().parents[2]))
+from tracking.colony.panorama_io import (  # noqa: E402
+    extract_key,
+    infer_side,
+    load_aruco_pkl,
+    load_sleap_pkl,
+    pick_one,
+)
 
 
-from pathlib import Path
-import pandas as pd
-
-def load_sleap_pkl(path: Path) -> pd.DataFrame:
-    # SLEAP outputs are DataFrame pickles
-    df = pd.read_pickle(path)
-    if not isinstance(df, pd.DataFrame):
-        raise TypeError(f"SLEAP PKL did not contain a DataFrame: {path} (type={type(df)})")
-    return df
-
-def load_aruco_pkl(path: Path) -> tuple[pd.DataFrame, int]:
-    # ArUco outputs are dict payloads: {"detections": DataFrame, "num_frames": int}
-    payload = pd.read_pickle(path)
-    if not isinstance(payload, dict) or "detections" not in payload:
-        raise TypeError(f"ARUCO PKL did not contain expected dict payload: {path} (type={type(payload)})")
-
-    det = payload["detections"]
-    if not isinstance(det, pd.DataFrame):
-        raise TypeError(f"ARUCO payload['detections'] is not a DataFrame: {path} (type={type(det)})")
-
-    num_frames = int(payload.get("num_frames", -1))
-    return det, num_frames
-
-
-def extract_key(filename: str) -> str | None:
-    m = KEY_RE.match(filename)
-    return m.group(1) if m else None
-
-
-def infer_side(filename: str) -> str | None:
-    fn = filename.lower()
-    for s in SIDES:
-        if f"_x_{s}" in fn or f"_{s}" in fn:
-            return s
-    return None
-
-
-def pick_one(matches: list[Path], label: str) -> Path | None:
-    """Pick lexicographically first to match submit script behavior."""
-    if not matches:
-        return None
-    matches_sorted = sorted(matches, key=lambda p: p.name)
-    if len(matches_sorted) > 1:
-        logging.warning(
-            "%s has %d matching files; using: %s",
-            label,
-            len(matches_sorted),
-            matches_sorted[0].name,
-        )
-    return matches_sorted[0]
-
-
-def process_one(input_file: Path, output_root: Path) -> None:
+def process_one(
+    input_file: Path,
+    output_root: Path,
+    *,
+    max_distance: float = 90.0,
+    lost_track_max_frames: int = 120,
+    lost_track_max_distance: float | None = None,
+    lost_track_aruco_max_distance: float | None = None,
+) -> None:
     """
     Flat-folder behavior:
       - derive key (<dataset>_chunkNNN) from input_file basename
@@ -119,16 +71,21 @@ def process_one(input_file: Path, output_root: Path) -> None:
     logging.info("SLEAP: %s", sleap_file.name)
     logging.info("ARUCO: %s", aruco_file.name)
 
+    from tracking.core.tracking_utils import get_complete_tracks
+
     sleap_det = load_sleap_pkl(sleap_file).dropna()
     aruco_det, num_frames = load_aruco_pkl(aruco_file)
-
 
     out_parquet = output_root / f"{key}_{side}.parquet"
     get_complete_tracks(
         output_path=str(out_parquet),
         aruco_detection=aruco_det,
         sleap_detection=sleap_det,
-        num_frames=num_frames
+        num_frames=num_frames,
+        max_distance=max_distance,
+        lost_track_max_frames=lost_track_max_frames,
+        lost_track_max_distance=lost_track_max_distance,
+        lost_track_aruco_max_distance=lost_track_aruco_max_distance,
     )
     logging.info("Wrote %s", out_parquet)
 
@@ -147,10 +104,21 @@ def main() -> None:
         type=Path,
         help="Flat output directory.",
     )
+    parser.add_argument("--max_distance", type=float, default=90.0)
+    parser.add_argument("--lost_track_max_frames", type=int, default=120)
+    parser.add_argument("--lost_track_max_distance", type=float, default=None)
+    parser.add_argument("--lost_track_aruco_max_distance", type=float, default=None)
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-    process_one(args.input_file, args.output_path)
+    process_one(
+        args.input_file,
+        args.output_path,
+        max_distance=args.max_distance,
+        lost_track_max_frames=args.lost_track_max_frames,
+        lost_track_max_distance=args.lost_track_max_distance,
+        lost_track_aruco_max_distance=args.lost_track_aruco_max_distance,
+    )
 
 
 if __name__ == "__main__":

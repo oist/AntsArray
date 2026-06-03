@@ -9,7 +9,7 @@ import sys
 
 # Add the parent directory to the path to import from tracking module
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from tracking.tracking_utils import get_complete_tracks
+from tracking.core.tracking_utils import get_complete_tracks
 
 
 
