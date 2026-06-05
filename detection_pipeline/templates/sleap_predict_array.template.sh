@@ -30,6 +30,7 @@ DEIGO_FLASH_SAION_PREFIX="__DEIGO_FLASH_SAION_PREFIX__"   # /deigo_flash/.../<ex
 DATA_DIR="__DATA_DIR__"                      # bucket path; reached via "saion" alias (login has write)
 SLEAP_BATCH_SIZE="${SLEAP_BATCH_SIZE:-16}"   # per-frame inference batch (engine max from export)
 BATCH_SIZE=__BATCH_SIZE__                    # chunks per array task
+SCRIPTS_DIR="__SCRIPTS_DIR__"                # pipeline scripts dir (sleap2h5.py, sleap2csv.py)
 
 WORKLIST="$REMOTE_JOBS/aruco_worklist.txt"
 
@@ -101,10 +102,27 @@ for (( row_idx=start_idx; row_idx<end_idx; row_idx++ )); do
 
 	echo "[OK] ${vname}_${chunk}"
 
-	# Inline upload: stream SLP to bucket via ssh saion (saion compute can't
-	# write /bucket directly). sleap_datacp at end-of-run is the safety net.
-	echo "[$(date)] uploading ${vname}_${chunk}.slp -> bucket"
-	rsync_retry -ah --chmod=Du=rwx,Dg=rwx,Fu=rw,Fg=rw \
-		"$out_slp" "saion:$DATA_DIR/" \
-		|| echo "[WARN] inline upload of ${vname}_${chunk} failed; sleap_datacp end-of-run will retry" >&2
+	# Post-process (slp -> h5, then rsync .slp + .h5 to bucket) runs in the
+	# BACKGROUND so the next chunk's GPU work overlaps with this chunk's CPU
+	# work + upload. With ~30 fps inference and ~few-min post-processing, at
+	# most ~1 background job is in flight at a time. The end-of-loop `wait`
+	# below ensures none are orphaned when the task exits. UV_TOOL_DIR is set
+	# by `module load sleap-nn/...`; pandas + h5py are in that venv.
+	# sleap_datacp end-of-run remains the safety net for anything missed here.
+	(
+		out_h5="$REMOTE_OUTPUT/${vname}_${chunk}_sleap_data.h5"
+		echo "[$(date)] [bg] slp -> h5 ${vname}_${chunk}"
+		"$UV_TOOL_DIR/sleap-nn/bin/python" "$SCRIPTS_DIR/sleap2h5.py" "$out_slp" "$REMOTE_OUTPUT" \
+			|| echo "[WARN] sleap2h5 failed for ${vname}_${chunk}; .slp will still upload" >&2
+
+		upload_files=( "$out_slp" )
+		[[ -s "$out_h5" ]] && upload_files+=( "$out_h5" )
+		echo "[$(date)] [bg] uploading ${vname}_${chunk} (.slp + .h5) -> bucket"
+		rsync_retry -ah --chmod=Du=rwx,Dg=rwx,Fu=rw,Fg=rw \
+			"${upload_files[@]}" "saion:$DATA_DIR/" \
+			|| echo "[WARN] inline upload of ${vname}_${chunk} failed; sleap_datacp end-of-run will retry" >&2
+	) &
 done
+# Wait for any backgrounded post-processing (slp2h5 + rsync) before exiting.
+wait
+echo "[$(date)] all background uploads finished; task done"

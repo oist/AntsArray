@@ -79,6 +79,7 @@ sed -e "s#__REMOTE_JOBS__#$REMOTE_JOBS#g" \
     -e "s#__DEIGO_FLASH_SAION_PREFIX__#$DEIGO_FLASH_SAION_PREFIX#g" \
     -e "s#__DATA_DIR__#$DATA_DIR#g" \
     -e "s#__HOSTS_LIB__#$LIB_DIR/hosts.sh#g" \
+    -e "s#__SCRIPTS_DIR__#$SCRIPTS_DIR#g" \
     "$TEMPLATES_DIR/sleap_predict_array.template.sh" > "$RENDERED_PREDICT"
 
 sed -e "s#__REMOTE_JOBS__#$REMOTE_JOBS#g" \
@@ -107,7 +108,7 @@ ARRAY_COUNT=$(( (N + BS - 1) / BS ))
 UPPER=$(( ARRAY_COUNT - 1 ))
 
 echo "[INFO] sbatch on saion: sleap_predict_array 0-$UPPER%$SLEAP_CONCURRENCY"
-JID_SLEAP=$(ssh_retry saion "sbatch --parsable --array=0-${UPPER}%${SLEAP_CONCURRENCY} '$REMOTE_JOBS/sleap_predict_array.sh'")
+JID_SLEAP=$(ssh_retry saion "sbatch --parsable --export=ALL,SLEAP_BATCH_SIZE=${SLEAP_BATCH_SIZE:-16} --array=0-${UPPER}%${SLEAP_CONCURRENCY} '$REMOTE_JOBS/sleap_predict_array.sh'")
 echo "  saion sleap         $JID_SLEAP"
 echo "$JID_SLEAP" > "$JOBS_ROOT/jid_saion_sleap.txt"
 
