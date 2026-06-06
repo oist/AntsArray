@@ -32,6 +32,7 @@ def run_mapping(
     panorama_dir: Path,
     map_mode: str,
     min_instance_frame_frac: float,
+    skip_existing: bool,
 ) -> None:
     from tracking.colony.map_combine import (
         infer_experiment_name,
@@ -51,10 +52,11 @@ def run_mapping(
             panorama_dir,
             exp,
             min_instance_frame_frac=min_instance_frame_frac,
+            skip_existing=skip_existing,
         )
 
     if map_mode in ("sleap", "both"):
-        process_sleap_chunks(hmats, data_dir, panorama_dir, exp)
+        process_sleap_chunks(hmats, data_dir, panorama_dir, exp, skip_existing=skip_existing)
 
 
 def run_combine(
@@ -70,10 +72,13 @@ def run_combine(
     time_limit: str,
     job_name: str,
     conda_env: str,
+    conda_bin: str,
+    python_bin: str | None,
     max_distance: float,
     lost_track_max_frames: int,
     lost_track_max_distance: float | None,
     lost_track_aruco_max_distance: float | None,
+    skip_existing: bool,
 ) -> None:
     tracks_dir.mkdir(parents=True, exist_ok=True)
     jobs = discover_jobs(panorama_dir, parse_sides(side))
@@ -89,6 +94,7 @@ def run_combine(
             lost_track_max_frames=lost_track_max_frames,
             lost_track_max_distance=lost_track_max_distance,
             lost_track_aruco_max_distance=lost_track_aruco_max_distance,
+            skip_existing=skip_existing,
         )
         return
 
@@ -102,10 +108,13 @@ def run_combine(
         time_limit=time_limit,
         job_name=job_name,
         conda_env=conda_env,
+        conda_bin=conda_bin,
+        python_bin=python_bin,
         max_distance=max_distance,
         lost_track_max_frames=lost_track_max_frames,
         lost_track_max_distance=lost_track_max_distance,
         lost_track_aruco_max_distance=lost_track_aruco_max_distance,
+        skip_existing=skip_existing,
     )
 
 
@@ -185,6 +194,8 @@ def main() -> None:
     parser.add_argument("--time", default="0-24:00:00")
     parser.add_argument("--job_name", default="combine_tracks")
     parser.add_argument("--conda_env", default="aruco_env")
+    parser.add_argument("--conda_bin", default="conda")
+    parser.add_argument("--python_bin", default=None, help="Python executable for SLURM combine jobs.")
     parser.add_argument("--max_distance", type=float, default=90.0)
     parser.add_argument("--lost_track_max_frames", type=int, default=120)
     parser.add_argument("--lost_track_max_distance", type=float, default=None)
@@ -223,6 +234,7 @@ def main() -> None:
             panorama_dir=panorama_dir,
             map_mode=args.map_mode,
             min_instance_frame_frac=args.min_instance_frame_frac,
+            skip_existing=args.skip_existing,
         )
 
     if not args.skip_combine:
@@ -239,10 +251,13 @@ def main() -> None:
             time_limit=args.time,
             job_name=args.job_name,
             conda_env=args.conda_env,
+            conda_bin=args.conda_bin,
+            python_bin=args.python_bin,
             max_distance=args.max_distance,
             lost_track_max_frames=args.lost_track_max_frames,
             lost_track_max_distance=args.lost_track_max_distance,
             lost_track_aruco_max_distance=args.lost_track_aruco_max_distance,
+            skip_existing=args.skip_existing,
         )
         if args.combine_runner == "slurm" and not args.skip_stitch:
             logging.info("SLURM combine jobs were submitted asynchronously; skipping stitching for this run.")

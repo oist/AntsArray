@@ -31,7 +31,9 @@ Downstream reading example (ArUco):
 from __future__ import annotations
 
 import argparse
+import gc
 import logging
+import os
 import re
 from collections import defaultdict
 from pathlib import Path
@@ -47,9 +49,9 @@ from tqdm import tqdm
 # -----------------------------------------------------------------------------#
 
 CONFIG = dict(
-    hmats_npz="/home/sam-reiter/bucket/ReiterU/Ants/basler/2025_Sep_no_pertubation/calibration_dataset/set0_patterns_elevated_by_2mm/initial_H_mats.npz",
-    data_dir="/home/sam-reiter/bucket/ReiterU/Ants/basler/20251117_2_stim/data/",
-    output_dir="/home/sam-reiter/bucket/ReiterU/Ants/basler/20251117_2_stim/",
+    hmats_npz="/bucket/ReiterU/Ants/basler/2025_Sep_no_pertubation/calibration_dataset/set0_patterns_elevated_by_2mm/initial_H_mats.npz",
+    data_dir="/bucket/ReiterU/Ants/basler/20251117_2_stim/data/",
+    output_dir="/bucket/ReiterU/Ants/basler/20251117_2_stim/",
 )
 
 X_THRESHOLD: float = 1740.0
@@ -81,19 +83,106 @@ def apply_homography(xy: np.ndarray, H: np.ndarray) -> np.ndarray:
     return proj[:, :2] / proj[:, [2]]
 
 
-def split_and_write_flat(df: pd.DataFrame, out_dir: Path, base_name: str) -> None:
+def _split_output_paths(out_dir: Path, base_name: str) -> tuple[Path, Path]:
+    return (
+        out_dir / f"{base_name}_x_left{int(X_THRESHOLD)}.pkl",
+        out_dir / f"{base_name}_x_right{int(X_THRESHOLD)}.pkl",
+    )
+
+
+def _both_split_outputs_exist(out_dir: Path, base_name: str) -> bool:
+    left_file, right_file = _split_output_paths(out_dir, base_name)
+    return left_file.exists() and right_file.exists()
+
+
+def _atomic_pickle(obj, path: Path) -> None:
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        pd.to_pickle(obj, tmp_path)
+        tmp_path.replace(path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+
+def split_and_write_flat(
+    df: pd.DataFrame,
+    out_dir: Path,
+    base_name: str,
+    *,
+    skip_existing: bool = False,
+    anchor_bodypoint: int = 0,
+) -> None:
     """
     Write DF pickles (SLEAP outputs), split into left/right, into a flat out_dir.
     """
-    left = df[df["X"] < X_THRESHOLD]
-    right = df[df["X"] >= X_THRESHOLD]
+    left, right = split_sleap_by_anchor(df, anchor_bodypoint=anchor_bodypoint)
+    left_file, right_file = _split_output_paths(out_dir, base_name)
 
     if not left.empty:
-        left_file = out_dir / f"{base_name}_x_left{int(X_THRESHOLD)}.pkl"
-        left.to_pickle(left_file)
+        if skip_existing and left_file.exists():
+            logging.info("Skipping existing %s", left_file)
+        else:
+            _atomic_pickle(left, left_file)
     if not right.empty:
-        right_file = out_dir / f"{base_name}_x_right{int(X_THRESHOLD)}.pkl"
-        right.to_pickle(right_file)
+        if skip_existing and right_file.exists():
+            logging.info("Skipping existing %s", right_file)
+        else:
+            _atomic_pickle(right, right_file)
+
+
+def split_sleap_by_anchor(
+    df: pd.DataFrame,
+    *,
+    anchor_bodypoint: int = 0,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Split a SLEAP DataFrame into left/right while keeping each skeleton together.
+
+    This avoids a full DataFrame merge on ["Frame", "Instance"], which is too
+    memory-heavy for large colony chunks. Side is assigned from the anchor
+    bodypoint when present; rows without an anchor fall back to their own X.
+    """
+    if df.empty:
+        return df.copy(), df.copy()
+
+    required = {"Frame", "Instance", "Bodypoint", "X"}
+    if not required.issubset(df.columns):
+        return df[df["X"] < X_THRESHOLD].copy(), df[df["X"] >= X_THRESHOLD].copy()
+
+    frame = df["Frame"].to_numpy(dtype=np.int64, copy=False)
+    inst = df["Instance"].to_numpy(dtype=np.int64, copy=False)
+    bodypoint = df["Bodypoint"].to_numpy(dtype=np.int64, copy=False)
+    x = df["X"].to_numpy(dtype=np.float64, copy=False)
+
+    side_x = x.copy()
+    anchor_mask = bodypoint == int(anchor_bodypoint)
+    if np.any(anchor_mask):
+        stride = max(int(inst.max()) + 1, 1)
+        keys = frame * stride + inst
+        anchor_keys = keys[anchor_mask]
+        anchor_x = x[anchor_mask]
+        finite = np.isfinite(anchor_x)
+        anchor_keys = anchor_keys[finite]
+        anchor_x = anchor_x[finite]
+
+        if anchor_keys.size:
+            order = np.argsort(anchor_keys)
+            sorted_keys = anchor_keys[order]
+            sorted_x = anchor_x[order]
+            starts = np.r_[0, np.flatnonzero(np.diff(sorted_keys)) + 1]
+            unique_keys = sorted_keys[starts]
+            counts = np.diff(np.r_[starts, sorted_keys.size])
+            anchor_mean_x = np.add.reduceat(sorted_x, starts) / counts
+
+            pos = np.searchsorted(unique_keys, keys)
+            valid_pos = pos < unique_keys.size
+            matched = np.zeros(keys.shape, dtype=bool)
+            matched[valid_pos] = unique_keys[pos[valid_pos]] == keys[valid_pos]
+            side_x[matched] = anchor_mean_x[pos[matched]]
+
+    left_mask = side_x < X_THRESHOLD
+    return df.loc[left_mask].copy(), df.loc[~left_mask].copy()
 
 
 def split_and_write_with_num_frames_flat(
@@ -101,6 +190,8 @@ def split_and_write_with_num_frames_flat(
     out_dir: Path,
     base_name: str,
     num_frames: int,
+    *,
+    skip_existing: bool = False,
 ) -> None:
     """
     Write dict payload with detections + num_frames (ArUco outputs),
@@ -108,15 +199,19 @@ def split_and_write_with_num_frames_flat(
     """
     left = df[df["X"] < X_THRESHOLD]
     right = df[df["X"] >= X_THRESHOLD]
+    left_file, right_file = _split_output_paths(out_dir, base_name)
 
     if not left.empty:
-        left_file = out_dir / f"{base_name}_x_left{int(X_THRESHOLD)}.pkl"
-        pd.to_pickle({"detections": left, "num_frames": int(num_frames)}, left_file)
+        if skip_existing and left_file.exists():
+            logging.info("Skipping existing %s", left_file)
+        else:
+            _atomic_pickle({"detections": left, "num_frames": int(num_frames)}, left_file)
 
     if not right.empty:
-        right_file = out_dir / f"{base_name}_x_right{int(X_THRESHOLD)}.pkl"
-        pd.to_pickle({"detections": right, "num_frames": int(num_frames)}, right_file)
-
+        if skip_existing and right_file.exists():
+            logging.info("Skipping existing %s", right_file)
+        else:
+            _atomic_pickle({"detections": right, "num_frames": int(num_frames)}, right_file)
 
 def aruco_h5_to_long_df_full(
     f: h5py.File,
@@ -195,6 +290,71 @@ def _load_aruco_h5_to_df_and_num_frames(
     return df, num_frames
 
 
+def _matching_aruco_tracks_file(file: Path) -> Path | None:
+    stem = file.stem
+    if stem.endswith("_aruco_tracks_") or stem.endswith("_aruco_tracks"):
+        return file
+    if not stem.endswith("_aruco_detections"):
+        return None
+
+    base = stem[: -len("_aruco_detections")]
+    for suffix in ("_aruco_tracks.h5", "_aruco_tracks_.h5", "_aruco_tracks.hdf5", "_aruco_tracks_.hdf5"):
+        candidate = file.with_name(f"{base}{suffix}")
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _load_aruco_detections_h5_to_df_and_num_frames(
+    file: Path,
+    *,
+    min_instance_frame_frac: float = 0.05,
+    ds_name: str = "aruco_tracks",
+) -> Tuple[pd.DataFrame, int]:
+    df = pd.read_hdf(file, key="detections")
+    required = ["Frame", "Instance", "X", "Y"]
+    missing = [col for col in required if col not in df.columns]
+    if missing:
+        raise ValueError(f"{file} missing ArUco detection columns: {missing}")
+
+    df = df.copy()
+    for col in required:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=required)
+    df[["Frame", "Instance"]] = df[["Frame", "Instance"]].astype(int)
+
+    tracks_file = _matching_aruco_tracks_file(file)
+    if tracks_file is None:
+        num_frames = int(df["Frame"].max() + 1) if not df.empty else 0
+        logging.warning(
+            "No matching dense ArUco tracks file for %s; using max(Frame)+1=%d for num_frames.",
+            file.name,
+            num_frames,
+        )
+    else:
+        with h5py.File(tracks_file, "r") as f:
+            num_frames = int(f[ds_name].shape[0])
+
+    df = _filter_instances_by_frame_fraction(df, min_instance_frame_frac=min_instance_frame_frac)
+    return df, num_frames
+
+
+def _load_aruco_input_to_df_and_num_frames(
+    file: Path,
+    *,
+    min_instance_frame_frac: float = 0.05,
+) -> Tuple[pd.DataFrame, int]:
+    if file.stem.endswith("_aruco_detections"):
+        return _load_aruco_detections_h5_to_df_and_num_frames(
+            file,
+            min_instance_frame_frac=min_instance_frame_frac,
+        )
+    return _load_aruco_h5_to_df_and_num_frames(
+        file,
+        min_instance_frame_frac=min_instance_frame_frac,
+    )
+
+
 def group_files_by_chunk(
     root: Path,
     pattern,
@@ -211,6 +371,16 @@ def group_files_by_chunk(
             continue
         cam = int(m.group(1))
         chunk = m.group(2)
+        existing = groups[chunk].get(cam)
+        if existing is not None:
+            is_aruco_conflict = "_aruco_" in existing.name or "_aruco_" in path.name
+            if is_aruco_conflict:
+                if "_aruco_detections" in existing.name:
+                    continue
+                if "_aruco_detections" not in path.name:
+                    continue
+            elif existing.suffix.lower() in {".h5", ".hdf5"}:
+                continue
         groups[chunk][cam] = path
 
     return {
@@ -226,6 +396,8 @@ def process_aruco_chunks(
     exp: str,
     *,
     min_instance_frame_frac: float,
+    chunks: set[str] | None = None,
+    skip_existing: bool = False,
 ) -> None:
     """
     Reads per-camera H5 files, homographies into panorama coordinates, concatenates per chunk,
@@ -237,7 +409,7 @@ def process_aruco_chunks(
         _cam\d+
         _\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}
         _(?P<chunk>\d{3})
-        (?:_aruco_tracks_)?
+        (?:_aruco_tracks_?)?
         (?:_aruco_detections)?
         \.(?:h5|hdf5)$
         """,
@@ -245,13 +417,20 @@ def process_aruco_chunks(
     )
 
     chunk_map: Dict[int, Dict[int, Path]] = group_files_by_chunk(aruco_dir, patt)
+    if chunks is not None:
+        chunk_map = {chunk: files for chunk, files in chunk_map.items() if chunk in chunks}
 
     for chunk, cam_files in tqdm(chunk_map.items(), desc="ArUco chunks"):
+        base = f"{exp}_chunk{chunk}_aruco_panorama"
+        if skip_existing and _both_split_outputs_exist(out_dir, base):
+            logging.info("ArUco panorama chunk %s already exists; skipped.", chunk)
+            continue
+
         dfs: List[pd.DataFrame] = []
         num_frames_vals: List[int] = []
 
         for cam_idx, file in cam_files.items():
-            df, n_frames = _load_aruco_h5_to_df_and_num_frames(
+            df, n_frames = _load_aruco_input_to_df_and_num_frames(
                 file, min_instance_frame_frac=min_instance_frame_frac
             )
             num_frames_vals.append(int(n_frames))
@@ -279,9 +458,14 @@ def process_aruco_chunks(
         num_frames = max(num_frames_vals)
 
         panorama_df = pd.concat(dfs, ignore_index=True)
-        base = f"{exp}_chunk{chunk}_aruco_panorama"
 
-        split_and_write_with_num_frames_flat(panorama_df, out_dir, base, num_frames=num_frames)
+        split_and_write_with_num_frames_flat(
+            panorama_df,
+            out_dir,
+            base,
+            num_frames=num_frames,
+            skip_existing=skip_existing,
+        )
         logging.info("ArUco panorama (chunk %s) → %s (num_frames=%s)", chunk, out_dir, num_frames)
 
 
@@ -330,28 +514,74 @@ def _load_sleap_file(file: Path) -> pd.DataFrame:
         return _normalize_sleap_df(pd.DataFrame(data))
 
 
-def process_sleap_chunks(hmats: List[np.ndarray], sleap_dir: Path, out_dir: Path, exp: str) -> None:
+def process_sleap_chunks(
+    hmats: List[np.ndarray],
+    sleap_dir: Path,
+    out_dir: Path,
+    exp: str,
+    *,
+    chunks: set[str] | None = None,
+    skip_existing: bool = False,
+) -> None:
     patt = re.compile(
         r"^cam(\d+)_cam\d+_\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}_(\d{3})(?:_sleap_data)?\.(?:h5|hdf5|csv)$"
     )
 
     chunk_map = group_files_by_chunk(sleap_dir, patt)
+    if chunks is not None:
+        chunk_map = {chunk: files for chunk, files in chunk_map.items() if chunk in chunks}
 
     for chunk, cam_files in tqdm(chunk_map.items(), desc="SLEAP chunks"):
-        dfs = []
+        base = f"{exp}_chunk{chunk}_sleap_panorama"
+        if skip_existing and _both_split_outputs_exist(out_dir, base):
+            logging.info("SLEAP panorama chunk %s already exists; skipped.", chunk)
+            continue
+
+        left_parts: list[pd.DataFrame] = []
+        right_parts: list[pd.DataFrame] = []
         for cam_idx, file in cam_files.items():
             df = _load_sleap_file(file)
             if df.empty:
                 continue
             xy = df[["X", "Y"]].to_numpy(float)
             df[["X", "Y"]] = apply_homography(xy, hmats[cam_idx - 1])
+            del xy
             df["Cam"] = cam_idx - 1
-            dfs.append(df)
+            left, right = split_sleap_by_anchor(df)
+            if not left.empty:
+                left_parts.append(left)
+            if not right.empty:
+                right_parts.append(right)
+            del df, left, right
+            gc.collect()
 
-        if dfs:
-            panorama_df = pd.concat(dfs, ignore_index=True)
-            base = f"{exp}_chunk{chunk}_sleap_panorama"
-            split_and_write_flat(panorama_df, out_dir, base)
+        if left_parts or right_parts:
+            left_file, right_file = _split_output_paths(out_dir, base)
+            if left_parts:
+                if skip_existing and left_file.exists():
+                    logging.info("Skipping existing %s", left_file)
+                else:
+                    left_out = (
+                        left_parts[0]
+                        if len(left_parts) == 1
+                        else pd.concat(left_parts, ignore_index=True, copy=False)
+                    )
+                    _atomic_pickle(left_out, left_file)
+                    del left_out
+                left_parts.clear()
+            if right_parts:
+                if skip_existing and right_file.exists():
+                    logging.info("Skipping existing %s", right_file)
+                else:
+                    right_out = (
+                        right_parts[0]
+                        if len(right_parts) == 1
+                        else pd.concat(right_parts, ignore_index=True, copy=False)
+                    )
+                    _atomic_pickle(right_out, right_file)
+                    del right_out
+                right_parts.clear()
+            gc.collect()
             logging.info("SLEAP panorama (chunk %s) → %s", chunk, out_dir)
         else:
             logging.info("No SLEAP data in chunk %s — skipped.", chunk)
@@ -389,11 +619,17 @@ def main() -> None:
 
     p.add_argument("--mode", choices=("aruco", "sleap", "both"), default="both")
     p.add_argument(
+        "--chunk",
+        action="append",
+        help="Only process this chunk number, e.g. 000. May be passed more than once.",
+    )
+    p.add_argument(
         "--min_instance_frame_frac",
         type=float,
         default=0.05,
         help="Drop ArUco Instances that appear in fewer than this fraction of frames (0..1). Default: 0.05",
     )
+    p.add_argument("--skip_existing", action="store_true", help="Do not overwrite existing panorama PKLs.")
 
     args = p.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -405,6 +641,9 @@ def main() -> None:
 
     data_dir = Path(args.data_dir)
     exp = infer_experiment_name(data_dir)
+    chunks = None
+    if args.chunk:
+        chunks = {str(chunk).zfill(3) for chunk in args.chunk}
 
     if args.mode in ("aruco", "both"):
         process_aruco_chunks(
@@ -413,10 +652,12 @@ def main() -> None:
             out_dir,
             exp,
             min_instance_frame_frac=args.min_instance_frame_frac,
+            chunks=chunks,
+            skip_existing=args.skip_existing,
         )
 
     if args.mode in ("sleap", "both"):
-        process_sleap_chunks(hmats, data_dir, out_dir, exp)
+        process_sleap_chunks(hmats, data_dir, out_dir, exp, chunks=chunks, skip_existing=args.skip_existing)
 
 
 if __name__ == "__main__":

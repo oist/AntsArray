@@ -91,6 +91,7 @@ def run_local(
     lost_track_max_frames: int = 120,
     lost_track_max_distance: float | None = None,
     lost_track_aruco_max_distance: float | None = None,
+    skip_existing: bool = False,
 ) -> None:
     from tracking.colony.combine_one_chunk import process_one
 
@@ -103,6 +104,7 @@ def run_local(
             lost_track_max_frames=lost_track_max_frames,
             lost_track_max_distance=lost_track_max_distance,
             lost_track_aruco_max_distance=lost_track_aruco_max_distance,
+            skip_existing=skip_existing,
         )
 
 
@@ -117,13 +119,18 @@ def submit_slurm(
     time_limit: str,
     job_name: str,
     conda_env: str,
+    conda_bin: str,
+    python_bin: str | None = None,
     max_distance: float = 90.0,
     lost_track_max_frames: int = 120,
     lost_track_max_distance: float | None = None,
     lost_track_aruco_max_distance: float | None = None,
-) -> None:
+    skip_existing: bool = False,
+) -> list[str]:
     logs_dir.mkdir(parents=True, exist_ok=True)
     script_path = Path(__file__).with_name("combine_one_chunk.py").resolve()
+    python_cmd = python_bin or f'{conda_bin} run -n "{conda_env}" python'
+    job_ids: list[str] = []
 
     for job in jobs:
         sbatch_script = logs_dir / f"sbatch_{job_name}_{job.key}_{job.side}.sh"
@@ -140,17 +147,16 @@ def submit_slurm(
                     f"#SBATCH -e {logs_dir}/{job_name}_{job.side}_{job.key}_%j.err",
                     "",
                     "set -euo pipefail",
-                    "source ~/.bashrc",
-                    f"conda activate {conda_env}",
+                    "export PYTHONNOUSERSITE=1",
                     "",
                     'echo "Running on host: $(hostname)"',
                     f'echo "Input file: {job.representative_file}"',
                     f'echo "Output root: {output_path}"',
-                    'echo "Python: $(which python)"',
+                    f'echo "Python command: {python_cmd}"',
                     "",
                     " ".join(
                         [
-                            f'python "{script_path}"',
+                            f'{python_cmd} "{script_path}"',
                             f'--input_file "{job.representative_file}"',
                             f'--output_path "{output_path}"',
                             f"--max_distance {float(max_distance)}",
@@ -165,6 +171,7 @@ def submit_slurm(
                                 if lost_track_aruco_max_distance is None
                                 else f"--lost_track_aruco_max_distance {float(lost_track_aruco_max_distance)}"
                             ),
+                            "" if not skip_existing else "--skip_existing",
                         ]
                     ).strip(),
                     "",
@@ -179,12 +186,15 @@ def submit_slurm(
             text=True,
             capture_output=True,
         )
+        job_id = result.stdout.strip()
+        job_ids.append(job_id)
         logging.info(
             "Submitted key=%s side=%s -> job %s",
             job.key,
             job.side,
-            result.stdout.strip(),
+            job_id,
         )
+    return job_ids
 
 
 def parse_sides(value: str) -> tuple[str, ...]:
@@ -208,10 +218,14 @@ def main() -> None:
     parser.add_argument("--time", default="0-24:00:00")
     parser.add_argument("--job_name", default="combine_tracks")
     parser.add_argument("--conda_env", default="aruco_env")
+    parser.add_argument("--conda_bin", default="conda")
+    parser.add_argument("--python_bin", default=None, help="Python executable to use inside submitted chunk jobs.")
+    parser.add_argument("--job_ids_file", type=Path, default=None, help="Write submitted SLURM job IDs here.")
     parser.add_argument("--max_distance", type=float, default=90.0)
     parser.add_argument("--lost_track_max_frames", type=int, default=120)
     parser.add_argument("--lost_track_max_distance", type=float, default=None)
     parser.add_argument("--lost_track_aruco_max_distance", type=float, default=None)
+    parser.add_argument("--skip_existing", action="store_true", help="Do not overwrite existing chunk parquets.")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -233,9 +247,10 @@ def main() -> None:
             lost_track_max_frames=args.lost_track_max_frames,
             lost_track_max_distance=args.lost_track_max_distance,
             lost_track_aruco_max_distance=args.lost_track_aruco_max_distance,
+            skip_existing=args.skip_existing,
         )
     else:
-        submit_slurm(
+        job_ids = submit_slurm(
             jobs,
             args.output_path,
             logs_dir=args.logs_dir,
@@ -245,11 +260,17 @@ def main() -> None:
             time_limit=args.time,
             job_name=args.job_name,
             conda_env=args.conda_env,
+            conda_bin=args.conda_bin,
+            python_bin=args.python_bin,
             max_distance=args.max_distance,
             lost_track_max_frames=args.lost_track_max_frames,
             lost_track_max_distance=args.lost_track_max_distance,
             lost_track_aruco_max_distance=args.lost_track_aruco_max_distance,
+            skip_existing=args.skip_existing,
         )
+        if args.job_ids_file is not None:
+            args.job_ids_file.parent.mkdir(parents=True, exist_ok=True)
+            args.job_ids_file.write_text("\n".join(job_ids) + ("\n" if job_ids else ""), encoding="utf-8")
 
 
 if __name__ == "__main__":

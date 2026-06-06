@@ -22,6 +22,7 @@ def process_one(
     lost_track_max_frames: int = 120,
     lost_track_max_distance: float | None = None,
     lost_track_aruco_max_distance: float | None = None,
+    skip_existing: bool = False,
 ) -> None:
     """
     Flat-folder behavior:
@@ -43,6 +44,11 @@ def process_one(
     side = infer_side(bn)
     if side is None:
         raise ValueError(f"Could not infer side (left/right) from filename: {bn}")
+
+    out_parquet = output_root / f"{key}_{side}.parquet"
+    if skip_existing and out_parquet.exists():
+        logging.info("Skipping existing %s", out_parquet)
+        return
 
     in_dir = input_file.parent
 
@@ -73,10 +79,11 @@ def process_one(
 
     from tracking.core.tracking_utils import get_complete_tracks
 
-    sleap_det = load_sleap_pkl(sleap_file).dropna()
+    sleap_det = load_sleap_pkl(sleap_file).dropna(
+        subset=["Frame", "Instance", "Bodypoint", "X", "Y"]
+    )
     aruco_det, num_frames = load_aruco_pkl(aruco_file)
 
-    out_parquet = output_root / f"{key}_{side}.parquet"
     get_complete_tracks(
         output_path=str(out_parquet),
         aruco_detection=aruco_det,
@@ -86,6 +93,7 @@ def process_one(
         lost_track_max_frames=lost_track_max_frames,
         lost_track_max_distance=lost_track_max_distance,
         lost_track_aruco_max_distance=lost_track_aruco_max_distance,
+        stream_output=True,
     )
     logging.info("Wrote %s", out_parquet)
 
@@ -108,6 +116,7 @@ def main() -> None:
     parser.add_argument("--lost_track_max_frames", type=int, default=120)
     parser.add_argument("--lost_track_max_distance", type=float, default=None)
     parser.add_argument("--lost_track_aruco_max_distance", type=float, default=None)
+    parser.add_argument("--skip_existing", action="store_true", help="Do not overwrite existing output parquet.")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -118,6 +127,7 @@ def main() -> None:
         lost_track_max_frames=args.lost_track_max_frames,
         lost_track_max_distance=args.lost_track_max_distance,
         lost_track_aruco_max_distance=args.lost_track_aruco_max_distance,
+        skip_existing=args.skip_existing,
     )
 
 

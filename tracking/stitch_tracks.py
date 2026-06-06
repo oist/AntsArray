@@ -113,6 +113,42 @@ def parquet_columns(fp: Path) -> set[str]:
     return set(pq.ParquetFile(fp).schema_arrow.names)
 
 
+def parquet_num_frames(fp: Path) -> Optional[int]:
+    import pyarrow.parquet as pq
+
+    metadata = pq.ParquetFile(fp).schema_arrow.metadata or {}
+    raw = metadata.get(b"num_frames")
+    if raw is None:
+        return None
+    try:
+        value = int(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def write_parquet_with_num_frames(
+    df: pd.DataFrame,
+    out_path: Path,
+    *,
+    num_frames: int,
+    engine: str,
+    compression: str,
+) -> None:
+    if engine != "pyarrow":
+        df.to_parquet(out_path, index=False, engine=engine, compression=compression)
+        return
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    table = pa.Table.from_pandas(df, preserve_index=False)
+    md = dict(table.schema.metadata or {})
+    md[b"num_frames"] = str(int(num_frames)).encode("utf-8")
+    table = table.replace_schema_metadata(md)
+    pq.write_table(table, str(out_path), compression=compression)
+
+
 # -----------------------
 # trajectory PNG rendering
 # -----------------------
@@ -197,27 +233,36 @@ def write_track_png(
         y_min -= 1.0
         y_max += 1.0
 
-    pad_x = 0.04 * (x_max - x_min)
-    pad_y = 0.04 * (y_max - y_min)
-    x_min -= pad_x
-    x_max += pad_x
-    y_min -= pad_y
-    y_max += pad_y
+    x_span = x_max - x_min
+    y_span = y_max - y_min
+    pad = 0.04 * max(x_span, y_span)
+    x_min -= pad
+    x_max += pad
+    y_min -= pad
+    y_max += pad
+    x_span = x_max - x_min
+    y_span = y_max - y_min
+
+    data_scale = min(plot_w / max(1e-6, x_span), plot_h / max(1e-6, y_span))
+    draw_w = x_span * data_scale
+    draw_h = y_span * data_scale
+    x_origin = left + (plot_w - draw_w) / 2.0
+    y_origin = top + (plot_h - draw_h) / 2.0
 
     cv2.rectangle(image, (left, top), (right, bottom), (80, 80, 80), 1)
     draw_text_with_outline(image, title[:110], (left, 32), (235, 235, 235), scale=0.7, thickness=1)
     draw_text_with_outline(image, "X", (left, height - 30), (230, 230, 230), scale=0.6, thickness=1)
     draw_text_with_outline(image, "Y", (18, top + 18), (230, 230, 230), scale=0.6, thickness=1)
 
-    xp = left + np.clip(
-        np.round((xs - x_min) / max(1e-6, x_max - x_min) * plot_w).astype(np.int32),
-        0,
-        plot_w,
+    xp = np.clip(
+        np.round(x_origin + (xs - x_min) * data_scale).astype(np.int32),
+        left,
+        right,
     )
-    yp = top + np.clip(
-        np.round((ys - y_min) / max(1e-6, y_max - y_min) * plot_h).astype(np.int32),
-        0,
-        plot_h,
+    yp = np.clip(
+        np.round(y_origin + (ys - y_min) * data_scale).astype(np.int32),
+        top,
+        bottom,
     )
 
     if len(frames) == 1:
@@ -273,13 +318,12 @@ def stitch_group(
     png_width: int = 1200,
     png_height: int = 900,
     skip_existing: bool = False,
+    track_ids_filter: Optional[set[int]] = None,
 ) -> None:
     if not files_sorted:
         return
 
     suffix_tag = safe_label(group_suffix)
-
-    parts_by_track: Dict[int, List[pd.DataFrame]] = {}
 
     # ---- precompute start times and reference start time (per group)
     start_dt_by_fp: Dict[Path, Optional[datetime]] = {
@@ -290,24 +334,30 @@ def stitch_group(
 
     # ---- fallback running offset for files with no timestamps
     running_frame_offset = 0
+    requested = list(dict.fromkeys(list(columns) + [track_col]))
+    file_infos: List[dict] = []
+    track_ids: set[int] = set()
 
-    pbar = tqdm(files_sorted, desc=f"Chunks [{suffix_tag}]", unit="file", leave=False)
+    pbar = tqdm(files_sorted, desc=f"Index [{suffix_tag}]", unit="file", leave=False)
 
     for fp in pbar:
         cols_in_file = parquet_columns(fp)
         if frame_col not in cols_in_file:
             continue
 
-        # Read frame column to determine local span and allow fallback running offset updates.
+        num_frames_meta = parquet_num_frames(fp)
+
         frame_df = pd.read_parquet(fp, columns=[frame_col], engine=engine)
         frame_df[frame_col] = pd.to_numeric(frame_df[frame_col], errors="coerce")
         frame_df = frame_df.dropna(subset=[frame_col])
-        if frame_df.empty:
+        if frame_df.empty and num_frames_meta is None:
             continue
 
-        local_min = int(frame_df[frame_col].min())
-        local_max = int(frame_df[frame_col].max())
-        local_len = (local_max - local_min) + 1
+        if num_frames_meta is not None:
+            local_len = int(num_frames_meta)
+        else:
+            local_max = int(frame_df[frame_col].max())
+            local_len = local_max + 1
 
         # Determine time-faithful offset (if timestamp available); else fall back.
         dt = start_dt_by_fp.get(fp)
@@ -318,50 +368,87 @@ def stitch_group(
         else:
             frame_offset = running_frame_offset
 
-        requested = list(dict.fromkeys(list(columns) + [track_col]))
         existing = [c for c in requested if c in cols_in_file]
-        df = pd.read_parquet(fp, columns=existing, engine=engine)
-        if df.empty:
-            if (ref_dt is None) or (dt is None):
-                running_frame_offset += local_len
-            continue
+        if track_col in cols_in_file:
+            tid_df = pd.read_parquet(fp, columns=[track_col], engine=engine)
+            tid_series = pd.to_numeric(tid_df[track_col], errors="coerce").dropna()
+            track_ids.update(int(tid) for tid in tid_series.unique())
+        else:
+            track_ids.add(0)
 
-        df[frame_col] = pd.to_numeric(df[frame_col], errors="coerce")
-        df = df.dropna(subset=[frame_col])
-        if df.empty:
-            if (ref_dt is None) or (dt is None):
-                running_frame_offset += local_len
-            continue
-        
-        df = ensure_trackid(df, track_col)
-
-        # Re-base local frames to start at 0, then add the chosen offset.
-        df[frame_col] = (df[frame_col].astype(np.int64) - local_min) + frame_offset
-
-        df[track_col] = df[track_col].astype(int)
-        df["source_file"] = fp.name
-
-        for tid, g in df.groupby(track_col, sort=False):
-            parts_by_track.setdefault(int(tid), []).append(g)
+        file_infos.append(
+            {
+                "path": fp,
+                "existing": existing,
+                "local_len": local_len,
+                "frame_offset": frame_offset,
+                "dt": dt,
+            }
+        )
 
         # Only advance running offset for timestamp-less mode.
         if (ref_dt is None) or (dt is None):
             running_frame_offset += local_len
 
-    # ---- write outputs (ALL into one directory)
-    for tid, parts in parts_by_track.items():
+    if track_ids_filter is not None:
+        track_ids &= track_ids_filter
+
+    # ---- write outputs (ALL into one directory), one TrackID at a time.
+    for tid in tqdm(sorted(track_ids), desc=f"Tracks [{suffix_tag}]", unit="track", leave=False):
+        out_path = per_track_dir / f"TrackID_{tid:04d}_all_{suffix_tag}.parquet"
+        target_dir = png_dir if png_dir is not None else (per_track_dir.parent / "track_pngs")
+        png_path = target_dir / f"TrackID_{tid:04d}_all_{suffix_tag}.png"
+
+        if skip_existing and out_path.exists():
+            if not write_track_pngs or png_path.exists():
+                continue
+            out = pd.read_parquet(out_path, engine=engine)
+            write_track_png(
+                out,
+                png_path,
+                title=f"TrackID {tid:04d} {suffix_tag}",
+                frame_col=frame_col,
+                x_col=x_col,
+                y_col=y_col,
+                width=png_width,
+                height=png_height,
+            )
+            continue
+
+        parts: List[pd.DataFrame] = []
+        for info in file_infos:
+            df = pd.read_parquet(info["path"], columns=info["existing"], engine=engine)
+            if df.empty:
+                continue
+
+            df[frame_col] = pd.to_numeric(df[frame_col], errors="coerce")
+            df = df.dropna(subset=[frame_col])
+            if df.empty:
+                continue
+
+            df = ensure_trackid(df, track_col)
+            df[track_col] = df[track_col].astype(int)
+            df = df[df[track_col] == int(tid)]
+            if df.empty:
+                continue
+
+            df[frame_col] = df[frame_col].astype(np.int64) + int(info["frame_offset"])
+            df["source_file"] = info["path"].name
+            parts.append(df)
+
         if not parts:
             continue
+
         out = pd.concat(parts, ignore_index=True)
-        out_path = per_track_dir / f"TrackID_{tid:04d}_all_{suffix_tag}.parquet"
-        if skip_existing and out_path.exists():
-            if write_track_pngs:
-                out = pd.read_parquet(out_path, engine=engine)
-        else:
-            out.to_parquet(out_path, index=False, engine=engine, compression=compression)
+        group_num_frames = max(int(info["frame_offset"]) + int(info["local_len"]) for info in file_infos)
+        write_parquet_with_num_frames(
+            out,
+            out_path,
+            num_frames=group_num_frames,
+            engine=engine,
+            compression=compression,
+        )
         if write_track_pngs:
-            target_dir = png_dir if png_dir is not None else (per_track_dir.parent / "track_pngs")
-            png_path = target_dir / f"TrackID_{tid:04d}_all_{suffix_tag}.png"
             if skip_existing and png_path.exists():
                 continue
             write_track_png(
@@ -410,6 +497,7 @@ def main(
     png_width: int = 1200,
     png_height: int = 900,
     skip_existing: bool = False,
+    track_ids_filter: Optional[set[int]] = None,
 ) -> None:
     files = sorted(Path(input_dir).glob(f"*{string}"))
     if not files:
@@ -444,6 +532,7 @@ def main(
             png_width=png_width,
             png_height=png_height,
             skip_existing=skip_existing,
+            track_ids_filter=track_ids_filter,
         )
 
 
@@ -521,6 +610,13 @@ if __name__ == "__main__":
     ap.add_argument("--track_png_width", type=int, default=1200)
     ap.add_argument("--track_png_height", type=int, default=900)
     ap.add_argument(
+        "--track_id",
+        action="append",
+        type=int,
+        default=None,
+        help="Only stitch this TrackID. May be passed more than once.",
+    )
+    ap.add_argument(
         "--columns",
         nargs="+",
         default=["Frame", "TrackID", "X", "Y", "Bodypoint"],
@@ -557,4 +653,5 @@ if __name__ == "__main__":
         png_width=args.track_png_width,
         png_height=args.track_png_height,
         skip_existing=args.skip_existing,
+        track_ids_filter=None if args.track_id is None else set(args.track_id),
     )

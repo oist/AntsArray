@@ -31,10 +31,6 @@ def get_complete_tracks(
     lost_track_max_distance: float | None = None,
     lost_track_aruco_max_distance: float | None = None,
     aruco_sleap_max_distance: float | None = None,
-    jump_distance: float | None = None,
-    jump_confirmation_frames: int = 3,
-    aruco_mislabel_tolerance: int = 2,
-    aruco_match_bonus: float = 0.5,
     start_frame: int = 0,
     harvest_interval: int = 5,
     # ---------------- NEW: debug visualization controls (no tracking logic changes)
@@ -48,6 +44,8 @@ def get_complete_tracks(
     debug_layout: str = "stack",  # "stack" (single annotated view) or "tiles" (3-panel)
     debug_window_prefix: str = "Tracking",
     debug_resize: Tuple[int, int] = (1080, 720),
+    stream_output: bool = False,
+    output_batch_rows: int = 200_000,
 ) -> List[Dict[int, Dict[int, Tuple[float, float]]]]:
     """
     Combine ArUco + SLEAP detections into tracks and optionally write a parquet output.
@@ -71,10 +69,11 @@ def get_complete_tracks(
         lost_track_max_distance = max_distance * 2.0
     if lost_track_aruco_max_distance is None:
         lost_track_aruco_max_distance = max(lost_track_max_distance * 2.0, max_distance * 4.0)
-    if jump_distance is None:
-        jump_distance = max_distance * 4.0
 
     use_video = video_file is not None
+    stream_output = bool(stream_output and output_path is not None)
+    if stream_output and use_video:
+        raise ValueError("stream_output is only supported for non-video tracking runs.")
 
     # --------------------------------------------------------- sanity checks
     if not use_video and (
@@ -95,6 +94,17 @@ def get_complete_tracks(
         raise ValueError("aruco_detection is missing required column 'Frame'")
     if (not sleap_detection.empty) and ("Frame" not in sleap_detection.columns):
         raise ValueError("sleap_detection is missing required column 'Frame'")
+
+    sleap_has_cam = False
+    sleap_instance_min = 0
+    sleap_instance_stride = 0
+    if not sleap_detection.empty and "Cam" in sleap_detection.columns:
+        cam = sleap_detection["Cam"]
+        inst = sleap_detection["Instance"]
+        if cam.notna().all() and inst.notna().all():
+            sleap_has_cam = True
+            sleap_instance_min = int(inst.min())
+            sleap_instance_stride = int(inst.max()) - sleap_instance_min + 1
 
     grouped_aruco = {f: g for f, g in aruco_detection.groupby("Frame")} if not aruco_detection.empty else {}
     grouped_sleap = {f: g for f, g in sleap_detection.groupby("Frame")} if not sleap_detection.empty else {}
@@ -143,11 +153,57 @@ def get_complete_tracks(
         writer = cv2.VideoWriter(str(video_out_path), fourcc, fps, (width, height))
 
     # --------------------------------------------------------- containers
-    all_pos: List[Dict[int, Dict[int, Tuple[float, float]]]] = [{} for _ in range(num_frames)]
-    tracked_anchor_xy: Dict[int, List[Tuple[int, Tuple[float, float]]]] = {}
+    all_pos: List[Dict[int, Dict[int, Tuple[float, float]]]] = [] if stream_output else [{} for _ in range(num_frames)]
+    prev_frame_pos: Dict[int, Dict[int, Tuple[float, float]]] = {}
     last_seen_tracks: Dict[int, Tuple[int, Dict[int, Tuple[float, float]]]] = {}
-    aruco_mismatch_streak: Dict[int, int] = {}
-    pending_jump: Dict[int, Dict[str, object]] = {}
+
+    parquet_writer = None
+    parquet_schema = None
+    output_rows: list[Tuple[int, int, int, float, float]] = []
+    output_path_obj = Path(output_path) if output_path is not None else None
+
+    if stream_output:
+        try:
+            import pyarrow as pa  # type: ignore
+            import pyarrow.parquet as pq  # type: ignore
+        except Exception as exc:
+            raise RuntimeError("stream_output requires pyarrow") from exc
+
+        assert output_path_obj is not None
+        output_path_obj.parent.mkdir(parents=True, exist_ok=True)
+        parquet_schema = pa.schema(
+            [
+                ("Frame", pa.int64()),
+                ("TrackID", pa.int64()),
+                ("Bodypoint", pa.int64()),
+                ("X", pa.float64()),
+                ("Y", pa.float64()),
+            ],
+            metadata={b"num_frames": str(int(num_frames)).encode("utf-8")},
+        )
+        parquet_writer = pq.ParquetWriter(str(output_path_obj), parquet_schema)
+
+    def _flush_output_rows() -> None:
+        nonlocal output_rows, parquet_writer
+        if not output_rows:
+            return
+        if parquet_writer is None or parquet_schema is None:
+            return
+        import pyarrow as pa  # type: ignore
+
+        df = pd.DataFrame(output_rows, columns=["Frame", "TrackID", "Bodypoint", "X", "Y"])
+        table = pa.Table.from_pandas(df, schema=parquet_schema, preserve_index=False)
+        parquet_writer.write_table(table)
+        output_rows = []
+
+    def _record_frame_rows(frame_idx: int, frame_pos: Dict[int, Dict[int, Tuple[float, float]]]) -> None:
+        if not stream_output:
+            return
+        for tid, nodes in frame_pos.items():
+            for bp, (x, y) in nodes.items():
+                output_rows.append((int(frame_idx), int(tid), int(bp), float(x), float(y)))
+        if len(output_rows) >= int(output_batch_rows):
+            _flush_output_rows()
 
     if harvest_crops and crops_output_dir is not None and use_video:
         Path(crops_output_dir).mkdir(parents=True, exist_ok=True)
@@ -307,6 +363,7 @@ def get_complete_tracks(
 
     # ======================================================== main loop
     for frame_idx in tqdm(range(start_frame, num_frames), unit="frame"):
+        frame_pos = {} if stream_output else all_pos[frame_idx]
         # -------------------------------- load frame (if available)
         if use_video:
             ok, frame = cap.read()
@@ -324,21 +381,52 @@ def get_complete_tracks(
             a_df[["Instance", "X", "Y"]].to_numpy(float) if not a_df.empty else np.empty((0, 3))
         )
         aruco_arr = raw_aruco_arr.copy()
-
+        raw_aruco_by_tag: Dict[int, List[Tuple[float, float]]] = {}
+        for tag_id, ax, ay in raw_aruco_arr:
+            if not (np.isfinite(tag_id) and np.isfinite(ax) and np.isfinite(ay)):
+                continue
+            raw_aruco_by_tag.setdefault(int(tag_id), []).append((float(ax), float(ay)))
 
         if s_df.empty:
+            s_instance_keys = np.empty((0,), dtype=np.int64)
             sleap_anchor = np.empty((0, 3))
         else:
-            s_anchor = s_df[s_df["Bodypoint"] == anchor_bodypoint]
-            sleap_anchor = s_anchor[["Instance", "X", "Y"]].to_numpy(float)
+            if sleap_has_cam:
+                s_instance_keys = (
+                    s_df["Cam"].to_numpy(dtype=np.int64, copy=False) * sleap_instance_stride
+                    + s_df["Instance"].to_numpy(dtype=np.int64, copy=False)
+                    - sleap_instance_min
+                )
+            else:
+                s_instance_keys = s_df["Instance"].to_numpy(dtype=np.int64, copy=False)
 
-        # ------- ArUco too far from any anchor → drop
+            anchor_mask = s_df["Bodypoint"].to_numpy(dtype=np.int64, copy=False) == anchor_bodypoint
+            if np.any(anchor_mask):
+                sleap_anchor = np.column_stack(
+                    [
+                        s_instance_keys[anchor_mask],
+                        s_df.loc[anchor_mask, "X"].to_numpy(float),
+                        s_df.loc[anchor_mask, "Y"].to_numpy(float),
+                    ]
+                )
+            else:
+                sleap_anchor = np.empty((0, 3))
+
+        # ------- ArUco too far from any anchor -> drop
+        #
+        # All tracking decisions below should use this post-filter ArUco set.
+        # Keeping a separate raw set is useful for debug overlays, but using raw
+        # detections for TrackID keep-alive lets camera-specific false positives
+        # revive a tag after a gap and block the real tag from being picked up.
         if len(aruco_arr) and len(sleap_anchor):
             diff = sleap_anchor[:, 1:3][None, :, :] - aruco_arr[:, 1:3][:, None, :]
             keep = np.linalg.norm(diff, axis=-1).min(axis=1) <= aruco_sleap_max_distance
             aruco_arr = aruco_arr[keep]
+        elif len(aruco_arr):
+            aruco_arr = np.empty((0, 3))
 
         inst_aruco_id: Dict[int, int] = {}
+        aruco_inst_candidates: Dict[int, List[Tuple[float, int]]] = {}
         if len(aruco_arr) and len(sleap_anchor):
             diff = aruco_arr[:, 1:3][None, :, :] - sleap_anchor[:, 1:3][:, None, :]
             dists_to_tags = np.linalg.norm(diff, axis=-1)
@@ -346,20 +434,26 @@ def get_complete_tracks(
             nearest_dist = dists_to_tags[np.arange(len(sleap_anchor)), nearest_tag]
             for s_idx, tag_idx in enumerate(nearest_tag):
                 if nearest_dist[s_idx] <= aruco_sleap_max_distance:
-                    inst_aruco_id[int(sleap_anchor[s_idx, 0])] = int(aruco_arr[tag_idx, 0])
+                    inst_id = int(sleap_anchor[s_idx, 0])
+                    tag_id = int(aruco_arr[tag_idx, 0])
+                    inst_aruco_id[inst_id] = tag_id
+                    aruco_inst_candidates.setdefault(tag_id, []).append(
+                        (float(nearest_dist[s_idx]), inst_id)
+                    )
 
         used_tag: set[int] = set()
         used_inst: set[int] = set()
-        aruco_by_tag: Dict[int, Tuple[float, float]] = {}
-        for tag_id, ax, ay in raw_aruco_arr:
+        sleap_anchor_xy_by_inst: Dict[int, Tuple[float, float]] = {
+            int(inst_id): (float(x), float(y)) for inst_id, x, y in sleap_anchor
+        }
+        aruco_by_tag: Dict[int, List[Tuple[float, float]]] = {}
+        for tag_id, ax, ay in aruco_arr:
             if not (np.isfinite(tag_id) and np.isfinite(ax) and np.isfinite(ay)):
                 continue
-            # Keep the first detection for a tag. ArUco inputs should be unique per
-            # frame, and deterministic tie-breaking is better than averaging labels.
-            aruco_by_tag.setdefault(int(tag_id), (float(ax), float(ay)))
+            aruco_by_tag.setdefault(int(tag_id), []).append((float(ax), float(ay)))
 
         def _nodes_for_instance(inst_id: int) -> Dict[int, Tuple[float, float]]:
-            inst_df = s_df[s_df["Instance"] == inst_id]
+            inst_df = s_df[s_instance_keys == inst_id]
             return {
                 int(b): (float(x), float(y))
                 for b, x, y in inst_df[["Bodypoint", "X", "Y"]].itertuples(index=False)
@@ -369,23 +463,39 @@ def get_complete_tracks(
             node_dict = _nodes_for_instance(inst_id)
             if anchor_bodypoint not in node_dict:
                 return False
-            all_pos[frame_idx][tid] = node_dict
+            frame_pos[tid] = node_dict
             last_seen_tracks[tid] = (frame_idx, node_dict)
-            tracked_anchor_xy.setdefault(tid, []).append(
-                (frame_idx, node_dict[anchor_bodypoint])
-            )
             used_inst.add(inst_id)
             tag_id = inst_aruco_id.get(inst_id)
             if tag_id == int(tid):
                 used_tag.add(int(tid))
             return True
 
+        def _nearest_raw_tag_xy(
+            tid: int,
+            prev_xy: Tuple[float, float],
+            distance_limit: float,
+        ) -> Tuple[float, float] | None:
+            candidates = raw_aruco_by_tag.get(int(tid), [])
+            if not candidates:
+                return None
+            prev_arr = np.asarray(prev_xy, dtype=float)
+            ax, ay = min(
+                candidates,
+                key=lambda xy: float(np.linalg.norm(np.asarray(xy) - prev_arr)),
+            )
+            dist = float(np.linalg.norm(np.asarray((ax, ay)) - prev_arr))
+            if dist > float(distance_limit):
+                return None
+            return (float(ax), float(ay))
+
         # ---------------- update existing tracks
         if frame_idx > start_frame:
             prev_tracks: list[tuple[int, Dict[int, Tuple[float, float]], int, float]] = []
             seen_tids: set[int] = set()
 
-            for tid, prev_nodes in all_pos[frame_idx - 1].items():
+            previous_pos = prev_frame_pos if stream_output else all_pos[frame_idx - 1]
+            for tid, prev_nodes in previous_pos.items():
                 prev_tracks.append((int(tid), prev_nodes, 1, float(max_distance)))
                 seen_tids.add(int(tid))
 
@@ -401,9 +511,94 @@ def get_complete_tracks(
                             (tid, prev_nodes, age, float(lost_track_max_distance))
                         )
 
-            # First claim the unambiguous cases: a nearby SLEAP instance whose
-            # nearest ArUco tag is the same as the existing TrackID.
+            # ArUco identity is primary. If an existing TrackID's tag is visible
+            # and matched to a SLEAP instance, use that instance even if SLEAP
+            # continuity had drifted to a different ant. Duplicate same-ID tags
+            # are common near camera borders; in that case, keep the candidate
+            # consistent with the current track and ignore one-frame far dupes.
+            for tid, prev_nodes, _age, _distance_limit in prev_tracks:
+                if tid in frame_pos:
+                    continue
+                cands = [
+                    (dist, inst_id)
+                    for dist, inst_id in aruco_inst_candidates.get(int(tid), [])
+                    if inst_id not in used_inst
+                ]
+                if not cands:
+                    continue
+                prev_xy = (
+                    prev_nodes[anchor_bodypoint]
+                    if anchor_bodypoint in prev_nodes
+                    else None
+                )
+                raw_near_prev = (
+                    _nearest_raw_tag_xy(
+                        int(tid),
+                        prev_xy,
+                        float(lost_track_aruco_max_distance),
+                    )
+                    if prev_xy is not None
+                    else None
+                )
+                if len(cands) == 1:
+                    inst_id = cands[0][1]
+                    anchor_xy = sleap_anchor_xy_by_inst.get(inst_id)
+                    if raw_near_prev is not None and anchor_xy is not None:
+                        prev_arr = np.asarray(prev_xy, dtype=float)
+                        candidate_dist = float(
+                            np.linalg.norm(np.asarray(anchor_xy) - prev_arr)
+                        )
+                        if candidate_dist > float(lost_track_aruco_max_distance):
+                            continue
+                elif anchor_bodypoint in prev_nodes:
+                    prev_xy_arr = np.asarray(prev_nodes[anchor_bodypoint], dtype=float)
+                    ranked: list[tuple[float, float, int]] = []
+                    for tag_dist, cand_inst_id in cands:
+                        anchor_xy = sleap_anchor_xy_by_inst.get(cand_inst_id)
+                        if anchor_xy is None:
+                            continue
+                        prev_dist = float(np.linalg.norm(np.asarray(anchor_xy) - prev_xy_arr))
+                        ranked.append((prev_dist, float(tag_dist), cand_inst_id))
+                    near_prev = [
+                        item
+                        for item in ranked
+                        if item[0] <= float(lost_track_aruco_max_distance)
+                    ]
+                    if not near_prev:
+                        continue
+                    _, _, inst_id = min(near_prev, key=lambda x: (x[0], x[1]))
+                else:
+                    continue
+                _assign_sleap_instance(int(tid), inst_id)
+
+            # If the same raw ArUco tag is still visible near the previous
+            # position but SLEAP is missing at that border, keep the track alive
+            # with the ArUco anchor only. This does not allow far raw detections
+            # to revive a stale ID.
+            for tid, prev_nodes, _age, _distance_limit in prev_tracks:
+                if tid in frame_pos or anchor_bodypoint not in prev_nodes:
+                    continue
+                if int(tid) in used_tag:
+                    continue
+                raw_xy = _nearest_raw_tag_xy(
+                    int(tid),
+                    prev_nodes[anchor_bodypoint],
+                    float(lost_track_aruco_max_distance),
+                )
+                if raw_xy is None:
+                    continue
+                frame_pos[int(tid)] = {anchor_bodypoint: raw_xy}
+                last_seen_tracks[int(tid)] = (
+                    frame_idx,
+                    {anchor_bodypoint: raw_xy},
+                )
+                used_tag.add(int(tid))
+
+            # Then claim the distance-consistent cases: a nearby SLEAP instance
+            # whose nearest ArUco tag is the same as the existing TrackID.
             for tid, prev_nodes, _age, distance_limit in prev_tracks:
+                if tid in frame_pos:
+                    continue
                 if anchor_bodypoint not in prev_nodes:
                     continue
                 prev_xy = prev_nodes[anchor_bodypoint]
@@ -421,10 +616,13 @@ def get_complete_tracks(
                     _, inst_id = min(cands, key=lambda x: x[0])
                     _assign_sleap_instance(int(tid), inst_id)
 
-            # Then bridge isolated SLEAP continuity. Conflicting ArUco labels on
-            # these instances are treated as unreliable evidence, not as new IDs.
+            # Then bridge isolated SLEAP continuity only when ArUco identity is
+            # absent. A visible same-ID tag elsewhere, or a conflicting tag on a
+            # nearby SLEAP instance, should not be overridden by SLEAP motion.
             for tid, prev_nodes, _age, distance_limit in prev_tracks:
-                if tid in all_pos[frame_idx] or anchor_bodypoint not in prev_nodes:
+                if tid in frame_pos or anchor_bodypoint not in prev_nodes:
+                    continue
+                if int(tid) in aruco_by_tag:
                     continue
                 if not len(sleap_anchor):
                     continue
@@ -435,36 +633,45 @@ def get_complete_tracks(
                     inst_id = int(sleap_anchor[i, 0])
                     if inst_id in used_inst:
                         continue
+                    candidate_tag_id = inst_aruco_id.get(inst_id)
+                    if candidate_tag_id is not None and candidate_tag_id != int(tid):
+                        continue
                     if dist <= distance_limit:
                         cands.append((float(dist), inst_id))
                 if len(cands) == 1:
                     _, inst_id = cands[0]
                     _assign_sleap_instance(int(tid), inst_id)
 
-            # Finally, if the matching ArUco tag is visible but no SLEAP instance
-            # could be assigned, keep the track alive with anchor_bodypoint only.
+            # Finally, if the matching post-filter ArUco tag is visible but no
+            # SLEAP instance could be assigned to this TrackID, keep the track
+            # alive with anchor_bodypoint only. "Post-filter" means the tag was
+            # near some SLEAP anchor in this frame; raw ArUco detections cannot
+            # revive a track here.
             for tid, prev_nodes, age, _distance_limit in prev_tracks:
-                if tid in all_pos[frame_idx] or anchor_bodypoint not in prev_nodes:
+                if tid in frame_pos or anchor_bodypoint not in prev_nodes:
                     continue
                 if int(tid) in used_tag or int(tid) not in aruco_by_tag:
                     continue
-                ax, ay = aruco_by_tag[int(tid)]
                 prev_xy = prev_nodes[anchor_bodypoint]
+                candidates = aruco_by_tag[int(tid)]
+                ax, ay = min(
+                    candidates,
+                    key=lambda xy: float(np.linalg.norm(np.asarray(xy) - np.asarray(prev_xy))),
+                )
                 aruco_dist = float(np.linalg.norm(np.asarray((ax, ay)) - np.asarray(prev_xy)))
                 if aruco_dist > float(lost_track_aruco_max_distance):
                     continue
-                all_pos[frame_idx][int(tid)] = {anchor_bodypoint: (ax, ay)}
+                frame_pos[int(tid)] = {anchor_bodypoint: (ax, ay)}
                 last_seen_tracks[int(tid)] = (
                     frame_idx,
                     {anchor_bodypoint: (ax, ay)},
                 )
-                tracked_anchor_xy.setdefault(int(tid), []).append((frame_idx, (ax, ay)))
                 used_tag.add(int(tid))
 
         # ---------------- spawn new tracks from unused ArUco
         for i, (tag_id, ax, ay) in enumerate(aruco_arr):
             tag_id = int(tag_id)
-            if tag_id in used_tag or tag_id in all_pos[frame_idx]:
+            if tag_id in used_tag or tag_id in frame_pos:
                 continue
             if len(sleap_anchor) == 0:
                 continue
@@ -477,9 +684,8 @@ def get_complete_tracks(
             inst_id = int(sleap_anchor[j, 0])
             if inst_id in used_inst:
                 continue
-            used_inst.add(inst_id)
 
-            inst_df = s_df[s_df["Instance"] == inst_id]
+            inst_df = s_df[s_instance_keys == inst_id]
             node_dict = {
                 int(b): (float(x), float(y))
                 for b, x, y in inst_df[["Bodypoint", "X", "Y"]].itertuples(index=False)
@@ -487,14 +693,30 @@ def get_complete_tracks(
             if anchor_bodypoint not in node_dict:
                 continue
 
+            recent = last_seen_tracks.get(tag_id)
+            if recent is not None:
+                last_frame, prev_nodes = recent
+                age = frame_idx - int(last_frame)
+                if age <= lost_frames and anchor_bodypoint in prev_nodes:
+                    distance_limit = (
+                        float(max_distance)
+                        if age <= 1
+                        else float(lost_track_max_distance)
+                    )
+                    prev_xy = prev_nodes[anchor_bodypoint]
+                    spawn_dist = float(
+                        np.linalg.norm(
+                            np.asarray(node_dict[anchor_bodypoint]) - np.asarray(prev_xy)
+                        )
+                    )
+                    if spawn_dist > distance_limit:
+                        continue
+
+            used_inst.add(inst_id)
             used_tag.add(tag_id)
-            aruco_mismatch_streak[tag_id] = 0
             tid = tag_id
-            all_pos[frame_idx][tid] = node_dict
+            frame_pos[tid] = node_dict
             last_seen_tracks[tid] = (frame_idx, node_dict)
-            tracked_anchor_xy.setdefault(tid, []).append(
-                (frame_idx, node_dict[anchor_bodypoint])
-            )
 
         lost_frames = max(0, int(lost_track_max_frames))
         if lost_frames > 0:
@@ -588,6 +810,10 @@ def get_complete_tracks(
                 # If debug_viz enabled, write the debug composite; otherwise original overlay.
                 writer.write(disp if debug_viz else disp_tracks)
 
+        if stream_output:
+            _record_frame_rows(frame_idx, frame_pos)
+            prev_frame_pos = frame_pos
+
     # ======================================================== cleanup
     if use_video and cap is not None:
         cap.release()
@@ -597,7 +823,11 @@ def get_complete_tracks(
             writer.release()
 
     # ---------------- save tracks
-    if output_path is not None:
+    if stream_output:
+        _flush_output_rows()
+        if parquet_writer is not None:
+            parquet_writer.close()
+    elif output_path is not None:
         rows: list[Tuple[int, int, int, float, float]] = []
         for f, posdict in enumerate(all_pos):
             for tid, nodes in posdict.items():
