@@ -115,6 +115,7 @@ This stage:
 - combines detections with `tracking/core/tracking_utils.py`;
 - uses ArUco IDs as `TrackID`;
 - requires ArUco detections to be near a SLEAP anchor before they can affect tracking;
+- keeps SLEAP bodypoint `X/Y` unchanged and writes ArUco-backed tracking position separately as `TrackX/TrackY`;
 - prevents recent same-ID respawns from jumping far from the last known position;
 - streams parquet output to avoid OOM.
 
@@ -125,6 +126,8 @@ OUTPUT_ROOT/block03/tracks/
   20260518_085922_chunk012_left.parquet
   20260518_085922_chunk012_right.parquet
 ```
+
+Tracking parquet columns include the original bodypoint coordinates `X/Y`, the position used for tracking and PNGs `TrackX/TrackY`, the matched tag coordinate `ArucoX/ArucoY`, and the original SLEAP anchor coordinate `SleapAnchorX/SleapAnchorY`.
 
 ### 3. Stitch Chunks Within Each Block
 
@@ -203,7 +206,7 @@ Track one chunk/side:
 python tracking/colony/combine_one_chunk.py \
   --input_file /path/to/panorama_pkls/20260518_085922_chunk012_aruco_panorama_x_right1740.pkl \
   --output_path /path/to/tracks \
-  --max_distance 90.0 \
+  --max_distance 100.0 \
   --lost_track_max_frames 120
 ```
 
@@ -270,13 +273,35 @@ python tracking/colony/pipeline.py \
 
 If `--combine_runner slurm` is used, combine jobs are submitted asynchronously and stitching is skipped in that run. Run a stitch-only command after those jobs finish.
 
+## Visual Tracking Debugger
+
+Use `tracking/gui/multicam_tracking_viewer.py` to play synchronized camera videos or image sequences with stitched tracking overlays projected from panorama coordinates back into each camera.
+
+```bash
+python tracking/gui/multicam_tracking_viewer.py \
+  --hmats /path/to/initial_H_mats.npz \
+  --video_dir /path/to/block03 \
+  --cameras 3,4,8,9 \
+  --tracks /path/to/stitched/per_track/TrackID_0017_all_085922_right.parquet \
+  --track_ids 17 \
+  --start_frame 2418500 \
+  --trail 24
+```
+
+The viewer accepts `--media` paths instead of `--video_dir` for explicit videos, images, image directories, or globs. `--cameras` uses one-based camera numbers matching filenames like `cam03...avi`; internally those map to homography index `2`.
+
+For current tracking outputs, the main overlay follows `TrackX/TrackY`, while the toggles can also show raw ArUco coordinates, SLEAP anchor coordinates, and unchanged SLEAP skeleton bodypoints. For chunk-local parquet files, pass `--track_frame_offset` so local chunk frames line up with the full camera video frame numbers.
+
+The viewer window is resizable. Playback advances one frame at a time; if rendering is slow, playback slows down instead of skipping frames. Use `Prev present` / `Next present`, or keyboard `p` / `n`, to jump to loaded TrackID frames that project inside the selected camera set.
+
 ## Tracking Notes
 
 - `TrackID` comes from ArUco `Instance`.
 - Dense ArUco H5 slot index is treated as `Instance`.
 - ArUco detections are filtered to those near a SLEAP anchor before tracking decisions use them.
-- Existing tracks are updated by same-ID ArUco/SLEAP matches first, then by isolated SLEAP continuity, then by filtered ArUco-only anchor keep-alive.
-- Recent same-ID respawns must be spatially consistent with the previous position.
+- Existing tracks are updated by same-ID ArUco/SLEAP matches first using ArUco position, then by isolated SLEAP continuity using SLEAP position, then by filtered ArUco-only anchor keep-alive.
+- Recent same-ID respawns must be spatially consistent with the previous position. By default, a consecutive-frame ArUco update is limited by `max_distance`; ArUco reacquisition grows by `lost_track_max_distance` per missed frame, defaulting to `max_distance`.
+- SLEAP-only continuity is always capped at `max_distance`; it does not grow with missed frames.
 - After `lost_track_max_frames`, an ID can be treated as a fresh acquisition again.
 - Duplicate same-ID ArUco detections in one frame are handled by choosing the candidate closest to the previous track position for keep-alive.
 

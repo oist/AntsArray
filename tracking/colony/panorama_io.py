@@ -82,7 +82,7 @@ def matching_sleap_h5_candidates(aruco_path: Path) -> tuple[Path, Path]:
 def find_aruco_input_files(data_dir: Path) -> list[Path]:
     return [
         path
-        for path in sorted(data_dir.glob("**/*"))
+        for path in sorted(data_dir.glob("*"))
         if "global" not in path.name and is_aruco_input_file(path)
     ]
 

@@ -18,7 +18,7 @@ def process_one(
     input_file: Path,
     output_root: Path,
     *,
-    max_distance: float = 90.0,
+    max_distance: float = 100.0,
     lost_track_max_frames: int = 120,
     lost_track_max_distance: float | None = None,
     lost_track_aruco_max_distance: float | None = None,
@@ -112,7 +112,7 @@ def main() -> None:
         type=Path,
         help="Flat output directory.",
     )
-    parser.add_argument("--max_distance", type=float, default=90.0)
+    parser.add_argument("--max_distance", type=float, default=100.0)
     parser.add_argument("--lost_track_max_frames", type=int, default=120)
     parser.add_argument("--lost_track_max_distance", type=float, default=None)
     parser.add_argument("--lost_track_aruco_max_distance", type=float, default=None)

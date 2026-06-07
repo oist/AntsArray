@@ -196,7 +196,7 @@ def main() -> None:
     parser.add_argument("--conda_env", default="aruco_env")
     parser.add_argument("--conda_bin", default="conda")
     parser.add_argument("--python_bin", default=None, help="Python executable for SLURM combine jobs.")
-    parser.add_argument("--max_distance", type=float, default=90.0)
+    parser.add_argument("--max_distance", type=float, default=100.0)
     parser.add_argument("--lost_track_max_frames", type=int, default=120)
     parser.add_argument("--lost_track_max_distance", type=float, default=None)
     parser.add_argument("--lost_track_aruco_max_distance", type=float, default=None)
@@ -204,9 +204,25 @@ def main() -> None:
     parser.add_argument("--fps", type=float, default=24.0)
     parser.add_argument("--frame_col", default="Frame")
     parser.add_argument("--track_col", default="TrackID")
-    parser.add_argument("--x_col", default="X")
-    parser.add_argument("--y_col", default="Y")
-    parser.add_argument("--columns", nargs="+", default=["Frame", "TrackID", "X", "Y", "Bodypoint"])
+    parser.add_argument("--x_col", default="TrackX")
+    parser.add_argument("--y_col", default="TrackY")
+    parser.add_argument(
+        "--columns",
+        nargs="+",
+        default=[
+            "Frame",
+            "TrackID",
+            "X",
+            "Y",
+            "Bodypoint",
+            "TrackX",
+            "TrackY",
+            "ArucoX",
+            "ArucoY",
+            "SleapAnchorX",
+            "SleapAnchorY",
+        ],
+    )
     parser.add_argument("--no_track_pngs", action="store_true")
     parser.add_argument("--track_png_dir", type=Path, default=None)
     parser.add_argument("--track_png_width", type=int, default=1200)

@@ -363,7 +363,7 @@ def group_files_by_chunk(
     groups: Dict[str, Dict[int, Path]] = defaultdict(dict)
     is_compiled = hasattr(pattern, "search")
 
-    for path in sorted(root.glob("**/*")):
+    for path in sorted(root.glob("*")):
         if path.is_dir() or ignore_substr in path.name:
             continue
         m = pattern.search(path.name) if is_compiled else re.search(pattern, path.name)

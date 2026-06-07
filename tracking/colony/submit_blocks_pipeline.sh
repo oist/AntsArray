@@ -73,9 +73,9 @@ TRACK_MEM="32G"
 TRACK_TIME="0-24:00:00"
 
 # Tracking parameters.
-MAX_DISTANCE="90.0"
+MAX_DISTANCE="100.0"
 LOST_TRACK_MAX_FRAMES="120"
-LOST_TRACK_MAX_DISTANCE=""
+LOST_TRACK_MAX_DISTANCE="100.0"
 LOST_TRACK_ARUCO_MAX_DISTANCE=""
 
 # Per-block stitch job resources.
@@ -188,7 +188,7 @@ Optional:
   --track_submit_cpus N     CPUs for dependent fan-out submitter job. Default: 1
   --track_submit_mem MEM    Memory for dependent fan-out submitter job. Default: 4G
   --track_submit_time TIME  Time for dependent fan-out submitter job. Default: 0-01:00:00
-  --max_distance FLOAT      Tracking max distance. Default: 90.0
+  --max_distance FLOAT      Tracking max distance. Default: 100.0
   --lost_track_max_frames N Tracking lost-frame limit. Default: 120
   --lost_track_max_distance FLOAT
   --lost_track_aruco_max_distance FLOAT
@@ -626,7 +626,20 @@ continuous_input = Path(sys.argv[3])
 
 side_re = re.compile(r"_(left|right)$")
 track_re = re.compile(r"^(TrackID_\\d+)_")
-columns = ["Frame", "TrackID", "Bodypoint", "X", "Y", "source_file"]
+columns = [
+    "Frame",
+    "TrackID",
+    "Bodypoint",
+    "X",
+    "Y",
+    "TrackX",
+    "TrackY",
+    "ArucoX",
+    "ArucoY",
+    "SleapAnchorX",
+    "SleapAnchorY",
+    "source_file",
+]
 schema = pa.schema(
     [
         ("Frame", pa.int64()),
@@ -634,6 +647,12 @@ schema = pa.schema(
         ("Bodypoint", pa.int64()),
         ("X", pa.float64()),
         ("Y", pa.float64()),
+        ("TrackX", pa.float64()),
+        ("TrackY", pa.float64()),
+        ("ArucoX", pa.float64()),
+        ("ArucoY", pa.float64()),
+        ("SleapAnchorX", pa.float64()),
+        ("SleapAnchorY", pa.float64()),
         ("source_file", pa.string()),
     ]
 )

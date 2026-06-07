@@ -87,7 +87,7 @@ def run_local(
     jobs: list[ChunkJob],
     output_path: Path,
     *,
-    max_distance: float = 90.0,
+    max_distance: float = 100.0,
     lost_track_max_frames: int = 120,
     lost_track_max_distance: float | None = None,
     lost_track_aruco_max_distance: float | None = None,
@@ -121,7 +121,7 @@ def submit_slurm(
     conda_env: str,
     conda_bin: str,
     python_bin: str | None = None,
-    max_distance: float = 90.0,
+    max_distance: float = 100.0,
     lost_track_max_frames: int = 120,
     lost_track_max_distance: float | None = None,
     lost_track_aruco_max_distance: float | None = None,
@@ -221,7 +221,7 @@ def main() -> None:
     parser.add_argument("--conda_bin", default="conda")
     parser.add_argument("--python_bin", default=None, help="Python executable to use inside submitted chunk jobs.")
     parser.add_argument("--job_ids_file", type=Path, default=None, help="Write submitted SLURM job IDs here.")
-    parser.add_argument("--max_distance", type=float, default=90.0)
+    parser.add_argument("--max_distance", type=float, default=100.0)
     parser.add_argument("--lost_track_max_frames", type=int, default=120)
     parser.add_argument("--lost_track_max_distance", type=float, default=None)
     parser.add_argument("--lost_track_aruco_max_distance", type=float, default=None)

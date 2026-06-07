@@ -32,6 +32,19 @@ CHUNK_KEY_RE = re.compile(r"^chunk(\d+)$")
 TS_KEY_RE = re.compile(r"^\d{8}-\d{6}$")
 TS_ANYWHERE_RE = re.compile(r"(\d{8}-\d{6})")  # first occurrence anywhere in stem
 CHUNK_TOKEN_IN_SUFFIX_RE = re.compile(r"(?:^|_)(chunk\d+)(?:_|$)")
+DEFAULT_COLUMNS = [
+    "Frame",
+    "TrackID",
+    "X",
+    "Y",
+    "Bodypoint",
+    "TrackX",
+    "TrackY",
+    "ArucoX",
+    "ArucoY",
+    "SleapAnchorX",
+    "SleapAnchorY",
+]
 
 
 def safe_label(s: str) -> str:
@@ -198,25 +211,38 @@ def write_track_png(
 ) -> None:
     import cv2
 
-    required = {frame_col, x_col, y_col}
+    png_x_col = x_col
+    png_y_col = y_col
+    if not {frame_col, png_x_col, png_y_col}.issubset(df.columns):
+        if (
+            x_col == "TrackX"
+            and y_col == "TrackY"
+            and {frame_col, "X", "Y"}.issubset(df.columns)
+        ):
+            png_x_col = "X"
+            png_y_col = "Y"
+        else:
+            return
+
+    required = {frame_col, png_x_col, png_y_col}
     if not required.issubset(df.columns):
         return
 
-    d = df[[frame_col, x_col, y_col]].copy()
+    d = df[[frame_col, png_x_col, png_y_col]].copy()
     d[frame_col] = pd.to_numeric(d[frame_col], errors="coerce")
-    d[x_col] = pd.to_numeric(d[x_col], errors="coerce")
-    d[y_col] = pd.to_numeric(d[y_col], errors="coerce")
-    d = d.dropna(subset=[frame_col, x_col, y_col]).sort_values(frame_col)
+    d[png_x_col] = pd.to_numeric(d[png_x_col], errors="coerce")
+    d[png_y_col] = pd.to_numeric(d[png_y_col], errors="coerce")
+    d = d.dropna(subset=[frame_col, png_x_col, png_y_col]).sort_values(frame_col)
     if d.empty:
         return
 
     # Multiple bodypoints can share the same frame. Collapse to one XY per frame
     # so the time-colored trace represents the track path, not skeleton density.
-    d = d.groupby(frame_col, as_index=False)[[x_col, y_col]].mean()
+    d = d.groupby(frame_col, as_index=False)[[png_x_col, png_y_col]].mean()
 
     frames = d[frame_col].to_numpy(np.int64)
-    xs = d[x_col].to_numpy(np.float64)
-    ys = d[y_col].to_numpy(np.float64)
+    xs = d[png_x_col].to_numpy(np.float64)
+    ys = d[png_y_col].to_numpy(np.float64)
 
     image = np.full((height, width, 3), 20, dtype=np.uint8)
     left, top = 72, 56
@@ -313,8 +339,8 @@ def stitch_group(
     compression: str = "zstd",
     write_track_pngs: bool = False,
     png_dir: Optional[Path] = None,
-    x_col: str = "X",
-    y_col: str = "Y",
+    x_col: str = "TrackX",
+    y_col: str = "TrackY",
     png_width: int = 1200,
     png_height: int = 900,
     skip_existing: bool = False,
@@ -492,8 +518,8 @@ def main(
     track_col: str = "TrackID",
     write_track_pngs: bool = False,
     png_dir: Optional[Path] = None,
-    x_col: str = "X",
-    y_col: str = "Y",
+    x_col: str = "TrackX",
+    y_col: str = "TrackY",
     png_width: int = 1200,
     png_height: int = 900,
     skip_existing: bool = False,
@@ -605,8 +631,8 @@ if __name__ == "__main__":
         default=None,
         help="Directory for time-colored track PNGs. Default: <out_dir>/track_pngs",
     )
-    ap.add_argument("--x_col", type=str, default="X")
-    ap.add_argument("--y_col", type=str, default="Y")
+    ap.add_argument("--x_col", type=str, default="TrackX")
+    ap.add_argument("--y_col", type=str, default="TrackY")
     ap.add_argument("--track_png_width", type=int, default=1200)
     ap.add_argument("--track_png_height", type=int, default=900)
     ap.add_argument(
@@ -619,7 +645,7 @@ if __name__ == "__main__":
     ap.add_argument(
         "--columns",
         nargs="+",
-        default=["Frame", "TrackID", "X", "Y", "Bodypoint"],
+        default=DEFAULT_COLUMNS,
     )
     args = ap.parse_args()
 

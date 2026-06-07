@@ -25,6 +25,9 @@ import argparse
 import bisect
 import json
 import math
+import re
+import struct
+import subprocess
 import threading
 import time
 from dataclasses import dataclass
@@ -75,6 +78,10 @@ def color_for_id(instance: int) -> Tuple[int, int, int]:
     rng = np.random.default_rng(int(instance) + 19)
     vals = rng.integers(80, 255, size=3, dtype=np.int32)
     return int(vals[2]), int(vals[1]), int(vals[0])
+
+
+def finite_xy(x: float, y: float) -> bool:
+    return math.isfinite(float(x)) and math.isfinite(float(y))
 
 
 @dataclass
@@ -137,6 +144,44 @@ class ArucoDetectionStore:
     def from_csv(cls, path: Path) -> "ArucoDetectionStore":
         path = Path(path)
         df = pd.read_csv(path)
+        return cls.from_dataframe(df, path)
+
+    @classmethod
+    def from_h5(cls, path: Path) -> "ArucoDetectionStore":
+        path = Path(path)
+        if path.stem.endswith("_aruco_detections"):
+            df = pd.read_hdf(path, key="detections")
+            return cls.from_dataframe(df, path)
+
+        with h5py.File(path, "r") as h5f:
+            if "aruco_tracks" not in h5f:
+                raise ValueError(f"{path} missing 'detections' table or 'aruco_tracks' dataset")
+            tracks = h5f["aruco_tracks"][:]
+            conf = h5f["aruco_confidences"][:] if "aruco_confidences" in h5f else None
+
+        frames, instances = np.nonzero(np.any(np.isfinite(tracks) & (tracks != 0), axis=2))
+        rows = {
+            "Frame": frames.astype(np.int64),
+            "Instance": instances.astype(np.int64),
+            "X": tracks[frames, instances, 0].astype(np.float32),
+            "Y": tracks[frames, instances, 1].astype(np.float32),
+        }
+        if conf is not None:
+            rows["Confidence"] = conf[frames, instances].astype(np.float32)
+        return cls.from_dataframe(pd.DataFrame(rows), path)
+
+    @classmethod
+    def from_path(cls, path: Path) -> "ArucoDetectionStore":
+        path = Path(path)
+        if path.suffix.lower() == ".csv":
+            return cls.from_csv(path)
+        if path.suffix.lower() in {".h5", ".hdf5"}:
+            return cls.from_h5(path)
+        raise ValueError(f"Unsupported ArUco detections file: {path}")
+
+    @classmethod
+    def from_dataframe(cls, df: pd.DataFrame, source_path: Path) -> "ArucoDetectionStore":
+        source_path = Path(source_path)
         missing = cls.REQUIRED_COLUMNS - set(df.columns)
         if missing:
             raise ValueError(f"ArUco detections missing required columns: {sorted(missing)}")
@@ -151,7 +196,7 @@ class ArucoDetectionStore:
         df["Frame"] = df["Frame"].astype(int)
         df["Instance"] = df["Instance"].astype(int)
 
-        store = cls(path)
+        store = cls(source_path)
         for row in df.itertuples(index=False):
             det = Detection(
                 frame=int(row.Frame),
@@ -437,7 +482,7 @@ class SleapAnchorStore:
         self.frame_candidates: Dict[int, np.ndarray] = {}
 
     @classmethod
-    def from_csv(
+    def from_path(
         cls,
         path: Path,
         *,
@@ -448,12 +493,7 @@ class SleapAnchorStore:
         grouped: Dict[int, List[np.ndarray]] = {}
         wanted = {"Frame", "Bodypoint", "X", "Y"}
 
-        reader = pd.read_csv(
-            path,
-            usecols=lambda c: c in wanted,
-            chunksize=int(chunksize),
-        )
-        for chunk in reader:
+        for chunk in iter_sleap_dataframes(path, wanted=wanted, chunksize=chunksize):
             for col in ("Frame", "Bodypoint", "X", "Y"):
                 chunk[col] = pd.to_numeric(chunk[col], errors="coerce")
             chunk = chunk.dropna(subset=["Frame", "Bodypoint", "X", "Y"])
@@ -475,6 +515,16 @@ class SleapAnchorStore:
         }
         return store
 
+    @classmethod
+    def from_csv(
+        cls,
+        path: Path,
+        *,
+        bodypoint: int = 0,
+        chunksize: int = 300_000,
+    ) -> "SleapAnchorStore":
+        return cls.from_path(path, bodypoint=bodypoint, chunksize=chunksize)
+
     def candidates_for_frame(self, frame: int) -> np.ndarray:
         arr = self.frame_candidates.get(int(frame))
         if arr is None:
@@ -489,7 +539,7 @@ class SleapSkeletonStore:
         self.bodypoint_count = 0
 
     @classmethod
-    def from_csv(
+    def from_path(
         cls,
         path: Path,
         *,
@@ -500,12 +550,7 @@ class SleapSkeletonStore:
         wanted = {"Frame", "Instance", "Bodypoint", "X", "Y", "Score_node"}
         max_bodypoint = -1
 
-        reader = pd.read_csv(
-            path,
-            usecols=lambda c: c in wanted,
-            chunksize=int(chunksize),
-        )
-        for chunk in reader:
+        for chunk in iter_sleap_dataframes(path, wanted=wanted, chunksize=chunksize):
             if "Score_node" not in chunk.columns:
                 chunk["Score_node"] = 1.0
             for col in ("Frame", "Instance", "Bodypoint", "X", "Y", "Score_node"):
@@ -532,11 +577,541 @@ class SleapSkeletonStore:
         store.bodypoint_count = max_bodypoint + 1 if max_bodypoint >= 0 else 0
         return store
 
+    @classmethod
+    def from_csv(
+        cls,
+        path: Path,
+        *,
+        chunksize: int = 300_000,
+    ) -> "SleapSkeletonStore":
+        return cls.from_path(path, chunksize=chunksize)
+
     def rows_for_frame(self, frame: int) -> np.ndarray:
         arr = self.frame_rows.get(int(frame))
         if arr is None:
             return np.empty((0, 5), dtype=np.float32)
         return arr
+
+
+@dataclass(frozen=True)
+class ChunkSpec:
+    chunk: int
+    start: int
+    stop: int
+    aruco_path: Path
+    sleap_path: Optional[Path]
+
+    @property
+    def frame_count(self) -> int:
+        return int(self.stop - self.start)
+
+    def contains(self, frame: int) -> bool:
+        return self.start <= int(frame) < self.stop
+
+    def to_local(self, frame: int) -> int:
+        return int(frame) - int(self.start)
+
+
+def iter_sleap_dataframes(
+    path: Path,
+    *,
+    wanted: set[str],
+    chunksize: int = 300_000,
+) -> Iterable[pd.DataFrame]:
+    path = Path(path)
+    if path.suffix.lower() == ".csv":
+        yield from pd.read_csv(path, usecols=lambda c: c in wanted, chunksize=int(chunksize))
+        return
+
+    if path.suffix.lower() not in {".h5", ".hdf5"}:
+        raise ValueError(f"Unsupported SLEAP file: {path}")
+
+    with h5py.File(path, "r") as h5f:
+        if "sleap_data" in h5f:
+            ds = h5f["sleap_data"]
+            names = list(ds.dtype.names or [])
+            cols = [col for col in names if col in wanted]
+            if not cols:
+                raise ValueError(f"{path} has no requested SLEAP columns: {sorted(wanted)}")
+            for start in range(0, int(ds.shape[0]), int(chunksize)):
+                arr = ds[start : start + int(chunksize)]
+                yield pd.DataFrame({col: arr[col] for col in cols})
+            return
+
+    reader = pd.read_hdf(path, key="sleap_data", chunksize=int(chunksize))
+    for chunk in reader:
+        yield chunk[[col for col in chunk.columns if col in wanted]].copy()
+
+
+def aruco_frame_count(path: Path) -> int:
+    path = Path(path)
+    if path.suffix.lower() == ".csv":
+        df = pd.read_csv(path, usecols=["Frame"])
+        return int(pd.to_numeric(df["Frame"], errors="coerce").max() + 1) if len(df) else 0
+
+    if path.stem.endswith("_aruco_detections"):
+        tracks_path = matching_aruco_tracks_path(path)
+        if tracks_path is not None:
+            return aruco_frame_count(tracks_path)
+        df = pd.read_hdf(path, key="detections", columns=["Frame"])
+        return int(pd.to_numeric(df["Frame"], errors="coerce").max() + 1) if len(df) else 0
+
+    with h5py.File(path, "r") as h5f:
+        if "aruco_tracks" not in h5f:
+            raise ValueError(f"{path} missing 'aruco_tracks'")
+        return int(h5f["aruco_tracks"].shape[0])
+
+
+def matching_aruco_tracks_path(path: Path) -> Optional[Path]:
+    stem = path.stem
+    if not stem.endswith("_aruco_detections"):
+        return None
+    base = stem[: -len("_aruco_detections")]
+    for suffix in ("_aruco_tracks.h5", "_aruco_tracks_.h5", "_aruco_tracks.hdf5", "_aruco_tracks_.hdf5"):
+        candidate = path.with_name(f"{base}{suffix}")
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def resolve_chunk_specs(video_path: Path, label_dir: Path) -> List[ChunkSpec]:
+    video_path = Path(video_path)
+    label_dir = Path(label_dir)
+    stem = video_path.stem
+    aruco_by_chunk: Dict[int, Path] = {}
+
+    chunk_re = re.compile(rf"^{re.escape(stem)}_(\d{{3}})_(aruco_detections|aruco_tracks_?)\.(?:h5|hdf5|csv)$")
+    for path in sorted(label_dir.glob(f"{stem}_*")):
+        m = chunk_re.match(path.name)
+        if not m:
+            continue
+        chunk = int(m.group(1))
+        old = aruco_by_chunk.get(chunk)
+        if old is None or ("_aruco_detections" in path.name and "_aruco_detections" not in old.name):
+            aruco_by_chunk[chunk] = path
+
+    specs: List[ChunkSpec] = []
+    offset = 0
+    for chunk in sorted(aruco_by_chunk):
+        aruco_path = aruco_by_chunk[chunk]
+        base = re.sub(r"_(?:aruco_detections|aruco_tracks_?)$", "", aruco_path.stem)
+        sleap_path = None
+        for suffix in ("_sleap_data.h5", "_sleap_data.hdf5", "_sleap_data.csv"):
+            candidate = aruco_path.with_name(f"{base}{suffix}")
+            if candidate.exists():
+                sleap_path = candidate
+                break
+        n_frames = aruco_frame_count(aruco_path)
+        specs.append(ChunkSpec(chunk=chunk, start=offset, stop=offset + n_frames, aruco_path=aruco_path, sleap_path=sleap_path))
+        offset += n_frames
+
+    if not specs:
+        raise FileNotFoundError(f"No chunked ArUco label files found for {video_path.name} in {label_dir}")
+    return specs
+
+
+def read_sleap_h5_frame(path: Path, frame: int) -> pd.DataFrame:
+    path = Path(path)
+    with h5py.File(path, "r") as h5f:
+        if "sleap_data" not in h5f:
+            raise ValueError(f"{path} missing 'sleap_data'")
+        ds = h5f["sleap_data"]
+        n = int(ds.shape[0])
+        frame = int(frame)
+
+        lo, hi = 0, n
+        while lo < hi:
+            mid = (lo + hi) // 2
+            mid_frame = int(ds[mid]["Frame"])
+            if mid_frame < frame:
+                lo = mid + 1
+            else:
+                hi = mid
+        start = lo
+
+        lo, hi = start, n
+        while lo < hi:
+            mid = (lo + hi) // 2
+            mid_frame = int(ds[mid]["Frame"])
+            if mid_frame <= frame:
+                lo = mid + 1
+            else:
+                hi = mid
+        stop = lo
+
+        if stop <= start:
+            return pd.DataFrame(columns=["Frame", "Instance", "Bodypoint", "X", "Y", "Score_node"])
+        arr = ds[start:stop]
+        return pd.DataFrame({name: arr[name] for name in ds.dtype.names or []})
+
+
+class ChunkedArucoDetectionStore:
+    def __init__(self, specs: List[ChunkSpec]):
+        self.specs = list(specs)
+        self.source_csv = specs[0].aruco_path
+        self.loaded: Dict[int, ArucoDetectionStore] = {}
+        self.frame_cache: Dict[int, Dict[int, Detection]] = {}
+        self.id_to_frames: Dict[int, List[int]] = {}
+        self.id_to_frame_sets: Dict[int, set[int]] = {}
+
+    def spec_for_frame(self, frame: int) -> ChunkSpec:
+        for spec in self.specs:
+            if spec.contains(frame):
+                return spec
+        return self.specs[-1] if int(frame) >= self.specs[-1].stop else self.specs[0]
+
+    def _load(self, spec: ChunkSpec) -> ArucoDetectionStore:
+        if spec.chunk not in self.loaded:
+            store = ArucoDetectionStore.from_path(spec.aruco_path)
+            self.loaded[spec.chunk] = store
+            for instance, frames in store.id_to_frames.items():
+                global_frames = [int(frame) + spec.start for frame in frames]
+                frame_set = self.id_to_frame_sets.setdefault(int(instance), set())
+                frame_list = self.id_to_frames.setdefault(int(instance), [])
+                for frame in global_frames:
+                    if frame not in frame_set:
+                        frame_set.add(frame)
+                        bisect.insort(frame_list, frame)
+        return self.loaded[spec.chunk]
+
+    def _local(self, frame: int) -> Tuple[ArucoDetectionStore, int, ChunkSpec]:
+        spec = self.spec_for_frame(frame)
+        return self._load(spec), spec.to_local(frame), spec
+
+    def _dense_tracks_path(self, spec: ChunkSpec) -> Optional[Path]:
+        if "aruco_tracks" in spec.aruco_path.name:
+            return spec.aruco_path
+        return matching_aruco_tracks_path(spec.aruco_path)
+
+    def _frame_map_for_frame(self, frame: int) -> Dict[int, Detection]:
+        frame = int(frame)
+        if frame in self.frame_cache:
+            return self.frame_cache[frame]
+
+        spec = self.spec_for_frame(frame)
+        local_frame = spec.to_local(frame)
+        tracks_path = self._dense_tracks_path(spec)
+        if tracks_path is not None:
+            with h5py.File(tracks_path, "r") as h5f:
+                tracks = h5f["aruco_tracks"][local_frame]
+                conf = h5f["aruco_confidences"][local_frame] if "aruco_confidences" in h5f else None
+            valid = np.isfinite(tracks[:, 0]) & np.isfinite(tracks[:, 1]) & ((tracks[:, 0] != 0) | (tracks[:, 1] != 0))
+            frame_map = {
+                int(instance): Detection(
+                    frame=frame,
+                    instance=int(instance),
+                    x=float(tracks[instance, 0]),
+                    y=float(tracks[instance, 1]),
+                    confidence=float(conf[instance]) if conf is not None else 1.0,
+                )
+                for instance in np.flatnonzero(valid)
+            }
+        else:
+            store, local_frame, spec = self._local(frame)
+            frame_map = {int(det.instance): det for det in self._globalize(store.snapshot_frame(local_frame), spec)}
+
+        self.frame_cache[frame] = frame_map
+        self._sync_index_for_frame(frame, frame_map.values())
+        return frame_map
+
+    def _globalize(self, detections: Iterable[Detection], spec: ChunkSpec) -> List[Detection]:
+        out = []
+        for det in detections:
+            d = det.clone()
+            d.frame = int(d.frame) + spec.start
+            out.append(d)
+        return out
+
+    def _localize(self, detections: Iterable[Detection], spec: ChunkSpec) -> List[Detection]:
+        out = []
+        for det in detections:
+            d = det.clone()
+            d.frame = int(d.frame) - spec.start
+            out.append(d)
+        return out
+
+    def _translate_action(self, action: Optional[FrameAction], spec: ChunkSpec) -> Optional[FrameAction]:
+        if action is None:
+            return None
+        translated = FrameAction(
+            kind=action.kind,
+            frame=int(action.frame) + spec.start,
+            before=self._globalize(action.before, spec),
+            after=self._globalize(action.after, spec),
+            details=dict(action.details),
+            created_at=action.created_at,
+        )
+        self._sync_index_for_frame(translated.frame, translated.after)
+        return translated
+
+    def _sync_index_for_frame(self, frame: int, detections: Iterable[Detection]) -> None:
+        frame = int(frame)
+        for instance, frame_set in list(self.id_to_frame_sets.items()):
+            if frame in frame_set:
+                frame_set.remove(frame)
+                frame_list = self.id_to_frames.get(instance, [])
+                idx = bisect.bisect_left(frame_list, frame)
+                if 0 <= idx < len(frame_list) and frame_list[idx] == frame:
+                    frame_list.pop(idx)
+                if not frame_list:
+                    self.id_to_frames.pop(instance, None)
+                    self.id_to_frame_sets.pop(instance, None)
+        for det in detections:
+            instance = int(det.instance)
+            frame_set = self.id_to_frame_sets.setdefault(instance, set())
+            frame_list = self.id_to_frames.setdefault(instance, [])
+            if frame not in frame_set:
+                frame_set.add(frame)
+                bisect.insort(frame_list, frame)
+
+    def snapshot_frame(self, frame: int) -> List[Detection]:
+        return [det.clone() for det in self._frame_map_for_frame(frame).values()]
+
+    def apply_frame_snapshot(self, frame: int, snapshot: Iterable[Detection]) -> None:
+        snapshot_list = [det.clone() for det in snapshot]
+        self.frame_cache[int(frame)] = {int(det.instance): det.clone() for det in snapshot_list}
+        self._sync_index_for_frame(frame, snapshot_list)
+
+    def get_frame_detections(self, frame: int) -> List[Detection]:
+        return self.snapshot_frame(frame)
+
+    def get_detection(self, frame: int, instance: int) -> Optional[Detection]:
+        det = self._frame_map_for_frame(frame).get(int(instance))
+        return None if det is None else det.clone()
+
+    def preview_move(self, frame: int, instance: int, x: float, y: float) -> None:
+        det = self._frame_map_for_frame(frame).get(int(instance))
+        if det is not None:
+            det.x = float(x)
+            det.y = float(y)
+
+    def create_upsert_action(self, frame: int, instance: int, x: float, y: float, confidence: float = 1.0, *, note: str = "") -> FrameAction:
+        frame = int(frame)
+        before = self.snapshot_frame(frame)
+        self._frame_map_for_frame(frame)[int(instance)] = Detection(frame, int(instance), float(x), float(y), float(confidence))
+        after = self.snapshot_frame(frame)
+        self._sync_index_for_frame(frame, after)
+        return FrameAction("upsert", frame, before, after, {"instance": int(instance), "note": note}, time.time())
+
+    def create_delete_action(self, frame: int, instance: int, *, note: str = "") -> Optional[FrameAction]:
+        frame = int(frame)
+        frame_map = self._frame_map_for_frame(frame)
+        if int(instance) not in frame_map:
+            return None
+        before = self.snapshot_frame(frame)
+        frame_map.pop(int(instance), None)
+        after = self.snapshot_frame(frame)
+        self._sync_index_for_frame(frame, after)
+        return FrameAction("delete", frame, before, after, {"instance": int(instance), "note": note}, time.time())
+
+    def create_relabel_action(self, frame: int, old_instance: int, new_instance: int, *, note: str = "") -> Optional[FrameAction]:
+        frame = int(frame)
+        frame_map = self._frame_map_for_frame(frame)
+        if int(old_instance) not in frame_map:
+            return None
+        before = self.snapshot_frame(frame)
+        det = frame_map.pop(int(old_instance))
+        det.instance = int(new_instance)
+        frame_map[int(new_instance)] = det
+        after = self.snapshot_frame(frame)
+        self._sync_index_for_frame(frame, after)
+        return FrameAction(
+            "relabel",
+            frame,
+            before,
+            after,
+            {"old_instance": int(old_instance), "new_instance": int(new_instance), "note": note},
+            time.time(),
+        )
+
+    def create_move_action(self, frame: int, before_snapshot: List[Detection], *, instance: int, note: str = "") -> Optional[FrameAction]:
+        after = self.snapshot_frame(frame)
+        if len(before_snapshot) == len(after) and not any(
+            int(a.instance) != int(b.instance)
+            or abs(float(a.x) - float(b.x)) > 1e-9
+            or abs(float(a.y) - float(b.y)) > 1e-9
+            or abs(float(a.confidence) - float(b.confidence)) > 1e-9
+            for a, b in zip(before_snapshot, after)
+        ):
+            return None
+        return FrameAction("move", int(frame), [d.clone() for d in before_snapshot], after, {"instance": int(instance), "note": note}, time.time())
+
+    def create_batch_upsert_action(self, frame: int, detections: Iterable[Detection], *, note: str = "") -> Optional[FrameAction]:
+        frame = int(frame)
+        to_apply = [det.clone() for det in detections]
+        if not to_apply:
+            return None
+        before = self.snapshot_frame(frame)
+        frame_map = self._frame_map_for_frame(frame)
+        for det in to_apply:
+            det.frame = frame
+            frame_map[int(det.instance)] = det
+        after = self.snapshot_frame(frame)
+        self._sync_index_for_frame(frame, after)
+        return FrameAction(
+            "batch_upsert",
+            frame,
+            before,
+            after,
+            {"instances": [int(det.instance) for det in to_apply], "count": len(to_apply), "note": note},
+            time.time(),
+        )
+
+    def to_dataframe(self) -> pd.DataFrame:
+        frames = []
+        for spec in self.specs:
+            store = self._load(spec)
+            df = store.to_dataframe()
+            if not df.empty:
+                df = df.copy()
+                df["Frame"] = df["Frame"].astype(int) + spec.start
+                frames.append(df)
+        if not frames:
+            return pd.DataFrame(columns=["Frame", "Instance", "X", "Y", "Confidence"])
+        return pd.concat(frames, ignore_index=True)
+
+    def export_dense_h5(self, output_path: Path, frame_count: int, dictionary_size: int) -> None:
+        ArucoDetectionStore.from_dataframe(self.to_dataframe(), output_path).export_dense_h5(output_path, frame_count, dictionary_size)
+
+    def present_frames_for_id(self, instance: int) -> List[int]:
+        for spec in self.specs:
+            self._load(spec)
+        return list(self.id_to_frames.get(int(instance), []))
+
+    def frame_has_instance(self, frame: int, instance: int) -> bool:
+        return int(instance) in self._frame_map_for_frame(frame)
+
+    def next_present_frame(self, instance: int, current: int) -> Optional[int]:
+        self._load(self.spec_for_frame(current))
+        frames = self.id_to_frames.get(int(instance), [])
+        idx = bisect.bisect_right(frames, int(current))
+        if idx < len(frames):
+            return int(frames[idx])
+        for spec in self.specs:
+            if spec.start > int(current):
+                self._load(spec)
+                frames = self.id_to_frames.get(int(instance), [])
+                idx = bisect.bisect_right(frames, int(current))
+                if idx < len(frames):
+                    return int(frames[idx])
+        return None
+
+    def prev_present_frame(self, instance: int, current: int) -> Optional[int]:
+        self._load(self.spec_for_frame(current))
+        frames = self.id_to_frames.get(int(instance), [])
+        idx = bisect.bisect_left(frames, int(current)) - 1
+        if idx >= 0:
+            return int(frames[idx])
+        for spec in reversed(self.specs):
+            if spec.stop <= int(current):
+                self._load(spec)
+                frames = self.id_to_frames.get(int(instance), [])
+                idx = bisect.bisect_left(frames, int(current)) - 1
+                if idx >= 0:
+                    return int(frames[idx])
+        return None
+
+    def next_missing_frame(self, instance: int, current: int, frame_count: int) -> Optional[int]:
+        seen = self.id_to_frame_sets.get(int(instance), set())
+        for frame in range(int(current) + 1, int(frame_count)):
+            self._load(self.spec_for_frame(frame))
+            if frame not in seen:
+                return frame
+        return None
+
+    def prev_missing_frame(self, instance: int, current: int) -> Optional[int]:
+        seen = self.id_to_frame_sets.get(int(instance), set())
+        for frame in range(int(current) - 1, -1, -1):
+            self._load(self.spec_for_frame(frame))
+            if frame not in seen:
+                return frame
+        return None
+
+
+class ChunkedSleapAnchorStore:
+    def __init__(self, specs: List[ChunkSpec], bodypoint: int = 0):
+        self.specs = [spec for spec in specs if spec.sleap_path is not None]
+        self.bodypoint = int(bodypoint)
+        self.source_csv = self.specs[0].sleap_path if self.specs else Path("")
+        self.loaded: Dict[int, SleapAnchorStore] = {}
+        self.frame_candidates: Dict[int, np.ndarray] = {}
+
+    @classmethod
+    def from_chunks(cls, specs: List[ChunkSpec], *, bodypoint: int = 0) -> "ChunkedSleapAnchorStore":
+        return cls(specs, bodypoint=bodypoint)
+
+    def spec_for_frame(self, frame: int) -> Optional[ChunkSpec]:
+        for spec in self.specs:
+            if spec.contains(frame):
+                return spec
+        return None
+
+    def _load(self, spec: ChunkSpec) -> SleapAnchorStore:
+        if spec.chunk not in self.loaded:
+            assert spec.sleap_path is not None
+            self.loaded[spec.chunk] = SleapAnchorStore.from_path(spec.sleap_path, bodypoint=self.bodypoint)
+        return self.loaded[spec.chunk]
+
+    def candidates_for_frame(self, frame: int) -> np.ndarray:
+        spec = self.spec_for_frame(frame)
+        if spec is None:
+            return np.empty((0, 2), dtype=np.float32)
+        if spec.sleap_path is not None and spec.sleap_path.suffix.lower() in {".h5", ".hdf5"}:
+            df = read_sleap_h5_frame(spec.sleap_path, spec.to_local(frame))
+            if df.empty:
+                return np.empty((0, 2), dtype=np.float32)
+            df = df.dropna(subset=["Bodypoint", "X", "Y"])
+            df = df[pd.to_numeric(df["Bodypoint"], errors="coerce").astype("Int64") == self.bodypoint]
+            if df.empty:
+                return np.empty((0, 2), dtype=np.float32)
+            return df[["X", "Y"]].to_numpy(dtype=np.float32)
+        return self._load(spec).candidates_for_frame(spec.to_local(frame))
+
+
+class ChunkedSleapSkeletonStore:
+    def __init__(self, specs: List[ChunkSpec]):
+        self.specs = [spec for spec in specs if spec.sleap_path is not None]
+        self.source_csv = self.specs[0].sleap_path if self.specs else Path("")
+        self.loaded: Dict[int, SleapSkeletonStore] = {}
+        self.frame_rows: Dict[int, np.ndarray] = {}
+        self.bodypoint_count = 0
+
+    @classmethod
+    def from_chunks(cls, specs: List[ChunkSpec]) -> "ChunkedSleapSkeletonStore":
+        return cls(specs)
+
+    def spec_for_frame(self, frame: int) -> Optional[ChunkSpec]:
+        for spec in self.specs:
+            if spec.contains(frame):
+                return spec
+        return None
+
+    def _load(self, spec: ChunkSpec) -> SleapSkeletonStore:
+        if spec.chunk not in self.loaded:
+            assert spec.sleap_path is not None
+            store = SleapSkeletonStore.from_path(spec.sleap_path)
+            self.loaded[spec.chunk] = store
+            self.bodypoint_count = max(self.bodypoint_count, store.bodypoint_count)
+        return self.loaded[spec.chunk]
+
+    def rows_for_frame(self, frame: int) -> np.ndarray:
+        spec = self.spec_for_frame(frame)
+        if spec is None:
+            return np.empty((0, 5), dtype=np.float32)
+        if spec.sleap_path is not None and spec.sleap_path.suffix.lower() in {".h5", ".hdf5"}:
+            df = read_sleap_h5_frame(spec.sleap_path, spec.to_local(frame))
+            if df.empty:
+                return np.empty((0, 5), dtype=np.float32)
+            if "Score_node" not in df.columns:
+                df["Score_node"] = 1.0
+            df = df.dropna(subset=["Instance", "Bodypoint", "X", "Y", "Score_node"])
+            if df.empty:
+                return np.empty((0, 5), dtype=np.float32)
+            max_bodypoint = pd.to_numeric(df["Bodypoint"], errors="coerce").max()
+            if pd.notna(max_bodypoint):
+                self.bodypoint_count = max(self.bodypoint_count, int(max_bodypoint) + 1)
+            return df[["Instance", "Bodypoint", "X", "Y", "Score_node"]].to_numpy(dtype=np.float32)
+        return self._load(spec).rows_for_frame(spec.to_local(frame))
 
 
 def infer_detections_from_video(video_path: Path) -> Path:
@@ -545,6 +1120,11 @@ def infer_detections_from_video(video_path: Path) -> Path:
 
 def infer_sleap_from_video(video_path: Path) -> Path:
     return video_path.with_name(f"{video_path.stem}_sleap_data.csv")
+
+
+def infer_chunked_label_dir(video_path: Path) -> Optional[Path]:
+    candidate = video_path.parent / "data"
+    return candidate if candidate.is_dir() else None
 
 
 def infer_video_from_detections(detections_path: Path) -> Optional[Path]:
@@ -588,19 +1168,252 @@ def lookup_frame_count_from_sidecar(sidecar: Path, video_name: str) -> Optional[
     return int(val)
 
 
-def resolve_frame_count(video_path: Path, cap: cv2.VideoCapture) -> int:
+class OpenCvVideoReader:
+    def __init__(self, video_path: Path):
+        self.video_path = Path(video_path)
+        self.cap = cv2.VideoCapture(str(self.video_path))
+        if not self.cap.isOpened():
+            raise FileNotFoundError(f"Could not open video: {self.video_path}")
+        self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1
+        self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1
+        self.fps = float(self.cap.get(cv2.CAP_PROP_FPS)) or 24.0
+        self.decoded_frame_index: Optional[int] = None
+
+    def frame_count(self) -> int:
+        return int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    def read_frame(self, frame_idx: int) -> np.ndarray:
+        frame_idx = int(frame_idx)
+        need_seek = self.decoded_frame_index is None or frame_idx != (self.decoded_frame_index + 1)
+        if need_seek:
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+
+        ok, frame = self.cap.read()
+        if (not ok or frame is None) and not need_seek:
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ok, frame = self.cap.read()
+        if not ok or frame is None:
+            raise RuntimeError(f"Could not read frame {frame_idx} from {self.video_path}")
+        self.decoded_frame_index = frame_idx
+        return frame
+
+    def close(self) -> None:
+        self.cap.release()
+
+
+class AviH264ElementaryReader:
+    """Read H264 AVI files whose OpenDML container confuses OpenCV/ffmpeg probing."""
+
+    def __init__(self, video_path: Path, *, frame_count: int):
+        self.video_path = Path(video_path)
+        self.width, self.height, self.fps = self._parse_header(self.video_path)
+        self._frame_count = int(frame_count)
+        self.frame_bytes = int(self.width * self.height * 3)
+        self.proc: Optional[subprocess.Popen[bytes]] = None
+        self.feed_thread: Optional[threading.Thread] = None
+        self.stop_feed = threading.Event()
+        self.decoded_frame_index: Optional[int] = None
+        self.packet_margin = 250
+        self.decode_batch_frames = 6
+        self.frame_cache: Dict[int, np.ndarray] = {}
+
+    @staticmethod
+    def _parse_header(path: Path) -> Tuple[int, int, float]:
+        with Path(path).open("rb") as fh:
+            header = fh.read(256)
+        if len(header) < 0xBC:
+            raise RuntimeError(f"AVI header too short: {path}")
+        usec_per_frame = struct.unpack_from("<I", header, 0x20)[0]
+        width = struct.unpack_from("<I", header, 0xB0)[0]
+        height = struct.unpack_from("<I", header, 0xB4)[0]
+        fps = 1_000_000.0 / usec_per_frame if usec_per_frame > 0 else 24.0
+        if width <= 0 or height <= 0:
+            raise RuntimeError(f"Could not parse AVI dimensions from {path}")
+        return int(width), int(height), float(fps)
+
+    def frame_count(self) -> int:
+        return self._frame_count
+
+    def _start_decoder(self) -> None:
+        self.close()
+        self.stop_feed.clear()
+        cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "h264",
+            "-i",
+            "pipe:0",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "bgr24",
+            "pipe:1",
+        ]
+        self.proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+        )
+        self.feed_thread = threading.Thread(target=self._feed_packets, daemon=True)
+        self.feed_thread.start()
+        self.decoded_frame_index = -1
+
+    def _feed_packets(self) -> None:
+        assert self.proc is not None
+        assert self.proc.stdin is not None
+        try:
+            with self.video_path.open("rb") as fh:
+                data = fh.read(1024 * 1024)
+                movi = data.find(b"movi")
+                if movi < 0:
+                    return
+                fh.seek(movi + 4)
+                while not self.stop_feed.is_set():
+                    header = fh.read(8)
+                    if len(header) < 8:
+                        break
+                    chunk_id = header[:4]
+                    size = struct.unpack("<I", header[4:])[0]
+                    if chunk_id == b"00dc":
+                        remaining = int(size)
+                        while remaining > 0 and not self.stop_feed.is_set():
+                            payload = fh.read(min(1024 * 1024, remaining))
+                            if not payload:
+                                return
+                            self.proc.stdin.write(payload)
+                            remaining -= len(payload)
+                        if size % 2:
+                            fh.seek(1, 1)
+                    elif chunk_id in {b"RIFF", b"LIST"}:
+                        list_type = fh.read(4)
+                        if list_type in {b"movi", b"AVIX"}:
+                            continue
+                        if size >= 4:
+                            fh.seek(size - 4 + (size % 2), 1)
+                    else:
+                        fh.seek(size + (size % 2), 1)
+        except Exception:
+            pass
+        finally:
+            try:
+                self.proc.stdin.close()
+            except Exception:
+                pass
+
+    def read_frame(self, frame_idx: int) -> np.ndarray:
+        frame_idx = int(frame_idx)
+        cached = self.frame_cache.get(frame_idx)
+        if cached is not None:
+            return cached.copy()
+
+        batch_stop = min(self._frame_count - 1, frame_idx + self.decode_batch_frames - 1)
+        packets = self._read_packet_window(batch_stop + self.packet_margin)
+        cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "h264",
+            "-i",
+            "pipe:0",
+            "-vf",
+            f"select=between(n\\,{frame_idx}\\,{batch_stop})",
+            "-frames:v",
+            str(batch_stop - frame_idx + 1),
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "bgr24",
+            "pipe:1",
+        ]
+        proc = subprocess.run(cmd, input=packets, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+        raw = proc.stdout
+        expected_frames = batch_stop - frame_idx + 1
+        if len(raw) < self.frame_bytes:
+            detail = proc.stderr.decode("utf-8", errors="replace").strip()
+            suffix = f": {detail}" if detail else ""
+            raise RuntimeError(f"Could not decode frame {frame_idx} from {self.video_path}{suffix}")
+        self.frame_cache.clear()
+        decoded_frames = min(expected_frames, len(raw) // self.frame_bytes)
+        for offset in range(decoded_frames):
+            start = offset * self.frame_bytes
+            stop = start + self.frame_bytes
+            self.frame_cache[frame_idx + offset] = (
+                np.frombuffer(raw[start:stop], dtype=np.uint8)
+                .reshape((self.height, self.width, 3))
+                .copy()
+            )
+        return self.frame_cache[frame_idx].copy()
+
+    def _read_packet_window(self, end_packet: int) -> bytes:
+        end_packet = max(1, int(end_packet))
+        out = bytearray()
+        count = 0
+        with self.video_path.open("rb") as fh:
+            data = fh.read(1024 * 1024)
+            movi = data.find(b"movi")
+            if movi < 0:
+                raise RuntimeError(f"Could not find AVI movi list in {self.video_path}")
+            fh.seek(movi + 4)
+            while count < end_packet:
+                header = fh.read(8)
+                if len(header) < 8:
+                    break
+                chunk_id = header[:4]
+                size = struct.unpack("<I", header[4:])[0]
+                if chunk_id == b"00dc":
+                    out.extend(fh.read(size))
+                    count += 1
+                    if size % 2:
+                        fh.seek(1, 1)
+                elif chunk_id in {b"RIFF", b"LIST"}:
+                    list_type = fh.read(4)
+                    if list_type in {b"movi", b"AVIX"}:
+                        continue
+                    if size >= 4:
+                        fh.seek(size - 4 + (size % 2), 1)
+                else:
+                    fh.seek(size + (size % 2), 1)
+        if not out:
+            raise RuntimeError(f"No H264 packets found in {self.video_path}")
+        return bytes(out)
+
+    def close(self) -> None:
+        self.stop_feed.set()
+        if self.proc is not None:
+            try:
+                if self.proc.stdin is not None:
+                    self.proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                self.proc.terminate()
+            except Exception:
+                pass
+        self.proc = None
+
+
+def resolve_frame_count(video_path: Path, reader: Optional[OpenCvVideoReader] = None) -> int:
     sidecar = infer_frame_counts_sidecar(video_path)
     if sidecar is not None:
         sidecar_count = lookup_frame_count_from_sidecar(sidecar, video_path.name)
         if sidecar_count is not None and sidecar_count > 0:
             return int(sidecar_count)
-    count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    count = int(reader.frame_count()) if reader is not None else 0
     if count <= 0:
         raise RuntimeError(f"Could not determine frame count for {video_path}")
     return count
 
 
 def pick_path_with_dialogs(args: argparse.Namespace) -> Tuple[Path, Path]:
+    if args.video is not None and args.label_dir is not None and args.detections is None:
+        return Path(args.video), Path(args.label_dir)
     if args.video is not None and args.detections is not None:
         return Path(args.video), Path(args.detections)
 
@@ -654,6 +1467,7 @@ class ArucoCurationApp:
         dictionary_size: int,
         start_frame: int,
         playback_fps: float,
+        chunk_specs: Optional[List[ChunkSpec]] = None,
     ):
         self.root = root
         self.video_path = Path(video_path)
@@ -661,7 +1475,10 @@ class ArucoCurationApp:
         self.output_dir = Path(output_dir)
         self.dictionary_size = int(dictionary_size)
         self.playback_delay_ms = max(10, int(round(1000.0 / max(playback_fps, 1.0))))
+        self.chunk_specs = list(chunk_specs or [])
         self.sleap_path = infer_sleap_from_video(self.video_path)
+        if self.chunk_specs and self.chunk_specs[0].sleap_path is not None:
+            self.sleap_path = self.chunk_specs[0].sleap_path
         self.sleap_store: Optional[SleapAnchorStore] = None
         self.sleap_loading = False
         self.sleap_error: Optional[str] = None
@@ -669,14 +1486,22 @@ class ArucoCurationApp:
         self.sleap_skeleton_loading = False
         self.sleap_skeleton_error: Optional[str] = None
 
-        self.store = ArucoDetectionStore.from_csv(self.detections_path)
-        self.cap = cv2.VideoCapture(str(self.video_path))
-        if not self.cap.isOpened():
-            raise FileNotFoundError(f"Could not open video: {self.video_path}")
+        self.store = (
+            ChunkedArucoDetectionStore(self.chunk_specs)
+            if self.chunk_specs
+            else ArucoDetectionStore.from_path(self.detections_path)
+        )
+        if self.chunk_specs and self.video_path.suffix.lower() == ".avi":
+            self.video_reader = AviH264ElementaryReader(
+                self.video_path,
+                frame_count=self.chunk_specs[-1].stop,
+            )
+        else:
+            self.video_reader = OpenCvVideoReader(self.video_path)
 
-        self.frame_count = resolve_frame_count(self.video_path, self.cap)
-        self.video_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1
-        self.video_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1
+        self.frame_count = self.video_reader.frame_count() or resolve_frame_count(self.video_path, self.video_reader)
+        self.video_width = int(self.video_reader.width) or 1
+        self.video_height = int(self.video_reader.height) or 1
 
         self.current_frame = clamp(int(start_frame), 0, max(0, self.frame_count - 1))
         self.current_bgr: Optional[np.ndarray] = None
@@ -698,7 +1523,6 @@ class ArucoCurationApp:
         self.auto_bridge_scope: Optional[str] = None
         self.dirty = False
         self.status_note = ""
-        self.decoded_frame_index: Optional[int] = None
         self.last_status_refresh_at = 0.0
         self.last_tree_refresh_at = 0.0
         self.last_controls_refresh_at = 0.0
@@ -1140,7 +1964,11 @@ class ArucoCurationApp:
 
     def _load_sleap_worker(self) -> None:
         try:
-            store = SleapAnchorStore.from_csv(self.sleap_path, bodypoint=0)
+            store = (
+                ChunkedSleapAnchorStore.from_chunks(self.chunk_specs, bodypoint=0)
+                if self.chunk_specs
+                else SleapAnchorStore.from_path(self.sleap_path, bodypoint=0)
+            )
         except Exception as exc:
             self.root.after(0, lambda: self._finish_sleap_load(None, str(exc)))
             return
@@ -1173,7 +2001,11 @@ class ArucoCurationApp:
 
     def _load_sleap_skeleton_worker(self) -> None:
         try:
-            store = SleapSkeletonStore.from_csv(self.sleap_path)
+            store = (
+                ChunkedSleapSkeletonStore.from_chunks(self.chunk_specs)
+                if self.chunk_specs
+                else SleapSkeletonStore.from_path(self.sleap_path)
+            )
         except Exception as exc:
             self.root.after(0, lambda: self._finish_sleap_skeleton_load(None, str(exc)))
             return
@@ -1301,10 +2133,14 @@ class ArucoCurationApp:
         else:
             bridge_mode = "AUTO-BRIDGE OFF"
         note = f" | {self.status_note}" if self.status_note else ""
+        chunk_text = ""
+        if self.chunk_specs:
+            spec = self.store.spec_for_frame(self.current_frame)
+            chunk_text = f" | chunk {spec.chunk:03d} local {spec.to_local(self.current_frame)}"
         self.status_var.set(
             f"Frame {self.current_frame + 1}/{self.frame_count} | "
             f"Mode {mode} | Selected {selected} | "
-            f"Frame detections {count} | {bridge_mode} | Dirty {self.dirty}{note}"
+            f"Frame detections {count}{chunk_text} | {bridge_mode} | Dirty {self.dirty}{note}"
         )
 
     def on_slider_changed(self, value: str) -> None:
@@ -1399,18 +2235,7 @@ class ArucoCurationApp:
         frame_idx = int(frame_idx)
         if self.current_bgr is not None and self.current_bgr_frame == frame_idx:
             return self.current_bgr
-
-        need_seek = self.decoded_frame_index is None or frame_idx != (self.decoded_frame_index + 1)
-        if need_seek:
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-
-        ok, frame = self.cap.read()
-        if (not ok or frame is None) and not need_seek:
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-            ok, frame = self.cap.read()
-        if not ok or frame is None:
-            raise RuntimeError(f"Could not read frame {frame_idx} from {self.video_path}")
-        self.decoded_frame_index = frame_idx
+        frame = self.video_reader.read_frame(frame_idx)
         self.current_bgr = frame
         self.current_bgr_frame = frame_idx
         return frame
@@ -1550,6 +2375,8 @@ class ArucoCurationApp:
                     continue
                 x0, y0, _score0 = nodes[bp0]
                 x1, y1, _score1 = nodes[bp1]
+                if not finite_xy(x0, y0) or not finite_xy(x1, y1):
+                    continue
                 cv2.line(
                     image,
                     (int(round(x0)), int(round(y0))),
@@ -1559,6 +2386,8 @@ class ArucoCurationApp:
                     cv2.LINE_AA,
                 )
             for bp, (x, y, _score) in nodes.items():
+                if not finite_xy(x, y):
+                    continue
                 radius = 6 if bp == 0 else 4
                 cv2.circle(image, (int(round(x)), int(round(y))), radius, color, -1)
                 if bp == 0:
@@ -1587,6 +2416,8 @@ class ArucoCurationApp:
         self.draw_sleap_overlay(frame)
 
         for det in current_dets:
+            if not finite_xy(det.x, det.y):
+                continue
             color = color_for_id(det.instance)
             center = (int(round(det.x)), int(round(det.y)))
             radius = 14 if det.instance == selected_instance else 11
@@ -2709,7 +3540,7 @@ class ArucoCurationApp:
             )
             if not ok:
                 return
-        self.cap.release()
+        self.video_reader.close()
         self.root.destroy()
 
 
@@ -2720,7 +3551,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--detections",
         type=Path,
         default=None,
-        help="Path to *_aruco_detections.csv. If omitted, try to infer from the video.",
+        help="Path to *_aruco_detections CSV/H5. If omitted, try to infer from the video.",
+    )
+    parser.add_argument(
+        "--label-dir",
+        type=Path,
+        default=None,
+        help="Directory containing chunked *_aruco_detections.h5 and *_sleap_data.h5 labels for a full video.",
     )
     parser.add_argument(
         "--output-dir",
@@ -2741,7 +3578,15 @@ def main() -> None:
     video_path, detections_path = pick_path_with_dialogs(args)
     if not video_path.exists():
         raise FileNotFoundError(video_path)
-    if not detections_path.exists():
+    chunk_specs: Optional[List[ChunkSpec]] = None
+    label_dir = Path(args.label_dir) if args.label_dir is not None else None
+    if label_dir is None and args.detections is None:
+        label_dir = infer_chunked_label_dir(video_path)
+    if label_dir is not None:
+        chunk_specs = resolve_chunk_specs(video_path, label_dir)
+        detections_path = chunk_specs[0].aruco_path
+
+    if chunk_specs is None and not detections_path.exists():
         inferred = infer_detections_from_video(video_path)
         raise FileNotFoundError(
             f"Detections file not found: {detections_path}\n"
@@ -2759,6 +3604,7 @@ def main() -> None:
         dictionary_size=int(args.dictionary_size),
         start_frame=int(args.start_frame),
         playback_fps=float(args.fps),
+        chunk_specs=chunk_specs,
     )
     print(SHORTCUTS_TEXT, flush=True)
     app.refresh_status()
