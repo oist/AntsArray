@@ -44,9 +44,12 @@ Concurrency:
   --datacp-concurrency N            default: 4
 
 Batching (minimize submitted job count):
-  --batch-size N                    chunks per array task. default: auto
-                                    auto = ceil(total_chunks / --max-array-tasks)
-  --max-array-tasks N               cap when auto-sizing batch. default: 500
+  --batch-size N                    chunks per array task. default: 1
+                                    (one chunk/task; avoids per-task walltime
+                                    timeouts on the slow aruco leg. Pass a larger
+                                    N to pack chunks, or "" to auto-size:
+                                    auto = ceil(total_chunks / --max-array-tasks))
+  --max-array-tasks N               cap when auto-sizing batch (--batch-size ""). default: 500
 
 Phase isolation (for testing):
   --only-chunk                      Stop after chunking
@@ -77,7 +80,7 @@ SLEAP_MODULE="sleap-nn/0.2.0"
 ARUCO_CONCURRENCY=400   # under deigo compute cap (cpu=2000/4=500); leaves ~20% headroom
 SLEAP_CONCURRENCY=8     # bounded by saion largegpu having only 4 A100 nodes anyway
 DATACP_CONCURRENCY=4
-BATCH_SIZE=""        # "" => auto
+BATCH_SIZE=1         # default: one chunk per array task (set "" to auto-size under MAX_ARRAY_TASKS)
 MAX_ARRAY_TASKS=500
 ONLY_CHUNK=0
 ONLY_ARUCO=0
