@@ -11,6 +11,7 @@ umask 0002
 
 JOBS_ROOT="__JOBS_ROOT__"
 source "$JOBS_ROOT/pipeline.env"
+source "$LIB_DIR/perms.sh"
 
 # Single-job datacp: scan the whole worklist and rsync every aruco h5 that
 # exists on /flash to $DATA_DIR. Submitting as one job (not an array) keeps
@@ -19,7 +20,7 @@ source "$JOBS_ROOT/pipeline.env"
 WORKLIST="$JOBS_ROOT/aruco_worklist.txt"
 
 mkdir -p "$DATA_DIR"
-chmod 2775 "$DATA_DIR" 2>/dev/null || true
+ensure_group_perms "$DATA_DIR"
 
 uploaded=0
 missing=0
@@ -32,7 +33,7 @@ while IFS=$'\t' read -r vname chunk _; do
 			missing=$((missing+1))
 			continue
 		fi
-		rsync -ah --chmod=Du=rwx,Dg=rwx,Fu=rw,Fg=rw "$src" "$DATA_DIR/"
+		rsync -ah --chmod=Du=rwx,Dg=rwx,Fu=rw,Fg=rw --chown=:"$OUTPUT_GROUP" "$src" "$DATA_DIR/"
 		uploaded=$((uploaded+1))
 	done
 done < "$WORKLIST"

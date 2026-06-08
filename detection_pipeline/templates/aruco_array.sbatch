@@ -12,6 +12,7 @@ shopt -s nullglob
 JOBS_ROOT="__JOBS_ROOT__"
 source "$JOBS_ROOT/pipeline.env"
 source "$LIB_DIR/hosts.sh"
+source "$LIB_DIR/perms.sh"
 
 module load opencv/4.9.0
 
@@ -33,7 +34,7 @@ for (( row_idx=start_idx; row_idx<end_idx; row_idx++ )); do
 	flash_dir="$FLASH_ROOT/$vname"
 	aruco_dir="$FLASH_ROOT/aruco/$vname"
 	mkdir -p "$aruco_dir"
-	chmod 2775 "$aruco_dir"
+	ensure_group_perms "$aruco_dir"
 
 	chunk_file="$flash_dir/${vname}_${chunk}.${CHUNK_EXT}"
 	if [[ ! -s "$chunk_file" ]]; then
@@ -58,7 +59,7 @@ for (( row_idx=start_idx; row_idx<end_idx; row_idx++ )); do
 		   [[ $(stat -c %s "$local_path") == $(stat -c %s "$DATA_DIR/$base_name" 2>/dev/null) ]]; then
 			return 0
 		fi
-		rsync_retry -ah --chmod=Du=rwx,Dg=rwx,Fu=rw,Fg=rw \
+		rsync_retry -ah --chmod=Du=rwx,Dg=rwx,Fu=rw,Fg=rw --chown=:"$OUTPUT_GROUP" \
 			"$local_path" "deigo:$DATA_DIR/" \
 			|| { echo "[WARN] inline upload of $base_name failed; aruco_datacp end-of-run will retry" >&2; return 1; }
 	}
