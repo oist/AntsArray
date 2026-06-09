@@ -737,8 +737,8 @@ def main() -> None:
 
         raw_h5_path = out_dir / f"{name_no_ext}_aruco_tracks.h5"
         with h5py.File(raw_h5_path, "w") as hdf:
-            hdf.create_dataset("aruco_tracks", data=tracks)
-            hdf.create_dataset("aruco_confidences", data=confidences)
+            hdf.create_dataset("aruco_tracks", data=tracks, compression="gzip", shuffle=True, chunks=True)
+            hdf.create_dataset("aruco_confidences", data=confidences, compression="gzip", shuffle=True, chunks=True)
         print(f"[INFO] Saved raw arrays to: {raw_h5_path}", flush=True)
 
         print("[INFO] Converting to DataFrame...", flush=True)
@@ -755,7 +755,7 @@ def main() -> None:
             try:
                 import tables  # noqa: F401
 
-                df.to_hdf(df_h5_path, key="detections", mode="w", format="table")
+                df.to_hdf(df_h5_path, key="detections", mode="w", format="table", complevel=4, complib="zlib")
                 print(f"[INFO] Saved DataFrame H5 to: {df_h5_path}", flush=True)
             except ImportError:
                 print("[WARN] 'tables' module not found. Skipping HDF5 DataFrame export.", flush=True)

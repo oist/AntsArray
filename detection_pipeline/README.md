@@ -60,6 +60,7 @@ detection_pipeline/
   lib/
     hosts.sh                       # SSH_CMD, ssh_retry, rsync_retry, host_resolves
     manifest.py                    # video discovery + sidecar/ffprobe cross-check
+    perms.sh                       # best-effort chgrp/setgid helpers for shared outputs
     worklist.py                    # chunk-ordered (chunk_idx ASC, vname ASC) TSV builder
   templates/
     chunk.sbatch                   # ffmpeg -c copy segment (no re-encode)
@@ -119,6 +120,24 @@ defaults:
 | `--aruco-concurrency`  | `16`             | array `%N` cap                                                                                      |
 | `--sleap-concurrency`  | `8`              | array `%N` cap                                                                                      |
 | `--datacp-concurrency` | `4`              | array `%N` cap (deigo has 4 mover nodes)                                                            |
+| `--group`              | `reiteruni`      | group owner for shared outputs; created dirs are chgrp'd and setgid where permitted                 |
+
+## Shared group permissions
+
+The pipeline keeps bucket and scratch outputs group-shareable by default. Pass
+`--group NAME` to change the target group; otherwise it uses `reiteruni`.
+`pipeline.sh` exports this as `OUTPUT_GROUP` so deigo and saion jobs use the
+same policy end to end.
+
+Directory setup is best-effort: helpers in `lib/perms.sh` run `chgrp` and set
+mode `2775` on pipeline-created directories so the setgid bit preserves group
+inheritance. The startup preflight only warns if the experiment directory itself
+is not group-owned, group-writable, or setgid, because that directory may contain
+files owned by other users.
+
+Upload stages also pass `rsync --chown=:$OUTPUT_GROUP` so `rsync -a` cannot
+preserve a source-side group into the bucket by accident. Permission fixes never
+abort a run if the current user cannot change a path they do not own.
 
 ## Phase isolation (for testing)
 

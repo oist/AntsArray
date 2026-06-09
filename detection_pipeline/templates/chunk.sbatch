@@ -13,6 +13,7 @@ module load ffmpeg/7.1
 
 JOBS_ROOT="__JOBS_ROOT__"
 source "$JOBS_ROOT/pipeline.env"
+source "$LIB_DIR/perms.sh"
 
 MANIFEST="$JOBS_ROOT/manifest.csv"
 OUT_EXT="$CHUNK_EXT"
@@ -28,7 +29,7 @@ source_path=$(echo "$row" | awk -F, '{print $2}')
 
 flash_dir="$FLASH_ROOT/$vname"
 mkdir -p "$flash_dir"
-chmod 2775 "$flash_dir"
+ensure_group_perms "$flash_dir"
 
 # Idempotency: skip if any chunk already present (assume prior successful run)
 if compgen -G "$flash_dir/${vname}_[0-9][0-9][0-9].${OUT_EXT}" > /dev/null; then

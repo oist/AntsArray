@@ -29,7 +29,8 @@ EXPORT_DIR="$EXPORT_ROOT/$MODEL_ID"
 echo "[INFO] preparing saion-side dirs"
 ssh_retry saion "
 	mkdir -p '$REMOTE_INPUT' '$REMOTE_OUTPUT' '$REMOTE_JOBS' '$EXPORT_ROOT' &&
-	chmod 2775 '$REMOTE_INPUT' '$REMOTE_OUTPUT' '$REMOTE_JOBS'
+	chmod 2775 '$REMOTE_INPUT' '$REMOTE_OUTPUT' '$REMOTE_JOBS' &&
+	{ chgrp $OUTPUT_GROUP '$REMOTE_INPUT' '$REMOTE_OUTPUT' '$REMOTE_JOBS' 2>/dev/null || true; }
 "
 
 # --- Lazy TRT export ----------------------------------------------------------
@@ -78,6 +79,7 @@ sed -e "s#__REMOTE_JOBS__#$REMOTE_JOBS#g" \
     -e "s#__BATCH_SIZE__#${BATCH_SIZE:-1}#g" \
     -e "s#__DEIGO_FLASH_SAION_PREFIX__#$DEIGO_FLASH_SAION_PREFIX#g" \
     -e "s#__DATA_DIR__#$DATA_DIR#g" \
+    -e "s#__OUTPUT_GROUP__#$OUTPUT_GROUP#g" \
     -e "s#__HOSTS_LIB__#$LIB_DIR/hosts.sh#g" \
     -e "s#__SCRIPTS_DIR__#$SCRIPTS_DIR#g" \
     "$TEMPLATES_DIR/sleap_predict_array.template.sh" > "$RENDERED_PREDICT"
@@ -85,6 +87,7 @@ sed -e "s#__REMOTE_JOBS__#$REMOTE_JOBS#g" \
 sed -e "s#__REMOTE_JOBS__#$REMOTE_JOBS#g" \
     -e "s#__REMOTE_OUTPUT__#$REMOTE_OUTPUT#g" \
     -e "s#__DATA_DIR__#$DATA_DIR#g" \
+    -e "s#__OUTPUT_GROUP__#$OUTPUT_GROUP#g" \
     -e "s#__SAION_DATACP_PARTITION__#$SAION_DATACP_PARTITION#g" \
     -e "s#__BATCH_SIZE__#${BATCH_SIZE:-1}#g" \
     "$TEMPLATES_DIR/sleap_datacp_array.template.sh" > "$RENDERED_DATACP"

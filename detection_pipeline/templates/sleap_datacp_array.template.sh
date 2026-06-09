@@ -11,6 +11,7 @@ set -eo pipefail
 REMOTE_JOBS="__REMOTE_JOBS__"
 REMOTE_OUTPUT="__REMOTE_OUTPUT__"
 DATA_DIR="__DATA_DIR__"
+OUTPUT_GROUP="__OUTPUT_GROUP__"
 
 # Single-job datacp on saion side: scan the worklist, rsync each .slp to bucket
 # via ssh saion (login has bucket write). One job to keep us under any per-user
@@ -31,7 +32,7 @@ rsync_retry() { local i; for i in 1 2 3 4 5; do rsync "$@" && return; echo "[WAR
 
 WORKLIST="$REMOTE_JOBS/aruco_worklist.txt"
 
-ssh_retry saion "mkdir -p '$DATA_DIR' && chmod 2775 '$DATA_DIR' 2>/dev/null || true"
+ssh_retry saion "mkdir -p '$DATA_DIR' && { chgrp $OUTPUT_GROUP '$DATA_DIR' 2>/dev/null; chmod 2775 '$DATA_DIR' 2>/dev/null; true; }"
 
 uploaded=0
 missing=0
@@ -43,7 +44,7 @@ while IFS=$'\t' read -r vname chunk _; do
 		missing=$((missing+1))
 		continue
 	fi
-	rsync_retry -ah --chmod=Du=rwx,Dg=rwx,Fu=rw,Fg=rw "$src" "saion:$DATA_DIR/"
+	rsync_retry -ah --chmod=Du=rwx,Dg=rwx,Fu=rw,Fg=rw --chown=:"$OUTPUT_GROUP" "$src" "saion:$DATA_DIR/"
 	uploaded=$((uploaded+1))
 done < "$WORKLIST"
 

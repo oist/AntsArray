@@ -28,6 +28,7 @@ SLEAP_MODEL_INSTANCE="__SLEAP_MODEL_INSTANCE__"
 SKIP_TRT_EXPORT=__SKIP_TRT_EXPORT__
 DEIGO_FLASH_SAION_PREFIX="__DEIGO_FLASH_SAION_PREFIX__"   # /deigo_flash/.../<exp> mount on saion
 DATA_DIR="__DATA_DIR__"                      # bucket path; reached via "saion" alias (login has write)
+OUTPUT_GROUP="__OUTPUT_GROUP__"              # group owner for shared bucket outputs
 SLEAP_BATCH_SIZE="${SLEAP_BATCH_SIZE:-16}"   # per-frame inference batch (engine max from export)
 BATCH_SIZE=__BATCH_SIZE__                    # chunks per array task
 SCRIPTS_DIR="__SCRIPTS_DIR__"                # pipeline scripts dir (sleap2h5.py, sleap2csv.py)
@@ -118,7 +119,7 @@ for (( row_idx=start_idx; row_idx<end_idx; row_idx++ )); do
 		upload_files=( "$out_slp" )
 		[[ -s "$out_h5" ]] && upload_files+=( "$out_h5" )
 		echo "[$(date)] [bg] uploading ${vname}_${chunk} (.slp + .h5) -> bucket"
-		rsync_retry -ah --chmod=Du=rwx,Dg=rwx,Fu=rw,Fg=rw \
+		rsync_retry -ah --chmod=Du=rwx,Dg=rwx,Fu=rw,Fg=rw --chown=:"$OUTPUT_GROUP" \
 			"${upload_files[@]}" "saion:$DATA_DIR/" \
 			|| echo "[WARN] inline upload of ${vname}_${chunk} failed; sleap_datacp end-of-run will retry" >&2
 	) &
