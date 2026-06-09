@@ -60,7 +60,7 @@ SKIP_EXISTING=1
 MAP_CPUS=8
 MAP_MEM="64G"
 MAP_TIME="0-12:00:00"
-MAP_MIN_INSTANCE_FRAME_FRAC="0.05"
+MAP_MIN_INSTANCE_FRAME_FRAC="0.25"
 
 # Small dependent job that submits the per-chunk tracking jobs after mapping.
 TRACK_SUBMIT_CPUS=1
@@ -182,6 +182,7 @@ Optional:
   --map_mem MEM             Memory for panorama jobs. Default: 64G
   --map_time TIME           Time for panorama jobs. Default: 0-12:00:00
   --map_min_instance_frame_frac FLOAT
+                            ArUco ID frame-fraction filter after all cameras in a chunk are merged.
   --track_cpus N            CPUs for each chunk tracking job. Default: 32
   --track_mem MEM           Memory for each chunk tracking job. Default: 32G
   --track_time TIME         Time for each chunk tracking job. Default: 0-24:00:00
@@ -355,19 +356,36 @@ for block_dir in "${blocks[@]}"; do
 import sys
 from pathlib import Path
 
-from tracking.colony.panorama_io import ARUCO_INPUT_RE, validate_aruco_inputs_have_sleap_h5
+from tracking.colony.panorama_io import discover_complete_input_chunks
 
 data_dir = Path(sys.argv[1])
-aruco_files = validate_aruco_inputs_have_sleap_h5(data_dir)
-chunks = sorted({ARUCO_INPUT_RE.match(path.name).group("chunk") for path in aruco_files})
+chunks, summary = discover_complete_input_chunks(data_dir)
+if not chunks:
+    print(
+        f"No complete ArUco/SLEAP chunks can be processed in {data_dir}; summary={summary}",
+        file=sys.stderr,
+    )
+    raise SystemExit(0)
+print(
+    "Complete ArUco/SLEAP chunks available: "
+    f"{len(chunks)} contiguous chunks (chunk{chunks[0]}..chunk{chunks[-1]}), "
+    f"{summary.get('reference_camera_count', 0)} cameras. "
+    f"First incomplete: {summary.get('first_incomplete')}",
+    file=sys.stderr,
+)
 for chunk in chunks:
     print(chunk)
 PY
   )
   if [[ ${#chunks[@]} -eq 0 ]]; then
-    echo "Skipping ${block_name}: no ArUco chunk files found in ${data_dir}" >&2
+    echo "Skipping ${block_name}: no complete ArUco/SLEAP chunks found in ${data_dir}" >&2
     continue
   fi
+  echo "${block_name}: ${#chunks[@]} contiguous complete chunks will be processed (chunk${chunks[0]}..chunk${chunks[-1]})."
+  complete_chunks_literal=""
+  for chunk in "${chunks[@]}"; do
+    complete_chunks_literal+=" \"${chunk}\""
+  done
 
   track_submit_script="$script_dir/submit_tracking_${block_name}.sbatch"
   stitch_script="$script_dir/stitch_${block_name}.sbatch"
@@ -439,6 +457,11 @@ export PYTHONNOUSERSITE=1
 cd "${REPO_ROOT}"
 mkdir -p "${tracks_dir}" "${chunk_logs_dir}"
 rm -f "${tracking_job_ids_file}" "${block_stitch_job_id_file}" "${stitch_track_ids_file}"
+complete_chunks=(${complete_chunks_literal})
+combine_chunk_args=()
+for chunk in "\${complete_chunks[@]}"; do
+  combine_chunk_args+=( --chunk "\${chunk}" )
+done
 "${python_bin}" "${COMBINE_BATCH_PY}" \\
   --input_folder "${panorama_dir}" \\
   --output_path "${tracks_dir}" \\
@@ -455,7 +478,8 @@ rm -f "${tracking_job_ids_file}" "${block_stitch_job_id_file}" "${stitch_track_i
   --python_bin "${python_bin}" \\
   --job_ids_file "${tracking_job_ids_file}" \\
   --max_distance "${max_distance}" \\
-  --lost_track_max_frames "${lost_track_max_frames}"${extra_tracking_text}${skip_existing_arg}
+  --lost_track_max_frames "${lost_track_max_frames}" \\
+  "\${combine_chunk_args[@]}"${extra_tracking_text}${skip_existing_arg}
 
 if [[ ! -s "${tracking_job_ids_file}" ]]; then
   echo "ERROR: no tracking job IDs were written by combine_batch.py" >&2
@@ -533,6 +557,10 @@ stitch_args=(
   --fps "${fps}"
   --track_id "\${tid}"
 )
+complete_chunks=(${complete_chunks_literal})
+for chunk in "\\\${complete_chunks[@]}"; do
+  stitch_args+=( --chunk "\\\${chunk}" )
+done
 if [[ -n "${stitch_no_pngs_arg}" ]]; then
   stitch_args+=( "${stitch_no_pngs_arg}" )
 fi
@@ -638,6 +666,9 @@ columns = [
     "ArucoY",
     "SleapAnchorX",
     "SleapAnchorY",
+    "CameraID",
+    "ArucoCam",
+    "SleapCam",
     "source_file",
 ]
 schema = pa.schema(
@@ -653,6 +684,9 @@ schema = pa.schema(
         ("ArucoY", pa.float64()),
         ("SleapAnchorX", pa.float64()),
         ("SleapAnchorY", pa.float64()),
+        ("CameraID", pa.int64()),
+        ("ArucoCam", pa.int64()),
+        ("SleapCam", pa.int64()),
         ("source_file", pa.string()),
     ]
 )

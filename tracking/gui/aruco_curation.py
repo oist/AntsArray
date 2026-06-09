@@ -26,8 +26,10 @@ import bisect
 import json
 import math
 import re
+import shlex
 import struct
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -68,6 +70,23 @@ SLEAP_SKELETON_EDGES = (
     (8, 9),
 )
 SLEAP_UNMATCHED_COLOR = (170, 170, 170)
+ARUCO_PARAM_CORNER_CHOICES = ("contour", "subpix", "none", "apriltag")
+ARUCO_PARAM_DEFAULTS = {
+    "corner_refinement": "contour",
+    "adaptive_thresh_constant": 3.0,
+    "adaptive_thresh_win_min": 10,
+    "adaptive_thresh_win_max": 40,
+    "adaptive_thresh_win_step": 10,
+    "error_correction_rate": 1.0,
+    "min_marker_perimeter_rate": 0.03,
+    "max_marker_perimeter_rate": 4.0,
+    "polygonal_approx_accuracy_rate": 0.03,
+}
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 
 def clamp(value: int, lo: int, hi: int) -> int:
@@ -82,6 +101,12 @@ def color_for_id(instance: int) -> Tuple[int, int, int]:
 
 def finite_xy(x: float, y: float) -> bool:
     return math.isfinite(float(x)) and math.isfinite(float(y))
+
+
+def local_custom_aruco_dict(label: str) -> Optional[Path]:
+    custom_dir = REPO_ROOT / "aruco_detection" / "custom_dicts"
+    candidates = sorted(custom_dir.glob(f"custom_4x4_{label}_d*_*.npz"), reverse=True)
+    return candidates[0] if candidates else None
 
 
 @dataclass
@@ -1216,6 +1241,15 @@ class AviH264ElementaryReader:
         self.packet_margin = 250
         self.decode_batch_frames = 6
         self.frame_cache: Dict[int, np.ndarray] = {}
+        self.packet_index: List[Tuple[int, int, bool]] = []
+        self._keyframe_indices: List[int] = []
+        self._keyframe_period: Optional[int] = None
+        self._keyframe_phase: int = 0
+        self._packet_scan_pos: Optional[int] = None
+        self._packet_scan_done = False
+        self._h264_parameter_sets = b""
+        self._opendml_superindex: Optional[List[Tuple[int, int, int]]] = None
+        self._opendml_next_index = 0
 
     @staticmethod
     def _parse_header(path: Path) -> Tuple[int, int, float]:
@@ -1312,7 +1346,34 @@ class AviH264ElementaryReader:
             return cached.copy()
 
         batch_stop = min(self._frame_count - 1, frame_idx + self.decode_batch_frames - 1)
-        packets = self._read_packet_window(batch_stop + self.packet_margin)
+        start_packet = self._decode_start_packet(frame_idx)
+        end_packet = min(self._frame_count - 1, batch_stop + self.packet_margin)
+        start_candidates = [start_packet]
+        if self._keyframe_period is not None:
+            for step in (1, 2, 4):
+                candidate = max(0, start_packet - step * self._keyframe_period)
+                if candidate not in start_candidates:
+                    start_candidates.append(candidate)
+
+        for candidate_start in start_candidates:
+            frame = self._decode_packet_window(frame_idx, batch_stop, candidate_start, end_packet)
+            if frame is not None:
+                return frame
+
+        raise RuntimeError(f"Could not decode frame {frame_idx} from {self.video_path}")
+
+    def _decode_packet_window(
+        self,
+        frame_idx: int,
+        batch_stop: int,
+        start_packet: int,
+        end_packet: int,
+        *,
+        timeout: int = 30,
+    ) -> Optional[np.ndarray]:
+        packets = self._read_packet_window(start_packet, end_packet)
+        relative_start = int(frame_idx) - int(start_packet)
+        relative_stop = int(batch_stop) - int(start_packet)
         cmd = [
             "ffmpeg",
             "-hide_banner",
@@ -1323,7 +1384,7 @@ class AviH264ElementaryReader:
             "-i",
             "pipe:0",
             "-vf",
-            f"select=between(n\\,{frame_idx}\\,{batch_stop})",
+            f"select=between(n\\,{relative_start}\\,{relative_stop})",
             "-frames:v",
             str(batch_stop - frame_idx + 1),
             "-f",
@@ -1332,13 +1393,11 @@ class AviH264ElementaryReader:
             "bgr24",
             "pipe:1",
         ]
-        proc = subprocess.run(cmd, input=packets, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+        proc = subprocess.run(cmd, input=packets, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
         raw = proc.stdout
         expected_frames = batch_stop - frame_idx + 1
         if len(raw) < self.frame_bytes:
-            detail = proc.stderr.decode("utf-8", errors="replace").strip()
-            suffix = f": {detail}" if detail else ""
-            raise RuntimeError(f"Could not decode frame {frame_idx} from {self.video_path}{suffix}")
+            return None
         self.frame_cache.clear()
         decoded_frames = min(expected_frames, len(raw) // self.frame_bytes)
         for offset in range(decoded_frames):
@@ -1351,38 +1410,242 @@ class AviH264ElementaryReader:
             )
         return self.frame_cache[frame_idx].copy()
 
-    def _read_packet_window(self, end_packet: int) -> bytes:
+    def _decode_start_packet(self, frame_idx: int) -> int:
+        frame_idx = max(0, min(int(frame_idx), self._frame_count - 1))
+        self._ensure_packet_index(frame_idx)
+        upper = min(frame_idx, len(self.packet_index) - 1)
+        for idx in range(upper, -1, -1):
+            _offset, _size, is_keyframe = self.packet_index[idx]
+            if is_keyframe:
+                return idx
+        return max(0, frame_idx - int(self.packet_margin))
+
+    def _read_packet_window(self, start_packet: int, end_packet: int) -> bytes:
+        start_packet = max(0, int(start_packet))
         end_packet = max(1, int(end_packet))
+        if end_packet < start_packet:
+            end_packet = start_packet
+        self._ensure_packet_index(end_packet)
+        if start_packet >= len(self.packet_index):
+            raise RuntimeError(f"No H264 packet {start_packet} found in {self.video_path}")
+
         out = bytearray()
-        count = 0
         with self.video_path.open("rb") as fh:
-            data = fh.read(1024 * 1024)
-            movi = data.find(b"movi")
-            if movi < 0:
-                raise RuntimeError(f"Could not find AVI movi list in {self.video_path}")
-            fh.seek(movi + 4)
-            while count < end_packet:
+            if start_packet > 0:
+                self._ensure_h264_parameter_sets(fh)
+            for offset, size, _is_keyframe in self.packet_index[start_packet : end_packet + 1]:
+                fh.seek(offset)
+                out.extend(fh.read(size))
+        if not out:
+            raise RuntimeError(f"No H264 packets found in {self.video_path}")
+        if start_packet > 0 and self._h264_parameter_sets:
+            return self._h264_parameter_sets + bytes(out)
+        return bytes(out)
+
+    def _ensure_packet_index(self, end_packet: int) -> None:
+        target = min(max(0, int(end_packet)), self._frame_count - 1)
+        if len(self.packet_index) > target or self._packet_scan_done:
+            return
+
+        if self._load_opendml_packets(target):
+            return
+
+        with self.video_path.open("rb") as fh:
+            if self._packet_scan_pos is None:
+                data = fh.read(1024 * 1024)
+                movi = data.find(b"movi")
+                if movi < 0:
+                    raise RuntimeError(f"Could not find AVI movi list in {self.video_path}")
+                self._packet_scan_pos = movi + 4
+
+            fh.seek(self._packet_scan_pos)
+            while len(self.packet_index) <= target:
                 header = fh.read(8)
                 if len(header) < 8:
+                    self._packet_scan_done = True
                     break
+
                 chunk_id = header[:4]
                 size = struct.unpack("<I", header[4:])[0]
+                payload_offset = fh.tell()
                 if chunk_id == b"00dc":
-                    out.extend(fh.read(size))
-                    count += 1
-                    if size % 2:
-                        fh.seek(1, 1)
+                    packet_idx = len(self.packet_index)
+                    if self._keyframe_period is None:
+                        sample = fh.read(min(int(size), 512))
+                        if not self._h264_parameter_sets:
+                            self._h264_parameter_sets = self._extract_h264_parameter_sets(sample)
+                        is_keyframe = self._payload_has_idr(sample)
+                    else:
+                        is_keyframe = (packet_idx - self._keyframe_phase) % self._keyframe_period == 0
+                    self.packet_index.append((payload_offset, int(size), is_keyframe))
+                    if is_keyframe:
+                        self._keyframe_indices.append(packet_idx)
+                        self._update_keyframe_period()
+                    fh.seek(payload_offset + int(size) + (int(size) % 2))
                 elif chunk_id in {b"RIFF", b"LIST"}:
                     list_type = fh.read(4)
                     if list_type in {b"movi", b"AVIX"}:
-                        continue
-                    if size >= 4:
+                        pass
+                    elif size >= 4:
                         fh.seek(size - 4 + (size % 2), 1)
                 else:
                     fh.seek(size + (size % 2), 1)
-        if not out:
-            raise RuntimeError(f"No H264 packets found in {self.video_path}")
+
+                self._packet_scan_pos = fh.tell()
+
+    def _update_keyframe_period(self) -> None:
+        if self._keyframe_period is not None or len(self._keyframe_indices) < 4:
+            return
+        recent = self._keyframe_indices[-4:]
+        diffs = [b - a for a, b in zip(recent, recent[1:])]
+        period = sorted(diffs)[len(diffs) // 2]
+        if period <= 0:
+            return
+        if all(abs(diff - period) <= 1 for diff in diffs):
+            self._keyframe_period = int(period)
+            self._keyframe_phase = int(recent[0] % period)
+
+    def _load_opendml_packets(self, target: int) -> bool:
+        if self._opendml_superindex is None:
+            self._opendml_superindex = self._read_opendml_superindex()
+        if not self._opendml_superindex:
+            return False
+
+        with self.video_path.open("rb") as fh:
+            while len(self.packet_index) <= target and self._opendml_next_index < len(self._opendml_superindex):
+                ix_offset, ix_size, _duration = self._opendml_superindex[self._opendml_next_index]
+                self._opendml_next_index += 1
+                self._append_opendml_standard_index(fh, ix_offset, ix_size)
+
+        if self._opendml_next_index >= len(self._opendml_superindex):
+            self._packet_scan_done = True
+        return len(self.packet_index) > target or self._packet_scan_done
+
+    def _read_opendml_superindex(self) -> List[Tuple[int, int, int]]:
+        with self.video_path.open("rb") as fh:
+            data = fh.read(1024 * 1024)
+
+        entries: List[Tuple[int, int, int]] = []
+        pos = 0
+        while True:
+            idx = data.find(b"indx", pos)
+            if idx < 0 or idx + 32 > len(data):
+                break
+            size = struct.unpack_from("<I", data, idx + 4)[0]
+            if idx + 8 + size > len(data):
+                break
+            try:
+                w_longs, _subtype, index_type, n_entries = struct.unpack_from("<HBBI", data, idx + 8)
+                chunk_id = data[idx + 16 : idx + 20]
+            except Exception:
+                pos = idx + 4
+                continue
+            if w_longs == 4 and index_type == 0 and chunk_id == b"00dc":
+                entry_start = idx + 8 + 24
+                for i in range(int(n_entries)):
+                    off = entry_start + i * 16
+                    if off + 16 > idx + 8 + size:
+                        break
+                    ix_offset, ix_size, duration = struct.unpack_from("<QII", data, off)
+                    if ix_offset and ix_size:
+                        entries.append((int(ix_offset), int(ix_size), int(duration)))
+                if entries:
+                    return entries
+            pos = idx + 4
+        return []
+
+    def _append_opendml_standard_index(self, fh, ix_offset: int, ix_size: int) -> None:
+        fh.seek(int(ix_offset))
+        data = fh.read(int(ix_size) + 8)
+        if len(data) < 32 or data[:4] != b"ix00":
+            return
+        size = struct.unpack_from("<I", data, 4)[0]
+        size = min(int(size), len(data) - 8)
+        w_longs, _subtype, index_type, n_entries = struct.unpack_from("<HBBI", data, 8)
+        chunk_id = data[16:20]
+        if w_longs != 2 or index_type != 1 or chunk_id != b"00dc":
+            return
+        base_offset = struct.unpack_from("<Q", data, 20)[0]
+        entry_start = 32
+        entry_stop = min(8 + size, entry_start + int(n_entries) * 8)
+        for off in range(entry_start, entry_stop, 8):
+            rel_offset, raw_size = struct.unpack_from("<II", data, off)
+            payload_size = int(raw_size & 0x7FFFFFFF)
+            if payload_size <= 0:
+                continue
+            is_keyframe = (raw_size & 0x80000000) == 0
+            packet_idx = len(self.packet_index)
+            self.packet_index.append((int(base_offset + rel_offset), payload_size, is_keyframe))
+            if is_keyframe:
+                self._keyframe_indices.append(packet_idx)
+
+    def _ensure_h264_parameter_sets(self, fh) -> None:
+        if self._h264_parameter_sets:
+            return
+        self._ensure_packet_index(0)
+        for offset, size, _is_keyframe in self.packet_index[: min(16, len(self.packet_index))]:
+            fh.seek(offset)
+            sample = fh.read(min(int(size), 8192))
+            self._h264_parameter_sets = self._extract_h264_parameter_sets(sample)
+            if self._h264_parameter_sets:
+                return
+
+    @staticmethod
+    def _payload_has_idr(payload: bytes) -> bool:
+        for _prefix, nal in AviH264ElementaryReader._annexb_nals(payload):
+            if nal and (nal[0] & 0x1F) == 5:
+                return True
+
+        # Some AVI encoders store AVC payloads with length-prefixed NAL units.
+        data = bytes(payload)
+        for length_size in (4, 3, 2):
+            pos = 0
+            while pos + length_size < len(data):
+                nal_len = int.from_bytes(data[pos : pos + length_size], "big", signed=False)
+                nal_start = pos + length_size
+                nal_stop = nal_start + nal_len
+                if nal_len <= 0 or nal_stop > len(data):
+                    break
+                if data[nal_start] & 0x1F == 5:
+                    return True
+                pos = nal_stop
+        return False
+
+    @staticmethod
+    def _extract_h264_parameter_sets(payload: bytes) -> bytes:
+        out = bytearray()
+        for prefix, nal in AviH264ElementaryReader._annexb_nals(payload):
+            if nal and (nal[0] & 0x1F) in {7, 8}:
+                out.extend(prefix)
+                out.extend(nal)
         return bytes(out)
+
+    @staticmethod
+    def _annexb_nals(payload: bytes) -> List[Tuple[bytes, bytes]]:
+        data = bytes(payload)
+        starts: List[Tuple[int, int]] = []
+        pos = 0
+        while True:
+            three = data.find(b"\x00\x00\x01", pos)
+            four = data.find(b"\x00\x00\x00\x01", pos)
+            candidates = [idx for idx in (three, four) if idx >= 0]
+            if not candidates:
+                break
+            idx = min(candidates)
+            prefix_len = 4 if data[idx : idx + 4] == b"\x00\x00\x00\x01" else 3
+            nal_start = idx + prefix_len
+            if nal_start < len(data):
+                starts.append((idx, nal_start))
+            pos = nal_start + 1
+
+        nals: List[Tuple[bytes, bytes]] = []
+        for i, (prefix_start, nal_start) in enumerate(starts):
+            next_prefix = starts[i + 1][0] if i + 1 < len(starts) else len(data)
+            prefix = data[prefix_start:nal_start]
+            nal = data[nal_start:next_prefix]
+            if nal:
+                nals.append((prefix, nal))
+        return nals
 
     def close(self) -> None:
         self.stop_feed.set()
@@ -1531,6 +1794,7 @@ class ArucoCurationApp:
         self.playback_controls_interval_s = 0.15
         self.playback_trajectory_interval_s = 0.35
         self.last_trajectory_refresh_at = 0.0
+        self.slider_seek_delay_ms = 250
 
         self.undo_stack: List[FrameAction] = []
         self.redo_stack: List[FrameAction] = []
@@ -1560,12 +1824,48 @@ class ArucoCurationApp:
         self.bridge_preview_start_var = tk.IntVar(value=0)
         self.bridge_preview_end_var = tk.IntVar(value=max(0, self.frame_count - 1))
         self.trajectory_zoom_var = tk.DoubleVar(value=1.0)
+        self.show_param_test_overlay_var = tk.BooleanVar(value=True)
+        self.param_test_status_var = tk.StringVar(value="ArUco parameter test: no test run")
+        self.param_corner_refinement_var = tk.StringVar(value=str(ARUCO_PARAM_DEFAULTS["corner_refinement"]))
+        self.param_adaptive_thresh_constant_var = tk.DoubleVar(
+            value=float(ARUCO_PARAM_DEFAULTS["adaptive_thresh_constant"])
+        )
+        self.param_adaptive_thresh_win_min_var = tk.IntVar(
+            value=int(ARUCO_PARAM_DEFAULTS["adaptive_thresh_win_min"])
+        )
+        self.param_adaptive_thresh_win_max_var = tk.IntVar(
+            value=int(ARUCO_PARAM_DEFAULTS["adaptive_thresh_win_max"])
+        )
+        self.param_adaptive_thresh_win_step_var = tk.IntVar(
+            value=int(ARUCO_PARAM_DEFAULTS["adaptive_thresh_win_step"])
+        )
+        self.param_error_correction_rate_var = tk.DoubleVar(
+            value=float(ARUCO_PARAM_DEFAULTS["error_correction_rate"])
+        )
+        self.param_min_marker_perimeter_rate_var = tk.DoubleVar(
+            value=float(ARUCO_PARAM_DEFAULTS["min_marker_perimeter_rate"])
+        )
+        self.param_max_marker_perimeter_rate_var = tk.DoubleVar(
+            value=float(ARUCO_PARAM_DEFAULTS["max_marker_perimeter_rate"])
+        )
+        self.param_polygonal_approx_accuracy_rate_var = tk.DoubleVar(
+            value=float(ARUCO_PARAM_DEFAULTS["polygonal_approx_accuracy_rate"])
+        )
+        self.param_custom_dict_var = tk.StringVar(value="")
+        self.param_test_start_var = tk.IntVar(value=self.current_frame)
+        self.param_test_end_var = tk.IntVar(value=self.current_frame)
+        self.param_test_stride_var = tk.IntVar(value=1)
+        self.param_test_results: Dict[int, Dict[int, Detection]] = {}
+        self.param_test_comparisons: Dict[int, Dict[str, object]] = {}
+        self.param_test_config_payload: Optional[Dict[str, object]] = None
+        self.param_test_running = False
 
         self.canvas_item_id: Optional[int] = None
         self.trajectory_canvas_item_id: Optional[int] = None
         self.selected_detection: Optional[Tuple[int, int]] = None
 
         self._build_ui()
+        self.refresh_param_test_status()
         self.tag_var.trace_add("write", self.on_tag_var_changed)
         self.trajectory_zoom_var.trace_add("write", self.on_trajectory_zoom_changed)
         self._bind_keys()
@@ -1782,6 +2082,116 @@ class ArucoCurationApp:
             command=self.undo_latest_bridge_command,
         )
         self.undo_bridge_button.pack(side=tk.RIGHT)
+
+        param_box = ttk.LabelFrame(right, text="ArUco Parameter Test")
+        param_box.pack(fill=tk.X, pady=(0, 10))
+        ttk.Label(param_box, textvariable=self.param_test_status_var, wraplength=320, justify=tk.LEFT).pack(
+            anchor=tk.W, padx=8, pady=(8, 6)
+        )
+        ttk.Checkbutton(
+            param_box,
+            text="Show Test Overlay",
+            variable=self.show_param_test_overlay_var,
+            command=self.on_param_test_overlay_changed,
+        ).pack(anchor=tk.W, padx=8, pady=(0, 6))
+
+        param_grid = ttk.Frame(param_box)
+        param_grid.pack(fill=tk.X, padx=8, pady=(0, 6))
+        for col in range(4):
+            param_grid.columnconfigure(col, weight=1)
+        ttk.Label(param_grid, text="Corner").grid(row=0, column=0, sticky=tk.W)
+        ttk.Combobox(
+            param_grid,
+            textvariable=self.param_corner_refinement_var,
+            values=ARUCO_PARAM_CORNER_CHOICES,
+            width=8,
+            state="readonly",
+        ).grid(row=0, column=1, sticky=tk.EW, padx=(4, 8))
+        ttk.Label(param_grid, text="Thresh C").grid(row=0, column=2, sticky=tk.W)
+        ttk.Entry(param_grid, textvariable=self.param_adaptive_thresh_constant_var, width=7).grid(
+            row=0, column=3, sticky=tk.EW, padx=(4, 0)
+        )
+        ttk.Label(param_grid, text="Win min").grid(row=1, column=0, sticky=tk.W, pady=(4, 0))
+        ttk.Entry(param_grid, textvariable=self.param_adaptive_thresh_win_min_var, width=7).grid(
+            row=1, column=1, sticky=tk.EW, padx=(4, 8), pady=(4, 0)
+        )
+        ttk.Label(param_grid, text="Win max").grid(row=1, column=2, sticky=tk.W, pady=(4, 0))
+        ttk.Entry(param_grid, textvariable=self.param_adaptive_thresh_win_max_var, width=7).grid(
+            row=1, column=3, sticky=tk.EW, padx=(4, 0), pady=(4, 0)
+        )
+        ttk.Label(param_grid, text="Win step").grid(row=2, column=0, sticky=tk.W, pady=(4, 0))
+        ttk.Entry(param_grid, textvariable=self.param_adaptive_thresh_win_step_var, width=7).grid(
+            row=2, column=1, sticky=tk.EW, padx=(4, 8), pady=(4, 0)
+        )
+        ttk.Label(param_grid, text="Err corr").grid(row=2, column=2, sticky=tk.W, pady=(4, 0))
+        ttk.Entry(param_grid, textvariable=self.param_error_correction_rate_var, width=7).grid(
+            row=2, column=3, sticky=tk.EW, padx=(4, 0), pady=(4, 0)
+        )
+        ttk.Label(param_grid, text="Min perim").grid(row=3, column=0, sticky=tk.W, pady=(4, 0))
+        ttk.Entry(param_grid, textvariable=self.param_min_marker_perimeter_rate_var, width=7).grid(
+            row=3, column=1, sticky=tk.EW, padx=(4, 8), pady=(4, 0)
+        )
+        ttk.Label(param_grid, text="Max perim").grid(row=3, column=2, sticky=tk.W, pady=(4, 0))
+        ttk.Entry(param_grid, textvariable=self.param_max_marker_perimeter_rate_var, width=7).grid(
+            row=3, column=3, sticky=tk.EW, padx=(4, 0), pady=(4, 0)
+        )
+        ttk.Label(param_grid, text="Poly acc").grid(row=4, column=0, sticky=tk.W, pady=(4, 0))
+        ttk.Entry(param_grid, textvariable=self.param_polygonal_approx_accuracy_rate_var, width=7).grid(
+            row=4, column=1, sticky=tk.EW, padx=(4, 8), pady=(4, 0)
+        )
+
+        dict_row = ttk.Frame(param_box)
+        dict_row.pack(fill=tk.X, padx=8, pady=(0, 6))
+        ttk.Label(dict_row, text="Dict").pack(side=tk.LEFT)
+        ttk.Entry(dict_row, textvariable=self.param_custom_dict_var, width=18).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 4)
+        )
+        ttk.Button(dict_row, text="A100", style="Compact.TButton", command=lambda: self.use_local_param_dict("A100")).pack(
+            side=tk.LEFT, padx=(0, 4)
+        )
+        ttk.Button(dict_row, text="B300", style="Compact.TButton", command=lambda: self.use_local_param_dict("B300")).pack(
+            side=tk.LEFT, padx=(0, 4)
+        )
+        ttk.Button(dict_row, text="...", style="Compact.TButton", command=self.browse_param_dict).pack(side=tk.LEFT)
+
+        test_range = ttk.Frame(param_box)
+        test_range.pack(fill=tk.X, padx=8, pady=(0, 4))
+        ttk.Label(test_range, text="Range").pack(side=tk.LEFT)
+        ttk.Entry(test_range, textvariable=self.param_test_start_var, width=7).pack(side=tk.LEFT, padx=(4, 4))
+        ttk.Label(test_range, text="to").pack(side=tk.LEFT)
+        ttk.Entry(test_range, textvariable=self.param_test_end_var, width=7).pack(side=tk.LEFT, padx=(4, 4))
+        ttk.Label(test_range, text="stride").pack(side=tk.LEFT)
+        ttk.Entry(test_range, textvariable=self.param_test_stride_var, width=5).pack(side=tk.LEFT, padx=(4, 0))
+
+        test_actions = ttk.Frame(param_box)
+        test_actions.pack(fill=tk.X, padx=8, pady=(0, 8))
+        self.param_test_current_button = ttk.Button(
+            test_actions,
+            text="Test Frame",
+            style="Compact.TButton",
+            command=self.run_param_test_current_frame,
+        )
+        self.param_test_current_button.pack(side=tk.LEFT)
+        self.param_test_range_button = ttk.Button(
+            test_actions,
+            text="Test Range",
+            style="Compact.TButton",
+            command=self.run_param_test_range,
+        )
+        self.param_test_range_button.pack(side=tk.LEFT, padx=(6, 0))
+        self.param_save_test_button = ttk.Button(
+            test_actions,
+            text="Save Test",
+            style="Compact.TButton",
+            command=self.save_param_test_results,
+        )
+        self.param_save_test_button.pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(
+            test_actions,
+            text="Copy Params",
+            style="Compact.TButton",
+            command=self.copy_param_cli_flags,
+        ).pack(side=tk.RIGHT)
 
         self.right_notebook = ttk.Notebook(right)
         self.right_notebook.pack(fill=tk.BOTH, expand=True)
@@ -2050,6 +2460,378 @@ class ArucoCurationApp:
             undo_state = tk.NORMAL if self.can_undo_latest_bridge_command() else tk.DISABLED
             self.undo_bridge_button.configure(state=undo_state)
 
+    def update_param_test_buttons(self) -> None:
+        if not hasattr(self, "param_test_current_button"):
+            return
+        state = tk.DISABLED if self.param_test_running else tk.NORMAL
+        self.param_test_current_button.configure(state=state)
+        self.param_test_range_button.configure(state=state)
+        save_state = tk.NORMAL if self.param_test_results and not self.param_test_running else tk.DISABLED
+        self.param_save_test_button.configure(state=save_state)
+
+    def on_param_test_overlay_changed(self) -> None:
+        self.status_note = "ArUco test overlay shown" if self.show_param_test_overlay_var.get() else "ArUco test overlay hidden"
+        if not self.is_playing:
+            self.render_current_frame()
+        else:
+            self.refresh_status(force=True)
+
+    def use_local_param_dict(self, label: str) -> None:
+        path = local_custom_aruco_dict(label)
+        if path is None:
+            messagebox.showerror("ArUco dictionary", f"Could not find local custom dictionary {label}.")
+            return
+        self.param_custom_dict_var.set(str(path))
+
+    def browse_param_dict(self) -> None:
+        selected = filedialog.askopenfilename(
+            title="Choose custom ArUco dictionary",
+            filetypes=[("NPZ dictionary", "*.npz"), ("All files", "*.*")],
+        )
+        if selected:
+            self.param_custom_dict_var.set(selected)
+
+    def _load_aruco_test_tools(self):
+        try:
+            from run_aruco import DetectorConfig, build_aruco_detector, load_custom_aruco_dict
+        except Exception as exc:
+            raise RuntimeError(f"Could not import run_aruco detector tools: {exc}") from exc
+        return DetectorConfig, build_aruco_detector, load_custom_aruco_dict
+
+    def get_param_test_config(self):
+        DetectorConfig, _build_aruco_detector, _load_custom_aruco_dict = self._load_aruco_test_tools()
+        corner = str(self.param_corner_refinement_var.get()).strip().lower()
+        if corner not in ARUCO_PARAM_CORNER_CHOICES:
+            raise ValueError(f"Corner refinement must be one of {', '.join(ARUCO_PARAM_CORNER_CHOICES)}")
+
+        values = {
+            "corner_refinement": corner,
+            "adaptive_thresh_constant": float(self.param_adaptive_thresh_constant_var.get()),
+            "adaptive_thresh_win_min": int(self.param_adaptive_thresh_win_min_var.get()),
+            "adaptive_thresh_win_max": int(self.param_adaptive_thresh_win_max_var.get()),
+            "adaptive_thresh_win_step": int(self.param_adaptive_thresh_win_step_var.get()),
+            "error_correction_rate": float(self.param_error_correction_rate_var.get()),
+            "min_marker_perimeter_rate": float(self.param_min_marker_perimeter_rate_var.get()),
+            "max_marker_perimeter_rate": float(self.param_max_marker_perimeter_rate_var.get()),
+            "polygonal_approx_accuracy_rate": float(self.param_polygonal_approx_accuracy_rate_var.get()),
+        }
+        if values["adaptive_thresh_win_min"] <= 0 or values["adaptive_thresh_win_max"] <= 0:
+            raise ValueError("Adaptive threshold windows must be positive.")
+        if values["adaptive_thresh_win_max"] < values["adaptive_thresh_win_min"]:
+            raise ValueError("Adaptive threshold max window must be >= min window.")
+        if values["adaptive_thresh_win_step"] <= 0:
+            raise ValueError("Adaptive threshold window step must be positive.")
+        if values["min_marker_perimeter_rate"] <= 0 or values["max_marker_perimeter_rate"] <= 0:
+            raise ValueError("Marker perimeter rates must be positive.")
+        if values["max_marker_perimeter_rate"] < values["min_marker_perimeter_rate"]:
+            raise ValueError("Max marker perimeter rate must be >= min marker perimeter rate.")
+        if values["polygonal_approx_accuracy_rate"] <= 0:
+            raise ValueError("Polygonal approximation accuracy must be positive.")
+
+        self.param_corner_refinement_var.set(corner)
+        self.param_adaptive_thresh_constant_var.set(values["adaptive_thresh_constant"])
+        self.param_adaptive_thresh_win_min_var.set(values["adaptive_thresh_win_min"])
+        self.param_adaptive_thresh_win_max_var.set(values["adaptive_thresh_win_max"])
+        self.param_adaptive_thresh_win_step_var.set(values["adaptive_thresh_win_step"])
+        self.param_error_correction_rate_var.set(values["error_correction_rate"])
+        self.param_min_marker_perimeter_rate_var.set(values["min_marker_perimeter_rate"])
+        self.param_max_marker_perimeter_rate_var.set(values["max_marker_perimeter_rate"])
+        self.param_polygonal_approx_accuracy_rate_var.set(values["polygonal_approx_accuracy_rate"])
+        return DetectorConfig(**values)
+
+    def get_param_custom_dict_path(self) -> Optional[Path]:
+        text = str(self.param_custom_dict_var.get()).strip()
+        if not text:
+            return None
+        path = Path(text).expanduser()
+        if not path.exists():
+            raise FileNotFoundError(f"Custom ArUco dictionary not found: {path}")
+        return path
+
+    def build_param_test_detector(self):
+        _DetectorConfig, build_aruco_detector, load_custom_aruco_dict = self._load_aruco_test_tools()
+        config = self.get_param_test_config()
+        dict_path = self.get_param_custom_dict_path()
+        aruco_dict = load_custom_aruco_dict(dict_path) if dict_path is not None else None
+        detector = build_aruco_detector(config, aruco_dict=aruco_dict)
+        return detector, config, dict_path
+
+    def get_param_test_range(self) -> Tuple[int, int, int]:
+        try:
+            start = int(self.param_test_start_var.get())
+        except Exception:
+            start = int(self.current_frame)
+        try:
+            end = int(self.param_test_end_var.get())
+        except Exception:
+            end = int(self.current_frame)
+        try:
+            stride = int(self.param_test_stride_var.get())
+        except Exception:
+            stride = 1
+        hi = max(0, self.frame_count - 1)
+        start = clamp(start, 0, hi)
+        end = clamp(end, 0, hi)
+        if start > end:
+            start, end = end, start
+        stride = max(1, stride)
+        self.param_test_start_var.set(start)
+        self.param_test_end_var.set(end)
+        self.param_test_stride_var.set(stride)
+        return start, end, stride
+
+    def param_detector_cli_flags(self, *, include_custom_dict: bool = False) -> str:
+        config = self.get_param_test_config()
+        parts = [
+            "--corner-refinement",
+            str(config.corner_refinement),
+            "--adaptive-thresh-constant",
+            f"{float(config.adaptive_thresh_constant):g}",
+            "--adaptive-thresh-win-min",
+            str(int(config.adaptive_thresh_win_min)),
+            "--adaptive-thresh-win-max",
+            str(int(config.adaptive_thresh_win_max)),
+            "--adaptive-thresh-win-step",
+            str(int(config.adaptive_thresh_win_step)),
+            "--error-correction-rate",
+            f"{float(config.error_correction_rate):g}",
+            "--min-marker-perimeter-rate",
+            f"{float(config.min_marker_perimeter_rate):g}",
+            "--max-marker-perimeter-rate",
+            f"{float(config.max_marker_perimeter_rate):g}",
+            "--polygonal-approx-accuracy-rate",
+            f"{float(config.polygonal_approx_accuracy_rate):g}",
+        ]
+        if include_custom_dict:
+            dict_path = self.get_param_custom_dict_path()
+            if dict_path is not None:
+                parts.extend(["--custom-dict", str(dict_path)])
+        return " ".join(shlex.quote(part) for part in parts)
+
+    def copy_param_cli_flags(self) -> None:
+        try:
+            flags = self.param_detector_cli_flags(include_custom_dict=False)
+        except Exception as exc:
+            messagebox.showerror("ArUco parameter flags", str(exc))
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(flags)
+        self.status_note = "Copied ArUco detector parameter flags"
+        self.refresh_status()
+
+    def detect_param_test_frame(self, detector, frame_idx: int) -> Dict[int, Detection]:
+        bgr = self.read_frame(frame_idx)
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        corners, ids, _rejected = detector.detectMarkers(gray)
+        frame_dets: Dict[int, Detection] = {}
+        if ids is None or len(ids) == 0:
+            return frame_dets
+
+        for i, marker_id in enumerate(ids.flatten()):
+            instance = int(marker_id)
+            if instance < 0 or instance >= int(self.dictionary_size):
+                continue
+            center = np.mean(corners[i][0], axis=0)
+            frame_dets[instance] = Detection(
+                frame=int(frame_idx),
+                instance=instance,
+                x=float(center[0]),
+                y=float(center[1]),
+                confidence=1.0,
+            )
+        return frame_dets
+
+    def compare_param_test_frame(self, frame: int, test_dets: Dict[int, Detection]) -> Dict[str, object]:
+        existing = {int(det.instance): det for det in self.store.get_frame_detections(frame)}
+        existing_ids = set(existing)
+        test_ids = set(test_dets)
+        matched_ids = sorted(existing_ids & test_ids)
+        added_ids = sorted(test_ids - existing_ids)
+        missing_ids = sorted(existing_ids - test_ids)
+        distances = [
+            math.hypot(float(test_dets[tag].x) - float(existing[tag].x), float(test_dets[tag].y) - float(existing[tag].y))
+            for tag in matched_ids
+        ]
+        mean_offset = float(np.mean(distances)) if distances else 0.0
+        max_offset = float(np.max(distances)) if distances else 0.0
+        return {
+            "frame": int(frame),
+            "existing_count": int(len(existing_ids)),
+            "test_count": int(len(test_ids)),
+            "matched_count": int(len(matched_ids)),
+            "added_count": int(len(added_ids)),
+            "missing_count": int(len(missing_ids)),
+            "exact_id_match": bool(existing_ids == test_ids),
+            "mean_offset_px": mean_offset,
+            "max_offset_px": max_offset,
+            "added_ids": ",".join(str(v) for v in added_ids),
+            "missing_ids": ",".join(str(v) for v in missing_ids),
+        }
+
+    def aggregate_param_test_comparisons(self) -> Dict[str, object]:
+        rows = list(self.param_test_comparisons.values())
+        if not rows:
+            return {
+                "frames": 0,
+                "existing_count": 0,
+                "test_count": 0,
+                "matched_count": 0,
+                "added_count": 0,
+                "missing_count": 0,
+                "exact_id_match_frames": 0,
+                "mean_offset_px": 0.0,
+                "max_offset_px": 0.0,
+            }
+
+        total_matched = sum(int(row["matched_count"]) for row in rows)
+        weighted_offset = sum(float(row["mean_offset_px"]) * int(row["matched_count"]) for row in rows)
+        return {
+            "frames": int(len(rows)),
+            "existing_count": int(sum(int(row["existing_count"]) for row in rows)),
+            "test_count": int(sum(int(row["test_count"]) for row in rows)),
+            "matched_count": int(total_matched),
+            "added_count": int(sum(int(row["added_count"]) for row in rows)),
+            "missing_count": int(sum(int(row["missing_count"]) for row in rows)),
+            "exact_id_match_frames": int(sum(1 for row in rows if bool(row["exact_id_match"]))),
+            "mean_offset_px": float(weighted_offset / total_matched) if total_matched else 0.0,
+            "max_offset_px": float(max(float(row["max_offset_px"]) for row in rows)),
+        }
+
+    def refresh_param_test_status(self) -> None:
+        self.update_param_test_buttons()
+        if self.param_test_running:
+            return
+        if not self.param_test_comparisons:
+            self.param_test_status_var.set("ArUco parameter test: no test run")
+            return
+        agg = self.aggregate_param_test_comparisons()
+        self.param_test_status_var.set(
+            "ArUco test: "
+            f"{agg['frames']} frames | existing {agg['existing_count']} | test {agg['test_count']} | "
+            f"matched {agg['matched_count']} | +{agg['added_count']} -{agg['missing_count']} | "
+            f"mean move {float(agg['mean_offset_px']):.1f}px"
+        )
+
+    def run_param_test_current_frame(self) -> None:
+        self.param_test_start_var.set(int(self.current_frame))
+        self.param_test_end_var.set(int(self.current_frame))
+        self.run_param_test_range()
+
+    def run_param_test_range(self) -> None:
+        if self.param_test_running:
+            return
+        self.pause_playback()
+        try:
+            detector, config, dict_path = self.build_param_test_detector()
+            start, end, stride = self.get_param_test_range()
+        except Exception as exc:
+            messagebox.showerror("ArUco parameter test", str(exc))
+            return
+
+        frames = list(range(start, end + 1, stride))
+        if not frames:
+            return
+        current_before = int(self.current_frame)
+        self.param_test_running = True
+        self.param_test_results.clear()
+        self.param_test_comparisons.clear()
+        self.param_test_status_var.set(f"ArUco test running: frames {start} to {end} stride {stride}")
+        self.update_param_test_buttons()
+        self.root.update_idletasks()
+
+        try:
+            for idx, frame in enumerate(frames, start=1):
+                detections = self.detect_param_test_frame(detector, frame)
+                self.param_test_results[int(frame)] = detections
+                self.param_test_comparisons[int(frame)] = self.compare_param_test_frame(frame, detections)
+                if idx == 1 or idx == len(frames) or idx % 10 == 0:
+                    self.param_test_status_var.set(
+                        f"ArUco test running: {idx}/{len(frames)} frames | current {frame}"
+                    )
+                    self.root.update_idletasks()
+        except Exception as exc:
+            self.param_test_results.clear()
+            self.param_test_comparisons.clear()
+            self.param_test_running = False
+            self.refresh_param_test_status()
+            messagebox.showerror("ArUco parameter test", str(exc))
+            return
+        finally:
+            self.param_test_running = False
+
+        agg = self.aggregate_param_test_comparisons()
+        self.param_test_config_payload = {
+            "detector_config": {
+                "corner_refinement": str(config.corner_refinement),
+                "adaptive_thresh_constant": float(config.adaptive_thresh_constant),
+                "adaptive_thresh_win_min": int(config.adaptive_thresh_win_min),
+                "adaptive_thresh_win_max": int(config.adaptive_thresh_win_max),
+                "adaptive_thresh_win_step": int(config.adaptive_thresh_win_step),
+                "error_correction_rate": float(config.error_correction_rate),
+                "min_marker_perimeter_rate": float(config.min_marker_perimeter_rate),
+                "max_marker_perimeter_rate": float(config.max_marker_perimeter_rate),
+                "polygonal_approx_accuracy_rate": float(config.polygonal_approx_accuracy_rate),
+            },
+            "custom_dict": str(dict_path) if dict_path is not None else "",
+            "dictionary_size": int(self.dictionary_size),
+            "range_start": int(start),
+            "range_end": int(end),
+            "stride": int(stride),
+            "pipeline_aruco_params": self.param_detector_cli_flags(include_custom_dict=False),
+            "run_aruco_params": self.param_detector_cli_flags(include_custom_dict=True),
+            "aggregate": agg,
+        }
+        if current_before not in self.param_test_results:
+            self.current_frame = int(frames[0])
+        else:
+            self.current_frame = current_before
+        self.status_note = f"ArUco test compared {len(frames)} frames"
+        self.refresh_param_test_status()
+        self.render_current_frame()
+
+    def param_test_detections_dataframe(self) -> pd.DataFrame:
+        rows: List[Dict[str, object]] = []
+        for frame in sorted(self.param_test_results):
+            for instance in sorted(self.param_test_results[frame]):
+                rows.append(self.param_test_results[frame][instance].to_dict())
+        return pd.DataFrame(rows, columns=["Frame", "Instance", "X", "Y", "Confidence"])
+
+    def save_param_test_results(self) -> None:
+        if not self.param_test_results:
+            messagebox.showinfo("ArUco parameter test", "No parameter test results to save.")
+            return
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        stem = self.detections_path.stem
+        base = stem[: -len("_aruco_detections")] if stem.endswith("_aruco_detections") else stem
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        detections_path = self.output_dir / f"{base}_aruco_param_test_{stamp}_detections.csv"
+        comparison_path = self.output_dir / f"{base}_aruco_param_test_{stamp}_comparison.csv"
+        params_path = self.output_dir / f"{base}_aruco_param_test_{stamp}_params.json"
+
+        self.param_test_detections_dataframe().to_csv(detections_path, index=False, float_format="%.3f")
+        pd.DataFrame(list(self.param_test_comparisons.values())).sort_values("frame").to_csv(
+            comparison_path,
+            index=False,
+            float_format="%.3f",
+        )
+        payload = dict(self.param_test_config_payload or {})
+        payload.update(
+            {
+                "video_path": str(self.video_path),
+                "source_detections": str(self.detections_path),
+                "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+        )
+        with open(params_path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2)
+
+        self.status_note = f"Saved ArUco parameter test {stamp}"
+        self.refresh_status()
+        messagebox.showinfo(
+            "ArUco parameter test saved",
+            f"Wrote:\n\n{detections_path}\n{comparison_path}\n{params_path}",
+        )
+
     def current_right_tab(self) -> str:
         if not hasattr(self, "right_notebook"):
             return "detections"
@@ -2150,7 +2932,7 @@ class ArucoCurationApp:
         self.frame_var.set(str(target))
         if self.slider_job is not None:
             self.root.after_cancel(self.slider_job)
-        self.slider_job = self.root.after(80, lambda: self.goto_frame(target))
+        self.slider_job = self.root.after(self.slider_seek_delay_ms, lambda: self.goto_frame(target))
 
     def goto_frame_from_entry(self) -> None:
         try:
@@ -2402,6 +3184,88 @@ class ArucoCurationApp:
             thickness=2,
         )
 
+    def draw_param_test_overlay(self, image: np.ndarray, current_dets: List[Detection]) -> None:
+        if not self.show_param_test_overlay_var.get():
+            return
+        test_map = self.param_test_results.get(int(self.current_frame))
+        if not test_map:
+            return
+
+        existing = {int(det.instance): det for det in current_dets}
+        comparison = self.param_test_comparisons.get(int(self.current_frame), {})
+        matched_ids = set(existing) & set(test_map)
+        missing_ids = set(existing) - set(test_map)
+        added_ids = set(test_map) - set(existing)
+
+        for tag in sorted(missing_ids):
+            det = existing[tag]
+            if not finite_xy(det.x, det.y):
+                continue
+            center = (int(round(det.x)), int(round(det.y)))
+            cv2.drawMarker(
+                image,
+                center,
+                (0, 0, 255),
+                markerType=cv2.MARKER_TILTED_CROSS,
+                markerSize=26,
+                thickness=3,
+                line_type=cv2.LINE_AA,
+            )
+
+        for tag in sorted(test_map):
+            det = test_map[tag]
+            if not finite_xy(det.x, det.y):
+                continue
+            center = (int(round(det.x)), int(round(det.y)))
+            color = (255, 255, 0) if tag in matched_ids else (255, 0, 255)
+            if tag in matched_ids:
+                old = existing[tag]
+                if finite_xy(old.x, old.y):
+                    old_center = (int(round(old.x)), int(round(old.y)))
+                    cv2.line(image, old_center, center, (210, 210, 210), 2, cv2.LINE_AA)
+            elif tag in added_ids:
+                cv2.rectangle(
+                    image,
+                    (center[0] - 13, center[1] - 13),
+                    (center[0] + 13, center[1] + 13),
+                    color,
+                    3,
+                    cv2.LINE_AA,
+                )
+            cv2.drawMarker(
+                image,
+                center,
+                color,
+                markerType=cv2.MARKER_CROSS,
+                markerSize=24,
+                thickness=3,
+                line_type=cv2.LINE_AA,
+            )
+            self.draw_text_with_outline(
+                image,
+                f"T{tag}",
+                (center[0] + 12, center[1] + 24),
+                color,
+                scale=0.85,
+                thickness=2,
+            )
+
+        if comparison:
+            y = max(116, int(self.video_height) - 28)
+            self.draw_text_with_outline(
+                image,
+                (
+                    f"ArUco test: existing {comparison.get('existing_count', 0)} | "
+                    f"test {comparison.get('test_count', 0)} | "
+                    f"+{comparison.get('added_count', 0)} -{comparison.get('missing_count', 0)} | "
+                    f"move {float(comparison.get('mean_offset_px', 0.0)):.1f}px"
+                ),
+                (10, y),
+                (255, 255, 0),
+                scale=0.8,
+                thickness=2,
+            )
+
     def render_current_frame(self, *, full_refresh: bool = True) -> None:
         try:
             bgr = self.read_frame(self.current_frame)
@@ -2433,6 +3297,8 @@ class ArucoCurationApp:
                 scale=1.5 if det.instance == selected_instance else 1.25,
                 thickness=4 if det.instance == selected_instance else 3,
             )
+
+        self.draw_param_test_overlay(frame, current_dets)
 
         mode_text = "ADD/UPDATE" if self.add_mode_var.get() else "SELECT/MOVE"
         self.draw_text_with_outline(

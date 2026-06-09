@@ -44,6 +44,9 @@ DEFAULT_COLUMNS = [
     "ArucoY",
     "SleapAnchorX",
     "SleapAnchorY",
+    "CameraID",
+    "ArucoCam",
+    "SleapCam",
 ]
 
 
@@ -160,6 +163,45 @@ def write_parquet_with_num_frames(
     md[b"num_frames"] = str(int(num_frames)).encode("utf-8")
     table = table.replace_schema_metadata(md)
     pq.write_table(table, str(out_path), compression=compression)
+
+
+def read_track_rows_streaming(
+    path: Path,
+    *,
+    columns: list[str],
+    track_col: str,
+    track_id: int,
+    engine: str,
+) -> pd.DataFrame:
+    if engine != "pyarrow":
+        df = pd.read_parquet(path, columns=columns, engine=engine)
+        df = ensure_trackid(df, track_col)
+        return df[df[track_col].astype(int) == int(track_id)]
+
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+
+    pf = pq.ParquetFile(path)
+    pieces: list[pd.DataFrame] = []
+    for row_group_idx in range(pf.num_row_groups):
+        table = pf.read_row_group(row_group_idx, columns=columns)
+        if track_col not in table.column_names:
+            if int(track_id) != 0:
+                continue
+            df_piece = table.to_pandas()
+            df_piece[track_col] = 0
+            pieces.append(df_piece)
+            continue
+
+        track_arr = pc.cast(table[track_col], "int64", safe=False)
+        mask = pc.equal(track_arr, int(track_id))
+        if pc.sum(pc.cast(mask, "int64")).as_py() == 0:
+            continue
+        pieces.append(table.filter(mask).to_pandas())
+
+    if not pieces:
+        return pd.DataFrame(columns=columns)
+    return pd.concat(pieces, ignore_index=True)
 
 
 # -----------------------
@@ -373,15 +415,14 @@ def stitch_group(
 
         num_frames_meta = parquet_num_frames(fp)
 
-        frame_df = pd.read_parquet(fp, columns=[frame_col], engine=engine)
-        frame_df[frame_col] = pd.to_numeric(frame_df[frame_col], errors="coerce")
-        frame_df = frame_df.dropna(subset=[frame_col])
-        if frame_df.empty and num_frames_meta is None:
-            continue
-
         if num_frames_meta is not None:
             local_len = int(num_frames_meta)
         else:
+            frame_df = pd.read_parquet(fp, columns=[frame_col], engine=engine)
+            frame_df[frame_col] = pd.to_numeric(frame_df[frame_col], errors="coerce")
+            frame_df = frame_df.dropna(subset=[frame_col])
+            if frame_df.empty:
+                continue
             local_max = int(frame_df[frame_col].max())
             local_len = local_max + 1
 
@@ -395,7 +436,9 @@ def stitch_group(
             frame_offset = running_frame_offset
 
         existing = [c for c in requested if c in cols_in_file]
-        if track_col in cols_in_file:
+        if track_ids_filter is not None:
+            track_ids.update(int(tid) for tid in track_ids_filter)
+        elif track_col in cols_in_file:
             tid_df = pd.read_parquet(fp, columns=[track_col], engine=engine)
             tid_series = pd.to_numeric(tid_df[track_col], errors="coerce").dropna()
             track_ids.update(int(tid) for tid in tid_series.unique())
@@ -443,7 +486,13 @@ def stitch_group(
 
         parts: List[pd.DataFrame] = []
         for info in file_infos:
-            df = pd.read_parquet(info["path"], columns=info["existing"], engine=engine)
+            df = read_track_rows_streaming(
+                info["path"],
+                columns=info["existing"],
+                track_col=track_col,
+                track_id=int(tid),
+                engine=engine,
+            )
             if df.empty:
                 continue
 
@@ -453,11 +502,6 @@ def stitch_group(
                 continue
 
             df = ensure_trackid(df, track_col)
-            df[track_col] = df[track_col].astype(int)
-            df = df[df[track_col] == int(tid)]
-            if df.empty:
-                continue
-
             df[frame_col] = df[frame_col].astype(np.int64) + int(info["frame_offset"])
             df["source_file"] = info["path"].name
             parts.append(df)
@@ -524,8 +568,17 @@ def main(
     png_height: int = 900,
     skip_existing: bool = False,
     track_ids_filter: Optional[set[int]] = None,
+    chunks_filter: Optional[set[str]] = None,
 ) -> None:
     files = sorted(Path(input_dir).glob(f"*{string}"))
+    if chunks_filter is not None:
+        chunks_norm = {str(chunk).zfill(3) for chunk in chunks_filter}
+        files = [
+            fp
+            for fp in files
+            if (match := re.search(r"_chunk(\d{3})_", fp.name)) is not None
+            and match.group(1) in chunks_norm
+        ]
     if not files:
         raise RuntimeError("No parquet files found")
 
@@ -643,6 +696,12 @@ if __name__ == "__main__":
         help="Only stitch this TrackID. May be passed more than once.",
     )
     ap.add_argument(
+        "--chunk",
+        action="append",
+        default=None,
+        help="Only stitch this chunk number. May be passed more than once.",
+    )
+    ap.add_argument(
         "--columns",
         nargs="+",
         default=DEFAULT_COLUMNS,
@@ -680,4 +739,5 @@ if __name__ == "__main__":
         png_height=args.track_png_height,
         skip_existing=args.skip_existing,
         track_ids_filter=None if args.track_id is None else set(args.track_id),
+        chunks_filter=None if args.chunk is None else {str(chunk).zfill(3) for chunk in args.chunk},
     )

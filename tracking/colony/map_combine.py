@@ -245,7 +245,12 @@ def _filter_instances_by_frame_fraction(
     min_instance_frame_frac: float,
 ) -> pd.DataFrame:
     """
-    Keep only instances that appear in at least `min_instance_frame_frac` of frames.
+    Keep only instances that appear in at least `min_instance_frame_frac`
+    of frames in the merged all-camera chunk.
+
+    This must run after all cameras are concatenated. Filtering each camera
+    independently removes short but real camera-edge appearances and breaks
+    cross-camera handoff.
     Uses unique frame counts per Instance (robust to duplicates).
     """
     if not (0.0 <= min_instance_frame_frac <= 1.0):
@@ -271,7 +276,6 @@ def _load_aruco_h5_to_df_and_num_frames(
     file: Path,
     *,
     frame_offset: int = 0,
-    min_instance_frame_frac: float = 0.05,
     ds_name: str = "aruco_tracks",
 ) -> Tuple[pd.DataFrame, int]:
     """
@@ -286,7 +290,6 @@ def _load_aruco_h5_to_df_and_num_frames(
         num_frames = int(f[ds_name].shape[0])
         df = aruco_h5_to_long_df_full(f, ds_name=ds_name, frame_offset=frame_offset)
 
-    df = _filter_instances_by_frame_fraction(df, min_instance_frame_frac=min_instance_frame_frac)
     return df, num_frames
 
 
@@ -308,7 +311,6 @@ def _matching_aruco_tracks_file(file: Path) -> Path | None:
 def _load_aruco_detections_h5_to_df_and_num_frames(
     file: Path,
     *,
-    min_instance_frame_frac: float = 0.05,
     ds_name: str = "aruco_tracks",
 ) -> Tuple[pd.DataFrame, int]:
     df = pd.read_hdf(file, key="detections")
@@ -335,24 +337,15 @@ def _load_aruco_detections_h5_to_df_and_num_frames(
         with h5py.File(tracks_file, "r") as f:
             num_frames = int(f[ds_name].shape[0])
 
-    df = _filter_instances_by_frame_fraction(df, min_instance_frame_frac=min_instance_frame_frac)
     return df, num_frames
 
 
 def _load_aruco_input_to_df_and_num_frames(
     file: Path,
-    *,
-    min_instance_frame_frac: float = 0.05,
 ) -> Tuple[pd.DataFrame, int]:
     if file.stem.endswith("_aruco_detections"):
-        return _load_aruco_detections_h5_to_df_and_num_frames(
-            file,
-            min_instance_frame_frac=min_instance_frame_frac,
-        )
-    return _load_aruco_h5_to_df_and_num_frames(
-        file,
-        min_instance_frame_frac=min_instance_frame_frac,
-    )
+        return _load_aruco_detections_h5_to_df_and_num_frames(file)
+    return _load_aruco_h5_to_df_and_num_frames(file)
 
 
 def group_files_by_chunk(
@@ -430,9 +423,7 @@ def process_aruco_chunks(
         num_frames_vals: List[int] = []
 
         for cam_idx, file in cam_files.items():
-            df, n_frames = _load_aruco_input_to_df_and_num_frames(
-                file, min_instance_frame_frac=min_instance_frame_frac
-            )
+            df, n_frames = _load_aruco_input_to_df_and_num_frames(file)
             num_frames_vals.append(int(n_frames))
 
             if df.empty:
@@ -458,6 +449,25 @@ def process_aruco_chunks(
         num_frames = max(num_frames_vals)
 
         panorama_df = pd.concat(dfs, ignore_index=True)
+        before_rows = len(panorama_df)
+        before_instances = int(panorama_df["Instance"].nunique()) if "Instance" in panorama_df else 0
+        panorama_df = _filter_instances_by_frame_fraction(
+            panorama_df,
+            min_instance_frame_frac=min_instance_frame_frac,
+        )
+        after_instances = int(panorama_df["Instance"].nunique()) if "Instance" in panorama_df else 0
+        logging.info(
+            "ArUco chunk %s all-camera frequency filter %.4g: rows %d -> %d, IDs %d -> %d",
+            chunk,
+            min_instance_frame_frac,
+            before_rows,
+            len(panorama_df),
+            before_instances,
+            after_instances,
+        )
+        if panorama_df.empty:
+            logging.info("No ArUco detections in chunk %s after all-camera filtering — skipped.", chunk)
+            continue
 
         split_and_write_with_num_frames_flat(
             panorama_df,
@@ -626,8 +636,11 @@ def main() -> None:
     p.add_argument(
         "--min_instance_frame_frac",
         type=float,
-        default=0.05,
-        help="Drop ArUco Instances that appear in fewer than this fraction of frames (0..1). Default: 0.05",
+        default=0.25,
+        help=(
+            "Drop ArUco IDs that appear in fewer than this fraction of frames "
+            "after all cameras in a chunk are merged. Default: 0.25"
+        ),
     )
     p.add_argument("--skip_existing", action="store_true", help="Do not overwrite existing panorama PKLs.")
 

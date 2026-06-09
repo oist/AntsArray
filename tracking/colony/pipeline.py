@@ -19,8 +19,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
-from tracking.colony.combine_batch import discover_jobs, parse_sides, run_local, submit_slurm  # noqa: E402
-from tracking.colony.panorama_io import validate_aruco_inputs_have_sleap_h5  # noqa: E402
+from tracking.colony.combine_batch import discover_jobs, filter_jobs_by_chunks, parse_sides, run_local, submit_slurm  # noqa: E402
+from tracking.colony.panorama_io import discover_complete_input_chunks  # noqa: E402
 from tracking.stitch_tracks import main as stitch_tracks  # noqa: E402
 from tracking.stitch_tracks import write_pngs_from_existing  # noqa: E402
 
@@ -33,6 +33,7 @@ def run_mapping(
     map_mode: str,
     min_instance_frame_frac: float,
     skip_existing: bool,
+    chunks: set[str] | None = None,
 ) -> None:
     from tracking.colony.map_combine import (
         infer_experiment_name,
@@ -52,11 +53,12 @@ def run_mapping(
             panorama_dir,
             exp,
             min_instance_frame_frac=min_instance_frame_frac,
+            chunks=chunks,
             skip_existing=skip_existing,
         )
 
     if map_mode in ("sleap", "both"):
-        process_sleap_chunks(hmats, data_dir, panorama_dir, exp, skip_existing=skip_existing)
+        process_sleap_chunks(hmats, data_dir, panorama_dir, exp, chunks=chunks, skip_existing=skip_existing)
 
 
 def run_combine(
@@ -79,9 +81,10 @@ def run_combine(
     lost_track_max_distance: float | None,
     lost_track_aruco_max_distance: float | None,
     skip_existing: bool,
+    chunks: set[str] | None = None,
 ) -> None:
     tracks_dir.mkdir(parents=True, exist_ok=True)
-    jobs = discover_jobs(panorama_dir, parse_sides(side))
+    jobs = filter_jobs_by_chunks(discover_jobs(panorama_dir, parse_sides(side)), chunks)
     if not jobs:
         raise RuntimeError(f"No complete ArUco/SLEAP chunk jobs found in {panorama_dir}")
 
@@ -134,6 +137,7 @@ def run_stitching(
     track_png_height: int,
     skip_existing: bool,
     pngs_from_existing: bool,
+    chunks: set[str] | None = None,
 ) -> None:
     stitched_dir.mkdir(parents=True, exist_ok=True)
     if pngs_from_existing:
@@ -167,6 +171,7 @@ def run_stitching(
         png_width=track_png_width,
         png_height=track_png_height,
         skip_existing=skip_existing,
+        chunks_filter=chunks,
     )
 
 
@@ -183,7 +188,12 @@ def main() -> None:
     parser.add_argument("--skip_combine", action="store_true")
     parser.add_argument("--skip_stitch", action="store_true")
     parser.add_argument("--map_mode", choices=("aruco", "sleap", "both"), default="both")
-    parser.add_argument("--min_instance_frame_frac", type=float, default=0.05)
+    parser.add_argument(
+        "--min_instance_frame_frac",
+        type=float,
+        default=0.25,
+        help="Drop ArUco IDs below this all-camera merged chunk frame fraction.",
+    )
 
     parser.add_argument("--side", choices=("left", "right", "both"), default="both")
     parser.add_argument("--combine_runner", choices=("local", "slurm"), default="local")
@@ -221,6 +231,9 @@ def main() -> None:
             "ArucoY",
             "SleapAnchorX",
             "SleapAnchorY",
+            "CameraID",
+            "ArucoCam",
+            "SleapCam",
         ],
     )
     parser.add_argument("--no_track_pngs", action="store_true")
@@ -239,8 +252,21 @@ def main() -> None:
     stitched_dir = args.stitched_dir or work_dir / "stitched"
     logs_dir = args.logs_dir or work_dir / "logs"
 
-    aruco_files = validate_aruco_inputs_have_sleap_h5(args.data_dir)
-    logging.info("Preflight passed: %d ArUco H5 files have matching SLEAP H5 files.", len(aruco_files))
+    complete_chunks, chunk_summary = discover_complete_input_chunks(args.data_dir)
+    if not complete_chunks:
+        raise FileNotFoundError(
+            "No complete ArUco/SLEAP chunks available to process. "
+            f"Summary: {chunk_summary}"
+        )
+    logging.info(
+        "Preflight passed: %d contiguous complete chunks can be processed "
+        "(chunk%s..chunk%s, %d cameras). First incomplete: %s",
+        len(complete_chunks),
+        complete_chunks[0],
+        complete_chunks[-1],
+        int(chunk_summary.get("reference_camera_count", 0)),
+        chunk_summary.get("first_incomplete"),
+    )
 
     if not args.skip_map:
         logging.info("Stage 1/3: mapping detections into panorama PKLs")
@@ -251,6 +277,7 @@ def main() -> None:
             map_mode=args.map_mode,
             min_instance_frame_frac=args.min_instance_frame_frac,
             skip_existing=args.skip_existing,
+            chunks=set(complete_chunks),
         )
 
     if not args.skip_combine:
@@ -274,6 +301,7 @@ def main() -> None:
             lost_track_max_distance=args.lost_track_max_distance,
             lost_track_aruco_max_distance=args.lost_track_aruco_max_distance,
             skip_existing=args.skip_existing,
+            chunks=set(complete_chunks),
         )
         if args.combine_runner == "slurm" and not args.skip_stitch:
             logging.info("SLURM combine jobs were submitted asynchronously; skipping stitching for this run.")
@@ -296,6 +324,7 @@ def main() -> None:
             track_png_height=args.track_png_height,
             skip_existing=args.skip_existing,
             pngs_from_existing=args.pngs_from_existing,
+            chunks=set(complete_chunks),
         )
 
 

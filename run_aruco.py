@@ -80,7 +80,25 @@ def _normalize_window_param(v: int) -> int:
     return vv
 
 
-def build_aruco_detector(config: DetectorConfig) -> aruco.ArucoDetector:
+def load_custom_aruco_dict(npz_path: str | Path) -> aruco.Dictionary:
+    data = np.load(str(npz_path), allow_pickle=True)
+    if "bytesList" not in data:
+        raise ValueError(f"Custom ArUco dictionary missing bytesList: {npz_path}")
+    if "max_correction_bits" not in data:
+        raise ValueError(f"Custom ArUco dictionary missing max_correction_bits: {npz_path}")
+
+    custom = aruco.Dictionary()
+    custom.bytesList = data["bytesList"]
+    custom.markerSize = int(data["marker_size"]) if "marker_size" in data.files else 4
+    custom.maxCorrectionBits = int(data["max_correction_bits"])
+    return custom
+
+
+def build_aruco_detector(
+    config: DetectorConfig,
+    *,
+    aruco_dict: Optional[aruco.Dictionary] = None,
+) -> aruco.ArucoDetector:
     params = aruco.DetectorParameters()
     _set_if_attr(params, "cornerRefinementMethod", _corner_refine_enum(config.corner_refinement))
     _set_if_attr(params, "adaptiveThreshConstant", float(config.adaptive_thresh_constant))
@@ -92,7 +110,8 @@ def build_aruco_detector(config: DetectorConfig) -> aruco.ArucoDetector:
     _set_if_attr(params, "maxMarkerPerimeterRate", float(config.max_marker_perimeter_rate))
     _set_if_attr(params, "polygonalApproxAccuracyRate", float(config.polygonal_approx_accuracy_rate))
 
-    aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_1000)
+    if aruco_dict is None:
+        aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_1000)
     return aruco.ArucoDetector(aruco_dict, params)
 
 
@@ -203,6 +222,7 @@ def detect_aruco_in_video(
     detector_config: DetectorConfig,
     *,
     dictionary_size: int = 300,
+    aruco_dict: Optional[aruco.Dictionary] = None,
     debug_vis: bool = False,
     debug_every: int = 1,
     debug_save_path: Optional[Path] = None,
@@ -226,7 +246,7 @@ def detect_aruco_in_video(
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    detector = build_aruco_detector(detector_config)
+    detector = build_aruco_detector(detector_config, aruco_dict=aruco_dict)
 
     writer = None
     if debug_save_path is not None:
@@ -333,6 +353,7 @@ def evaluate_detector_on_video(
     detector_config: DetectorConfig,
     *,
     dictionary_size: int,
+    aruco_dict: Optional[aruco.Dictionary] = None,
     frame_stride: int,
     max_frames: int,
 ) -> Dict[str, object]:
@@ -340,7 +361,7 @@ def evaluate_detector_on_video(
     if not cap.isOpened():
         raise ValueError(f"Could not open video file: {video_file}")
 
-    detector = build_aruco_detector(detector_config)
+    detector = build_aruco_detector(detector_config, aruco_dict=aruco_dict)
     frame_idx = 0
 
     eval_frames = 0
@@ -430,6 +451,7 @@ def run_parameter_search(
     out_dir: Path,
     name_no_ext: str,
     dictionary_size: int,
+    aruco_dict: Optional[aruco.Dictionary] = None,
     base_config: DetectorConfig,
     frame_stride: int,
     max_frames: int,
@@ -478,6 +500,7 @@ def run_parameter_search(
                 video_file,
                 cfg,
                 dictionary_size=dictionary_size,
+                aruco_dict=aruco_dict,
                 frame_stride=frame_stride,
                 max_frames=max_frames,
             )
@@ -521,6 +544,12 @@ def main() -> None:
             type=int,
             default=300,
             help="Maximum marker ID to track (default: 300)",
+        )
+        p.add_argument(
+            "--custom-dict",
+            type=Path,
+            default=None,
+            help="Path to custom ArUco dictionary .npz with bytesList and max_correction_bits.",
         )
         p.add_argument(
             "--output-format",
@@ -638,6 +667,7 @@ def main() -> None:
             max_marker_perimeter_rate=args.max_marker_perimeter_rate,
             polygonal_approx_accuracy_rate=args.polygonal_approx_accuracy_rate,
         )
+        aruco_dict = load_custom_aruco_dict(args.custom_dict) if args.custom_dict is not None else None
 
         detector_config = base_config
         if args.optimize_params:
@@ -647,6 +677,7 @@ def main() -> None:
                 out_dir=out_dir,
                 name_no_ext=name_no_ext,
                 dictionary_size=args.dictionary_size,
+                aruco_dict=aruco_dict,
                 base_config=base_config,
                 frame_stride=max(1, int(args.optimize_frame_stride)),
                 max_frames=max(0, int(args.optimize_max_frames)),
@@ -695,6 +726,7 @@ def main() -> None:
             args.video_file,
             detector_config=detector_config,
             dictionary_size=args.dictionary_size,
+            aruco_dict=aruco_dict,
             debug_vis=args.debug_vis,
             debug_every=args.debug_every,
             debug_save_path=debug_video_path,

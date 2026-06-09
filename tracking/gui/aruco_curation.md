@@ -31,6 +31,10 @@ Default playback is 20 FPS. Override it with `--fps` if you want a slower or fas
 - Use the `Range` boxes plus `Preview Range` to preview bridging over a selectable frame subset without playback.
 - Use `Back Bridge` to undo the most recent grouped bridge command.
 - The SLEAP bridge flow is non-blocking and does not open a popup window.
+- Use `ArUco Parameter Test` to change OpenCV detector parameters, re-detect the current frame or a frame range, and compare the test detections against the loaded ArUco file without modifying the curated detections.
+- Use `A100`, `B300`, or the dictionary picker in `ArUco Parameter Test` when testing custom dictionaries used by the pipeline.
+- Use `Copy Params` to copy detector flags for future `detection_pipeline/pipeline.sh --aruco-params "..."` runs.
+- Use `Save Test` to write test detections, per-frame comparison metrics, and the parameter JSON into the output directory.
 - Use the bottom transport bar for `<<`, `<`, `Play/Pause`, `>`, and `>>`.
 - The right-side panel has a `Current Frame Detections` tab and a `Tag Trajectory` tab. The trajectory tab shows the selected tag ID from the tag box as an XY path with color encoding time from early to late, supports a zoom control, and clicking the path seeks the main video to the nearest plotted frame.
 
