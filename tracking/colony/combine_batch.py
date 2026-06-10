@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -81,6 +82,18 @@ def discover_jobs(input_folder: Path, sides: Iterable[str]) -> list[ChunkJob]:
             jobs.append(ChunkJob(key=key, side=side, representative_file=representative))
 
     return jobs
+
+
+def filter_jobs_by_chunks(jobs: list[ChunkJob], chunks: set[str] | None) -> list[ChunkJob]:
+    if chunks is None:
+        return jobs
+    chunk_set = {str(chunk).zfill(3) for chunk in chunks}
+    return [
+        job
+        for job in jobs
+        if (match := re.search(r"_chunk(\d{3})", job.key)) is not None
+        and match.group(1) in chunk_set
+    ]
 
 
 def run_local(
@@ -225,6 +238,7 @@ def main() -> None:
     parser.add_argument("--lost_track_max_frames", type=int, default=120)
     parser.add_argument("--lost_track_max_distance", type=float, default=None)
     parser.add_argument("--lost_track_aruco_max_distance", type=float, default=None)
+    parser.add_argument("--chunk", action="append", default=None, help="Only process this chunk number. May be repeated.")
     parser.add_argument("--skip_existing", action="store_true", help="Do not overwrite existing chunk parquets.")
     args = parser.parse_args()
 
@@ -234,7 +248,8 @@ def main() -> None:
         raise NotADirectoryError(args.input_folder)
 
     args.output_path.mkdir(parents=True, exist_ok=True)
-    jobs = discover_jobs(args.input_folder, parse_sides(args.side))
+    chunks = None if args.chunk is None else {str(chunk).zfill(3) for chunk in args.chunk}
+    jobs = filter_jobs_by_chunks(discover_jobs(args.input_folder, parse_sides(args.side)), chunks)
     if not jobs:
         raise RuntimeError(f"No complete ArUco/SLEAP chunk jobs found in {args.input_folder}")
 

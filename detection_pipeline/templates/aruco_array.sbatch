@@ -21,6 +21,10 @@ ARUCO_SCRIPT="${ARUCO_SCRIPT:-$SCRIPTS_DIR/run_aruco_mp.py}"
 
 WORKLIST="$JOBS_ROOT/aruco_worklist.txt"
 BATCH_SIZE="${BATCH_SIZE:-1}"
+aruco_extra_args=()
+if [[ -n "${ARUCO_EXTRA_ARGS:-}" ]]; then
+	read -r -a aruco_extra_args <<< "$ARUCO_EXTRA_ARGS"
+fi
 
 start_idx=$(( SLURM_ARRAY_TASK_ID * BATCH_SIZE ))
 end_idx=$(( start_idx + BATCH_SIZE ))
@@ -82,7 +86,8 @@ for (( row_idx=start_idx; row_idx<end_idx; row_idx++ )); do
 		--output-path "$aruco_dir/" \
 		--custom-dict "$ARUCO_DICT_PATH" \
 		"${nframes_args[@]}" \
-		--output-format h5
+		--output-format h5 \
+		"${aruco_extra_args[@]}"
 
 	touch "$sentinel"
 	echo "[OK] ${vname}_${chunk}"

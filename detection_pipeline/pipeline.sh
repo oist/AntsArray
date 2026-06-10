@@ -27,6 +27,8 @@ Required:
 Aruco:
   --aruco-dict {A|B|PATH}           A=custom_4x4_A100, B=custom_4x4_B300, or full .npz path
                                     default: A
+  --aruco-params "FLAGS"            Extra run_aruco.py detector parameter flags
+                                    from aruco_curation.py parameter tests.
 
 Chunking:
   --chunk-sec N                     Chunk duration in seconds. default: 7200 (2h)
@@ -74,6 +76,7 @@ EOT
 # Defaults
 DIR=""
 ARUCO_DICT="A"
+ARUCO_EXTRA_ARGS=""
 CHUNK_SEC=7200
 CHUNK_EXT=mkv
 SLEAP_MODEL_CENTROID=""
@@ -98,6 +101,7 @@ while [[ $# -gt 0 ]]; do
 	case "$1" in
 		--dir) DIR="$2"; shift 2 ;;
 		--aruco-dict) ARUCO_DICT="$2"; shift 2 ;;
+		--aruco-params) ARUCO_EXTRA_ARGS="$2"; shift 2 ;;
 		--chunk-sec) CHUNK_SEC="$2"; shift 2 ;;
 		--chunk-ext) CHUNK_EXT="$2"; shift 2 ;;
 		--sleap-model-centroid) SLEAP_MODEL_CENTROID="$2"; shift 2 ;;
@@ -180,6 +184,7 @@ export SCRIPTS_DIR="$SCRIPTS_DIR"
 export CHUNK_SEC="$CHUNK_SEC"
 export CHUNK_EXT="$CHUNK_EXT"
 export ARUCO_DICT_PATH="$ARUCO_DICT_PATH"
+export ARUCO_EXTRA_ARGS="$ARUCO_EXTRA_ARGS"
 export ARUCO_CONCURRENCY="$ARUCO_CONCURRENCY"
 export SLEAP_CONCURRENCY="$SLEAP_CONCURRENCY"
 export DATACP_CONCURRENCY="$DATACP_CONCURRENCY"

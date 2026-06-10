@@ -112,6 +112,7 @@ defaults:
 | `--chunk-sec`          | `7200` (2 h)     | passed to `ffmpeg -segment_time`                                                                    |
 | `--chunk-ext`          | `mkv`            | output container; sleap-nn 0.2 reads mkv via sleap-io                                                 |
 | `--aruco-dict`         | `A`              | resolves to `custom_4x4_A100_d4_*.npz` (latest by name) under `/bucket/ReiterU/Ants/aruco_dicts/` |
+| `--aruco-params`       | empty              | extra `run_aruco.py` detector flags copied from the curation GUI parameter test                       |
 | `--sleap-runtime`      | `tensorrt`       | also `onnx`, `pytorch` (last = no export needed)                                                  |
 | `--skip-trt-export`    | off                | fall back to `sleap-nn track` (raw model dirs, no export)                                           |
 | `--saion-partition`    | `largegpu`       | A100 SM80                                                                                             |
