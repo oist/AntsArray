@@ -15,6 +15,7 @@ land in `<exp>/data/` first.
 deigo-login (detection_pipeline/pipeline.sh)
   └── chunk_array (one task per grid video)
         └── chunk_finalize
+              ├── backup (single datacp job; updates stable Backup archive)
               ├── aruco_array (cross-video, chunk-ordered, BATCH_SIZE chunks/task)
               │     │     ↳ each chunk: inline rsync h5 → bucket (via ssh deigo login)
               │     └── aruco_datacp (single safety-net job; idempotent rsync)
@@ -58,11 +59,13 @@ detection_pipeline/
   pipeline.sh                      # entry point (deigo-login)
   README.md                        # this file
   lib/
+    backup_list.py                 # source-video + metadata list for Bucket Backup archives
     hosts.sh                       # SSH_CMD, ssh_retry, rsync_retry, host_resolves
     manifest.py                    # video discovery + sidecar/ffprobe cross-check
     perms.sh                       # best-effort chgrp/setgid helpers for shared outputs
     worklist.py                    # chunk-ordered (chunk_idx ASC, vname ASC) TSV builder
   templates/
+    backup.sbatch                  # update stable raw-video archive under /bucket/<unit>/Backup
     chunk.sbatch                   # ffmpeg -c copy segment (no re-encode)
     chunk_finalize.sbatch          # build worklist + submit downstream sbatches
     aruco_array.sbatch             # run_aruco.py per chunk with --custom-dict
@@ -121,6 +124,9 @@ defaults:
 | `--sleap-concurrency`  | `8`              | array `%N` cap                                                                                      |
 | `--datacp-concurrency` | `4`              | array `%N` cap (deigo has 4 mover nodes)                                                            |
 | `--group`              | `reiteruni`      | group owner for shared outputs; created dirs are chgrp'd and setgid where permitted                 |
+| `--no-backup`          | off              | skip the automatic raw-video backup                                                                 |
+| `--backup-root`        | `/bucket/<unit>/Backup` | OIST Bucket Backup destination directory                                                     |
+| `--backup-archive`     | `<relative_exp_path>_raw_videos.zip` | stable per-block archive filename; reruns update this same file                  |
 
 ## Shared group permissions
 
@@ -138,6 +144,26 @@ files owned by other users.
 Upload stages also pass `rsync --chown=:$OUTPUT_GROUP` so `rsync -a` cannot
 preserve a source-side group into the bucket by accident. Permission fixes never
 abort a run if the current user cannot change a path they do not own.
+
+## Bucket Backups
+
+By default, normal pipeline runs submit one `datacp` backup job after chunking
+finishes. The job updates a stable per-block archive under the unit Backup
+folder, for example:
+
+```bash
+/bucket/ReiterU/Backup/Ants_basler_20260520_block02_raw_videos.zip
+```
+
+The archive contains the raw source videos listed in `manifest.csv` plus all
+top-level `.txt` and `.json` metadata files in the experiment directory. A
+matching `.txt` description file is written next to the archive with the
+required `name:` and `project:` lines for OIST Bucket Backup.
+
+Re-running the same block updates the same archive with `zip -0 -FS`; it does
+not create timestamped duplicates. OIST's weekly Backup snapshots preserve older
+versions remotely. Pass `--no-backup` for test runs where no Backup archive
+should be updated.
 
 ## Phase isolation (for testing)
 
