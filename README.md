@@ -22,7 +22,7 @@ Compute nodes may not be able to write to `/bucket`, so the cluster wrapper writ
 
 ## Main Colony Pipeline
 
-Use `tracking/colony/submit_blocks_pipeline.sh` for production colony runs. It handles blocks, chunks, SLURM dependencies, stitching, PNG generation, and final transfer.
+Use `tracking/colony/submit_blocks_pipeline.sh` for production colony runs. It handles blocks, chunks, SLURM dependencies, stitching, sleep/behavior analysis, PNG generation, and final transfer.
 
 Edit the configuration block at the top of:
 
@@ -38,6 +38,7 @@ HMATS="/bucket/ReiterU/Ants/basler/cameraArray_calib/.../initial_H_mats.npz"
 OUTPUT_ROOT="/flash/ReiterU/ant_tmp/${USER}/colony_pipeline/20260515"
 SUBMIT_ROOT="${OUTPUT_ROOT}/jobs"
 PYTHON_BIN="/bucket/ReiterU/sam/miniforge3/envs/aruco_env/bin/python"
+RUN_SLEEP_ANALYSIS=1
 ```
 
 Then submit:
@@ -170,9 +171,41 @@ OUTPUT_ROOT/continuous_stitched/
   track_pngs/
 ```
 
-### 5. Transfer Back To Bucket
+### 5. Sleep/Behavior Analysis
 
-When continuous stitching finishes successfully, a login-side transfer watcher copies outputs from flash back to bucket with `rsync --ignore-existing`.
+After continuous stitching succeeds, the wrapper submits a sleep-analysis fan-out. It first prepares a good-track worklist from:
+
+```text
+OUTPUT_ROOT/continuous_stitched/per_track/
+```
+
+Then it runs the expensive per-ant stages as explicit Slurm fan-out workers, one sbatch job per ant:
+
+- speed cache generation;
+- sleep/wake labeling;
+- outside-colony labeling and per-ant behavior/rhythm summaries.
+
+Small dependent jobs estimate or record the stationary threshold, write colony boxes, and aggregate per-ant outputs.
+
+Default flash outputs:
+
+```text
+OUTPUT_ROOT/colony_sleep_behavior/
+  analysis_cache/
+    speed_tracks/
+    labeled_tracks/
+    outside_labeled_tracks/
+    per_track_behavior_summary/
+    per_track_rhythm_bins/
+  outputs/
+  sleep_behavior_complete.ok
+```
+
+The default analysis parameters match `analysis/colony_sleep_behavior_interactive.py`, including `SLEEP_STATIONARY_THRESHOLD_MM_S=0.1` and the manual colony boxes in `SLEEP_COLONY_BOXES_MM`. Use `--no_sleep_analysis` to skip this stage, or `--sleep_colony_boxes_mm auto` to infer colony boxes from occupancy.
+
+### 6. Transfer Back To Bucket
+
+When the final enabled post-processing stage finishes successfully, a login-side transfer watcher copies outputs from flash back to bucket with `rsync --ignore-existing`.
 
 Default transfer destinations:
 
@@ -181,6 +214,7 @@ Default transfer destinations:
 /bucket/.../block03/tracks
 /bucket/.../block03/stitched
 /bucket/.../continuous_stitched
+/bucket/.../colony_sleep_behavior
 ```
 
 Flash files are kept by default. Set `DELETE_FLASH_AFTER_TRANSFER=1` or pass `--delete_flash_after_transfer` to remove transferred flash contents after successful `rsync`.

@@ -539,6 +539,21 @@ def get_complete_tracks(
         sleap_anchor_xy_by_inst: Dict[int, Tuple[float, float]] = {
             int(inst_id): (float(x), float(y)) for inst_id, x, y in sleap_anchor
         }
+        sleap_fullness_by_inst: Dict[int, int] = {}
+        if not s_df.empty:
+            x_vals = pd.to_numeric(s_df["X"], errors="coerce").to_numpy(float)
+            y_vals = pd.to_numeric(s_df["Y"], errors="coerce").to_numpy(float)
+            bp_vals = pd.to_numeric(s_df["Bodypoint"], errors="coerce").to_numpy(float)
+            finite = np.isfinite(x_vals) & np.isfinite(y_vals) & np.isfinite(bp_vals)
+            bodypoints_by_inst: Dict[int, set[int]] = {}
+            for inst_id, bp, ok in zip(s_instance_keys, bp_vals, finite):
+                if not ok:
+                    continue
+                bodypoints_by_inst.setdefault(int(inst_id), set()).add(int(bp))
+            sleap_fullness_by_inst = {
+                inst_id: len(bodypoints)
+                for inst_id, bodypoints in bodypoints_by_inst.items()
+            }
         sleap_cam_by_inst: Dict[int, int | None] = {}
         if not s_df.empty and "Cam" in s_df.columns:
             anchor_rows = s_df.loc[
@@ -640,6 +655,34 @@ def get_complete_tracks(
                 return None
             return (float(ax), float(ay), cam_i)
 
+        def _select_sleap_candidate(
+            candidates: List[Tuple[float, int]],
+        ) -> Tuple[float, int] | None:
+            if not candidates:
+                return None
+            cams = {
+                sleap_cam_by_inst.get(int(inst_id))
+                for _dist, inst_id in candidates
+                if sleap_cam_by_inst.get(int(inst_id)) is not None
+            }
+            if len(cams) > 1:
+                return min(
+                    candidates,
+                    key=lambda item: (
+                        -sleap_fullness_by_inst.get(int(item[1]), 0),
+                        float(item[0]),
+                        int(item[1]),
+                    ),
+                )
+            return min(
+                candidates,
+                key=lambda item: (
+                    float(item[0]),
+                    -sleap_fullness_by_inst.get(int(item[1]), 0),
+                    int(item[1]),
+                ),
+            )
+
         def _nearest_unused_sleap_to_aruco(
             tid: int,
             aruco_xy: Tuple[float, float],
@@ -648,17 +691,18 @@ def get_complete_tracks(
                 return None
             aruco_xy_arr = np.asarray(aruco_xy, dtype=float)
             dists = np.linalg.norm(sleap_anchor[:, 1:3] - aruco_xy_arr, axis=1)
-            ranked = sorted((float(dist), int(sleap_anchor[i, 0])) for i, dist in enumerate(dists))
-            for dist, inst_id in ranked:
+            candidates: List[Tuple[float, int]] = []
+            for i, dist in enumerate(dists):
                 if dist > float(aruco_sleap_max_distance):
-                    return None
+                    continue
+                inst_id = int(sleap_anchor[i, 0])
                 if inst_id in used_inst:
                     continue
                 candidate_tag_id = inst_aruco_id.get(inst_id)
                 if candidate_tag_id is not None and candidate_tag_id != int(tid):
                     continue
-                return (dist, inst_id)
-            return None
+                candidates.append((float(dist), inst_id))
+            return _select_sleap_candidate(candidates)
 
         # ---------------- update existing tracks
         if frame_idx > start_frame:
@@ -728,8 +772,9 @@ def get_complete_tracks(
 
             # ArUco identity is primary. When the same tag is detected in
             # overlapping cameras, choose the duplicate closest to the previous
-            # tracked ArUco position first, then attach the nearest compatible
-            # SLEAP instance to that selected tag.
+            # tracked ArUco position first, then attach the best compatible
+            # SLEAP instance to that selected tag. At camera overlaps, "best"
+            # prefers the fuller skeleton over the closest cut-off skeleton.
             for tid, prev_nodes, age, _distance_limit, prev_track_xy, _prev_sleap_xy in prev_tracks:
                 if tid in frame_pos:
                     continue
@@ -826,8 +871,9 @@ def get_complete_tracks(
                     )
                     if candidate_dist <= distance_limit:
                         cands.append((candidate_dist, inst_id))
-                if cands:
-                    _, inst_id = min(cands, key=lambda x: x[0])
+                sleap_hit = _select_sleap_candidate(cands)
+                if sleap_hit is not None:
+                    _, inst_id = sleap_hit
                     _assign_sleap_instance(int(tid), inst_id)
 
             # Then bridge isolated SLEAP continuity only when ArUco identity is
@@ -902,14 +948,10 @@ def get_complete_tracks(
             if len(sleap_anchor) == 0:
                 continue
 
-            dists = np.linalg.norm(sleap_anchor[:, 1:3] - (ax, ay), axis=1)
-            j = int(np.argmin(dists))
-            if dists[j] > aruco_sleap_max_distance:
+            sleap_hit = _nearest_unused_sleap_to_aruco(tag_id, (float(ax), float(ay)))
+            if sleap_hit is None:
                 continue
-
-            inst_id = int(sleap_anchor[j, 0])
-            if inst_id in used_inst:
-                continue
+            _sleap_dist, inst_id = sleap_hit
 
             inst_df = s_df[s_instance_keys == inst_id]
             node_dict = {

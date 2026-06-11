@@ -32,6 +32,7 @@ CHUNK_KEY_RE = re.compile(r"^chunk(\d+)$")
 TS_KEY_RE = re.compile(r"^\d{8}-\d{6}$")
 TS_ANYWHERE_RE = re.compile(r"(\d{8}-\d{6})")  # first occurrence anywhere in stem
 CHUNK_TOKEN_IN_SUFFIX_RE = re.compile(r"(?:^|_)(chunk\d+)(?:_|$)")
+TRACK_ID_TOKEN_RE = re.compile(r"(?:^|_)TrackID_(\d+)(?:_|$)")
 DEFAULT_COLUMNS = [
     "Frame",
     "TrackID",
@@ -55,6 +56,17 @@ def safe_label(s: str) -> str:
     if not s:
         return "NO_SUFFIX"
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", s).strip("_") or "NO_SUFFIX"
+
+
+def track_id_from_group_suffix(group_suffix: str) -> Optional[int]:
+    m = TRACK_ID_TOKEN_RE.search(group_suffix)
+    if not m:
+        return None
+    return int(m.group(1))
+
+
+def stitched_parquet_path(per_track_dir: Path, tid: int, suffix_tag: str) -> Path:
+    return per_track_dir / f"TrackID_{int(tid):04d}_all_{suffix_tag}.parquet"
 
 
 @dataclass(frozen=True)
@@ -392,6 +404,16 @@ def stitch_group(
         return
 
     suffix_tag = safe_label(group_suffix)
+    if skip_existing and track_ids_filter is not None:
+        remaining_track_ids = {
+            int(tid)
+            for tid in track_ids_filter
+            if not stitched_parquet_path(per_track_dir, int(tid), suffix_tag).exists()
+        }
+        if not remaining_track_ids:
+            print(f"Skipping existing stitch output for {suffix_tag}", flush=True)
+            return
+        track_ids_filter = remaining_track_ids
 
     # ---- precompute start times and reference start time (per group)
     start_dt_by_fp: Dict[Path, Optional[datetime]] = {
@@ -464,24 +486,11 @@ def stitch_group(
 
     # ---- write outputs (ALL into one directory), one TrackID at a time.
     for tid in tqdm(sorted(track_ids), desc=f"Tracks [{suffix_tag}]", unit="track", leave=False):
-        out_path = per_track_dir / f"TrackID_{tid:04d}_all_{suffix_tag}.parquet"
+        out_path = stitched_parquet_path(per_track_dir, tid, suffix_tag)
         target_dir = png_dir if png_dir is not None else (per_track_dir.parent / "track_pngs")
         png_path = target_dir / f"TrackID_{tid:04d}_all_{suffix_tag}.png"
 
         if skip_existing and out_path.exists():
-            if not write_track_pngs or png_path.exists():
-                continue
-            out = pd.read_parquet(out_path, engine=engine)
-            write_track_png(
-                out,
-                png_path,
-                title=f"TrackID {tid:04d} {suffix_tag}",
-                frame_col=frame_col,
-                x_col=x_col,
-                y_col=y_col,
-                width=png_width,
-                height=png_height,
-            )
             continue
 
         parts: List[pd.DataFrame] = []
@@ -593,6 +602,27 @@ def main(
         pn = parse_parquet_name(fp)
         parsed[fp] = pn
         groups.setdefault(pn.group_suffix, []).append(fp)
+
+    if track_ids_filter is not None:
+        original_group_count = len(groups)
+        encoded_group_track_ids = {
+            group_suffix: track_id_from_group_suffix(group_suffix)
+            for group_suffix in groups
+        }
+        if any(tid is not None for tid in encoded_group_track_ids.values()):
+            groups = {
+                group_suffix: fps_list
+                for group_suffix, fps_list in groups.items()
+                if encoded_group_track_ids[group_suffix] in track_ids_filter
+            }
+            print(
+                "TrackID filter "
+                f"{sorted(track_ids_filter)} kept {len(groups)}/{original_group_count} encoded groups",
+                flush=True,
+            )
+            if not groups:
+                print("No input groups match requested TrackID filter", flush=True)
+                return
 
     for group_suffix, fps_list in groups.items():
         fps_sorted = sorted(fps_list, key=lambda p: iter_key_sort_value(parsed[p].iter_key))
