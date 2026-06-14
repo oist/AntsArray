@@ -202,6 +202,8 @@ def main():
 	                help="parallel probe workers (sidecar reads are cheap; default 8)")
 	ap.add_argument("--sidecar-only", action="store_true",
 	                help="error out instead of running ffprobe when sidecar is missing")
+	ap.add_argument("--no-probe", action="store_true",
+	                help="Skip sidecar/ffprobe entirely; emit source_path only (for --only-backup). fps/frame_count left 0.")
 	args = ap.parse_args()
 
 	if not args.dir.is_dir():
@@ -234,6 +236,27 @@ def main():
 		log("[ERR] no grid videos found under %s" % args.dir)
 		with args.out.open("w", newline="") as f:
 			f.write("vname,source_path,ext,fps,frame_count,duration_sec,n_chunks\n")
+		return 0
+
+	if args.no_probe:
+		# --only-backup needs only source_path; skip the slow sidecar/ffprobe probe.
+		rows = [{
+			"vname": v.stem,
+			"source_path": str(v.resolve()),
+			"ext": v.suffix.lstrip("."),
+			"fps": "0.000",
+			"frame_count": 0,
+			"duration_sec": "0.0",
+			"n_chunks": 0,
+		} for v in candidates]
+		with args.out.open("w", newline="") as f:
+			w = csv.DictWriter(f, fieldnames=[
+				"vname", "source_path", "ext", "fps",
+				"frame_count", "duration_sec", "n_chunks",
+			])
+			w.writeheader()
+			w.writerows(rows)
+		log("[INFO] --no-probe: listed %d grid videos (no fps/frames) -> %s" % (len(rows), args.out))
 		return 0
 
 	log("[INFO] scanning %d videos with %d workers (sidecar=truth, ffprobe=fallback)" %

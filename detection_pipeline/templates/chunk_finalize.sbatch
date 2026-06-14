@@ -44,6 +44,17 @@ echo "[INFO] worklist=$N chunks, batch_size=$BATCH_SIZE -> array 0-$UPPER ($ARRA
 JID_ARUCO=""
 JID_ARUCO_DC=""
 JID_BRIDGE=""
+JID_BACKUP=""
+
+# --- Bucket Backup branch ---
+if (( RUN_BACKUP == 1 )); then
+	echo "[INFO] sbatch backup (single job, stable archive: $BACKUP_ARCHIVE_PATH)"
+	JID_BACKUP=$(sbatch --parsable \
+		--partition="$BACKUP_PARTITION" \
+		"$JOBS_ROOT/backup.sbatch")
+	echo "  backup        $JID_BACKUP"
+	echo "$JID_BACKUP" > "$JOBS_ROOT/jid_backup.txt"
+fi
 
 # --- ArUco branch ---
 if (( ONLY_SLEAP != 1 )); then

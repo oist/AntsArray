@@ -1,8 +1,8 @@
 #!/bin/bash -l
 #SBATCH -t 0-12
-#SBATCH -c 4
+#SBATCH -c 16
 #SBATCH --partition=compute
-#SBATCH --mem=8G
+#SBATCH --mem=24G
 #SBATCH -J aruco
 #SBATCH -o __JOBS_ROOT__/aruco_%A_%a.out
 #SBATCH -e __JOBS_ROOT__/aruco_%A_%a.err
@@ -16,7 +16,7 @@ source "$LIB_DIR/perms.sh"
 
 module load opencv/4.9.0
 
-ARUCO_SCRIPT="${ARUCO_SCRIPT:-$HOME/run_aruco.py}"
+ARUCO_SCRIPT="${ARUCO_SCRIPT:-$SCRIPTS_DIR/run_aruco_mp.py}"
 [[ -f "$ARUCO_SCRIPT" ]] || { echo "[ERR] missing $ARUCO_SCRIPT" >&2; exit 2; }
 
 WORKLIST="$JOBS_ROOT/aruco_worklist.txt"
@@ -34,6 +34,7 @@ for (( row_idx=start_idx; row_idx<end_idx; row_idx++ )); do
 	[[ -n "$row" ]] || break  # ran off the end of the worklist
 	vname=$(printf '%s' "$row" | cut -f1)
 	chunk=$(printf '%s' "$row" | cut -f2)
+	nframes=$(printf '%s' "$row" | cut -f3)   # expected_frames; balances MP frame ranges
 
 	flash_dir="$FLASH_ROOT/$vname"
 	aruco_dir="$FLASH_ROOT/aruco/$vname"
@@ -76,10 +77,15 @@ for (( row_idx=start_idx; row_idx<end_idx; row_idx++ )); do
 	fi
 
 	echo "[$(date)] aruco on ${vname}_${chunk} (dict: $ARUCO_DICT_PATH)"
+	# run_aruco_mp.py takes --n-frames (worklist col 3) to balance its parallel
+	# frame ranges; the serial run_aruco.py does not, so only pass it for the MP script.
+	nframes_args=()
+	[[ "$ARUCO_SCRIPT" == *run_aruco_mp.py ]] && nframes_args=(--n-frames "${nframes:-0}")
 	python3 "$ARUCO_SCRIPT" \
 		--video-file "$chunk_file" \
 		--output-path "$aruco_dir/" \
 		--custom-dict "$ARUCO_DICT_PATH" \
+		"${nframes_args[@]}" \
 		--output-format h5 \
 		"${aruco_extra_args[@]}"
 
