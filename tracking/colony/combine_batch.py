@@ -96,6 +96,14 @@ def filter_jobs_by_chunks(jobs: list[ChunkJob], chunks: set[str] | None) -> list
     ]
 
 
+def output_file_for_job(output_path: Path, job: ChunkJob) -> Path:
+    return output_path / f"{job.key}_{job.side}.parquet"
+
+
+def filter_existing_outputs(jobs: list[ChunkJob], output_path: Path) -> list[ChunkJob]:
+    return [job for job in jobs if not output_file_for_job(output_path, job).exists()]
+
+
 def run_local(
     jobs: list[ChunkJob],
     output_path: Path,
@@ -134,6 +142,7 @@ def submit_slurm(
     conda_env: str,
     conda_bin: str,
     python_bin: str | None = None,
+    sbatch_bin: str = "sbatch",
     max_distance: float = 100.0,
     lost_track_max_frames: int = 120,
     lost_track_max_distance: float | None = None,
@@ -194,7 +203,7 @@ def submit_slurm(
         )
         sbatch_script.chmod(0o755)
         result = subprocess.run(
-            ["sbatch", "--parsable", str(sbatch_script)],
+            [sbatch_bin, "--parsable", str(sbatch_script)],
             check=True,
             text=True,
             capture_output=True,
@@ -233,6 +242,7 @@ def main() -> None:
     parser.add_argument("--conda_env", default="aruco_env")
     parser.add_argument("--conda_bin", default="conda")
     parser.add_argument("--python_bin", default=None, help="Python executable to use inside submitted chunk jobs.")
+    parser.add_argument("--sbatch_bin", default="sbatch")
     parser.add_argument("--job_ids_file", type=Path, default=None, help="Write submitted SLURM job IDs here.")
     parser.add_argument("--max_distance", type=float, default=100.0)
     parser.add_argument("--lost_track_max_frames", type=int, default=120)
@@ -253,7 +263,19 @@ def main() -> None:
     if not jobs:
         raise RuntimeError(f"No complete ArUco/SLEAP chunk jobs found in {args.input_folder}")
 
+    total_jobs = len(jobs)
+    if args.skip_existing:
+        jobs = filter_existing_outputs(jobs, args.output_path)
+        logging.info("Skipping %d existing chunk outputs", total_jobs - len(jobs))
+
     logging.info("Prepared %d chunk-side jobs", len(jobs))
+    if not jobs:
+        logging.info("No chunk tracking jobs to run; all discovered outputs already exist.")
+        if args.job_ids_file is not None:
+            args.job_ids_file.parent.mkdir(parents=True, exist_ok=True)
+            args.job_ids_file.write_text("", encoding="utf-8")
+        return
+
     if args.runner == "local":
         run_local(
             jobs,
@@ -277,6 +299,7 @@ def main() -> None:
             conda_env=args.conda_env,
             conda_bin=args.conda_bin,
             python_bin=args.python_bin,
+            sbatch_bin=args.sbatch_bin,
             max_distance=args.max_distance,
             lost_track_max_frames=args.lost_track_max_frames,
             lost_track_max_distance=args.lost_track_max_distance,
