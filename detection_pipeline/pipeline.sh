@@ -226,6 +226,7 @@ ENV_FILE="$JOBS_ROOT/pipeline.env"
 
 mkdir -p "$JOBS_ROOT" "$FLASH_ROOT" "$DATA_DIR" "$HPC_LOGS_DIR"
 source "$LIB_DIR/perms.sh"
+source "$LIB_DIR/hosts.sh"   # sbatch_retry: survive transient slurmctld socket timeouts
 ensure_group_perms "$JOBS_ROOT" "$FLASH_ROOT" "$DATA_DIR" "$HPC_LOGS_DIR"
 # Preflight: warn (don't fail) if the experiment dir isn't group-shared. It may
 # hold other users' files we can't chgrp, so this is advisory only.
@@ -300,7 +301,7 @@ done
 # --only-backup: build manifest + submit ONLY the raw-video backup job.
 if (( ONLY_BACKUP )); then
 	(( RUN_BACKUP == 1 )) || { echo "[ERR] --only-backup conflicts with --no-backup" >&2; exit 2; }
-	JID_BACKUP=$(sbatch --parsable --partition="$BACKUP_PARTITION" "$JOBS_ROOT/backup.sbatch")
+	JID_BACKUP=$(sbatch_retry backup --partition="$BACKUP_PARTITION" "$JOBS_ROOT/backup.sbatch")
 	echo "  backup        $JID_BACKUP"
 	echo "$JID_BACKUP" > "$JOBS_ROOT/jid_backup.txt"
 	echo "[INFO] --only-backup: submitted backup job only -> ${BACKUP_ARCHIVE_PATH:-(disabled)}"
@@ -310,7 +311,7 @@ fi
 # Submit chunk array
 CHUNK_UPPER=$(( N_VIDEOS - 1 ))
 echo "[INFO] sbatch chunk_array=0-${CHUNK_UPPER}"
-JID_CHUNK=$(sbatch --parsable --array=0-${CHUNK_UPPER} "$JOBS_ROOT/chunk.sbatch")
+JID_CHUNK=$(sbatch_retry chunk --array=0-${CHUNK_UPPER} "$JOBS_ROOT/chunk.sbatch")
 echo "  chunk         $JID_CHUNK"
 echo "$JID_CHUNK" > "$JOBS_ROOT/jid_chunk.txt"
 
@@ -320,7 +321,7 @@ if (( ONLY_CHUNK )); then
 fi
 
 # Submit chunk_finalize (builds worklist + submits aruco / bridge / cleanup)
-JID_CHUNK_FIN=$(sbatch --parsable --dependency=afterok:$JID_CHUNK "$JOBS_ROOT/chunk_finalize.sbatch")
+JID_CHUNK_FIN=$(sbatch_retry chunk_fin --dependency=afterok:$JID_CHUNK "$JOBS_ROOT/chunk_finalize.sbatch")
 echo "  chunk_finalize $JID_CHUNK_FIN (dep: $JID_CHUNK)"
 echo "$JID_CHUNK_FIN" > "$JOBS_ROOT/jid_chunk_fin.txt"
 
