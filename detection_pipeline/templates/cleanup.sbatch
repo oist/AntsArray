@@ -1,5 +1,6 @@
 #!/bin/bash -l
-#SBATCH -t 0-6
+# short assoc caps wall at 2h; -t 0-6 was rejected (AssocMaxWallDurationPerJobLimit).
+#SBATCH -t 0-2
 #SBATCH -c 1
 #SBATCH --partition=short
 #SBATCH --mem=2G
@@ -38,7 +39,7 @@ archive_deigo_logs || true
 # visible on the /saion_work read-only mount.
 WORKLIST="$JOBS_ROOT/aruco_worklist.txt"
 SAION_INPUT_DIR="/saion_work/ReiterU/$USER/$EXP_NAME/input"
-CHUNK_COPY_TIMEOUT="${CHUNK_COPY_TIMEOUT:-${SLEAP_TIMEOUT:-21600}}"   # 6h default
+CHUNK_COPY_TIMEOUT="${CHUNK_COPY_TIMEOUT:-${SLEAP_TIMEOUT:-5400}}"   # 1.5h: stays within the short 2h walltime (leaves margin for archive+rm)
 POLL_SECS="${CLEANUP_POLL_SECS:-300}"     # check every 5 min
 
 if [[ ! -f "$WORKLIST" ]]; then
