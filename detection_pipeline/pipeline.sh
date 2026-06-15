@@ -39,6 +39,7 @@ SLEAP runtime:
   --skip-trt-export                 Use 'sleap-nn track' fallback (raw model dirs)
   --saion-partition NAME            default: largegpu
   --sleap-module NAME               saion module name. default: sleap-nn/0.2.0
+  --sleap-batch-size N              TRT inference batch; must be <= engine max profile batch. default: 8
 
 Concurrency:
   --aruco-concurrency N             default: 16
@@ -97,6 +98,11 @@ SLEAP_RUNTIME=tensorrt
 SKIP_TRT_EXPORT=0
 SAION_PARTITION=largegpu
 SLEAP_MODULE="sleap-nn/0.2.0"
+# TRT per-frame inference batch. Must be <= the exported engine's max optimization
+# profile batch. Full-res Simple_skeleton engines max out at 8 (batch>=16 fails to
+# build with a Myelin int32 overflow), so 8 is the safe default; raise only if the
+# engine was exported with a larger max batch.
+SLEAP_BATCH_SIZE=8
 ARUCO_CONCURRENCY=400   # under deigo compute cap (cpu=2000/4=500); leaves ~20% headroom
 SLEAP_CONCURRENCY=8     # bounded by saion largegpu having only 4 A100 nodes anyway
 DATACP_CONCURRENCY=4
@@ -129,6 +135,7 @@ while [[ $# -gt 0 ]]; do
 		--skip-trt-export) SKIP_TRT_EXPORT=1; shift ;;
 		--saion-partition) SAION_PARTITION="$2"; shift 2 ;;
 		--sleap-module) SLEAP_MODULE="$2"; shift 2 ;;
+		--sleap-batch-size) SLEAP_BATCH_SIZE="$2"; shift 2 ;;
 		--aruco-concurrency) ARUCO_CONCURRENCY="$2"; shift 2 ;;
 		--sleap-concurrency) SLEAP_CONCURRENCY="$2"; shift 2 ;;
 		--datacp-concurrency) DATACP_CONCURRENCY="$2"; shift 2 ;;
@@ -250,6 +257,7 @@ export MAX_ARRAY_TASKS="$MAX_ARRAY_TASKS"
 export OUTPUT_GROUP="$OUTPUT_GROUP"
 export SAION_PARTITION="$SAION_PARTITION"
 export SLEAP_MODULE="$SLEAP_MODULE"
+export SLEAP_BATCH_SIZE="$SLEAP_BATCH_SIZE"
 export SLEAP_MODEL_CENTROID="$SLEAP_MODEL_CENTROID"
 export SLEAP_MODEL_INSTANCE="$SLEAP_MODEL_INSTANCE"
 export SLEAP_RUNTIME="$SLEAP_RUNTIME"

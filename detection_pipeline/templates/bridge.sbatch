@@ -113,7 +113,7 @@ ARRAY_COUNT=$(( (N + BS - 1) / BS ))
 UPPER=$(( ARRAY_COUNT - 1 ))
 
 echo "[INFO] sbatch on saion: sleap_predict_array 0-$UPPER%$SLEAP_CONCURRENCY"
-JID_SLEAP=$(ssh_retry saion "sbatch --parsable --export=ALL,SLEAP_BATCH_SIZE=${SLEAP_BATCH_SIZE:-16} --array=0-${UPPER}%${SLEAP_CONCURRENCY} '$REMOTE_JOBS/sleap_predict_array.sh'")
+JID_SLEAP=$(ssh_retry saion "sbatch --parsable --export=ALL,SLEAP_BATCH_SIZE=${SLEAP_BATCH_SIZE:-8} --array=0-${UPPER}%${SLEAP_CONCURRENCY} '$REMOTE_JOBS/sleap_predict_array.sh'")
 echo "  saion sleap         $JID_SLEAP"
 echo "$JID_SLEAP" > "$JOBS_ROOT/jid_saion_sleap.txt"
 

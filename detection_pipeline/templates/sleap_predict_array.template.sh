@@ -32,7 +32,7 @@ SKIP_TRT_EXPORT=__SKIP_TRT_EXPORT__
 DEIGO_FLASH_SAION_PREFIX="__DEIGO_FLASH_SAION_PREFIX__"   # /deigo_flash/.../<exp> mount on saion
 DATA_DIR="__DATA_DIR__"                      # bucket path; reached via "saion" alias (login has write)
 OUTPUT_GROUP="__OUTPUT_GROUP__"              # group owner for shared bucket outputs
-SLEAP_BATCH_SIZE="${SLEAP_BATCH_SIZE:-16}"   # per-frame inference batch (engine max from export)
+SLEAP_BATCH_SIZE="${SLEAP_BATCH_SIZE:-8}"   # per-frame inference batch (must be <= engine max profile batch)
 BATCH_SIZE=__BATCH_SIZE__                    # chunks per array task
 SCRIPTS_DIR="__SCRIPTS_DIR__"                # pipeline scripts dir (sleap2h5.py, sleap2csv.py)
 
