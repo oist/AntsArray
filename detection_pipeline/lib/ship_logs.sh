@@ -70,6 +70,11 @@ log_stream_start() {
 		done
 	) &
 	_LS_PID=$!
+	# Detach the shipper from the job table so a bare `wait` at the end of the task
+	# script (e.g. sleap_predict_array's wait for background uploads) does NOT block
+	# on this infinite loop. The EXIT trap still kills it by PID. Without this the
+	# task hangs after inference until walltime, wedging the GPU and the %N array cap.
+	disown "$_LS_PID" 2>/dev/null || true
 	return 0
 }
 
