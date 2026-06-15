@@ -282,6 +282,49 @@ and copy them into local `/work` at task start; no bulk deigo→saion rsync is
 needed. `cleanup.sbatch` polls bucket for final SLEAP outputs before deleting
 `/flash` — if outputs are missing, it exits non-zero and preserves the data.
 
+## Run logs (`hpc_logs/`) — survive mid-run failures
+
+Job logs used to live only on scratch (`/work` on saion, `/flash` on deigo) and were
+destroyed by cleanup — saion's `rm -rf "$REMOTE_ROOT"` deletes the `jobs/` dir that
+holds the sleap `.out`/`.err`. So a walltime kill, node failure, mass `scancel`, or
+maintenance drain left nothing to diagnose. The pipeline now captures logs to bucket
+under `<exp>/hpc_logs/` in four layers (defense in depth):
+
+```
+<exp>/hpc_logs/
+  sleap/     sleap_<A>_<a>.out|.err|.status, sacct_sleap_<jid>.tsv   (saion)
+  aruco/     aruco_<A>_<a>.out|.err|.status, sacct_aruco_<jid>.tsv   (deigo)
+  pipeline/  chunk_*, bridge_*, aruco_datacp_*, cleanup_*, manifest.csv, pipeline.env
+```
+
+- **Layer 1 — live streaming** (`lib/ship_logs.sh`): each array task ships its own
+  Slurm `.out`/`.err` to bucket every `LOG_SHIP_INTERVAL` (default 300s, ship-only-on-change,
+  per-task jitter) and on a `TERM`/`EXIT` trap. `#SBATCH --signal=TERM@60` makes Slurm
+  deliver SIGTERM ~60s before the walltime SIGKILL, so the final lines + a `.status`
+  marker (`reason=signal …`) reach bucket *before* the task dies. This does not depend
+  on any downstream job running.
+- **Layer 2 — `sacct` post-mortem**: authoritative `State/ExitCode/Reason/Elapsed/MaxRSS`
+  from slurmdbd (survives the scratch wipe). sleap sacct is taken in `saion_cleanup`
+  (after the array is terminal); aruco sacct in deigo `cleanup`.
+- **Layer 3 — archive-before-delete**: `saion_cleanup` and deigo `cleanup` rsync all
+  task logs to bucket *before* any `rm`/scratch reclamation (idempotent safety net).
+- **Layer 4 — fps line**: each sleap chunk prints `[FPS] <chunk> frames=N elapsed=Ns fps=F`,
+  giving a durable, greppable throughput history for the TRT path.
+
+Compute nodes cannot write `/bucket`; every ship rsyncs over SSH to the cluster login
+alias (`deigo:` / `saion:`), the same mechanism the `.slp`/`.h5` uploads use. Payloads
+are KB–MB text, so node load is negligible; the only real cost is SSH connections,
+kept low by the coarse interval, change-gating, and jitter (and `rsync_retry` backoff
+for the documented `kex_exchange_identification` resets).
+
+Quick triage after a failed/odd run:
+
+```bash
+grep -h '^\[FPS\]' /bucket/.../<exp>/hpc_logs/sleap/*.out | sort   # throughput per chunk
+cat /bucket/.../<exp>/hpc_logs/sleap/*.status                       # which tasks died and why
+column -t -s'|' /bucket/.../<exp>/hpc_logs/sleap/sacct_sleap_*.tsv  # TIMEOUT/OOM/NODE_FAIL/CANCELLED
+```
+
 ## Open verifications (before relying on this for new experiments)
 
 - Sidecar JSON field names from pylonrecorder2 ([VIDEO_AI_HANDOFF.md](../../PylonRecorder2/docs/VIDEO_AI_HANDOFF.md)) — `manifest.py` accepts `fps`/`framerate`/`FPS` and `frames_encoded`/`frame_count`/`frames`/`frames_emitted`. Run the manifest builder once on a real recording dir and check the warnings.
