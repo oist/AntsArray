@@ -227,6 +227,13 @@ def main():
 		if v.stem.endswith(("_renc", "_nvenc")):
 			log("[SKIP] %s (re-encoded artifact)" % name)
 			continue
+		# Skip broken symlinks / non-regular files: is_file() follows the link and
+		# returns False for a dangling target. Without this, dead links (e.g. a
+		# cross-block symlink whose target dir does not exist) are ingested as
+		# 0-frame "grid videos", which then fail chunking and wedge the afterok DAG.
+		if not v.is_file():
+			log("[SKIP] %s (broken symlink or not a regular file)" % name)
+			continue
 		candidates.append(v)
 
 	n = len(candidates)
