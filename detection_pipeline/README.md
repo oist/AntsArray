@@ -120,7 +120,7 @@ defaults:
 | `--skip-trt-export`    | off                | fall back to `sleap-nn track` (raw model dirs, no export)                                           |
 | `--saion-partition`    | `largegpu`       | A100 SM80                                                                                             |
 | `--sleap-module`       | `sleap-nn/0.2.0` | saion module to `module load` for predict tasks                                                     |
-| `--aruco-concurrency`  | `16`             | array `%N` cap                                                                                      |
+| `--aruco-concurrency`  | `100`            | array `%N` cap; compute cpu cap 2000 / `-c 16` ≈ 125 max                                             |
 | `--sleap-concurrency`  | `8`              | array `%N` cap                                                                                      |
 | `--datacp-concurrency` | `4`              | array `%N` cap (deigo has 4 mover nodes)                                                            |
 | `--group`              | `reiteruni`      | group owner for shared outputs; created dirs are chgrp'd and setgid where permitted                 |
@@ -210,7 +210,7 @@ Per-user association limits as of 2026-05-20:
 
 Practical implications:
 
-- aruco_array at `-c 4 --mem=8G` per task → ceiling is `2000/4 = 500` concurrent tasks (cpu-bound). Default `ARUCO_CONCURRENCY=128` leaves headroom for other work; bump to ~400 if running standalone.
+- aruco_array at `-c 16 --mem=24G` per task → ceiling is `2000/16 ≈ 125` concurrent tasks (cpu-bound). Default `ARUCO_CONCURRENCY=100` uses ~1600 cpu and leaves headroom for the bridge (also on `compute`); raise toward ~125 only if running standalone — higher just queues `AssocGrpCpuLimit`.
 - Bridge must use `compute` (rsync to saion can take hours; 2 h cap on `short` is fatal).
 - Anything multiplicative — never submit per-chunk arrays on `datacp` (20-job cap is trivial to blow). Use single jobs.
 

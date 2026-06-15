@@ -103,7 +103,7 @@ SLEAP_MODULE="sleap-nn/0.2.0"
 # build with a Myelin int32 overflow), so 8 is the safe default; raise only if the
 # engine was exported with a larger max batch.
 SLEAP_BATCH_SIZE=8
-ARUCO_CONCURRENCY=400   # under deigo compute cap (cpu=2000/4=500); leaves ~20% headroom
+ARUCO_CONCURRENCY=100   # compute assoc cap=2000 cpu; at -c 16 that's ~125 concurrent max, so 100 leaves headroom for the bridge (also on compute)
 SLEAP_CONCURRENCY=8     # bounded by saion largegpu having only 4 A100 nodes anyway
 DATACP_CONCURRENCY=4
 BATCH_SIZE=1         # default: one chunk per array task (set "" to auto-size under MAX_ARRAY_TASKS)
