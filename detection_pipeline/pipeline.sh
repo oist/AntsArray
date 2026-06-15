@@ -214,11 +214,12 @@ JOBS_ROOT="${JOBS_ROOT:-/flash/ReiterU/$USER/jobs/$EXP_NAME}"
 FLASH_ROOT="${FLASH_ROOT:-/flash/ReiterU/$USER/$EXP_NAME}"
 SAION_WORK_ROOT="/work/ReiterU/$USER/$EXP_NAME"
 DATA_DIR="$DIR/data"
+HPC_LOGS_DIR="$DIR/hpc_logs"
 ENV_FILE="$JOBS_ROOT/pipeline.env"
 
-mkdir -p "$JOBS_ROOT" "$FLASH_ROOT" "$DATA_DIR"
+mkdir -p "$JOBS_ROOT" "$FLASH_ROOT" "$DATA_DIR" "$HPC_LOGS_DIR"
 source "$LIB_DIR/perms.sh"
-ensure_group_perms "$JOBS_ROOT" "$FLASH_ROOT" "$DATA_DIR"
+ensure_group_perms "$JOBS_ROOT" "$FLASH_ROOT" "$DATA_DIR" "$HPC_LOGS_DIR"
 # Preflight: warn (don't fail) if the experiment dir isn't group-shared. It may
 # hold other users' files we can't chgrp, so this is advisory only.
 check_group_perms "$DIR" || true
@@ -228,6 +229,8 @@ cat > "$ENV_FILE" <<EOF
 export EXP_NAME="$EXP_NAME"
 export EXP_DIR="$DIR"
 export DATA_DIR="$DATA_DIR"
+export HPC_LOGS_DIR="$HPC_LOGS_DIR"
+export LOG_SHIP_INTERVAL="${LOG_SHIP_INTERVAL:-300}"
 export FLASH_ROOT="$FLASH_ROOT"
 export JOBS_ROOT="$JOBS_ROOT"
 export ENV_FILE="$ENV_FILE"

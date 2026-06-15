@@ -10,6 +10,27 @@ set -eo pipefail
 
 JOBS_ROOT="__JOBS_ROOT__"
 source "$JOBS_ROOT/pipeline.env"
+source "$LIB_DIR/hosts.sh"
+
+# Layers 2+3 (deigo side): persist deigo job logs + the aruco sacct post-mortem to
+# bucket before ANY scratch reclamation. Runs first so even the timeout-keep path
+# below still archives. aruco/bridge are terminal by now (cleanup deps afterany on
+# both). Compute can't write /bucket -> rsync via the deigo login alias.
+archive_deigo_logs() {
+	if [[ -f "$JOBS_ROOT/jid_aruco.txt" ]]; then
+		local ja; ja=$(cat "$JOBS_ROOT/jid_aruco.txt")
+		sacct -j "$ja" \
+			--format=JobID,JobName,State,ExitCode,DerivedExitCode,Elapsed,Timelimit,MaxRSS,ReqMem,NodeList,Start,End,Reason%60 \
+			-P > "$JOBS_ROOT/sacct_aruco_$ja.tsv" 2>/dev/null || echo "[WARN] aruco sacct failed"
+	fi
+	shopt -s nullglob
+	ssh_retry deigo "mkdir -p '$HPC_LOGS_DIR/aruco' '$HPC_LOGS_DIR/pipeline' && { chgrp $OUTPUT_GROUP '$HPC_LOGS_DIR/aruco' '$HPC_LOGS_DIR/pipeline' 2>/dev/null; chmod 2775 '$HPC_LOGS_DIR/aruco' '$HPC_LOGS_DIR/pipeline' 2>/dev/null; true; }" || true
+	local aruco_logs=( "$JOBS_ROOT"/aruco_*.out "$JOBS_ROOT"/aruco_*.err "$JOBS_ROOT"/aruco_*.status "$JOBS_ROOT"/sacct_aruco_*.tsv )
+	(( ${#aruco_logs[@]} )) && { rsync_retry -ah --chmod=Du=rwx,Dg=rwx,Fu=rw,Fg=rw --chown=:"$OUTPUT_GROUP" "${aruco_logs[@]}" "deigo:$HPC_LOGS_DIR/aruco/" || echo "[WARN] aruco log archive failed; streamed copies remain"; }
+	local ctl_logs=( "$JOBS_ROOT"/chunk_*.out "$JOBS_ROOT"/chunk_*.err "$JOBS_ROOT"/bridge_*.out "$JOBS_ROOT"/bridge_*.err "$JOBS_ROOT"/aruco_datacp_*.out "$JOBS_ROOT"/cleanup_*.out "$JOBS_ROOT"/manifest.csv "$JOBS_ROOT"/aruco_worklist.txt "$JOBS_ROOT"/pipeline.env )
+	(( ${#ctl_logs[@]} )) && { rsync_retry -ah --chmod=Du=rwx,Dg=rwx,Fu=rw,Fg=rw --chown=:"$OUTPUT_GROUP" "${ctl_logs[@]}" "deigo:$HPC_LOGS_DIR/pipeline/" || echo "[WARN] pipeline log archive failed"; }
+}
+archive_deigo_logs || true
 
 # /flash only needs to outlive the chunk-copy to saion, NOT saion's sleap
 # inference. Saion holds its own /work copies once self-fetch (or bridge rsync)

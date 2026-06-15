@@ -81,6 +81,8 @@ sed -e "s#__REMOTE_JOBS__#$REMOTE_JOBS#g" \
     -e "s#__DATA_DIR__#$DATA_DIR#g" \
     -e "s#__OUTPUT_GROUP__#$OUTPUT_GROUP#g" \
     -e "s#__HOSTS_LIB__#$LIB_DIR/hosts.sh#g" \
+    -e "s#__SHIP_LIB__#$LIB_DIR/ship_logs.sh#g" \
+    -e "s#__HPC_LOGS_DIR__#$HPC_LOGS_DIR#g" \
     -e "s#__SCRIPTS_DIR__#$SCRIPTS_DIR#g" \
     "$TEMPLATES_DIR/sleap_predict_array.template.sh" > "$RENDERED_PREDICT"
 
@@ -130,6 +132,26 @@ ssh_retry saion "cat > '$REMOTE_JOBS/saion_cleanup.sh'" <<CLEAN
 #SBATCH -o $REMOTE_JOBS/saion_cleanup_%j.out
 #SBATCH -e $REMOTE_JOBS/saion_cleanup_%j.err
 set -eo pipefail
+shopt -s nullglob
+source "$LIB_DIR/hosts.sh"
+
+# Layer 2: authoritative post-mortem from slurmdbd. Runs on saion where the sleap
+# array ran (after it is terminal), so sacct has final State/ExitCode/Reason even
+# when /work is about to be wiped. The deigo cleanup runs too early for this (it
+# fires right after bridge exits), which is why the sleap sacct lives here.
+sacct -j $JID_SLEAP \
+	--format=JobID,JobName,State,ExitCode,DerivedExitCode,Elapsed,Timelimit,MaxRSS,ReqMem,NodeList,Start,End,Reason%60 \
+	-P > "$REMOTE_JOBS/sacct_sleap_$JID_SLEAP.tsv" 2>/dev/null || echo "[WARN] sacct failed"
+
+# Layer 3: archive every sleap task log to bucket BEFORE deleting the scratch tree.
+# Compute can't write /bucket, so rsync via the saion login alias (has bucket write).
+ssh_retry saion "mkdir -p '$HPC_LOGS_DIR/sleap' && { chgrp $OUTPUT_GROUP '$HPC_LOGS_DIR/sleap' 2>/dev/null; chmod 2775 '$HPC_LOGS_DIR/sleap' 2>/dev/null; true; }" || true
+logs=( $REMOTE_JOBS/sleap_*.out $REMOTE_JOBS/sleap_*.err $REMOTE_JOBS/sleap_*.status $REMOTE_JOBS/sacct_sleap_*.tsv $REMOTE_JOBS/saion_cleanup_*.out )
+if (( \${#logs[@]} )); then
+	rsync_retry -ah --chmod=Du=rwx,Dg=rwx,Fu=rw,Fg=rw --chown=:$OUTPUT_GROUP \
+		"\${logs[@]}" "saion:$HPC_LOGS_DIR/sleap/" || echo "[WARN] log archive failed; streamed copies remain on bucket"
+fi
+
 echo "[INFO] removing $REMOTE_ROOT"
 rm -rf "$REMOTE_ROOT"
 CLEAN

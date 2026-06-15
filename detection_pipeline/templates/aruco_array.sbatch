@@ -6,6 +6,8 @@
 #SBATCH -J aruco
 #SBATCH -o __JOBS_ROOT__/aruco_%A_%a.out
 #SBATCH -e __JOBS_ROOT__/aruco_%A_%a.err
+# Deliver SIGTERM ~60s before the walltime SIGKILL so the log-stream trap can flush.
+#SBATCH --signal=TERM@60
 set -eo pipefail
 shopt -s nullglob
 
@@ -13,6 +15,17 @@ JOBS_ROOT="__JOBS_ROOT__"
 source "$JOBS_ROOT/pipeline.env"
 source "$LIB_DIR/hosts.sh"
 source "$LIB_DIR/perms.sh"
+source "$LIB_DIR/ship_logs.sh"
+
+# Layer 1: stream this task's Slurm log to bucket (via the deigo login, which has
+# bucket write -- compute nodes do not) while it runs, so a walltime/scancel/node
+# death still leaves a diagnosable log under hpc_logs/aruco/.
+_LA="${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID:-0}}"; _la="${SLURM_ARRAY_TASK_ID:-0}"
+log_stream_start "deigo" "$HPC_LOGS_DIR/aruco" \
+	"$JOBS_ROOT/aruco_${_LA}_${_la}.status" \
+	"$JOBS_ROOT/aruco_${_LA}_${_la}.out" \
+	"$JOBS_ROOT/aruco_${_LA}_${_la}.err"
+install_log_traps
 
 module load opencv/4.9.0
 
