@@ -263,7 +263,119 @@ The metadata includes `frame_min`, `frame_max`, `n_frames`, and `n_observed_fram
 
 ### Sleep Crop Label GUI
 
-The sleep label GUI works on small per-ant crop videos, not the original full camera videos. First export crop videos for a 10-minute window:
+The sleep label GUI works on small per-ant crop videos, not the original full camera videos. The intended workflow is:
+
+1. Export or receive crop videos around single tracked ants.
+2. Label sleep/wake by eye in `analysis/sleep_label_gui.py`.
+3. Use the saved label vectors as supervised training data for an automatic classifier.
+
+This is better than manually tuning antenna-angle thresholds. If antenna angles or other pose features are useful, the model can learn that from the labels.
+
+#### Fresh Setup For A Labeler
+
+These commands are written for someone who only needs to label attached crop videos. They do not need to install the full tracking pipeline.
+
+Open Terminal on macOS/Linux, or PowerShell on Windows. Copy and paste one code block at a time.
+
+Install `git` if it is not already installed:
+
+```bash
+# macOS
+xcode-select --install
+
+# Ubuntu/Linux
+sudo apt update
+sudo apt install -y git
+```
+
+```powershell
+# Windows PowerShell
+winget install --id Git.Git -e
+```
+
+Install `uv`, which will handle the Python environment:
+
+```bash
+# macOS/Linux
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+```powershell
+# Windows PowerShell
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
+Close and reopen Terminal/PowerShell after installing `git` or `uv`.
+
+Download the repository:
+
+```bash
+# macOS/Linux
+cd "$HOME/Desktop"
+git clone https://github.com/oist/AntsArray.git
+cd AntsArray
+git pull
+```
+
+```powershell
+# Windows PowerShell
+cd "$HOME\Desktop"
+git clone https://github.com/oist/AntsArray.git
+cd AntsArray
+git pull
+```
+
+Make a folder for the crop videos and put the attached `.mp4` files in it:
+
+```bash
+# macOS/Linux
+mkdir -p "$HOME/Desktop/ant_sleep_videos"
+```
+
+```powershell
+# Windows PowerShell
+mkdir "$HOME\Desktop\ant_sleep_videos"
+```
+
+Check that the GUI dependencies can be loaded:
+
+```bash
+uv run --no-project --with numpy --with pandas --with pyarrow --with opencv-python --with pillow python -c "import cv2, numpy, pandas, PIL, pyarrow; print('Setup OK')"
+```
+
+Run the GUI on a folder of crop videos:
+
+```bash
+# macOS/Linux, from inside the AntsArray folder
+uv run --no-project --with numpy --with pandas --with pyarrow --with opencv-python --with pillow python analysis/sleep_label_gui.py --video_dir "$HOME/Desktop/ant_sleep_videos"
+```
+
+```powershell
+# Windows PowerShell, from inside the AntsArray folder
+uv run --no-project --with numpy --with pandas --with pyarrow --with opencv-python --with pillow python analysis\sleep_label_gui.py --video_dir "$HOME\Desktop\ant_sleep_videos"
+```
+
+To update the GUI later:
+
+```bash
+# macOS/Linux
+cd "$HOME/Desktop/AntsArray"
+git pull
+```
+
+```powershell
+# Windows PowerShell
+cd "$HOME\Desktop\AntsArray"
+git pull
+```
+
+To run it again after setup, use the same GUI command. `uv` caches the packages, so later runs should start faster.
+
+When finished, send back the whole `label_vectors/` folder that appears next to the crop videos. Do not rename the videos after labeling, because label filenames are based on video filenames.
+
+#### Export Crop Videos Yourself
+
+If you have the full block data and need to make the crop videos first, export one small crop video per visible ant over a 10-minute window:
 
 ```bash
 /home/sam-reiter/miniforge3/envs/ants/bin/python analysis/export_sleep_crop_videos.py \
@@ -278,6 +390,8 @@ The crop exporter infers `tracks/` from the video block by default, maps track p
 ```text
 block02/stitched/sleep_crop_videos/
 ```
+
+#### Run The GUI
 
 Open a folder of crop videos in the Tk GUI:
 
