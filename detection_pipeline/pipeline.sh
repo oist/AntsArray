@@ -39,6 +39,7 @@ SLEAP runtime:
   --skip-trt-export                 Use 'sleap-nn track' fallback (raw model dirs)
   --saion-partition NAME            default: largegpu
   --sleap-module NAME               saion module name. default: sleap-nn/0.2.0
+  --sleap-batch-size N              TRT inference batch; must be <= engine max profile batch. default: 8
 
 Concurrency:
   --aruco-concurrency N             default: 16
@@ -97,7 +98,12 @@ SLEAP_RUNTIME=tensorrt
 SKIP_TRT_EXPORT=0
 SAION_PARTITION=largegpu
 SLEAP_MODULE="sleap-nn/0.2.0"
-ARUCO_CONCURRENCY=400   # under deigo compute cap (cpu=2000/4=500); leaves ~20% headroom
+# TRT per-frame inference batch. Must be <= the exported engine's max optimization
+# profile batch. Full-res Simple_skeleton engines max out at 8 (batch>=16 fails to
+# build with a Myelin int32 overflow), so 8 is the safe default; raise only if the
+# engine was exported with a larger max batch.
+SLEAP_BATCH_SIZE=8
+ARUCO_CONCURRENCY=100   # compute assoc cap=2000 cpu; at -c 16 that's ~125 concurrent max, so 100 leaves headroom for the bridge (also on compute)
 SLEAP_CONCURRENCY=8     # bounded by saion largegpu having only 4 A100 nodes anyway
 DATACP_CONCURRENCY=4
 BATCH_SIZE=1         # default: one chunk per array task (set "" to auto-size under MAX_ARRAY_TASKS)
@@ -129,6 +135,7 @@ while [[ $# -gt 0 ]]; do
 		--skip-trt-export) SKIP_TRT_EXPORT=1; shift ;;
 		--saion-partition) SAION_PARTITION="$2"; shift 2 ;;
 		--sleap-module) SLEAP_MODULE="$2"; shift 2 ;;
+		--sleap-batch-size) SLEAP_BATCH_SIZE="$2"; shift 2 ;;
 		--aruco-concurrency) ARUCO_CONCURRENCY="$2"; shift 2 ;;
 		--sleap-concurrency) SLEAP_CONCURRENCY="$2"; shift 2 ;;
 		--datacp-concurrency) DATACP_CONCURRENCY="$2"; shift 2 ;;
@@ -214,11 +221,13 @@ JOBS_ROOT="${JOBS_ROOT:-/flash/ReiterU/$USER/jobs/$EXP_NAME}"
 FLASH_ROOT="${FLASH_ROOT:-/flash/ReiterU/$USER/$EXP_NAME}"
 SAION_WORK_ROOT="/work/ReiterU/$USER/$EXP_NAME"
 DATA_DIR="$DIR/data"
+HPC_LOGS_DIR="$DIR/hpc_logs"
 ENV_FILE="$JOBS_ROOT/pipeline.env"
 
-mkdir -p "$JOBS_ROOT" "$FLASH_ROOT" "$DATA_DIR"
+mkdir -p "$JOBS_ROOT" "$FLASH_ROOT" "$DATA_DIR" "$HPC_LOGS_DIR"
 source "$LIB_DIR/perms.sh"
-ensure_group_perms "$JOBS_ROOT" "$FLASH_ROOT" "$DATA_DIR"
+source "$LIB_DIR/hosts.sh"   # sbatch_retry: survive transient slurmctld socket timeouts
+ensure_group_perms "$JOBS_ROOT" "$FLASH_ROOT" "$DATA_DIR" "$HPC_LOGS_DIR"
 # Preflight: warn (don't fail) if the experiment dir isn't group-shared. It may
 # hold other users' files we can't chgrp, so this is advisory only.
 check_group_perms "$DIR" || true
@@ -228,6 +237,8 @@ cat > "$ENV_FILE" <<EOF
 export EXP_NAME="$EXP_NAME"
 export EXP_DIR="$DIR"
 export DATA_DIR="$DATA_DIR"
+export HPC_LOGS_DIR="$HPC_LOGS_DIR"
+export LOG_SHIP_INTERVAL="${LOG_SHIP_INTERVAL:-300}"
 export FLASH_ROOT="$FLASH_ROOT"
 export JOBS_ROOT="$JOBS_ROOT"
 export ENV_FILE="$ENV_FILE"
@@ -247,6 +258,7 @@ export MAX_ARRAY_TASKS="$MAX_ARRAY_TASKS"
 export OUTPUT_GROUP="$OUTPUT_GROUP"
 export SAION_PARTITION="$SAION_PARTITION"
 export SLEAP_MODULE="$SLEAP_MODULE"
+export SLEAP_BATCH_SIZE="$SLEAP_BATCH_SIZE"
 export SLEAP_MODEL_CENTROID="$SLEAP_MODEL_CENTROID"
 export SLEAP_MODEL_INSTANCE="$SLEAP_MODEL_INSTANCE"
 export SLEAP_RUNTIME="$SLEAP_RUNTIME"
@@ -289,7 +301,7 @@ done
 # --only-backup: build manifest + submit ONLY the raw-video backup job.
 if (( ONLY_BACKUP )); then
 	(( RUN_BACKUP == 1 )) || { echo "[ERR] --only-backup conflicts with --no-backup" >&2; exit 2; }
-	JID_BACKUP=$(sbatch --parsable --partition="$BACKUP_PARTITION" "$JOBS_ROOT/backup.sbatch")
+	JID_BACKUP=$(sbatch_retry backup --partition="$BACKUP_PARTITION" "$JOBS_ROOT/backup.sbatch")
 	echo "  backup        $JID_BACKUP"
 	echo "$JID_BACKUP" > "$JOBS_ROOT/jid_backup.txt"
 	echo "[INFO] --only-backup: submitted backup job only -> ${BACKUP_ARCHIVE_PATH:-(disabled)}"
@@ -299,7 +311,7 @@ fi
 # Submit chunk array
 CHUNK_UPPER=$(( N_VIDEOS - 1 ))
 echo "[INFO] sbatch chunk_array=0-${CHUNK_UPPER}"
-JID_CHUNK=$(sbatch --parsable --array=0-${CHUNK_UPPER} "$JOBS_ROOT/chunk.sbatch")
+JID_CHUNK=$(sbatch_retry chunk --array=0-${CHUNK_UPPER} "$JOBS_ROOT/chunk.sbatch")
 echo "  chunk         $JID_CHUNK"
 echo "$JID_CHUNK" > "$JOBS_ROOT/jid_chunk.txt"
 
@@ -309,7 +321,7 @@ if (( ONLY_CHUNK )); then
 fi
 
 # Submit chunk_finalize (builds worklist + submits aruco / bridge / cleanup)
-JID_CHUNK_FIN=$(sbatch --parsable --dependency=afterok:$JID_CHUNK "$JOBS_ROOT/chunk_finalize.sbatch")
+JID_CHUNK_FIN=$(sbatch_retry chunk_fin --dependency=afterok:$JID_CHUNK "$JOBS_ROOT/chunk_finalize.sbatch")
 echo "  chunk_finalize $JID_CHUNK_FIN (dep: $JID_CHUNK)"
 echo "$JID_CHUNK_FIN" > "$JOBS_ROOT/jid_chunk_fin.txt"
 

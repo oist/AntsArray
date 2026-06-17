@@ -120,7 +120,7 @@ defaults:
 | `--skip-trt-export`    | off                | fall back to `sleap-nn track` (raw model dirs, no export)                                           |
 | `--saion-partition`    | `largegpu`       | A100 SM80                                                                                             |
 | `--sleap-module`       | `sleap-nn/0.2.0` | saion module to `module load` for predict tasks                                                     |
-| `--aruco-concurrency`  | `16`             | array `%N` cap                                                                                      |
+| `--aruco-concurrency`  | `100`            | array `%N` cap; compute cpu cap 2000 / `-c 16` ≈ 125 max                                             |
 | `--sleap-concurrency`  | `8`              | array `%N` cap                                                                                      |
 | `--datacp-concurrency` | `4`              | array `%N` cap (deigo has 4 mover nodes)                                                            |
 | `--group`              | `reiteruni`      | group owner for shared outputs; created dirs are chgrp'd and setgid where permitted                 |
@@ -210,7 +210,7 @@ Per-user association limits as of 2026-05-20:
 
 Practical implications:
 
-- aruco_array at `-c 4 --mem=8G` per task → ceiling is `2000/4 = 500` concurrent tasks (cpu-bound). Default `ARUCO_CONCURRENCY=128` leaves headroom for other work; bump to ~400 if running standalone.
+- aruco_array at `-c 16 --mem=24G` per task → ceiling is `2000/16 ≈ 125` concurrent tasks (cpu-bound). Default `ARUCO_CONCURRENCY=100` uses ~1600 cpu and leaves headroom for the bridge (also on `compute`); raise toward ~125 only if running standalone — higher just queues `AssocGrpCpuLimit`.
 - Bridge must use `compute` (rsync to saion can take hours; 2 h cap on `short` is fatal).
 - Anything multiplicative — never submit per-chunk arrays on `datacp` (20-job cap is trivial to blow). Use single jobs.
 
@@ -281,6 +281,49 @@ Mounts are **read-only**. Saion predict tasks read chunks from `/deigo_flash`
 and copy them into local `/work` at task start; no bulk deigo→saion rsync is
 needed. `cleanup.sbatch` polls bucket for final SLEAP outputs before deleting
 `/flash` — if outputs are missing, it exits non-zero and preserves the data.
+
+## Run logs (`hpc_logs/`) — survive mid-run failures
+
+Job logs used to live only on scratch (`/work` on saion, `/flash` on deigo) and were
+destroyed by cleanup — saion's `rm -rf "$REMOTE_ROOT"` deletes the `jobs/` dir that
+holds the sleap `.out`/`.err`. So a walltime kill, node failure, mass `scancel`, or
+maintenance drain left nothing to diagnose. The pipeline now captures logs to bucket
+under `<exp>/hpc_logs/` in four layers (defense in depth):
+
+```
+<exp>/hpc_logs/
+  sleap/     sleap_<A>_<a>.out|.err|.status, sacct_sleap_<jid>.tsv   (saion)
+  aruco/     aruco_<A>_<a>.out|.err|.status, sacct_aruco_<jid>.tsv   (deigo)
+  pipeline/  chunk_*, bridge_*, aruco_datacp_*, cleanup_*, manifest.csv, pipeline.env
+```
+
+- **Layer 1 — live streaming** (`lib/ship_logs.sh`): each array task ships its own
+  Slurm `.out`/`.err` to bucket every `LOG_SHIP_INTERVAL` (default 300s, ship-only-on-change,
+  per-task jitter) and on a `TERM`/`EXIT` trap. `#SBATCH --signal=TERM@60` makes Slurm
+  deliver SIGTERM ~60s before the walltime SIGKILL, so the final lines + a `.status`
+  marker (`reason=signal …`) reach bucket *before* the task dies. This does not depend
+  on any downstream job running.
+- **Layer 2 — `sacct` post-mortem**: authoritative `State/ExitCode/Reason/Elapsed/MaxRSS`
+  from slurmdbd (survives the scratch wipe). sleap sacct is taken in `saion_cleanup`
+  (after the array is terminal); aruco sacct in deigo `cleanup`.
+- **Layer 3 — archive-before-delete**: `saion_cleanup` and deigo `cleanup` rsync all
+  task logs to bucket *before* any `rm`/scratch reclamation (idempotent safety net).
+- **Layer 4 — fps line**: each sleap chunk prints `[FPS] <chunk> frames=N elapsed=Ns fps=F`,
+  giving a durable, greppable throughput history for the TRT path.
+
+Compute nodes cannot write `/bucket`; every ship rsyncs over SSH to the cluster login
+alias (`deigo:` / `saion:`), the same mechanism the `.slp`/`.h5` uploads use. Payloads
+are KB–MB text, so node load is negligible; the only real cost is SSH connections,
+kept low by the coarse interval, change-gating, and jitter (and `rsync_retry` backoff
+for the documented `kex_exchange_identification` resets).
+
+Quick triage after a failed/odd run:
+
+```bash
+grep -h '^\[FPS\]' /bucket/.../<exp>/hpc_logs/sleap/*.out | sort   # throughput per chunk
+cat /bucket/.../<exp>/hpc_logs/sleap/*.status                       # which tasks died and why
+column -t -s'|' /bucket/.../<exp>/hpc_logs/sleap/sacct_sleap_*.tsv  # TIMEOUT/OOM/NODE_FAIL/CANCELLED
+```
 
 ## Open verifications (before relying on this for new experiments)
 

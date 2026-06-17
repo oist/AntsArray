@@ -9,6 +9,8 @@
 #SBATCH -J sleap
 #SBATCH -o __REMOTE_JOBS__/sleap_%A_%a.out
 #SBATCH -e __REMOTE_JOBS__/sleap_%A_%a.err
+# Deliver SIGTERM ~60s before the walltime SIGKILL so the log-stream trap can flush.
+#SBATCH --signal=TERM@60
 set -eo pipefail
 
 source ~/.bashrc
@@ -16,6 +18,7 @@ module load __SLEAP_MODULE__
 
 # Home is shared deigo<->saion, so the rendered deigo repo path also works on saion.
 source "__HOSTS_LIB__"
+source "__SHIP_LIB__"
 
 REMOTE_JOBS="__REMOTE_JOBS__"
 REMOTE_INPUT="__REMOTE_INPUT__"
@@ -29,11 +32,23 @@ SKIP_TRT_EXPORT=__SKIP_TRT_EXPORT__
 DEIGO_FLASH_SAION_PREFIX="__DEIGO_FLASH_SAION_PREFIX__"   # /deigo_flash/.../<exp> mount on saion
 DATA_DIR="__DATA_DIR__"                      # bucket path; reached via "saion" alias (login has write)
 OUTPUT_GROUP="__OUTPUT_GROUP__"              # group owner for shared bucket outputs
-SLEAP_BATCH_SIZE="${SLEAP_BATCH_SIZE:-16}"   # per-frame inference batch (engine max from export)
+SLEAP_BATCH_SIZE="${SLEAP_BATCH_SIZE:-8}"   # per-frame inference batch (must be <= engine max profile batch)
 BATCH_SIZE=__BATCH_SIZE__                    # chunks per array task
 SCRIPTS_DIR="__SCRIPTS_DIR__"                # pipeline scripts dir (sleap2h5.py, sleap2csv.py)
 
 WORKLIST="$REMOTE_JOBS/aruco_worklist.txt"
+
+# Layer 1: stream this task's Slurm log to bucket (via the saion login, which has
+# bucket write -- compute nodes do not) while it runs, so a walltime/scancel/node
+# death still leaves a diagnosable log under hpc_logs/sleap/. saion_cleanup also
+# archives logs before rm, but streaming does not depend on any downstream job.
+HPC_LOGS_DIR="__HPC_LOGS_DIR__"
+_LA="${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID:-0}}"; _la="${SLURM_ARRAY_TASK_ID:-0}"
+log_stream_start "saion" "$HPC_LOGS_DIR/sleap" \
+	"$REMOTE_JOBS/sleap_${_LA}_${_la}.status" \
+	"$REMOTE_JOBS/sleap_${_LA}_${_la}.out" \
+	"$REMOTE_JOBS/sleap_${_LA}_${_la}.err"
+install_log_traps
 
 start_idx=$(( SLURM_ARRAY_TASK_ID * BATCH_SIZE ))
 end_idx=$(( start_idx + BATCH_SIZE ))
@@ -78,6 +93,7 @@ for (( row_idx=start_idx; row_idx<end_idx; row_idx++ )); do
 
 	echo "[$(date)] sleap on ${vname}_${chunk} (runtime=$SLEAP_RUNTIME, skip_trt=$SKIP_TRT_EXPORT)"
 
+	_t0=$SECONDS
 	if (( SKIP_TRT_EXPORT == 0 )) && [[ "$SLEAP_RUNTIME" != "pytorch" ]]; then
 		# Exported-model path: ONNX or TensorRT
 		sleap-nn predict "$EXPORT_DIR" "$input" \
@@ -99,6 +115,16 @@ for (( row_idx=start_idx; row_idx<end_idx; row_idx++ )); do
 			-d cuda \
 			--batch_size "$SLEAP_BATCH_SIZE" \
 			--no_empty_frames
+	fi
+	_dt=$(( SECONDS - _t0 ))
+
+	# Layer 4: greppable per-chunk throughput line -> durable fps history in bucket.
+	# n_frames is worklist col 3 (expected_frames); empty on legacy 2-col worklists.
+	if [[ "${n_frames:-}" =~ ^[0-9]+$ ]] && (( _dt > 0 )); then
+		awk -v f="$n_frames" -v s="$_dt" -v c="${vname}_${chunk}" \
+			'BEGIN{ printf "[FPS] %s frames=%d elapsed=%ds fps=%.2f\n", c, f, s, f/s }'
+	else
+		echo "[FPS] ${vname}_${chunk} frames=${n_frames:-NA} elapsed=${_dt}s fps=NA"
 	fi
 
 	echo "[OK] ${vname}_${chunk}"
