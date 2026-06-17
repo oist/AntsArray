@@ -307,11 +307,11 @@ powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | ie
 
 Close and reopen Terminal/PowerShell after installing `git` or `uv`.
 
-Download the repository:
+Download the repository into any folder you want to work from:
 
 ```bash
 # macOS/Linux
-cd "$HOME/Desktop"
+cd "<FOLDER_WHERE_YOU_WANT_THE_CODE>"
 git clone https://github.com/oist/AntsArray.git
 cd AntsArray
 git pull
@@ -319,22 +319,22 @@ git pull
 
 ```powershell
 # Windows PowerShell
-cd "$HOME\Desktop"
+cd "<FOLDER_WHERE_YOU_WANT_THE_CODE>"
 git clone https://github.com/oist/AntsArray.git
 cd AntsArray
 git pull
 ```
 
-Make a folder for the crop videos and put the attached `.mp4` files in it:
+Put the attached `.mp4` crop videos in one folder. Set `CROP_VIDEO_FOLDER` to that folder path:
 
 ```bash
 # macOS/Linux
-mkdir -p "$HOME/Desktop/ant_sleep_videos"
+CROP_VIDEO_FOLDER="<PATH_TO_FOLDER_WITH_CROP_VIDEOS>"
 ```
 
 ```powershell
 # Windows PowerShell
-mkdir "$HOME\Desktop\ant_sleep_videos"
+$CROP_VIDEO_FOLDER = "<PATH_TO_FOLDER_WITH_CROP_VIDEOS>"
 ```
 
 Check that the GUI dependencies can be loaded:
@@ -347,25 +347,25 @@ Run the GUI on a folder of crop videos:
 
 ```bash
 # macOS/Linux, from inside the AntsArray folder
-uv run --no-project --with numpy --with pandas --with pyarrow --with opencv-python --with pillow python analysis/sleep_label_gui.py --video_dir "$HOME/Desktop/ant_sleep_videos"
+uv run --no-project --with numpy --with pandas --with pyarrow --with opencv-python --with pillow python analysis/sleep_label_gui.py --video_dir "$CROP_VIDEO_FOLDER"
 ```
 
 ```powershell
 # Windows PowerShell, from inside the AntsArray folder
-uv run --no-project --with numpy --with pandas --with pyarrow --with opencv-python --with pillow python analysis\sleep_label_gui.py --video_dir "$HOME\Desktop\ant_sleep_videos"
+uv run --no-project --with numpy --with pandas --with pyarrow --with opencv-python --with pillow python analysis\sleep_label_gui.py --video_dir "$CROP_VIDEO_FOLDER"
 ```
 
 To update the GUI later:
 
 ```bash
 # macOS/Linux
-cd "$HOME/Desktop/AntsArray"
+cd "<PATH_TO_ANTSARRAY>"
 git pull
 ```
 
 ```powershell
 # Windows PowerShell
-cd "$HOME\Desktop\AntsArray"
+cd "<PATH_TO_ANTSARRAY>"
 git pull
 ```
 
@@ -378,8 +378,8 @@ When finished, send back the whole `label_vectors/` folder that appears next to 
 If you have the full block data and need to make the crop videos first, export one small crop video per visible ant over a 10-minute window:
 
 ```bash
-/home/sam-reiter/miniforge3/envs/ants/bin/python analysis/export_sleep_crop_videos.py \
-  --video /home/sam-reiter/bucket/ReiterU/Ants/basler/20260515/block02/cam07_cam6_2026-05-15-14-20-44.avi \
+python analysis/export_sleep_crop_videos.py \
+  --video "<PATH_TO_CAMERA_VIDEO>" \
   --start_time 0 \
   --crop_size_px 360 \
   --video_backend h264
@@ -396,15 +396,15 @@ block02/stitched/sleep_crop_videos/
 Open a folder of crop videos in the Tk GUI:
 
 ```bash
-/home/sam-reiter/miniforge3/envs/ants/bin/python analysis/sleep_label_gui.py \
-  --video_dir /home/sam-reiter/bucket/ReiterU/Ants/basler/20260515/block02/stitched/sleep_crop_videos/<window>
+uv run --no-project --with numpy --with pandas --with pyarrow --with opencv-python --with pillow python analysis/sleep_label_gui.py \
+  --video_dir "<CROP_VIDEO_FOLDER>"
 ```
 
 To label one crop video directly:
 
 ```bash
-/home/sam-reiter/miniforge3/envs/ants/bin/python analysis/sleep_label_gui.py \
-  --video /path/to/crop_video.mp4
+uv run --no-project --with numpy --with pandas --with pyarrow --with opencv-python --with pillow python analysis/sleep_label_gui.py \
+  --video "<CROP_VIDEO.mp4>"
 ```
 
 Optional arguments:
