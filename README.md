@@ -261,6 +261,102 @@ speed_metadata.json
 
 The metadata includes `frame_min`, `frame_max`, `n_frames`, and `n_observed_frames`; interactive scripts use `n_observed_frames / n_frames` to filter good tracks.
 
+### Sleep Crop Label GUI
+
+The sleep label GUI works on small per-ant crop videos, not the original full camera videos. First export crop videos for a 10-minute window:
+
+```bash
+/home/sam-reiter/miniforge3/envs/ants/bin/python analysis/export_sleep_crop_videos.py \
+  --video /home/sam-reiter/bucket/ReiterU/Ants/basler/20260515/block02/cam07_cam6_2026-05-15-14-20-44.avi \
+  --start_time 0 \
+  --crop_size_px 360 \
+  --video_backend h264
+```
+
+The crop exporter infers `tracks/` from the video block by default, maps track positions to camera frames, and writes a folder under:
+
+```text
+block02/stitched/sleep_crop_videos/
+```
+
+Open a folder of crop videos in the Tk GUI:
+
+```bash
+/home/sam-reiter/miniforge3/envs/ants/bin/python analysis/sleep_label_gui.py \
+  --video_dir /home/sam-reiter/bucket/ReiterU/Ants/basler/20260515/block02/stitched/sleep_crop_videos/<window>
+```
+
+To label one crop video directly:
+
+```bash
+/home/sam-reiter/miniforge3/envs/ants/bin/python analysis/sleep_label_gui.py \
+  --video /path/to/crop_video.mp4
+```
+
+Optional arguments:
+
+- `--labels_dir /path/to/label_vectors`: write labels somewhere other than the crop video's `label_vectors/` folder.
+- `--start_frame 1234`: open the first video at a specific frame.
+
+The GUI saves per-frame label vectors beside the crop videos by default:
+
+```text
+sleep_crop_videos/<window>/label_vectors/
+  <crop_video>_labels.npy
+  <crop_video>_labels.parquet
+  <crop_video>_metadata.json
+```
+
+Label values are `-1` for unlabeled, `0` for wake, and `1` for sleep. The bar under the seek slider shows unlabeled frames in gray, wake in blue, and sleep in orange. Clicking the bar seeks to that part of the video.
+
+Basic labeling workflow:
+
+- Press `s` or the `Sleep` button to start labeling sleep from the current frame.
+- Press `w`, `n`, or the `Wake` button to start labeling wake from the current frame.
+- While a label is active, normal playback paints each frame the playhead reaches. Seeking to a different frame resets the active label anchor, so skipped frames are not filled.
+- Press the same label again, `e`, or `End` to stop the active label at the current frame.
+- Press `[` to set a range start, then press `s` or `w` at another frame to label that whole interval once.
+- Press `c` or `Clear` to clear the current frame, or to clear the selected interval after setting a range start.
+- Use `Save` or `ctrl+s` to save manually. Labels are also saved when changing videos or closing the GUI.
+
+Useful hotkeys:
+
+- space: play/pause;
+- left/right: previous/next frame;
+- `a`/`d`: jump backward/forward 1 second;
+- `A`/`D`: play backward/forward at 2x, then faster up to 30x on repeated presses;
+- `s`: start/switch/end `sleep`;
+- `w` or `n`: start/switch/end `wake`;
+- `c`: clear the current frame or selected range;
+- `e`: end the active label at the current frame;
+- `[`: set range start for a one-shot interval label;
+- `,`/`.`: previous/next crop video;
+- `ctrl+s`: save.
+
+### Supervised Sleep Classifier
+
+Train the random-forest classifier:
+
+```bash
+/home/sam-reiter/miniforge3/envs/ants/bin/python analysis/sleep_classifier.py train \
+  --labels /home/sam-reiter/bucket/ReiterU/Ants/basler/20260515/block02/stitched/sleep_labels/*_sleep_labels.parquet \
+  --per_track_dir /home/sam-reiter/bucket/ReiterU/Ants/basler/20260515/block02/stitched/per_track \
+  --speed_root /home/sam-reiter/bucket/ReiterU/Ants/basler/20260515/block02/stitched/speed_vectors \
+  --out /home/sam-reiter/bucket/ReiterU/Ants/basler/20260515/block02/stitched/sleep_classifier
+```
+
+The model is intentionally simple and interpretable: a balanced random forest trained from speed summaries, posture angles, bodypoint distances, and pose bounding-box cues. Outputs include `sleep_random_forest.joblib`, `feature_importance.csv`, `training_report.txt`, and the labeled `training_features.parquet`.
+
+Apply the classifier to tracks:
+
+```bash
+/home/sam-reiter/miniforge3/envs/ants/bin/python analysis/sleep_classifier.py predict \
+  --model /home/sam-reiter/bucket/ReiterU/Ants/basler/20260515/block02/stitched/sleep_classifier/sleep_random_forest.joblib \
+  --per_track_dir /home/sam-reiter/bucket/ReiterU/Ants/basler/20260515/block02/stitched/per_track \
+  --speed_root /home/sam-reiter/bucket/ReiterU/Ants/basler/20260515/block02/stitched/speed_vectors \
+  --out /home/sam-reiter/bucket/ReiterU/Ants/basler/20260515/block02/stitched/sleep_predictions
+```
+
 ### Colony Presence Vectors
 
 Operation script:
@@ -352,6 +448,30 @@ and plots all clusters as tiled occupancy maps with optional additional time bin
 ### `analysis/ant_interaction_lightweight_test.py`
 
 Local debugging script for tuning interaction radii and antenna bodypoint behavior on one chunk. It can generate labeled SLEAP skeleton debug images with interaction radii marked. Production interaction extraction is in `tracking/colony/interaction_batch.py` and `tracking/colony/interaction_one_chunk.py`.
+
+### `analysis/interaction_analysis.py`
+
+Loads bucket `interactions/` chunk parquet files with the matching `tracks/` chunk parquet and `stitched/grid_occupancy_histograms/track_cluster_ids.csv`. Use `CHUNKS = "all"` to run every chunk for the selected side, `CHUNKS = "000"` for a single chunk, or `MAX_CHUNKS` while tuning.
+
+Expensive intermediate tables are cached under:
+
+```text
+stitched/analysis_cache/interaction_analysis/
+```
+
+Set `FORCE_REBUILD_CACHE = True` in the script to recompute them.
+
+It plots:
+
+- directed cluster-pair interaction counts;
+- antenna/source interaction locations by occupancy cluster;
+- body/receiver interaction locations by occupancy cluster;
+- interaction counts by time since light on, averaged over light-cycle days by default;
+- spatial interaction heatmaps tiled by cluster and time-of-day bin, averaged over light-cycle days by default;
+- immobile-bout tests that threshold speed, count interactions involving each immobile ant, and correlate interaction count with time to mobility or bout length.
+- wake-prediction regressions that compare elapsed immobility time, cumulative interaction count, and their weighted combination as predictors of waking from immobility.
+
+Helper functions live in `analysis/interaction_analysis_utils.py`.
 
 ## Manual Commands
 
@@ -460,9 +580,14 @@ For current tracking outputs, the main overlay follows `TrackX/TrackY`; toggles 
 | `analysis/compute_track_speed_vector.py` | Per-track speed vector operation. |
 | `analysis/compute_track_colony_presence_vector.py` | Per-track colony in/out vector operation. |
 | `analysis/compute_track_grid_occupancy.py` | Per-track normalized grid occupancy operation. |
+| `analysis/sleep_label_gui.py` | Tk GUI for crop-video per-frame sleep/wake label vectors. |
+| `analysis/export_sleep_crop_videos.py` | Export per-ant crop videos for fast sleep/wake labeling. |
+| `analysis/sleep_classifier.py` | Train/apply random-forest supervised sleep classifier. |
+| `analysis/sleep_classifier_features.py` | Shared posture and velocity feature extraction helpers. |
 | `analysis/colony_speed.py` | VS Code/Jupyter interactive speed and colony-presence plots. |
 | `analysis/grid_occupancy.py` | VS Code/Jupyter interactive grid occupancy clustering plots. |
 | `analysis/cluster_time_of_day_occupancy.py` | Local time-of-day occupancy analysis by cluster. |
+| `analysis/interaction_analysis.py` | VS Code/Jupyter interactive interaction spatial and time-of-day plots. |
 | `tracking/stitch_tracks.py` | Chunk/block stitcher and trajectory PNG writer. |
 | `run_aruco.py` | ArUco detection for one video. |
 
