@@ -56,6 +56,7 @@ SAMPLE_INTERACTIONS = False
 DROP_UNCLUSTERED = True
 USE_CACHE = True
 FORCE_REBUILD_CACHE = False
+NORMALIZE_BY_N_ANTS = True
 
 LIGHT_ON_HOUR = 5.5
 TIME_BIN_MINUTES = 30.0
@@ -91,6 +92,21 @@ cache_settings = {
 cache_key = ia.interaction_analysis_cache_key(chunks, cache_settings)
 cache_dir = CACHE_ROOT / f"{SIDE}_{cache_key}"
 
+
+def derived_cache_key(stage: str, **settings) -> str:
+    return ia.interaction_analysis_cache_key(
+        chunks,
+        {
+            **cache_settings,
+            "stage": stage,
+            **settings,
+        },
+    )
+
+
+EVENT_WEIGHT_COL = "interaction_count_per_ant" if NORMALIZE_BY_N_ANTS else "interaction_count"
+PAIR_VALUE_COL = "interactions_per_directed_ant_pair" if NORMALIZE_BY_N_ANTS else "n_interactions"
+
 interactions_raw = ia.load_or_build_table(
     cache_dir / "interactions_raw.parquet",
     lambda: ia.load_interactions_for_chunks(
@@ -104,6 +120,12 @@ interactions_raw = ia.load_or_build_table(
 interactions = ia.load_or_build_table(
     cache_dir / "interactions_clustered.parquet",
     lambda: ia.attach_cluster_labels(interactions_raw, clusters, drop_unclustered=DROP_UNCLUSTERED),
+    use_cache=USE_CACHE,
+    force=FORCE_REBUILD_CACHE,
+)
+cluster_ant_counts = ia.load_or_build_table(
+    cache_dir / "cluster_ant_counts.parquet",
+    lambda: ia.cluster_ant_counts(clusters),
     use_cache=USE_CACHE,
     force=FORCE_REBUILD_CACHE,
 )
@@ -126,20 +148,36 @@ print(f"Chunk selection: {chunk_summary} ({SIDE})")
 print(f"Interaction rows loaded: {len(interactions_raw):,}")
 print(f"Interaction rows after cluster filter: {len(interactions):,}")
 print(f"Clustered tracks: {len(clusters):,}")
+print(f"Cluster-normalized analysis: {NORMALIZE_BY_N_ANTS} ({EVENT_WEIGHT_COL})")
 print(f"Cache directory: {cache_dir}")
 display(chunk_table)
 display(interactions.head())
 display(clusters.head())
+display(cluster_ant_counts)
 
 
 # %%
 # Summarize directed cluster pairs: antenna/source cluster -> body/receiver cluster.
-cluster_pair_table = ia.cluster_pair_counts(interactions)
+pair_cache_key = derived_cache_key(
+    "cluster_pair_table",
+    normalize_by_n_ants=NORMALIZE_BY_N_ANTS,
+)
+cluster_pair_table = ia.load_or_build_table(
+    cache_dir / f"cluster_pair_table_{pair_cache_key}.parquet",
+    lambda: ia.cluster_pair_counts(
+        interactions,
+        clusters=clusters,
+        normalize_by_n_ants=NORMALIZE_BY_N_ANTS,
+    ),
+    use_cache=USE_CACHE,
+    force=FORCE_REBUILD_CACHE,
+)
 display(cluster_pair_table.head(30))
 
-cluster_pair_matrix = ia.plot_cluster_pair_matrix(
-    interactions,
-    title=f"{SIDE} {chunk_summary} directed interactions by occupancy cluster",
+cluster_pair_matrix = ia.plot_cluster_pair_matrix_from_table(
+    cluster_pair_table,
+    value_col=PAIR_VALUE_COL,
+    title=f"{SIDE} {chunk_summary} relative directed interactions by occupancy cluster",
 )
 display(cluster_pair_matrix)
 
@@ -148,7 +186,7 @@ display(cluster_pair_matrix)
 # Build weighted spatial event tables. Positions are loaded one chunk at a time.
 # Each row is one ant/frame/cluster with interaction_count equal to the number
 # of directed interactions involving that ant in that role.
-antenna_events = ia.load_or_build_table(
+antenna_events_raw = ia.load_or_build_table(
     cache_dir / "antenna_events.parquet",
     lambda: ia.role_event_positions_for_chunks(
         interactions,
@@ -164,7 +202,7 @@ antenna_events = ia.load_or_build_table(
     use_cache=USE_CACHE,
     force=FORCE_REBUILD_CACHE,
 )
-body_events = ia.load_or_build_table(
+body_events_raw = ia.load_or_build_table(
     cache_dir / "body_events.parquet",
     lambda: ia.role_event_positions_for_chunks(
         interactions,
@@ -180,6 +218,22 @@ body_events = ia.load_or_build_table(
     use_cache=USE_CACHE,
     force=FORCE_REBUILD_CACHE,
 )
+if NORMALIZE_BY_N_ANTS:
+    antenna_events = ia.load_or_build_table(
+        cache_dir / "antenna_events_per_ant.parquet",
+        lambda: ia.add_cluster_size_weights(antenna_events_raw, clusters),
+        use_cache=USE_CACHE,
+        force=FORCE_REBUILD_CACHE,
+    )
+    body_events = ia.load_or_build_table(
+        cache_dir / "body_events_per_ant.parquet",
+        lambda: ia.add_cluster_size_weights(body_events_raw, clusters),
+        use_cache=USE_CACHE,
+        force=FORCE_REBUILD_CACHE,
+    )
+else:
+    antenna_events = antenna_events_raw
+    body_events = body_events_raw
 
 print(f"Antenna/source spatial events: {len(antenna_events):,}")
 print(f"Body/receiver spatial events: {len(body_events):,}")
@@ -194,12 +248,21 @@ SPATIAL_NCOLS = 3
 SPATIAL_NORMALIZE = False
 SPATIAL_VMAX_PERCENTILE = 99.0
 
-antenna_cluster_hists = ia.plot_spatial_heatmaps_by_cluster(
-    antenna_events,
-    bin_size_mm=SPATIAL_BIN_SIZE_MM,
-    max_clusters=MAX_CLUSTERS,
+antenna_cluster_hists_result = ia.load_or_build_pickle(
+    cache_dir / f"antenna_cluster_hists_{derived_cache_key('antenna_cluster_hists', bin_size_mm=SPATIAL_BIN_SIZE_MM, max_clusters=MAX_CLUSTERS, normalize=SPATIAL_NORMALIZE, weight_col=EVENT_WEIGHT_COL)}.pkl",
+    lambda: ia.spatial_heatmaps_by_cluster(
+        antenna_events,
+        bin_size_mm=SPATIAL_BIN_SIZE_MM,
+        max_clusters=MAX_CLUSTERS,
+        normalize=SPATIAL_NORMALIZE,
+        weight_col=EVENT_WEIGHT_COL,
+    ),
+    use_cache=USE_CACHE,
+    force=FORCE_REBUILD_CACHE,
+)
+antenna_cluster_hists = ia.plot_spatial_heatmaps_by_cluster_result(
+    antenna_cluster_hists_result,
     ncols=SPATIAL_NCOLS,
-    normalize=SPATIAL_NORMALIZE,
     vmax_percentile=SPATIAL_VMAX_PERCENTILE,
     title=f"{SIDE} {chunk_summary} antenna/source interaction locations by cluster",
 )
@@ -207,12 +270,21 @@ antenna_cluster_hists = ia.plot_spatial_heatmaps_by_cluster(
 
 # %%
 # Spatial dependence by body/receiver occupancy cluster.
-body_cluster_hists = ia.plot_spatial_heatmaps_by_cluster(
-    body_events,
-    bin_size_mm=SPATIAL_BIN_SIZE_MM,
-    max_clusters=MAX_CLUSTERS,
+body_cluster_hists_result = ia.load_or_build_pickle(
+    cache_dir / f"body_cluster_hists_{derived_cache_key('body_cluster_hists', bin_size_mm=SPATIAL_BIN_SIZE_MM, max_clusters=MAX_CLUSTERS, normalize=SPATIAL_NORMALIZE, weight_col=EVENT_WEIGHT_COL)}.pkl",
+    lambda: ia.spatial_heatmaps_by_cluster(
+        body_events,
+        bin_size_mm=SPATIAL_BIN_SIZE_MM,
+        max_clusters=MAX_CLUSTERS,
+        normalize=SPATIAL_NORMALIZE,
+        weight_col=EVENT_WEIGHT_COL,
+    ),
+    use_cache=USE_CACHE,
+    force=FORCE_REBUILD_CACHE,
+)
+body_cluster_hists = ia.plot_spatial_heatmaps_by_cluster_result(
+    body_cluster_hists_result,
     ncols=SPATIAL_NCOLS,
-    normalize=SPATIAL_NORMALIZE,
     vmax_percentile=SPATIAL_VMAX_PERCENTILE,
     title=f"{SIDE} {chunk_summary} body/receiver interaction locations by cluster",
 )
@@ -225,10 +297,27 @@ TIME_COUNT_MAX_CLUSTERS = None
 TIME_COUNT_AVERAGE_OVER_DAYS = True
 
 time_count_events = antenna_events if TIME_COUNT_ROLE == "antenna" else body_events
-time_count_table = ia.plot_time_counts_by_cluster(
-    time_count_events,
-    max_clusters=TIME_COUNT_MAX_CLUSTERS,
-    average_over_days=TIME_COUNT_AVERAGE_OVER_DAYS,
+time_count_table = ia.load_or_build_pickle(
+    cache_dir / f"time_count_table_{derived_cache_key('time_count_table', role=TIME_COUNT_ROLE, max_clusters=TIME_COUNT_MAX_CLUSTERS, average_over_days=TIME_COUNT_AVERAGE_OVER_DAYS, weight_col=EVENT_WEIGHT_COL)}.pkl",
+    lambda: ia.time_counts_by_cluster(
+        time_count_events,
+        max_clusters=TIME_COUNT_MAX_CLUSTERS,
+        average_over_days=TIME_COUNT_AVERAGE_OVER_DAYS,
+        weight_col=EVENT_WEIGHT_COL,
+    ),
+    use_cache=USE_CACHE,
+    force=FORCE_REBUILD_CACHE,
+)
+time_count_color_label = "directed interactions / ant" if NORMALIZE_BY_N_ANTS else "directed interactions"
+if TIME_COUNT_AVERAGE_OVER_DAYS:
+    time_count_color_label = (
+        "mean directed interactions / ant / light-cycle day"
+        if NORMALIZE_BY_N_ANTS
+        else "mean directed interactions / light-cycle day"
+    )
+ia.plot_time_counts_table(
+    time_count_table,
+    color_label=time_count_color_label,
     title=(
         f"{SIDE} {chunk_summary} {TIME_COUNT_ROLE} interaction counts "
         f"by {TIME_BIN_MINUTES:g}-min time bin since light on"
@@ -246,11 +335,22 @@ TIMESERIES_AVERAGE_OVER_DAYS = True
 TIMESERIES_YLIM = None
 
 timeseries_events = antenna_events if TIMESERIES_ROLE == "antenna" else body_events
-interaction_rate_timeseries = ia.plot_interaction_timeseries_by_cluster(
-    timeseries_events,
-    bin_minutes=TIME_BIN_MINUTES,
+interaction_rate_timeseries = ia.load_or_build_table(
+    cache_dir / f"interaction_rate_timeseries_{derived_cache_key('interaction_rate_timeseries', role=TIMESERIES_ROLE, bin_minutes=TIME_BIN_MINUTES, smooth_bins=TIMESERIES_SMOOTH_BINS, max_clusters=TIMESERIES_MAX_CLUSTERS, average_over_days=TIMESERIES_AVERAGE_OVER_DAYS, weight_col=EVENT_WEIGHT_COL)}.parquet",
+    lambda: ia.interaction_timeseries_plot_table_by_cluster(
+        timeseries_events,
+        bin_minutes=TIME_BIN_MINUTES,
+        smooth_bins=TIMESERIES_SMOOTH_BINS,
+        max_clusters=TIMESERIES_MAX_CLUSTERS,
+        average_over_days=TIMESERIES_AVERAGE_OVER_DAYS,
+        weight_col=EVENT_WEIGHT_COL,
+    ),
+    use_cache=USE_CACHE,
+    force=FORCE_REBUILD_CACHE,
+)
+ia.plot_interaction_timeseries_table(
+    interaction_rate_timeseries,
     smooth_bins=TIMESERIES_SMOOTH_BINS,
-    max_clusters=TIMESERIES_MAX_CLUSTERS,
     average_over_days=TIMESERIES_AVERAGE_OVER_DAYS,
     ylim=TIMESERIES_YLIM,
     title=(
@@ -272,13 +372,22 @@ TILE_AVERAGE_OVER_DAYS = True
 TILE_VMAX_PERCENTILE = 99.0
 
 tile_events = antenna_events if TILE_ROLE == "antenna" else body_events
-cluster_time_hists = ia.plot_spatial_heatmaps_by_cluster_and_time(
-    tile_events,
-    bin_size_mm=TILE_BIN_SIZE_MM,
-    max_clusters=TILE_MAX_CLUSTERS,
-    max_time_bins=TILE_MAX_TIME_BINS,
-    average_over_days=TILE_AVERAGE_OVER_DAYS,
-    normalize=TILE_NORMALIZE,
+cluster_time_hists_result = ia.load_or_build_pickle(
+    cache_dir / f"cluster_time_hists_{derived_cache_key('cluster_time_hists', role=TILE_ROLE, bin_size_mm=TILE_BIN_SIZE_MM, max_clusters=TILE_MAX_CLUSTERS, max_time_bins=TILE_MAX_TIME_BINS, average_over_days=TILE_AVERAGE_OVER_DAYS, normalize=TILE_NORMALIZE, weight_col=EVENT_WEIGHT_COL)}.pkl",
+    lambda: ia.spatial_heatmaps_by_cluster_and_time(
+        tile_events,
+        bin_size_mm=TILE_BIN_SIZE_MM,
+        max_clusters=TILE_MAX_CLUSTERS,
+        max_time_bins=TILE_MAX_TIME_BINS,
+        average_over_days=TILE_AVERAGE_OVER_DAYS,
+        normalize=TILE_NORMALIZE,
+        weight_col=EVENT_WEIGHT_COL,
+    ),
+    use_cache=USE_CACHE,
+    force=FORCE_REBUILD_CACHE,
+)
+cluster_time_hists = ia.plot_spatial_heatmaps_by_cluster_and_time_result(
+    cluster_time_hists_result,
     vmax_percentile=TILE_VMAX_PERCENTILE,
     title=(
         f"{SIDE} {chunk_summary} {TILE_ROLE} interaction locations "

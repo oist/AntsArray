@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Minimal crop-video GUI for labeling per-frame sleep/wake vectors."""
+"""Minimal crop-video GUI for labeling per-frame crop-video states."""
 
 from __future__ import annotations
 
 import argparse
+import colorsys
+import hashlib
 import json
 from datetime import datetime
 from pathlib import Path
@@ -18,10 +20,12 @@ import pandas as pd
 VIDEO_SUFFIXES = {".avi", ".mp4", ".mov", ".mkv"}
 LABEL_TO_VALUE = {"wake": 0, "sleep": 1}
 VALUE_TO_LABEL = {-1: "unlabeled", 0: "wake", 1: "sleep"}
+UNLABELED_LABEL = "unlabeled"
+BINARY_LABELS = tuple(LABEL_TO_VALUE)
 LABEL_BAR_COLORS = {
-    -1: (70, 70, 70),
-    0: (55, 150, 255),
-    1: (255, 170, 70),
+    UNLABELED_LABEL: (70, 70, 70),
+    "wake": (55, 150, 255),
+    "sleep": (255, 170, 70),
 }
 FAST_PLAYBACK_RATES = (2.0, 4.0, 8.0, 16.0, 30.0)
 PLAYBACK_TIMER_MS = 15
@@ -33,6 +37,7 @@ HOTKEY_HELP = "\n".join(
         "A/D: play backward/forward at 2x, then faster up to 30x on repeated presses",
         "s: start/switch/end sleep",
         "w or n: start/switch/end wake",
+        "enter in Label box or Apply: start/switch/end the text label",
         "c: clear the current frame or selected range",
         "e: end the active label at the current frame",
         "[: set range start for a one-shot interval label",
@@ -81,14 +86,79 @@ def label_paths(labels_dir: Path, video_path: Path) -> tuple[Path, Path, Path]:
     )
 
 
+def label_text_path(labels_dir: Path, video_path: Path) -> Path:
+    return Path(labels_dir) / f"{Path(video_path).stem}_label_text.npy"
+
+
+def canonical_label_text(label: object) -> str:
+    try:
+        if pd.isna(label):
+            return UNLABELED_LABEL
+    except (TypeError, ValueError):
+        pass
+    text = str(label).strip()
+    if not text:
+        return UNLABELED_LABEL
+    if text.lower() == UNLABELED_LABEL:
+        return UNLABELED_LABEL
+    return text
+
+
+def labels_to_legacy_values(labels: np.ndarray) -> np.ndarray:
+    values = np.full(len(labels), -1, dtype=np.int8)
+    for label, value in LABEL_TO_VALUE.items():
+        values[np.char.lower(labels.astype(str)) == label] = int(value)
+    return values
+
+
+def _custom_color_for_label(label: object, *, collision_offset: int = 0) -> tuple[int, int, int]:
+    key = f"{canonical_label_text(label).lower()}|{int(collision_offset)}"
+    digest = int.from_bytes(hashlib.blake2b(key.encode("utf-8"), digest_size=8).digest(), byteorder="big")
+    hue = digest / float(1 << 64)
+    saturation = 0.62 + (((digest >> 8) & 0xFF) / 255.0) * 0.23
+    value = 0.82 + (((digest >> 16) & 0xFF) / 255.0) * 0.14
+    red, green, blue = colorsys.hsv_to_rgb(hue, saturation, value)
+    return tuple(int(round(channel * 255.0)) for channel in (red, green, blue))
+
+
+def color_for_label(label: object, *, used_colors: set[tuple[int, int, int]] | None = None) -> tuple[int, int, int]:
+    text = canonical_label_text(label)
+    key = text.lower()
+    if key in LABEL_BAR_COLORS:
+        return LABEL_BAR_COLORS[key]
+
+    used_colors = set() if used_colors is None else used_colors
+    for offset in range(256):
+        color = _custom_color_for_label(text, collision_offset=offset)
+        if color not in used_colors:
+            return color
+    return _custom_color_for_label(text, collision_offset=256)
+
+
+def label_color_map(labels: np.ndarray) -> dict[str, tuple[int, int, int]]:
+    unique_labels = sorted({canonical_label_text(label) for label in labels}, key=lambda label: label.lower())
+    colors: dict[str, tuple[int, int, int]] = {}
+    used_colors = set(LABEL_BAR_COLORS.values())
+    for label in unique_labels:
+        key = label.lower()
+        if key in LABEL_BAR_COLORS:
+            color = LABEL_BAR_COLORS[key]
+        else:
+            color = color_for_label(label, used_colors=used_colors)
+        colors[label] = color
+        used_colors.add(color)
+    return colors
+
+
 def vector_to_frame_table(label_vector: np.ndarray, video_path: Path) -> pd.DataFrame:
-    values = label_vector.astype(np.int8, copy=False)
-    labels = [VALUE_TO_LABEL.get(int(value), "unlabeled") for value in values]
+    labels = np.asarray([canonical_label_text(label) for label in label_vector], dtype=str)
+    values = labels_to_legacy_values(labels)
     return pd.DataFrame(
         {
             "Frame": np.arange(len(values), dtype=np.int64),
             "label_value": values.astype(np.int8),
             "label": labels,
+            "is_sleep_wake_label": np.isin(np.char.lower(labels.astype(str)), list(BINARY_LABELS)),
             "video_path": str(video_path),
         }
     )
@@ -96,22 +166,40 @@ def vector_to_frame_table(label_vector: np.ndarray, video_path: Path) -> pd.Data
 
 def load_label_vector(labels_dir: Path, video_path: Path, frame_count: int) -> np.ndarray:
     npy_path, table_path, _metadata_path = label_paths(labels_dir, video_path)
-    labels = np.full(int(frame_count), -1, dtype=np.int8)
-    if npy_path.exists():
-        loaded = np.load(npy_path).astype(np.int8, copy=False).reshape(-1)
+    text_path = label_text_path(labels_dir, video_path)
+    labels = np.full(int(frame_count), UNLABELED_LABEL, dtype=object)
+    if text_path.exists():
+        loaded = np.load(text_path, allow_pickle=False).astype(str, copy=False).reshape(-1)
         n = min(len(labels), len(loaded))
-        labels[:n] = loaded[:n]
+        labels[:n] = [canonical_label_text(label) for label in loaded[:n]]
+        return labels
+    if npy_path.exists():
+        loaded = np.load(npy_path, allow_pickle=False).reshape(-1)
+        n = min(len(labels), len(loaded))
+        if loaded.dtype.kind in {"i", "u", "f", "b"}:
+            values = loaded[:n].astype(np.int8, copy=False)
+            labels[:n] = [VALUE_TO_LABEL.get(int(value), UNLABELED_LABEL) for value in values]
+        else:
+            labels[:n] = [canonical_label_text(label) for label in loaded[:n].astype(str, copy=False)]
         return labels
     if table_path.exists():
         table = pd.read_parquet(table_path)
-        if "Frame" in table.columns and "label_value" in table.columns:
+        if "Frame" in table.columns and "label" in table.columns:
+            frames = pd.to_numeric(table["Frame"], errors="coerce").to_numpy()
+            values = table["label"].astype(str).to_numpy()
+            valid = np.isfinite(frames)
+            frames = frames[valid].astype(np.int64)
+            values = values[valid]
+            in_range = (frames >= 0) & (frames < len(labels))
+            labels[frames[in_range]] = [canonical_label_text(label) for label in values[in_range]]
+        elif "Frame" in table.columns and "label_value" in table.columns:
             frames = pd.to_numeric(table["Frame"], errors="coerce").to_numpy()
             values = pd.to_numeric(table["label_value"], errors="coerce").to_numpy()
             valid = np.isfinite(frames) & np.isfinite(values)
             frames = frames[valid].astype(np.int64)
             values = values[valid].astype(np.int8)
             in_range = (frames >= 0) & (frames < len(labels))
-            labels[frames[in_range]] = values[in_range]
+            labels[frames[in_range]] = [VALUE_TO_LABEL.get(int(value), UNLABELED_LABEL) for value in values[in_range]]
     return labels
 
 
@@ -126,24 +214,32 @@ def save_label_vector(
     labels_dir = Path(labels_dir)
     labels_dir.mkdir(parents=True, exist_ok=True)
     npy_path, table_path, metadata_path = label_paths(labels_dir, video_path)
-    values = label_vector.astype(np.int8, copy=False)
+    text_path = label_text_path(labels_dir, video_path)
+    labels = np.asarray([canonical_label_text(label) for label in label_vector], dtype=str)
+    values = labels_to_legacy_values(labels)
     np.save(npy_path, values)
-    table = vector_to_frame_table(values, video_path)
+    np.save(text_path, labels)
+    table = vector_to_frame_table(labels, video_path)
     try:
         table.to_parquet(table_path, index=False)
     except Exception:
         table_path = table_path.with_suffix(".csv")
         table.to_csv(table_path, index=False)
+    label_counts = table["label"].value_counts(dropna=False).sort_index().to_dict()
     metadata = {
         "video_path": str(video_path),
-        "label_vector": str(npy_path),
+        "label_vector": str(text_path),
+        "legacy_sleep_wake_label_vector": str(npy_path),
         "label_table": str(table_path),
         "frame_count": int(frame_count),
         "fps": float(fps),
         "label_map": LABEL_TO_VALUE,
+        "unlabeled_label": UNLABELED_LABEL,
+        "label_counts": {str(key): int(value) for key, value in label_counts.items()},
         "n_sleep": int(np.sum(values == LABEL_TO_VALUE["sleep"])),
         "n_wake": int(np.sum(values == LABEL_TO_VALUE["wake"])),
-        "n_unlabeled": int(np.sum(values < 0)),
+        "n_unlabeled": int(np.sum(labels == UNLABELED_LABEL)),
+        "n_custom_labeled": int(np.sum((labels != UNLABELED_LABEL) & (values < 0))),
         "saved_at": datetime.now().isoformat(timespec="seconds"),
     }
     metadata_path.write_text(json.dumps(metadata, indent=2) + "\n")
@@ -232,9 +328,9 @@ class CropLabelWindow:
         self.current_frame = 0
         self.current_bgr: np.ndarray | None = None
         self.current_bgr_frame: int | None = None
-        self.label_vector = np.empty((0,), dtype=np.int8)
+        self.label_vector = np.empty((0,), dtype=object)
 
-        self.active_label_value: int | None = None
+        self.active_label_text: str | None = None
         self.active_start_frame: int | None = None
         self.active_last_painted_frame: int | None = None
         self.range_start_frame: int | None = None
@@ -266,6 +362,7 @@ class CropLabelWindow:
         self.root = tk.Tk()
         self.root.title("Sleep/wake crop labels")
         self.frame_var = tk.StringVar(value="0")
+        self.label_text_var = tk.StringVar(value="sleep")
         self.status_var = tk.StringVar(value="")
         self.play_pause_button = None
 
@@ -307,8 +404,8 @@ class CropLabelWindow:
             ("+1 s", lambda: self.seek_relative(round(self.fps))),
             ("Rewind", lambda: self.start_fast_playback(-1)),
             ("Fast forward", lambda: self.start_fast_playback(1)),
-            ("Sleep", lambda: self.apply_or_switch_label(LABEL_TO_VALUE["sleep"])),
-            ("Wake", lambda: self.apply_or_switch_label(LABEL_TO_VALUE["wake"])),
+            ("Sleep", lambda: self.apply_named_label("sleep")),
+            ("Wake", lambda: self.apply_named_label("wake")),
             ("Clear", self.clear_label_selection),
             ("End", self.end_active_label),
             ("Save", self.save_labels),
@@ -326,6 +423,11 @@ class CropLabelWindow:
         entry.bind("<Return>", lambda _event: self.goto_frame_from_entry())
         ttk.Button(row, text="Go", command=self.goto_frame_from_entry).pack(side=tk.LEFT)
         ttk.Button(row, text="Hotkeys", command=self.show_hotkeys).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Label(row, text="Label").pack(side=tk.LEFT, padx=(16, 0))
+        self.label_entry = ttk.Entry(row, textvariable=self.label_text_var, width=18)
+        self.label_entry.pack(side=tk.LEFT, padx=(5, 4))
+        self.label_entry.bind("<Return>", lambda _event: self.apply_label_from_entry())
+        ttk.Button(row, text="Apply", command=self.apply_label_from_entry).pack(side=tk.LEFT)
 
         self.status_label = ttk.Label(self.root, textvariable=self.status_var, anchor="w")
         self.status_label.pack(side=tk.TOP, fill=tk.X, padx=8)
@@ -352,23 +454,34 @@ class CropLabelWindow:
         self.video_canvas.bind("<Configure>", self.on_canvas_configure)
 
     def bind_keys(self) -> None:
-        self.root.bind("<space>", lambda _event: self.toggle_playback())
-        self.root.bind("<Left>", lambda _event: self.seek_relative(-1))
-        self.root.bind("<Right>", lambda _event: self.seek_relative(1))
-        self.root.bind("<KeyPress-a>", lambda _event: self.seek_relative(-round(self.fps)))
-        self.root.bind("<KeyPress-d>", lambda _event: self.seek_relative(round(self.fps)))
-        self.root.bind("<KeyPress-A>", lambda _event: self.start_fast_playback(-1))
-        self.root.bind("<KeyPress-D>", lambda _event: self.start_fast_playback(1))
-        self.root.bind("<KeyPress-s>", lambda _event: self.apply_or_switch_label(LABEL_TO_VALUE["sleep"]))
-        self.root.bind("<KeyPress-w>", lambda _event: self.apply_or_switch_label(LABEL_TO_VALUE["wake"]))
-        self.root.bind("<KeyPress-n>", lambda _event: self.apply_or_switch_label(LABEL_TO_VALUE["wake"]))
-        self.root.bind("<KeyPress-c>", lambda _event: self.clear_label_selection())
-        self.root.bind("<KeyPress-e>", lambda _event: self.end_active_label())
-        self.root.bind("<KeyPress-bracketleft>", lambda _event: self.set_range_start())
-        self.root.bind("<KeyPress-comma>", lambda _event: self.change_video(-1))
-        self.root.bind("<KeyPress-period>", lambda _event: self.change_video(1))
+        self.root.bind("<space>", lambda event: self.run_hotkey(event, self.toggle_playback))
+        self.root.bind("<Left>", lambda event: self.run_hotkey(event, lambda: self.seek_relative(-1)))
+        self.root.bind("<Right>", lambda event: self.run_hotkey(event, lambda: self.seek_relative(1)))
+        self.root.bind("<KeyPress-a>", lambda event: self.run_hotkey(event, lambda: self.seek_relative(-round(self.fps))))
+        self.root.bind("<KeyPress-d>", lambda event: self.run_hotkey(event, lambda: self.seek_relative(round(self.fps))))
+        self.root.bind("<KeyPress-A>", lambda event: self.run_hotkey(event, lambda: self.start_fast_playback(-1)))
+        self.root.bind("<KeyPress-D>", lambda event: self.run_hotkey(event, lambda: self.start_fast_playback(1)))
+        self.root.bind("<KeyPress-s>", lambda event: self.run_hotkey(event, lambda: self.apply_named_label("sleep")))
+        self.root.bind("<KeyPress-w>", lambda event: self.run_hotkey(event, lambda: self.apply_named_label("wake")))
+        self.root.bind("<KeyPress-n>", lambda event: self.run_hotkey(event, lambda: self.apply_named_label("wake")))
+        self.root.bind("<KeyPress-c>", lambda event: self.run_hotkey(event, self.clear_label_selection))
+        self.root.bind("<KeyPress-e>", lambda event: self.run_hotkey(event, self.end_active_label))
+        self.root.bind("<KeyPress-bracketleft>", lambda event: self.run_hotkey(event, self.set_range_start))
+        self.root.bind("<KeyPress-comma>", lambda event: self.run_hotkey(event, lambda: self.change_video(-1)))
+        self.root.bind("<KeyPress-period>", lambda event: self.run_hotkey(event, lambda: self.change_video(1)))
         self.root.bind("<Control-s>", lambda _event: self.save_labels())
-        self.root.bind("<KeyPress-q>", lambda _event: self.close())
+        self.root.bind("<KeyPress-q>", lambda event: self.run_hotkey(event, self.close))
+
+    def run_hotkey(self, event, callback) -> str | None:
+        widget = getattr(event, "widget", None)
+        try:
+            widget_class = widget.winfo_class() if widget is not None else ""
+        except Exception:
+            widget_class = ""
+        if widget_class in {"Entry", "TEntry"}:
+            return None
+        callback()
+        return "break"
 
     def show_hotkeys(self) -> None:
         self.messagebox.showinfo("Hotkeys", HOTKEY_HELP, parent=self.root)
@@ -410,7 +523,7 @@ class CropLabelWindow:
         self.current_bgr_frame = None
         self.label_vector = load_label_vector(self.labels_dir, self.video_path, self.frame_count)
         self.label_bar_dirty = True
-        self.active_label_value = None
+        self.active_label_text = None
         self.active_start_frame = None
         self.active_last_painted_frame = None
         self.range_start_frame = None
@@ -553,42 +666,43 @@ class CropLabelWindow:
         elapsed_ms = int(round((time.perf_counter() - started_at) * 1000.0))
         self.play_job = self.root.after(max(1, PLAYBACK_TIMER_MS - elapsed_ms), self.play_step)
 
-    def paint_label_interval(self, start: int, end: int, value: int) -> tuple[int, int, bool]:
+    def paint_label_interval(self, start: int, end: int, label: str) -> tuple[int, int, bool]:
         start = clamp(int(start), 0, self.frame_count - 1)
         end = clamp(int(end), 0, self.frame_count - 1)
         if end < start:
             start, end = end, start
-        value = int(value)
+        label = canonical_label_text(label)
         segment = self.label_vector[start : end + 1]
-        changed = bool(np.any(segment != value))
+        changed = bool(np.any(segment != label))
         if changed:
-            segment[:] = value
+            segment[:] = label
             self.label_bar_dirty = True
         return start, end, changed
 
     def paint_active_label_to_frame(self, frame: int, *, redraw_bar: bool = False) -> bool:
-        if self.active_label_value is None:
+        if self.active_label_text is None:
             return False
         frame = clamp(int(frame), 0, self.frame_count - 1)
         start = self.active_last_painted_frame
         if start is None:
             start = self.active_start_frame if self.active_start_frame is not None else frame
-        _start, _end, changed = self.paint_label_interval(start, frame, self.active_label_value)
+        _start, _end, changed = self.paint_label_interval(start, frame, self.active_label_text)
         self.active_last_painted_frame = frame
         if redraw_bar and changed:
             self.draw_label_bar()
         return changed
 
     def reset_active_label_anchor(self, frame: int) -> None:
-        if self.active_label_value is None:
+        if self.active_label_text is None:
             return
         frame = clamp(int(frame), 0, self.frame_count - 1)
         self.active_start_frame = frame
         self.active_last_painted_frame = None
 
-    def fill_interval(self, start: int, end: int, value: int) -> None:
-        start, end, _changed = self.paint_label_interval(start, end, value)
-        self.status_note = f"Labeled {VALUE_TO_LABEL[int(value)]}: frames {start}-{end}"
+    def fill_interval(self, start: int, end: int, label: str) -> None:
+        label = canonical_label_text(label)
+        start, end, _changed = self.paint_label_interval(start, end, label)
+        self.status_note = f"Labeled {label}: frames {start}-{end}"
         self.save_labels()
         self.draw_label_bar()
 
@@ -597,43 +711,60 @@ class CropLabelWindow:
         self.status_note = f"Range start {self.range_start_frame}"
         self.redraw_status(force=True)
 
-    def apply_or_switch_label(self, value: int) -> None:
-        value = int(value)
+    def apply_named_label(self, label: str) -> None:
+        label = canonical_label_text(label)
+        self.label_text_var.set(label)
+        self.apply_or_switch_label(label)
+
+    def apply_label_from_entry(self) -> None:
+        label = canonical_label_text(self.label_text_var.get())
+        if label == UNLABELED_LABEL:
+            self.status_note = "Type a label other than unlabeled, or use Clear"
+            self.redraw_status(force=True)
+            return
+        self.label_text_var.set(label)
+        self.apply_or_switch_label(label)
+
+    def apply_or_switch_label(self, label: str) -> None:
+        label = canonical_label_text(label)
+        if label == UNLABELED_LABEL:
+            self.clear_label_selection()
+            return
         if self.range_start_frame is not None:
-            self.fill_interval(self.range_start_frame, self.current_frame, value)
+            self.fill_interval(self.range_start_frame, self.current_frame, label)
             self.range_start_frame = None
             self.redraw(full_refresh=False)
             return
-        if self.active_label_value is None:
-            self.active_label_value = value
+        if self.active_label_text is None:
+            self.active_label_text = label
             self.active_start_frame = int(self.current_frame)
             self.active_last_painted_frame = None
             self.paint_active_label_to_frame(self.current_frame, redraw_bar=True)
-            self.status_note = f"Started {VALUE_TO_LABEL[value]} at frame {self.active_start_frame}"
-        elif self.active_label_value == value:
+            self.status_note = f"Started {label} at frame {self.active_start_frame}"
+        elif self.active_label_text == label:
             self.end_active_label()
             return
         else:
             start = int(self.active_start_frame if self.active_start_frame is not None else self.current_frame)
             current = int(self.current_frame)
             if current > start:
-                self.fill_interval(start, current - 1, self.active_label_value)
+                self.fill_interval(start, current - 1, self.active_label_text)
             elif current < start:
-                self.fill_interval(current + 1, start, self.active_label_value)
-            self.active_label_value = value
+                self.fill_interval(current + 1, start, self.active_label_text)
+            self.active_label_text = label
             self.active_start_frame = current
             self.active_last_painted_frame = None
             self.paint_active_label_to_frame(current, redraw_bar=True)
-            self.status_note = f"Switched to {VALUE_TO_LABEL[value]} at frame {self.active_start_frame}"
+            self.status_note = f"Switched to {label} at frame {self.active_start_frame}"
         self.redraw_status(force=True)
 
     def end_active_label(self) -> None:
-        if self.active_label_value is None or self.active_start_frame is None:
+        if self.active_label_text is None or self.active_start_frame is None:
             self.status_note = "No active label"
             self.redraw_status(force=True)
             return
-        self.fill_interval(self.active_start_frame, self.current_frame, self.active_label_value)
-        self.active_label_value = None
+        self.fill_interval(self.active_start_frame, self.current_frame, self.active_label_text)
+        self.active_label_text = None
         self.active_start_frame = None
         self.active_last_painted_frame = None
         self.redraw(full_refresh=False)
@@ -649,7 +780,7 @@ class CropLabelWindow:
         end = clamp(int(end), 0, self.frame_count - 1)
         if end < start:
             start, end = end, start
-        self.label_vector[start : end + 1] = -1
+        self.label_vector[start : end + 1] = UNLABELED_LABEL
         self.label_bar_dirty = True
         self.status_note = f"Cleared frames {start}-{end}"
         self.save_labels()
@@ -668,8 +799,8 @@ class CropLabelWindow:
 
     def current_label(self) -> str:
         if len(self.label_vector) == 0:
-            return "unlabeled"
-        return VALUE_TO_LABEL.get(int(self.label_vector[self.current_frame]), "unlabeled")
+            return UNLABELED_LABEL
+        return canonical_label_text(self.label_vector[self.current_frame])
 
     def resize_frame_to_canvas(self, img: np.ndarray) -> np.ndarray:
         canvas_w = max(10, int(self.video_canvas.winfo_width()))
@@ -718,10 +849,16 @@ class CropLabelWindow:
                 np.int64
             )
             frame_indices = np.clip(frame_indices, 0, max(0, len(self.label_vector) - 1))
-            values = self.label_vector[frame_indices] if len(self.label_vector) else np.full(width, -1, dtype=np.int8)
+            values = (
+                self.label_vector[frame_indices].astype(str)
+                if len(self.label_vector)
+                else np.full(width, UNLABELED_LABEL, dtype=object)
+            )
+            values = np.asarray([canonical_label_text(value) for value in values], dtype=str)
             row = np.zeros((width, 3), dtype=np.uint8)
-            for value, color in LABEL_BAR_COLORS.items():
-                row[values == int(value)] = np.asarray(color, dtype=np.uint8)
+            colors = label_color_map(values)
+            for value, color in colors.items():
+                row[values == value] = np.asarray(color, dtype=np.uint8)
             image = np.repeat(row.reshape(1, width, 3), height, axis=0)
             image[0, :, :] = 25
             image[-1, :, :] = 25
@@ -777,20 +914,24 @@ class CropLabelWindow:
         if self.play_pause_button is not None:
             self.play_pause_button.configure(text="Pause" if self.is_playing else "Play")
         active = (
-            f"{VALUE_TO_LABEL[int(self.active_label_value)]} from {self.active_start_frame}"
-            if self.active_label_value is not None
+            f"{self.active_label_text} from {self.active_start_frame}"
+            if self.active_label_text is not None
             else "-"
         )
         range_text = str(self.range_start_frame) if self.range_start_frame is not None else "-"
-        n_sleep = int(np.sum(self.label_vector == LABEL_TO_VALUE["sleep"]))
-        n_wake = int(np.sum(self.label_vector == LABEL_TO_VALUE["wake"]))
-        labeled_pct = 100.0 * float(n_sleep + n_wake) / max(1, len(self.label_vector))
+        lower_labels = np.char.lower(self.label_vector.astype(str)) if len(self.label_vector) else np.asarray([])
+        n_sleep = int(np.sum(lower_labels == "sleep"))
+        n_wake = int(np.sum(lower_labels == "wake"))
+        n_labeled = int(np.sum(lower_labels != UNLABELED_LABEL))
+        n_custom = max(0, n_labeled - n_sleep - n_wake)
+        labeled_pct = 100.0 * float(n_labeled) / max(1, len(self.label_vector))
         note = f" | {self.status_note}" if self.status_note else ""
         self.status_var.set(
             f"Video {self.video_index + 1}/{len(self.video_paths)}: {self.video_path.name} | "
             f"Frame {self.current_frame + 1}/{self.frame_count} | mode {self.playback_mode_text()} | "
             f"current {self.current_label()} | "
-            f"active {active} | range {range_text} | labeled {labeled_pct:.1f}%{note}"
+            f"active {active} | range {range_text} | labeled {labeled_pct:.1f}% "
+            f"(sleep {n_sleep:,}, wake {n_wake:,}, other {n_custom:,}){note}"
         )
 
     def redraw(self, *, full_refresh: bool = True) -> None:

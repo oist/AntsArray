@@ -1,394 +1,491 @@
-import numpy as np
-import pandas as pd
-from typing import Iterable, Optional
+# %%
+# VS Code/Jupyter interactive script for sleep and interaction exploration.
+try:
+    get_ipython().run_line_magic("matplotlib", "qt")  # type: ignore[name-defined]
+except Exception:
+    pass
 
-
-
-def angle_between(v1: np.ndarray, v2: np.ndarray) -> np.ndarray:
-    ang1 = np.arctan2(v1[:, 1], v1[:, 0])
-    ang2 = np.arctan2(v2[:, 1], v2[:, 0])
-    ddeg = (np.degrees(ang2 - ang1) + 360.0) % 360.0
-
-    l1 = np.linalg.norm(v1, axis=1)
-    l2 = np.linalg.norm(v2, axis=1)
-    bad = (l1 == 0) | (l2 == 0) | np.isnan(ang1) | np.isnan(ang2)
-    ddeg[bad] = np.nan
-    return ddeg
+import importlib
+import sys
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from typing import Optional, Iterable
 
-import numpy as np
-import pandas as pd
-from typing import Optional, Iterable
+try:
+    from IPython.display import display
+except Exception:
+    display = print
 
-import numpy as np
-import pandas as pd
-from typing import Optional, Iterable
+repo_root = Path.cwd().resolve()
+for candidate in [repo_root, *repo_root.parents]:
+    if (candidate / "analysis" / "sleep_analysis_utils.py").exists():
+        repo_root = candidate
+        break
+else:
+    raise FileNotFoundError("Could not find analysis/sleep_analysis_utils.py from the current working directory")
 
-def classify_sleep_wake_from_sleap(
-    sleap_df: pd.DataFrame,
-    *,
-    fps: float,
-    track_ids: Optional[Iterable[int]] = None,
-    speed_bodypoint: int = 0,
-    speed_smooth_window: Optional[int] = None,
-    max_speed_pix_s: Optional[float] = None,
-    # XY smoothing for speed
-    max_interp_gap: int = 5,
-    xy_smooth_sigma: float = 3.0,
-    speed_nan_mode: str = "interp",
-    # angle smoothing (circular)
-    angle_max_interp_gap: int = 5,
-    angle_smooth_sigma: float = 3.0,
-    angle_smooth_window: Optional[int] = None,
-    # thresholds
-    thr_inL: float = 90.0,
-    thr_inR: float = 90.0,
-    thr_outL: float = 130.0,
-    thr_outR: float = 130.0,
-    thr_speed_pix_s: float = 22.17,
-    # sleep smoothing (median filter on binary sleep evidence)
-    sleep_median_win_sec: float = 20.0,
-    # duplicates handling
-    duplicate_agg: str = "mean",
-    # output row index policy
-    output_frame_index: str = "observed",
-) -> pd.DataFrame:
-    """
-    Returns per-frame smoothed angles + smoothed speed (+ smoothed XY used for speed) + sleep/wake classification.
+if str(repo_root) not in sys.path:
+    sys.path.insert(0, str(repo_root))
 
-    Speed:
-      - Reindex X/Y onto dense frame grid
-      - Interpolate short gaps (support smoothing)
-      - Smooth X/Y (Gaussian preferred)
-      - Compute speed from smoothed X/Y
-      - Mask speed by `speed_nan_mode`:
-          * "interp": endpoints must exist after limited interpolation
-          * "raw": endpoints must exist in raw XY (legacy behavior)
-          * "none": no endpoint-validity masking
+import analysis.colony_speed_utils as cs
+import analysis.interaction_analysis_utils as ia
+import analysis.sleep_analysis_utils as sleep_utils
 
-    Angles:
-      - Compute raw angles from pose geometry
-      - Circularly smooth angles (smooth sin/cos then atan2), with short-gap interp for support
-      - Mask smoothed angles back to NaN where raw angle was missing (no hallucinated angles)
+importlib.reload(cs)
+importlib.reload(ia)
+importlib.reload(sleep_utils)
 
-    Sleep classification:
-      - Compute framewise sleep evidence from smoothed angles + smoothed speed (NaN-aware)
-      - Apply a centered rolling median (majority filter) over sleep evidence (no state machine)
-      - Unknown (NaN) stays unknown unless surrounding evidence supports a median value
 
-    Output frame rows:
-      - output_frame_index="observed": rows at original observed pose frames only (legacy behavior)
-      - output_frame_index="full": rows for every frame in [min_frame, max_frame]
-    """
+# %%
+# Edit these settings first. Defaults load one chunk/side for fast plotting.
+DATASET_ROOT = Path("/home/sam-reiter/bucket/ReiterU/Ants/basler/20260515/block02")
+INTERACTION_ROOT = DATASET_ROOT / "interactions"
+TRACKS_ROOT = DATASET_ROOT / "tracks"
+SPEED_ROOT = DATASET_ROOT / "stitched" / "speed_vectors"
+PER_TRACK_ROOT = DATASET_ROOT / "stitched" / "per_track"
 
-    # ---------- helpers ----------
+SIDE = "left"  # "left" or "right"
+CHUNKS = "all"  # Use "all" for the full side, or ["000", "001"].
+MAX_CHUNKS = None
+FPS = 24.0
+MM_PER_PX = 0.016
+MIN_PRESENT_FRAC = 0.40
 
-    def col_or_nan(wide: pd.DataFrame, xy: str, bp: int) -> pd.Series:
-        if (xy, bp) in wide.columns:
-            return wide[(xy, bp)]
-        return pd.Series(np.nan, index=wide.index)
+SINGLE_ANT_ROW = None       # Row from speed_tracks; overrides track id when not None.
+SINGLE_ANT_TRACK_ID = 22  # Set to an integer TrackID, or None for first selected track.
+SINGLE_ANT_SIDE = 'left'
 
-    def get_vec(wide: pd.DataFrame, bp_from: int, bp_to: int) -> np.ndarray:
-        dx = col_or_nan(wide, "X", bp_to) - col_or_nan(wide, "X", bp_from)
-        dy = col_or_nan(wide, "Y", bp_to) - col_or_nan(wide, "Y", bp_from)
-        return np.column_stack([dx.to_numpy(), dy.to_numpy()])
+BIN_SECONDS = 30.0
+SPEED_SMOOTH_SECONDS = 5 * 60
+QUIESCENCE_SPEED_THRESHOLD_MM_S = 0.1
+MIN_QUIESCENT_BOUT_SECONDS = 10.0
+SPEED_YLIM = None
+INTERACTION_YLIM = None
 
-    def smooth_circular_angle_deg(
-        angle_deg: pd.Series,
-        full_index: pd.RangeIndex,
-        *,
-        max_interp_gap: int,
-        smooth_sigma: float,
-        smooth_window: Optional[int],
-    ) -> pd.Series:
-        """Circular smoothing for degrees in [0, 360). Returns a Series on full_index."""
-        a = angle_deg.reindex(full_index).astype(float)
-        raw_valid = np.isfinite(a.to_numpy())
+POSTURE_LOW_INTERACTION_MAX = 0
+POSTURE_HIGH_INTERACTION_MIN = None  # None uses POSTURE_HIGH_INTERACTION_QUANTILE.
+POSTURE_HIGH_INTERACTION_QUANTILE = 0.75
+POSTURE_INCLUDE_NON_QUIESCENT = True
+POSTURE_MAX_FRAMES_PER_GROUP = 20000
+POSTURE_RANDOM_STATE = 0
+POSTURE_JOINT_MAX_POINTS_PER_GROUP = 5000
+POSTURE_FEATURE_COLUMNS = [
+    "angle_in_left_deg",
+    "angle_out_left_deg",
+    "angle_in_right_deg",
+    "angle_out_right_deg",
+    "pose_width_mm",
+    "pose_height_mm",
+    "pose_area_mm2",
+]
+POSTURE_JOINT_FEATURE_COLUMNS = [
+    *POSTURE_FEATURE_COLUMNS,
+    "bp1_bp4_dist_mm",
+    "bp1_bp7_dist_mm",
+    "bp4_bp5_dist_mm",
+    "bp5_bp6_dist_mm",
+    "bp7_bp8_dist_mm",
+    "bp8_bp9_dist_mm",
+    "bp4_bp7_dist_mm",
+    "bp5_bp8_dist_mm",
+]
+POSTURE_EXTRA_DISTANCE_FEATURE_COLUMNS = [
+    "bp1_bp5_dist_mm",
+    "bp1_bp6_dist_mm",
+    "bp1_bp8_dist_mm",
+    "bp1_bp9_dist_mm",
+    "bp4_bp6_dist_mm",
+    "bp4_bp8_dist_mm",
+    "bp4_bp9_dist_mm",
+    "bp5_bp7_dist_mm",
+    "bp5_bp9_dist_mm",
+    "bp6_bp7_dist_mm",
+    "bp6_bp8_dist_mm",
+    "bp6_bp9_dist_mm",
+    "bp7_bp9_dist_mm",
+]
+POSTURE_ENGINEERED_FEATURE_COLUMNS = [
+    "pose_aspect_ratio",
+    "pose_extent_mm",
+    "pose_compactness",
+    "angle_in_mean_deg",
+    "angle_out_mean_deg",
+    "angle_all_mean_deg",
+    "angle_in_abs_diff_deg",
+    "angle_out_abs_diff_deg",
+    "angle_left_sum_deg",
+    "angle_right_sum_deg",
+    "left_side_chain_mm",
+    "right_side_chain_mm",
+    "side_chain_mean_mm",
+    "side_chain_abs_diff_mm",
+    "side_chain_ratio",
+    "left_segment_ratio",
+    "right_segment_ratio",
+    "mid_span_ratio",
+    "tip_span_mm",
+    "tip_span_to_pose_width",
+    "head_to_left_tip_ratio",
+    "head_to_right_tip_ratio",
+]
+POSTURE_NORMALIZED_DISTANCE_FEATURE_COLUMNS = [
+    f"{feature}_per_pose_width"
+    for feature in [
+        *POSTURE_JOINT_FEATURE_COLUMNS[7:],
+        *POSTURE_EXTRA_DISTANCE_FEATURE_COLUMNS,
+    ]
+]
+POSTURE_CLASSIFIER_FEATURE_COLUMNS = [
+    *POSTURE_JOINT_FEATURE_COLUMNS,
+    *POSTURE_EXTRA_DISTANCE_FEATURE_COLUMNS,
+    *POSTURE_ENGINEERED_FEATURE_COLUMNS,
+    *POSTURE_NORMALIZED_DISTANCE_FEATURE_COLUMNS,
+]
 
-        lim = int(max(0, max_interp_gap))
-        if lim > 0:
-            a_fill = a.interpolate("linear", limit=lim, limit_direction="both")
-        else:
-            a_fill = a
+CLASSIFIER_FEATURE_COLUMNS = POSTURE_CLASSIFIER_FEATURE_COLUMNS
+CLASSIFIER_SPLIT_BY = "time_bout"  # "time_bout", "random_bout", or "random_frame".
+CLASSIFIER_TEST_SIZE = 0.5
+CLASSIFIER_RANDOM_STATE = POSTURE_RANDOM_STATE
+CLASSIFIER_MAX_WEIGHT_FEATURES = 12
 
-        rad = np.deg2rad(a_fill.to_numpy(dtype=float))
-        s = pd.Series(np.sin(rad), index=full_index)
-        c = pd.Series(np.cos(rad), index=full_index)
+LOW_INTERACTION_CLUSTER_SPLIT = "test"  # Use held-out bouts/ants by default.
+LOW_INTERACTION_CLUSTER_SCORE_THRESHOLD = 0.5
+LOW_INTERACTION_CLUSTER_MIN_FRAME_FRACTION = 0.5
+LOW_INTERACTION_CLUSTER_CORRELATION_X = "n_interactions_total"
+LOW_INTERACTION_CLUSTER_CORRELATION_Y = "bout_duration_seconds"
 
-        if smooth_sigma is not None and float(smooth_sigma) > 0:
-            sigma = float(smooth_sigma)
-            win = int(max(3, round(6 * sigma + 1)))
-            if win % 2 == 0:
-                win += 1
-            s_sm = s.rolling(win, win_type="gaussian", center=True, min_periods=1).mean(std=sigma)
-            c_sm = c.rolling(win, win_type="gaussian", center=True, min_periods=1).mean(std=sigma)
-        else:
-            w = None if smooth_window is None else int(smooth_window)
-            if w is None or w <= 1:
-                s_sm, c_sm = s, c
-            else:
-                s_sm = s.rolling(w, center=True, min_periods=1).mean()
-                c_sm = c.rolling(w, center=True, min_periods=1).mean()
+CROSS_ANT_TRACK_IDS = None  # None uses the first CROSS_ANT_MAX_TRACKS selected tracks on SINGLE_ANT_SIDE.
+CROSS_ANT_MAX_TRACKS = 20
+CROSS_ANT_TRAIN_TRACK_IDS = None  # Set explicit track IDs here, or leave None for a random ant split.
+CROSS_ANT_TEST_TRACK_IDS = None
+CROSS_ANT_MAX_FRAMES_PER_GROUP = 5000
 
-        ang = (np.rad2deg(np.arctan2(s_sm.to_numpy(), c_sm.to_numpy())) + 360.0) % 360.0
-        out = pd.Series(ang, index=full_index)
-        out[~raw_valid] = np.nan  # do not output angles where raw was missing
-        return out
 
-    # ---------- main ----------
+# %%
+# Resolve chunk files, load speed-vector metadata, and load directed interactions.
+chunks = ia.resolve_chunks(
+    INTERACTION_ROOT,
+    TRACKS_ROOT,
+    chunks=CHUNKS,
+    side=SIDE,
+    fps=FPS,
+    max_chunks=MAX_CHUNKS,
+)
+chunk_summary = ia.describe_chunks(chunks)
+ANALYSIS_FRAME_START = min(int(chunk.chunk_global_frame_offset) for chunk in chunks)
+ANALYSIS_FRAME_STOP = max(int(chunk.chunk_global_frame_offset + chunk.chunk_frame_count) for chunk in chunks)
 
-    df = sleap_df.copy()
-    if "TrackID" not in df.columns:
-        df["TrackID"] = 0
+speed_tracks_all = cs.load_speed_tracks(SPEED_ROOT)
+speed_tracks = cs.select_tracks(speed_tracks_all, MIN_PRESENT_FRAC)
+speed_tracks_side = speed_tracks[speed_tracks["side"] == SINGLE_ANT_SIDE].reset_index(drop=False)
+if speed_tracks_side.empty:
+    raise ValueError(f"No speed tracks passed MIN_PRESENT_FRAC={MIN_PRESENT_FRAC} for side={SINGLE_ANT_SIDE!r}")
 
-    required = {"Frame", "TrackID", "Bodypoint", "X", "Y"}
-    missing = required - set(df.columns)
-    if missing:
-        raise ValueError(f"Missing required columns: {sorted(missing)}")
+if SINGLE_ANT_TRACK_ID is None and SINGLE_ANT_ROW is None:
+    SINGLE_ANT_TRACK_ID = int(speed_tracks_side.iloc[0]["track_id"])
 
-    if track_ids is not None:
-        df = df[df["TrackID"].isin(list(track_ids))]
+interactions_raw = ia.load_interactions_for_chunks(chunks)
+interaction_counts_by_track = ia.interaction_frame_counts_by_track(
+    interactions_raw,
+    chunk_global_frame_offset=0,
+)
 
-    if duplicate_agg not in {"mean", "median", "first"}:
-        raise ValueError("duplicate_agg must be one of: 'mean', 'median', 'first'")
-    if speed_nan_mode not in {"interp", "raw", "none"}:
-        raise ValueError("speed_nan_mode must be one of: 'interp', 'raw', 'none'")
-    if output_frame_index not in {"observed", "full"}:
-        raise ValueError("output_frame_index must be one of: 'observed', 'full'")
+chunk_table = pd.DataFrame(
+    [
+        {
+            "chunk": chunk.chunk,
+            "side": chunk.side,
+            "start": ia.format_clock_time(chunk.chunk_start_clock_seconds),
+            "frame_offset": chunk.chunk_global_frame_offset,
+            "n_frames": chunk.chunk_frame_count,
+            "interaction_file": chunk.interaction_path.name,
+        }
+        for chunk in chunks
+    ]
+)
 
-    rows = []
+print(f"Chunk selection: {chunk_summary} ({SIDE})")
+print(f"Loaded speed tracks: {len(speed_tracks):,}/{len(speed_tracks_all):,} passing present_frac > {MIN_PRESENT_FRAC:g}")
+print(f"Interaction rows loaded: {len(interactions_raw):,}")
+print(f"Selected ant: row={SINGLE_ANT_ROW}, track_id={SINGLE_ANT_TRACK_ID}, side={SINGLE_ANT_SIDE}")
+display(chunk_table)
+display(
+    speed_tracks_side[
+        ["index", "side", "track_id", "track_name", "present_frac", "n_observed_frames", "n_frames"]
+    ].head(20)
+)
 
-    for tid, g in df.groupby("TrackID", sort=False):
-        g = g.sort_values("Frame", kind="mergesort")
 
-        # --- build wide pose table ---
-        if duplicate_agg == "first":
-            gg = (
-                g.sort_values(["Frame", "Bodypoint"], kind="mergesort")
-                .drop_duplicates(subset=["Frame", "Bodypoint"], keep="first")
-            )
-            wide = gg.pivot(index="Frame", columns="Bodypoint", values=["X", "Y"]).sort_index()
-        else:
-            wide = (
-                g.pivot_table(
-                    index="Frame",
-                    columns="Bodypoint",
-                    values=["X", "Y"],
-                    aggfunc=duplicate_agg,
-                    dropna=False,
-                )
-                .sort_index()
-            )
+# %%
+# Single-ant plot: 5-minute-smoothed speed plus directed social interactions.
+single_ant_speed_interactions = sleep_utils.plot_single_ant_speed_interactions(
+    speed_tracks,
+    interactions_raw,
+    row_number=SINGLE_ANT_ROW,
+    track_id=SINGLE_ANT_TRACK_ID,
+    side=SINGLE_ANT_SIDE,
+    bin_seconds=BIN_SECONDS,
+    speed_smooth_seconds=SPEED_SMOOTH_SECONDS,
+    quiescence_speed_threshold_mm_s=QUIESCENCE_SPEED_THRESHOLD_MM_S,
+    min_quiescent_seconds=MIN_QUIESCENT_BOUT_SECONDS,
+    analysis_frame_start=ANALYSIS_FRAME_START,
+    analysis_frame_stop=ANALYSIS_FRAME_STOP,
+    speed_ylim=SPEED_YLIM,
+    interaction_ylim=INTERACTION_YLIM,
+    counts_by_track=interaction_counts_by_track,
+)
+display(single_ant_speed_interactions.head(20))
 
-        wide.columns = pd.MultiIndex.from_arrays(
-            [wide.columns.get_level_values(0), wide.columns.get_level_values(1).astype(int)]
+
+# %%
+# Quick bout-level quantification for the plotted ant.
+single_ant_track_row = sleep_utils.selected_speed_track(
+    speed_tracks,
+    row_number=SINGLE_ANT_ROW,
+    track_id=SINGLE_ANT_TRACK_ID,
+    side=SINGLE_ANT_SIDE,
+)
+single_ant_quiescent_bouts = single_ant_speed_interactions.attrs.get("quiescent_bouts", pd.DataFrame()).copy()
+single_ant_non_quiescent_bouts = sleep_utils.non_quiescent_threshold_bouts_for_track_row(
+    single_ant_track_row,
+    interaction_counts_by_track,
+    speed_smooth_seconds=SPEED_SMOOTH_SECONDS,
+    quiescence_speed_threshold_mm_s=QUIESCENCE_SPEED_THRESHOLD_MM_S,
+    min_non_quiescent_seconds=MIN_QUIESCENT_BOUT_SECONDS,
+    frame_start=ANALYSIS_FRAME_START,
+    frame_stop=ANALYSIS_FRAME_STOP,
+)
+if not single_ant_quiescent_bouts.empty:
+    single_ant_quiescent_bouts["state"] = "quiescent"
+if not single_ant_non_quiescent_bouts.empty:
+    single_ant_non_quiescent_bouts["state"] = "not_quiescent"
+single_ant_bouts = pd.concat(
+    [df for df in [single_ant_quiescent_bouts, single_ant_non_quiescent_bouts] if not df.empty],
+    ignore_index=True,
+) if (not single_ant_quiescent_bouts.empty or not single_ant_non_quiescent_bouts.empty) else pd.DataFrame()
+
+if single_ant_bouts.empty:
+    single_ant_quiescence_summary = pd.DataFrame()
+else:
+    single_ant_bouts["has_interaction"] = single_ant_bouts["n_interactions_total"] > 0
+    single_ant_quiescence_summary = (
+        single_ant_bouts.groupby("state", sort=False)
+        .agg(
+            n_bouts=("bout_id", "size"),
+            total_bout_duration_s=("bout_duration_seconds", "sum"),
+            median_bout_duration_s=("bout_duration_seconds", "median"),
+            fraction_bouts_with_interaction=("has_interaction", "mean"),
+            mean_interactions_per_bout=("n_interactions_total", "mean"),
+            median_interactions_per_bout=("n_interactions_total", "median"),
         )
-
-        if wide.index.size == 0:
-            continue
-
-        fmin, fmax = int(wide.index.min()), int(wide.index.max())
-        full_index = pd.RangeIndex(fmin, fmax + 1)
-
-        # ---------- speed from smoothed XY ----------
-        speed_X_raw = col_or_nan(wide, "X", int(speed_bodypoint)).astype(float)
-        speed_Y_raw = col_or_nan(wide, "Y", int(speed_bodypoint)).astype(float)
-
-        x = speed_X_raw.reindex(full_index)
-        y = speed_Y_raw.reindex(full_index)
-
-        raw_xy_valid = np.isfinite(x.to_numpy()) & np.isfinite(y.to_numpy())
-
-        lim = int(max(0, max_interp_gap))
-        if lim > 0:
-            x_fill = x.interpolate("linear", limit=lim, limit_direction="both")
-            y_fill = y.interpolate("linear", limit=lim, limit_direction="both")
-        else:
-            x_fill, y_fill = x, y
-        interp_xy_valid = np.isfinite(x_fill.to_numpy()) & np.isfinite(y_fill.to_numpy())
-
-        if xy_smooth_sigma is not None and float(xy_smooth_sigma) > 0:
-            sigma = float(xy_smooth_sigma)
-            win = int(max(3, round(6 * sigma + 1)))
-            if win % 2 == 0:
-                win += 1
-            x_s = x_fill.rolling(win, win_type="gaussian", center=True, min_periods=1).mean(std=sigma)
-            y_s = y_fill.rolling(win, win_type="gaussian", center=True, min_periods=1).mean(std=sigma)
-        else:
-            w = None if speed_smooth_window is None else int(speed_smooth_window)
-            if w is None or w <= 1:
-                x_s, y_s = x_fill, y_fill
-            else:
-                x_s = x_fill.rolling(w, center=True, min_periods=1).mean()
-                y_s = y_fill.rolling(w, center=True, min_periods=1).mean()
-
-        dx = x_s.diff()
-        dy = y_s.diff()
-        speed_full = np.sqrt(dx * dx + dy * dy).to_numpy(dtype=float) * float(fps)
-        speed_full[0] = np.nan
-        if speed_nan_mode == "raw":
-            step_valid = raw_xy_valid[1:] & raw_xy_valid[:-1]
-        elif speed_nan_mode == "interp":
-            step_valid = interp_xy_valid[1:] & interp_xy_valid[:-1]
-        else:  # "none"
-            step_valid = np.ones(len(speed_full) - 1, dtype=bool)
-        speed_full[1:][~step_valid] = np.nan
-
-        speed_pix_s_full = pd.Series(speed_full, index=full_index)
-
-        # ---------- raw angles ----------
-        v_5_4 = get_vec(wide, 5, 4)
-        v_5_6 = get_vec(wide, 5, 6)
-        v_4_1 = get_vec(wide, 4, 1)
-        v_4_5 = get_vec(wide, 4, 5)
-        v_8_7 = get_vec(wide, 8, 7)
-        v_8_9 = get_vec(wide, 8, 9)
-        v_7_1 = get_vec(wide, 7, 1)
-        v_7_8 = get_vec(wide, 7, 8)
-
-        raw_angles = pd.DataFrame(
-            {
-                "Frame": wide.index.astype(int),
-                "angle_InL_raw": 360.0 - angle_between(v_5_4, v_5_6),
-                "angle_OutL_raw": angle_between(v_4_1, v_4_5),
-                "angle_InR_raw": angle_between(v_8_7, v_8_9),
-                "angle_OutR_raw": 360.0 - angle_between(v_7_1, v_7_8),
-            }
-        )
-
-        # ---------- smooth angles (output ONLY smoothed) ----------
-        smoothed_angles_full = {}
-        for raw_col, out_col in [
-            ("angle_InL_raw", "angle_InL_deg"),
-            ("angle_OutL_raw", "angle_OutL_deg"),
-            ("angle_InR_raw", "angle_InR_deg"),
-            ("angle_OutR_raw", "angle_OutR_deg"),
-        ]:
-            s = pd.Series(raw_angles[raw_col].to_numpy(dtype=float),
-                          index=raw_angles["Frame"].to_numpy(dtype=int))
-            sm = smooth_circular_angle_deg(
-                s,
-                full_index,
-                max_interp_gap=angle_max_interp_gap,
-                smooth_sigma=angle_smooth_sigma,
-                smooth_window=angle_smooth_window,
-            )
-            smoothed_angles_full[out_col] = sm
-
-        frame_out = full_index if output_frame_index == "full" else wide.index
-
-        out_track = pd.DataFrame(
-            {
-                "TrackID": tid,
-                "Frame": frame_out.to_numpy(dtype=int),
-                "angle_InL_deg": smoothed_angles_full["angle_InL_deg"].reindex(frame_out).to_numpy(dtype=float),
-                "angle_OutL_deg": smoothed_angles_full["angle_OutL_deg"].reindex(frame_out).to_numpy(dtype=float),
-                "angle_InR_deg": smoothed_angles_full["angle_InR_deg"].reindex(frame_out).to_numpy(dtype=float),
-                "angle_OutR_deg": smoothed_angles_full["angle_OutR_deg"].reindex(frame_out).to_numpy(dtype=float),
-                "speed_pix_s": speed_pix_s_full.reindex(frame_out).to_numpy(dtype=float),
-                "speed_X_s": x_s.reindex(frame_out).to_numpy(dtype=float),
-                "speed_Y_s": y_s.reindex(frame_out).to_numpy(dtype=float),
-            }
-        )
-
-        # ---------- invalidate unrealistic jumps: WIPE speed + ALL angles + XY ----------
-        if max_speed_pix_s is not None:
-            bad = out_track["speed_pix_s"] > float(max_speed_pix_s)
-            wipe = [
-                "angle_InL_deg", "angle_OutL_deg",
-                "angle_InR_deg", "angle_OutR_deg",
-                "speed_pix_s", "speed_X_s", "speed_Y_s",
-            ]
-            out_track.loc[bad, wipe] = np.nan
-
-        # ---------- sleep evidence (NaN-aware) + median filter ----------
-        req = ["angle_InL_deg", "angle_InR_deg", "angle_OutL_deg", "angle_OutR_deg", "speed_pix_s"]
-        valid = out_track[req].notna().all(axis=1)
-
-        sleep_raw = pd.Series(np.nan, index=out_track.index, dtype=float)
-        sleep_raw.loc[valid] = (
-            (out_track.loc[valid, "angle_InL_deg"]  < thr_inL) &
-            (out_track.loc[valid, "angle_InR_deg"]  < thr_inR) &
-            (out_track.loc[valid, "angle_OutL_deg"] < thr_outL) &
-            (out_track.loc[valid, "angle_OutR_deg"] < thr_outR) &
-            (out_track.loc[valid, "speed_pix_s"]    < thr_speed_pix_s)
-        ).astype(float)  # 1 sleep, 0 wake, NaN unknown
-
-        win = int(round(float(sleep_median_win_sec) * float(fps)))
-        win = max(3, win | 1)  # odd, >=3
-
-        sleep_score = sleep_raw.rolling(window=win, center=True, min_periods=1).median()
-
-        out_track["sleep_score"] = sleep_score.to_numpy(dtype=float)
-        out_track["is_sleep"] = (sleep_score >= 0.5) & sleep_score.notna()
-        out_track["is_wake"] = ~out_track["is_sleep"]
-
-        rows.append(out_track)
-
-    out = (
-        pd.concat(rows, ignore_index=True)
-        .sort_values(["TrackID", "Frame"], kind="mergesort")
-        .reset_index(drop=True)
+        .reset_index()
     )
-    return out
+display(single_ant_bouts.head(20))
+display(single_ant_quiescence_summary)
 
 
-def get_event_trig_avg(sig, event_inds, backlag, forwardlag):
-    """
-    Calculate the event-triggered average.
+# %%
+# Compare posture distributions in quiescent periods with little/no vs more interactions.
+posture_samples, posture_bout_summary = sleep_utils.quiescent_posture_samples_by_interaction(
+    single_ant_speed_interactions,
+    speed_tracks,
+    row_number=SINGLE_ANT_ROW,
+    track_id=SINGLE_ANT_TRACK_ID,
+    side=SINGLE_ANT_SIDE,
+    counts_by_track=interaction_counts_by_track,
+    per_track_root=PER_TRACK_ROOT,
+    fps=FPS,
+    mm_per_px=MM_PER_PX,
+    speed_smooth_seconds=SPEED_SMOOTH_SECONDS,
+    quiescence_speed_threshold_mm_s=QUIESCENCE_SPEED_THRESHOLD_MM_S,
+    min_quiescent_seconds=MIN_QUIESCENT_BOUT_SECONDS,
+    analysis_frame_start=ANALYSIS_FRAME_START,
+    analysis_frame_stop=ANALYSIS_FRAME_STOP,
+    low_interaction_max=POSTURE_LOW_INTERACTION_MAX,
+    high_interaction_min=POSTURE_HIGH_INTERACTION_MIN,
+    high_interaction_quantile=POSTURE_HIGH_INTERACTION_QUANTILE,
+    include_non_quiescent=POSTURE_INCLUDE_NON_QUIESCENT,
+    max_frames_per_group=POSTURE_MAX_FRAMES_PER_GROUP,
+    random_state=POSTURE_RANDOM_STATE,
+)
+display(posture_bout_summary)
 
-    Parameters:
-    - sig (numpy.ndarray): Input signal.
-    - event_inds (numpy.ndarray): Indices of events.
-    - backlag (int): Backward time lag.
-    - forwardlag (int): Forward time lag.
+posture_distribution_summary = sleep_utils.plot_quiescent_posture_distributions(
+    posture_samples,
+    feature_cols=POSTURE_FEATURE_COLUMNS,
+)
+display(posture_distribution_summary)
 
-    Returns:
-    - ev_avg (numpy.ndarray): Event-triggered average.
-    - ev_mat (numpy.ndarray): Event-triggered matrix.
 
-    """
-    event_inds = np.round(event_inds).astype(int) 
-    if sig.ndim==1:
-        sig=np.expand_dims(sig,0)
-        
-    min_nevents = 1  # minimum number of events where we will even compute a triggered avg
+# %%
+# Joint posture analysis for quiescent little/no-interaction vs more-interaction frames.
+posture_joint_embedding, posture_joint_metrics, posture_joint_loadings = (
+    sleep_utils.plot_multivariate_quiescent_posture_analysis(
+        posture_samples,
+        feature_cols=POSTURE_JOINT_FEATURE_COLUMNS,
+        groups=("little_or_no_interaction", "more_interaction"),
+        random_state=POSTURE_RANDOM_STATE,
+        max_points_per_group=POSTURE_JOINT_MAX_POINTS_PER_GROUP,
+    )
+)
+display(posture_joint_metrics)
+display(posture_joint_loadings)
 
-    orig_size = sig.shape
 
-    lags = np.arange(-backlag, forwardlag + 1)
+# %%
+# Classifier reliability for the selected ant: train on one subset of quiescent bouts, test on held-out bouts.
+same_ant_classifier_predictions, same_ant_classifier_metrics, same_ant_classifier_weights, same_ant_classifier_model = (
+    sleep_utils.plot_quiescent_posture_classifier(
+        posture_samples,
+        feature_cols=CLASSIFIER_FEATURE_COLUMNS,
+        groups=("little_or_no_interaction", "more_interaction"),
+        split_by=CLASSIFIER_SPLIT_BY,
+        test_size=CLASSIFIER_TEST_SIZE,
+        random_state=CLASSIFIER_RANDOM_STATE,
+        max_weight_features=CLASSIFIER_MAX_WEIGHT_FEATURES,
+    )
+)
+display(same_ant_classifier_metrics)
+display(same_ant_classifier_weights)
 
-    # get rid of events that happen within the lag-range of the end points
-    bad_ids = np.where(event_inds <= backlag)[0]
-    if len(bad_ids) > 0:
-        print(f'Dropping {len(bad_ids)} early events')
-        event_inds = np.delete(event_inds, bad_ids)
 
-    bad_ids = np.where(event_inds >= (orig_size[1] - forwardlag))[0]
-    if len(bad_ids) > 0:
-        print(f'Dropping {len(bad_ids)} late events')
-        event_inds = np.delete(event_inds, bad_ids)
+# %%
+# Treat classifier-low quiescent bouts as their own state and ask how interactions relate to that state.
+same_ant_low_quiescent_bins, same_ant_low_quiescent_summary, same_ant_low_quiescent_bouts, same_ant_low_quiescent_corr = (
+    sleep_utils.plot_low_interaction_quiescent_cluster_analysis(
+        same_ant_classifier_predictions,
+        groups=("little_or_no_interaction", "more_interaction"),
+        split=LOW_INTERACTION_CLUSTER_SPLIT,
+        bin_seconds=BIN_SECONDS,
+        low_score_threshold=LOW_INTERACTION_CLUSTER_SCORE_THRESHOLD,
+        min_predicted_low_fraction=LOW_INTERACTION_CLUSTER_MIN_FRAME_FRACTION,
+        correlation_x_col=LOW_INTERACTION_CLUSTER_CORRELATION_X,
+        correlation_y_col=LOW_INTERACTION_CLUSTER_CORRELATION_Y,
+        title=f"Selected ant {SINGLE_ANT_SIDE} TrackID {SINGLE_ANT_TRACK_ID}: low-interaction quiescent classifier state",
+    )
+)
+display(same_ant_low_quiescent_summary)
+display(same_ant_low_quiescent_corr.to_frame().T)
+display(same_ant_low_quiescent_bouts.head(30))
 
-    n_events = len(event_inds)
 
-    # check that we have at least the minimum number of events to work with
-    if n_events < min_nevents:
-        ev_avg = np.full((orig_size[0], len(lags)), np.nan)
-        ev_mat = np.nan
-        return ev_avg, ev_mat
+# %%
+# Build posture samples from several ants for cross-ant train/test.
+if CROSS_ANT_TRACK_IDS is None:
+    explicit_cross_ant_ids = []
+    if CROSS_ANT_TRAIN_TRACK_IDS is not None:
+        explicit_cross_ant_ids.extend(list(CROSS_ANT_TRAIN_TRACK_IDS))
+    if CROSS_ANT_TEST_TRACK_IDS is not None:
+        explicit_cross_ant_ids.extend(list(CROSS_ANT_TEST_TRACK_IDS))
+    if explicit_cross_ant_ids:
+        cross_ant_track_ids = list(dict.fromkeys(int(track_id) for track_id in explicit_cross_ant_ids))
+    else:
+        cross_ant_track_ids = (
+            speed_tracks_side["track_id"]
+            .dropna()
+            .astype(int)
+            .drop_duplicates()
+            .head(int(CROSS_ANT_MAX_TRACKS))
+            .to_list()
+        )
+else:
+    cross_ant_track_ids = list(CROSS_ANT_TRACK_IDS)
 
-    ev_avg = np.zeros((orig_size[0], len(lags)))
-    ev_mat = np.zeros((n_events, orig_size[0], len(lags)))
+if len(cross_ant_track_ids) < 2:
+    raise ValueError("Need at least two CROSS_ANT_TRACK_IDS for a cross-ant classifier split")
 
-    for i in range(n_events):
-        cur_ids = np.arange(event_inds[i] - backlag, event_inds[i] + forwardlag + 1)
-        temp_sig = sig[:, cur_ids]
-        ev_avg += temp_sig
-        ev_mat[i,:, :] = temp_sig
+cross_ant_posture_samples, cross_ant_bout_summary, cross_ant_speed_interactions = (
+    sleep_utils.quiescent_posture_samples_for_tracks(
+        speed_tracks,
+        interactions_raw,
+        track_ids=cross_ant_track_ids,
+        side=SINGLE_ANT_SIDE,
+        per_track_root=PER_TRACK_ROOT,
+        fps=FPS,
+        mm_per_px=MM_PER_PX,
+        bin_seconds=BIN_SECONDS,
+        speed_smooth_seconds=SPEED_SMOOTH_SECONDS,
+        quiescence_speed_threshold_mm_s=QUIESCENCE_SPEED_THRESHOLD_MM_S,
+        min_quiescent_seconds=MIN_QUIESCENT_BOUT_SECONDS,
+        analysis_frame_start=ANALYSIS_FRAME_START,
+        analysis_frame_stop=ANALYSIS_FRAME_STOP,
+        low_interaction_max=POSTURE_LOW_INTERACTION_MAX,
+        high_interaction_min=POSTURE_HIGH_INTERACTION_MIN,
+        high_interaction_quantile=POSTURE_HIGH_INTERACTION_QUANTILE,
+        include_non_quiescent=False,
+        max_frames_per_group=CROSS_ANT_MAX_FRAMES_PER_GROUP,
+        random_state=CLASSIFIER_RANDOM_STATE,
+        counts_by_track=interaction_counts_by_track,
+    )
+)
+display(cross_ant_bout_summary)
 
-    ev_avg /= n_events
 
-    return np.squeeze(ev_avg), np.squeeze(ev_mat)
+# %%
+# Cross-ant classifier: train on some ants and test on different ants.
+available_cross_ant_track_ids = sorted(cross_ant_posture_samples["track_id"].dropna().astype(int).unique().tolist())
+if CROSS_ANT_TRAIN_TRACK_IDS is None and CROSS_ANT_TEST_TRACK_IDS is None:
+    rng = np.random.default_rng(CLASSIFIER_RANDOM_STATE)
+    shuffled_track_ids = np.asarray(available_cross_ant_track_ids, dtype=int)
+    rng.shuffle(shuffled_track_ids)
+    split_at = max(1, len(shuffled_track_ids) // 2)
+    train_track_ids = sorted(shuffled_track_ids[:split_at].astype(int).tolist())
+    test_track_ids = sorted(shuffled_track_ids[split_at:].astype(int).tolist())
+elif CROSS_ANT_TRAIN_TRACK_IDS is None:
+    test_track_ids = [int(track_id) for track_id in CROSS_ANT_TEST_TRACK_IDS]
+    train_track_ids = [track_id for track_id in available_cross_ant_track_ids if track_id not in set(test_track_ids)]
+elif CROSS_ANT_TEST_TRACK_IDS is None:
+    train_track_ids = [int(track_id) for track_id in CROSS_ANT_TRAIN_TRACK_IDS]
+    test_track_ids = [track_id for track_id in available_cross_ant_track_ids if track_id not in set(train_track_ids)]
+else:
+    train_track_ids = [int(track_id) for track_id in CROSS_ANT_TRAIN_TRACK_IDS]
+    test_track_ids = [int(track_id) for track_id in CROSS_ANT_TEST_TRACK_IDS]
+
+if not train_track_ids or not test_track_ids:
+    raise ValueError("Cross-ant classifier needs at least one train ant and one test ant")
+
+train_track_id_set = {str(track_id) for track_id in train_track_ids}
+test_track_id_set = {str(track_id) for track_id in test_track_ids}
+cross_ant_train_mask = cross_ant_posture_samples["track_id"].astype(str).isin(train_track_id_set)
+cross_ant_test_mask = cross_ant_posture_samples["track_id"].astype(str).isin(test_track_id_set)
+
+print(f"Cross-ant train track IDs: {train_track_ids}")
+print(f"Cross-ant test track IDs: {test_track_ids}")
+
+cross_ant_classifier_predictions, cross_ant_classifier_metrics, cross_ant_classifier_weights, cross_ant_classifier_model = (
+    sleep_utils.plot_quiescent_posture_classifier(
+        cross_ant_posture_samples,
+        feature_cols=CLASSIFIER_FEATURE_COLUMNS,
+        groups=("little_or_no_interaction", "more_interaction"),
+        train_mask=cross_ant_train_mask,
+        test_mask=cross_ant_test_mask,
+        random_state=CLASSIFIER_RANDOM_STATE,
+        split_label="cross_ant",
+        max_weight_features=CLASSIFIER_MAX_WEIGHT_FEATURES,
+    )
+)
+display(cross_ant_classifier_metrics)
+display(cross_ant_classifier_weights)
+
+
+# %%
+# Same low-interaction-quiescent state analysis on held-out ants from the cross-ant classifier.
+cross_ant_low_quiescent_bins, cross_ant_low_quiescent_summary, cross_ant_low_quiescent_bouts, cross_ant_low_quiescent_corr = (
+    sleep_utils.plot_low_interaction_quiescent_cluster_analysis(
+        cross_ant_classifier_predictions,
+        groups=("little_or_no_interaction", "more_interaction"),
+        split=LOW_INTERACTION_CLUSTER_SPLIT,
+        bin_seconds=BIN_SECONDS,
+        low_score_threshold=LOW_INTERACTION_CLUSTER_SCORE_THRESHOLD,
+        min_predicted_low_fraction=LOW_INTERACTION_CLUSTER_MIN_FRAME_FRACTION,
+        correlation_x_col=LOW_INTERACTION_CLUSTER_CORRELATION_X,
+        correlation_y_col=LOW_INTERACTION_CLUSTER_CORRELATION_Y,
+        title=f"Cross-ant held-out ants: low-interaction quiescent classifier state",
+    )
+)
+display(cross_ant_low_quiescent_summary)
+display(cross_ant_low_quiescent_corr.to_frame().T)
+display(cross_ant_low_quiescent_bouts.head(30))
+
+# %%

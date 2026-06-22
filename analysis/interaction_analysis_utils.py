@@ -7,6 +7,7 @@ from pathlib import Path
 import hashlib
 import json
 import math
+import pickle
 import re
 
 import matplotlib.pyplot as plt
@@ -297,6 +298,27 @@ def load_or_build_table(
     return table
 
 
+def load_or_build_pickle(
+    path: Path,
+    builder,
+    *,
+    use_cache: bool = True,
+    force: bool = False,
+):
+    path = Path(path)
+    if use_cache and not force and path.exists():
+        print(f"cache hit: {path}")
+        with path.open("rb") as f:
+            return pickle.load(f)
+
+    print(f"cache build: {path}")
+    value = builder()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("wb") as f:
+        pickle.dump(value, f, protocol=pickle.HIGHEST_PROTOCOL)
+    return value
+
+
 def load_interactions(path: Path, *, max_interactions: int | None = None, sample: bool = False, random_state: int = 0) -> pd.DataFrame:
     interactions = pd.read_parquet(path, columns=["Frame", "antenna_track_id", "body_track_id"])
     for col in ["Frame", "antenna_track_id", "body_track_id"]:
@@ -396,6 +418,60 @@ def load_cluster_table(path: Path, *, side: str | None = None) -> pd.DataFrame:
     if side is not None:
         clusters = clusters[clusters["side"] == side].copy()
     return clusters.reset_index(drop=True)
+
+
+def cluster_ant_counts(
+    clusters: pd.DataFrame,
+    *,
+    cluster_col: str = "cluster_id",
+    track_col: str = "TrackID",
+) -> pd.DataFrame:
+    required = {cluster_col, track_col}
+    missing = required.difference(clusters.columns)
+    if missing:
+        raise ValueError(f"clusters is missing required columns: {sorted(missing)}")
+
+    counts = clusters[[cluster_col, track_col]].dropna().copy()
+    counts[cluster_col] = counts[cluster_col].astype(str)
+    return (
+        counts.groupby(cluster_col, sort=True)[track_col]
+        .nunique()
+        .rename("n_ants")
+        .reset_index()
+    )
+
+
+def cluster_ant_count_map(
+    clusters: pd.DataFrame,
+    *,
+    cluster_col: str = "cluster_id",
+    track_col: str = "TrackID",
+) -> dict[str, int]:
+    counts = cluster_ant_counts(clusters, cluster_col=cluster_col, track_col=track_col)
+    return dict(zip(counts[cluster_col].astype(str), counts["n_ants"].astype(int)))
+
+
+def add_cluster_size_weights(
+    events: pd.DataFrame,
+    clusters: pd.DataFrame,
+    *,
+    cluster_col: str = "cluster_id",
+    count_col: str = "interaction_count",
+    output_col: str = "interaction_count_per_ant",
+    cluster_size_col: str = "cluster_n_ants",
+) -> pd.DataFrame:
+    required = {cluster_col, count_col}
+    missing = required.difference(events.columns)
+    if missing:
+        raise ValueError(f"events is missing required columns: {sorted(missing)}")
+
+    out = events.copy()
+    ant_counts = cluster_ant_count_map(clusters)
+    n_ants = out[cluster_col].astype(str).map(ant_counts).astype("float64")
+    counts = pd.to_numeric(out[count_col], errors="coerce").astype("float64")
+    out[cluster_size_col] = n_ants
+    out[output_col] = np.where(n_ants > 0, counts / n_ants, np.nan)
+    return out
 
 
 def attach_cluster_labels(
@@ -544,19 +620,59 @@ def role_event_positions_for_chunks(
     return pd.concat(rows, ignore_index=True)
 
 
-def cluster_pair_counts(interactions: pd.DataFrame) -> pd.DataFrame:
-    return (
+def _is_per_ant_weight(weight_col: str) -> bool:
+    return str(weight_col).endswith("_per_ant")
+
+
+def cluster_pair_counts(
+    interactions: pd.DataFrame,
+    *,
+    clusters: pd.DataFrame | None = None,
+    normalize_by_n_ants: bool = False,
+) -> pd.DataFrame:
+    pairs = (
         interactions.groupby(["antenna_cluster_id", "body_cluster_id"], dropna=False)
         .size()
         .rename("n_interactions")
         .reset_index()
-        .sort_values("n_interactions", ascending=False, kind="mergesort")
-        .reset_index(drop=True)
     )
 
+    if clusters is not None:
+        ant_counts = cluster_ant_count_map(clusters)
+        pairs["n_antenna_ants"] = pairs["antenna_cluster_id"].astype(str).map(ant_counts).astype("float64")
+        pairs["n_body_ants"] = pairs["body_cluster_id"].astype(str).map(ant_counts).astype("float64")
+        same_cluster = pairs["antenna_cluster_id"].astype(str) == pairs["body_cluster_id"].astype(str)
+        cross_cluster_pairs = pairs["n_antenna_ants"] * pairs["n_body_ants"]
+        same_cluster_pairs = pairs["n_antenna_ants"] * np.maximum(pairs["n_antenna_ants"] - 1.0, 0.0)
+        pairs["n_possible_directed_ant_pairs"] = np.where(same_cluster, same_cluster_pairs, cross_cluster_pairs)
+        denominator = pairs["n_possible_directed_ant_pairs"]
+        pairs["interactions_per_directed_ant_pair"] = np.where(
+            denominator > 0,
+            pairs["n_interactions"].astype("float64") / denominator,
+            np.nan,
+        )
+    elif normalize_by_n_ants:
+        raise ValueError("clusters is required when normalize_by_n_ants=True")
 
-def cluster_order(events: pd.DataFrame, *, cluster_col: str = "cluster_id", max_clusters: int | None = None) -> list[str]:
-    counts = events.groupby(cluster_col)["interaction_count"].sum().sort_values(ascending=False)
+    sort_col = "interactions_per_directed_ant_pair" if normalize_by_n_ants else "n_interactions"
+    return pairs.sort_values(sort_col, ascending=False, kind="mergesort", na_position="last").reset_index(drop=True)
+
+
+def cluster_order(
+    events: pd.DataFrame,
+    *,
+    cluster_col: str = "cluster_id",
+    weight_col: str = "interaction_count",
+    max_clusters: int | None = None,
+) -> list[str]:
+    if events.empty:
+        return []
+    if weight_col not in events.columns:
+        raise ValueError(f"events is missing weight column: {weight_col!r}")
+    values = events[[cluster_col, weight_col]].copy()
+    values["_cluster_label"] = values[cluster_col].astype(str)
+    values[weight_col] = pd.to_numeric(values[weight_col], errors="coerce").fillna(0.0)
+    counts = values.groupby("_cluster_label")[weight_col].sum().sort_values(ascending=False)
     labels = [str(label) for label in counts.index]
     if max_clusters is not None:
         labels = labels[: int(max_clusters)]
@@ -585,12 +701,21 @@ def spatial_edges(
     return x_edges, y_edges
 
 
-def weighted_hist2d(events: pd.DataFrame, x_edges: np.ndarray, y_edges: np.ndarray, *, normalize: bool) -> np.ndarray:
+def weighted_hist2d(
+    events: pd.DataFrame,
+    x_edges: np.ndarray,
+    y_edges: np.ndarray,
+    *,
+    normalize: bool,
+    weight_col: str = "interaction_count",
+) -> np.ndarray:
+    if weight_col not in events.columns:
+        raise ValueError(f"events is missing weight column: {weight_col!r}")
     hist, _, _ = np.histogram2d(
         events["y_mm"].to_numpy(np.float64),
         events["x_mm"].to_numpy(np.float64),
         bins=[y_edges, x_edges],
-        weights=events["interaction_count"].to_numpy(np.float64),
+        weights=pd.to_numeric(events[weight_col], errors="coerce").fillna(0.0).to_numpy(np.float64),
     )
     if normalize and hist.sum() > 0:
         hist = hist / hist.sum()
@@ -603,14 +728,15 @@ def day_averaged_weighted_hist2d(
     y_edges: np.ndarray,
     *,
     normalize: bool,
+    weight_col: str = "interaction_count",
 ) -> np.ndarray:
     if events.empty:
         return np.zeros((len(y_edges) - 1, len(x_edges) - 1), dtype=float)
     if "light_cycle_day" not in events.columns:
-        return weighted_hist2d(events, x_edges, y_edges, normalize=normalize)
+        return weighted_hist2d(events, x_edges, y_edges, normalize=normalize, weight_col=weight_col)
 
     hists = [
-        weighted_hist2d(day_events, x_edges, y_edges, normalize=False)
+        weighted_hist2d(day_events, x_edges, y_edges, normalize=False, weight_col=weight_col)
         for _, day_events in events.groupby("light_cycle_day", sort=True)
     ]
     if not hists:
@@ -621,14 +747,32 @@ def day_averaged_weighted_hist2d(
     return hist
 
 
-def plot_cluster_pair_matrix(interactions: pd.DataFrame, *, title: str = "Directed interaction counts by cluster pair"):
-    pairs = cluster_pair_counts(interactions)
+def cluster_pair_matrix_from_table(
+    pairs: pd.DataFrame,
+    *,
+    value_col: str = "n_interactions",
+) -> pd.DataFrame:
+    if value_col not in pairs.columns:
+        raise ValueError(f"pairs is missing value column: {value_col!r}")
     antenna_labels = sorted(str(v) for v in pairs["antenna_cluster_id"].dropna().unique())
     body_labels = sorted(str(v) for v in pairs["body_cluster_id"].dropna().unique())
     matrix = pd.DataFrame(0.0, index=antenna_labels, columns=body_labels)
-    for row in pairs.itertuples(index=False):
-        matrix.loc[str(row.antenna_cluster_id), str(row.body_cluster_id)] = float(row.n_interactions)
+    for _, row in pairs.iterrows():
+        value = row[value_col]
+        matrix.loc[str(row["antenna_cluster_id"]), str(row["body_cluster_id"])] = float(value) if pd.notna(value) else np.nan
+    return matrix
 
+
+def plot_cluster_pair_matrix_from_table(
+    pairs: pd.DataFrame,
+    *,
+    value_col: str = "n_interactions",
+    title: str = "Directed interaction counts by cluster pair",
+    colorbar_label: str | None = None,
+) -> pd.DataFrame:
+    matrix = cluster_pair_matrix_from_table(pairs, value_col=value_col)
+    antenna_labels = matrix.index.tolist()
+    body_labels = matrix.columns.tolist()
     fig, ax = plt.subplots(figsize=(max(5, 0.6 * len(body_labels)), max(4, 0.5 * len(antenna_labels))))
     image = ax.imshow(matrix.to_numpy(), origin="upper", interpolation="none", cmap="magma")
     ax.set_xticks(np.arange(len(body_labels)))
@@ -638,41 +782,103 @@ def plot_cluster_pair_matrix(interactions: pd.DataFrame, *, title: str = "Direct
     ax.set_xlabel("body/receiver cluster")
     ax.set_ylabel("antenna/source cluster")
     ax.set_title(title)
-    fig.colorbar(image, ax=ax, label="directed interactions")
+    if colorbar_label is None:
+        colorbar_label = "directed interactions"
+        if value_col == "interactions_per_directed_ant_pair":
+            colorbar_label = "interactions / possible directed ant-pair"
+    fig.colorbar(image, ax=ax, label=colorbar_label)
     fig.tight_layout()
     return matrix
 
 
-def plot_spatial_heatmaps_by_cluster(
+def plot_cluster_pair_matrix(
+    interactions: pd.DataFrame,
+    *,
+    clusters: pd.DataFrame | None = None,
+    normalize_by_n_ants: bool = False,
+    value_col: str | None = None,
+    title: str = "Directed interaction counts by cluster pair",
+    colorbar_label: str | None = None,
+) -> pd.DataFrame:
+    pairs = cluster_pair_counts(interactions, clusters=clusters, normalize_by_n_ants=normalize_by_n_ants)
+    if value_col is None:
+        value_col = "interactions_per_directed_ant_pair" if normalize_by_n_ants else "n_interactions"
+    return plot_cluster_pair_matrix_from_table(
+        pairs,
+        value_col=value_col,
+        title=title,
+        colorbar_label=colorbar_label,
+    )
+
+
+def spatial_heatmaps_by_cluster(
     events: pd.DataFrame,
     *,
     bin_size_mm: float = 10.0,
     max_clusters: int | None = None,
-    ncols: int = 3,
     normalize: bool = False,
-    vmax_percentile: float = 99.0,
-    cmap: str = "magma",
-    title: str = "Interaction locations by cluster",
-):
-    labels = cluster_order(events, max_clusters=max_clusters)
+    weight_col: str = "interaction_count",
+) -> dict[str, object]:
+    labels = cluster_order(events, max_clusters=max_clusters, weight_col=weight_col)
     if not labels:
         raise ValueError("No clusters to plot")
     x_edges, y_edges = spatial_edges(events, bin_size_mm=float(bin_size_mm))
     histograms = {}
+    for label in labels:
+        hist = weighted_hist2d(
+            events[events["cluster_id"].astype(str) == label],
+            x_edges,
+            y_edges,
+            normalize=normalize,
+            weight_col=weight_col,
+        )
+        histograms[label] = hist
+    return {
+        "labels": labels,
+        "x_edges": x_edges,
+        "y_edges": y_edges,
+        "histograms": histograms,
+        "bin_size_mm": float(bin_size_mm),
+        "normalize": bool(normalize),
+        "weight_col": str(weight_col),
+    }
+
+
+def plot_spatial_heatmaps_by_cluster_result(
+    result: dict[str, object],
+    *,
+    ncols: int = 3,
+    vmax_percentile: float = 99.0,
+    cmap: str = "magma",
+    title: str = "Interaction locations by cluster",
+    colorbar_label: str | None = None,
+):
+    labels = [str(label) for label in result["labels"]]
+    x_edges = np.asarray(result["x_edges"], dtype=np.float64)
+    y_edges = np.asarray(result["y_edges"], dtype=np.float64)
+    histograms = result["histograms"]
+    weight_col = str(result.get("weight_col", "interaction_count"))
+    normalize = bool(result.get("normalize", False))
     nonzero_values = []
     for label in labels:
-        hist = weighted_hist2d(events[events["cluster_id"].astype(str) == label], x_edges, y_edges, normalize=normalize)
-        histograms[label] = hist
+        hist = np.asarray(histograms[label], dtype=np.float64)
         nonzero_values.extend(hist[hist > 0].ravel().tolist())
     vmax = None
     if nonzero_values:
         vmax = float(np.percentile(np.asarray(nonzero_values), float(vmax_percentile)))
+    if colorbar_label is None:
+        if normalize:
+            colorbar_label = "fraction of cluster total"
+        elif _is_per_ant_weight(weight_col):
+            colorbar_label = "directed interactions / ant"
+        else:
+            colorbar_label = "directed interactions"
 
     ncols = max(1, int(ncols))
     nrows = math.ceil(len(labels) / ncols)
     fig, axes = plt.subplots(nrows, ncols, figsize=(4.6 * ncols, 4.2 * nrows), squeeze=False)
     for ax, label in zip(axes.ravel(), labels):
-        hist = histograms[label]
+        hist = np.asarray(histograms[label], dtype=np.float64)
         image = ax.imshow(
             hist,
             extent=[x_edges[0], x_edges[-1], y_edges[0], y_edges[-1]],
@@ -683,10 +889,12 @@ def plot_spatial_heatmaps_by_cluster(
             vmax=vmax,
         )
         total = float(hist.sum())
-        ax.set_title(f"{label} n={total:.0f}")
+        total_name = "strength" if _is_per_ant_weight(weight_col) else "n"
+        total_fmt = ".3g" if (_is_per_ant_weight(weight_col) or normalize) else ".0f"
+        ax.set_title(f"{label} {total_name}={total:{total_fmt}}")
         ax.set_xlabel("x (mm)")
         ax.set_ylabel("y (mm)")
-        fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+        fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04, label=colorbar_label)
     for ax in axes.ravel()[len(labels):]:
         ax.axis("off")
     fig.suptitle(title)
@@ -694,49 +902,79 @@ def plot_spatial_heatmaps_by_cluster(
     return histograms
 
 
-def plot_time_counts_by_cluster(
+def plot_spatial_heatmaps_by_cluster(
+    events: pd.DataFrame,
+    *,
+    bin_size_mm: float = 10.0,
+    max_clusters: int | None = None,
+    ncols: int = 3,
+    normalize: bool = False,
+    weight_col: str = "interaction_count",
+    vmax_percentile: float = 99.0,
+    cmap: str = "magma",
+    title: str = "Interaction locations by cluster",
+):
+    result = spatial_heatmaps_by_cluster(
+        events,
+        bin_size_mm=bin_size_mm,
+        max_clusters=max_clusters,
+        normalize=normalize,
+        weight_col=weight_col,
+    )
+    plot_spatial_heatmaps_by_cluster_result(
+        result,
+        ncols=ncols,
+        vmax_percentile=vmax_percentile,
+        cmap=cmap,
+        title=title,
+    )
+    return result["histograms"]
+
+
+def time_counts_by_cluster(
     events: pd.DataFrame,
     *,
     max_clusters: int | None = None,
     average_over_days: bool = True,
-    title: str = "Interaction counts by time since light on",
-    cmap: str = "magma",
+    weight_col: str = "interaction_count",
 ) -> pd.DataFrame:
-    labels = cluster_order(events, max_clusters=max_clusters)
+    labels = cluster_order(events, max_clusters=max_clusters, weight_col=weight_col)
     filtered = events[events["cluster_id"].astype(str).isin(labels)].copy()
+    filtered["_cluster_label"] = filtered["cluster_id"].astype(str)
+    filtered[weight_col] = pd.to_numeric(filtered[weight_col], errors="coerce").fillna(0.0)
     if average_over_days and "light_cycle_day" in filtered.columns:
         values = (
             filtered.groupby(
-                ["cluster_id", "light_cycle_day", "time_bin", "time_bin_label", "time_bin_start_h"],
+                ["_cluster_label", "light_cycle_day", "time_bin", "time_bin_label", "time_bin_start_h"],
                 sort=True,
-            )["interaction_count"]
+            )[weight_col]
             .sum()
-            .rename("daily_interaction_count")
+            .rename("daily_interaction_value")
             .reset_index()
         )
         values = (
-            values.groupby(["cluster_id", "time_bin", "time_bin_label", "time_bin_start_h"], sort=True)[
-                "daily_interaction_count"
+            values.groupby(["_cluster_label", "time_bin", "time_bin_label", "time_bin_start_h"], sort=True)[
+                "daily_interaction_value"
             ]
             .mean()
-            .rename("interaction_count")
+            .rename("interaction_value")
             .reset_index()
         )
-        color_label = "mean directed interactions / light-cycle day"
     else:
         values = (
-            filtered.groupby(["cluster_id", "time_bin", "time_bin_label", "time_bin_start_h"], sort=True)[
-                "interaction_count"
+            filtered.groupby(["_cluster_label", "time_bin", "time_bin_label", "time_bin_start_h"], sort=True)[
+                weight_col
             ]
             .sum()
+            .rename("interaction_value")
             .reset_index()
         )
-        color_label = "directed interactions"
+    values = values.rename(columns={"_cluster_label": "cluster_id"})
 
     pivot = values.pivot_table(
         index="cluster_id",
         columns="time_bin_label",
-        values="interaction_count",
+        values="interaction_value",
         aggfunc="sum",
         fill_value=0.0,
     )
@@ -748,6 +986,18 @@ def plot_time_counts_by_cluster(
         .tolist()
     )
     pivot = pivot.reindex(columns=time_order)
+    return pivot
+
+
+def plot_time_counts_table(
+    pivot: pd.DataFrame,
+    *,
+    title: str = "Interaction counts by time since light on",
+    cmap: str = "magma",
+    color_label: str = "directed interactions",
+) -> pd.DataFrame:
+    labels = [str(label) for label in pivot.index.tolist()]
+    time_order = [str(label) for label in pivot.columns.tolist()]
 
     fig, ax = plt.subplots(figsize=(max(5, 0.65 * len(time_order)), max(3, 0.45 * len(labels))))
     image = ax.imshow(pivot.to_numpy(dtype=float), origin="upper", interpolation="none", aspect="auto", cmap=cmap)
@@ -761,6 +1011,30 @@ def plot_time_counts_by_cluster(
     fig.colorbar(image, ax=ax, label=color_label)
     fig.tight_layout()
     return pivot
+
+
+def plot_time_counts_by_cluster(
+    events: pd.DataFrame,
+    *,
+    max_clusters: int | None = None,
+    average_over_days: bool = True,
+    weight_col: str = "interaction_count",
+    title: str = "Interaction counts by time since light on",
+    cmap: str = "magma",
+) -> pd.DataFrame:
+    pivot = time_counts_by_cluster(
+        events,
+        max_clusters=max_clusters,
+        average_over_days=average_over_days,
+        weight_col=weight_col,
+    )
+    if average_over_days:
+        color_label = "mean directed interactions / light-cycle day"
+        if _is_per_ant_weight(weight_col):
+            color_label = "mean directed interactions / ant / light-cycle day"
+    else:
+        color_label = "directed interactions / ant" if _is_per_ant_weight(weight_col) else "directed interactions"
+    return plot_time_counts_table(pivot, title=title, cmap=cmap, color_label=color_label)
 
 
 def smooth_series(values: np.ndarray, sigma_bins: float) -> np.ndarray:
@@ -789,6 +1063,7 @@ def interaction_timeseries_by_cluster(
     bin_minutes: float,
     cluster_col: str = "cluster_id",
     average_over_days: bool = True,
+    weight_col: str = "interaction_count",
 ) -> pd.DataFrame:
     if events.empty:
         return pd.DataFrame(
@@ -801,46 +1076,55 @@ def interaction_timeseries_by_cluster(
                 "interaction_rate_per_min",
             ]
         )
+    if weight_col not in events.columns:
+        raise ValueError(f"events is missing weight column: {weight_col!r}")
+    values = events.copy()
+    values["_cluster_label"] = values[cluster_col].astype(str)
+    values[weight_col] = pd.to_numeric(values[weight_col], errors="coerce").fillna(0.0)
     if average_over_days and "light_cycle_day" in events.columns:
         grouped = (
-            events.groupby([cluster_col, "light_cycle_day", "time_bin", "time_bin_start_h"], sort=True)[
-                "interaction_count"
+            values.groupby(["_cluster_label", "light_cycle_day", "time_bin", "time_bin_start_h"], sort=True)[
+                weight_col
             ]
             .sum()
-            .rename("daily_interactions")
+            .rename("daily_interaction_value")
             .reset_index()
         )
         grouped = (
-            grouped.groupby([cluster_col, "time_bin", "time_bin_start_h"], sort=True)["daily_interactions"]
+            grouped.groupby(["_cluster_label", "time_bin", "time_bin_start_h"], sort=True)["daily_interaction_value"]
             .mean()
             .rename("n_interactions")
             .reset_index()
         )
     else:
         grouped = (
-            events.groupby([cluster_col, "time_bin", "time_bin_start_h"], sort=True)["interaction_count"]
+            values.groupby(["_cluster_label", "time_bin", "time_bin_start_h"], sort=True)[weight_col]
             .sum()
             .rename("n_interactions")
             .reset_index()
         )
+    grouped = grouped.rename(columns={"_cluster_label": cluster_col})
     grouped["time_bin_mid_h"] = grouped["time_bin_start_h"] + float(bin_minutes) / 120.0
     grouped["interaction_rate_per_min"] = grouped["n_interactions"] / float(bin_minutes)
     return grouped
 
 
-def plot_interaction_timeseries_by_cluster(
+def interaction_timeseries_plot_table_by_cluster(
     events: pd.DataFrame,
     *,
     bin_minutes: float,
     smooth_bins: float = 0.0,
     max_clusters: int | None = None,
     average_over_days: bool = True,
-    ylim: tuple[float, float] | None = None,
-    title: str = "Interaction time series by cluster",
-    cmap: str = "tab10",
+    weight_col: str = "interaction_count",
 ) -> pd.DataFrame:
-    table = interaction_timeseries_by_cluster(events, bin_minutes=bin_minutes, average_over_days=average_over_days)
-    labels = cluster_order(events, max_clusters=max_clusters)
+    table = interaction_timeseries_by_cluster(
+        events,
+        bin_minutes=bin_minutes,
+        average_over_days=average_over_days,
+        weight_col=weight_col,
+    )
+    labels = cluster_order(events, max_clusters=max_clusters, weight_col=weight_col)
     if not labels:
         raise ValueError("No clusters to plot")
 
@@ -876,7 +1160,22 @@ def plot_interaction_timeseries_by_cluster(
         )
         plot_rows.append(cluster_df)
     plot_df = pd.concat(plot_rows, ignore_index=True)
+    plot_df["weight_col"] = str(weight_col)
+    plot_df["average_over_days"] = bool(average_over_days)
+    return plot_df
 
+
+def plot_interaction_timeseries_table(
+    plot_df: pd.DataFrame,
+    *,
+    smooth_bins: float = 0.0,
+    average_over_days: bool = True,
+    ylim: tuple[float, float] | None = None,
+    title: str = "Interaction time series by cluster",
+    cmap: str = "tab10",
+) -> pd.DataFrame:
+    labels = [str(label) for label in plot_df["cluster_id"].drop_duplicates().tolist()]
+    weight_col = str(plot_df["weight_col"].dropna().iloc[0]) if "weight_col" in plot_df and not plot_df.empty else "interaction_count"
     fig, ax = plt.subplots(figsize=(9, 4.8))
     colors = plt.get_cmap(cmap, len(labels))
     y_col = "smoothed_rate_per_min" if smooth_bins > 0 else "interaction_rate_per_min"
@@ -892,7 +1191,12 @@ def plot_interaction_timeseries_by_cluster(
             color=colors(i),
         )
     ax.set_xlabel("hours since light on")
-    ylabel = "mean directed interactions / min / light-cycle day" if average_over_days else "directed interactions / min"
+    if average_over_days:
+        ylabel = "mean directed interactions / min / light-cycle day"
+        if _is_per_ant_weight(weight_col):
+            ylabel = "mean directed interactions / min / ant / light-cycle day"
+    else:
+        ylabel = "directed interactions / min / ant" if _is_per_ant_weight(weight_col) else "directed interactions / min"
     ax.set_ylabel(ylabel)
     ax.set_title(title)
     if ylim is not None:
@@ -903,7 +1207,37 @@ def plot_interaction_timeseries_by_cluster(
     return plot_df
 
 
-def plot_spatial_heatmaps_by_cluster_and_time(
+def plot_interaction_timeseries_by_cluster(
+    events: pd.DataFrame,
+    *,
+    bin_minutes: float,
+    smooth_bins: float = 0.0,
+    max_clusters: int | None = None,
+    average_over_days: bool = True,
+    weight_col: str = "interaction_count",
+    ylim: tuple[float, float] | None = None,
+    title: str = "Interaction time series by cluster",
+    cmap: str = "tab10",
+) -> pd.DataFrame:
+    plot_df = interaction_timeseries_plot_table_by_cluster(
+        events,
+        bin_minutes=bin_minutes,
+        smooth_bins=smooth_bins,
+        max_clusters=max_clusters,
+        average_over_days=average_over_days,
+        weight_col=weight_col,
+    )
+    return plot_interaction_timeseries_table(
+        plot_df,
+        smooth_bins=smooth_bins,
+        average_over_days=average_over_days,
+        ylim=ylim,
+        title=title,
+        cmap=cmap,
+    )
+
+
+def spatial_heatmaps_by_cluster_and_time(
     events: pd.DataFrame,
     *,
     bin_size_mm: float = 10.0,
@@ -911,11 +1245,9 @@ def plot_spatial_heatmaps_by_cluster_and_time(
     max_time_bins: int | None = None,
     average_over_days: bool = True,
     normalize: bool = False,
-    vmax_percentile: float = 99.0,
-    cmap: str = "magma",
-    title: str = "Interaction locations by cluster and time",
-):
-    labels = cluster_order(events, max_clusters=max_clusters)
+    weight_col: str = "interaction_count",
+) -> dict[str, object]:
+    labels = cluster_order(events, max_clusters=max_clusters, weight_col=weight_col)
     if not labels:
         raise ValueError("No clusters to plot")
     time_bins = (
@@ -930,21 +1262,72 @@ def plot_spatial_heatmaps_by_cluster_and_time(
     x_edges, y_edges = spatial_edges(events, bin_size_mm=float(bin_size_mm))
 
     hists = {}
-    nonzero_values = []
     for label in labels:
         for time_id, time_label in zip(time_ids, time_labels):
             subset = events[(events["cluster_id"].astype(str) == label) & (events["time_bin"] == time_id)]
             if average_over_days:
-                hist = day_averaged_weighted_hist2d(subset, x_edges, y_edges, normalize=normalize)
+                hist = day_averaged_weighted_hist2d(
+                    subset,
+                    x_edges,
+                    y_edges,
+                    normalize=normalize,
+                    weight_col=weight_col,
+                )
             else:
-                hist = weighted_hist2d(subset, x_edges, y_edges, normalize=normalize) if not subset.empty else np.zeros(
-                    (len(y_edges) - 1, len(x_edges) - 1), dtype=float
+                hist = (
+                    weighted_hist2d(subset, x_edges, y_edges, normalize=normalize, weight_col=weight_col)
+                    if not subset.empty
+                    else np.zeros((len(y_edges) - 1, len(x_edges) - 1), dtype=float)
                 )
             hists[(label, time_label)] = hist
-            nonzero_values.extend(hist[hist > 0].ravel().tolist())
+    return {
+        "labels": labels,
+        "time_labels": time_labels,
+        "time_ids": time_ids,
+        "x_edges": x_edges,
+        "y_edges": y_edges,
+        "hists": hists,
+        "bin_size_mm": float(bin_size_mm),
+        "average_over_days": bool(average_over_days),
+        "normalize": bool(normalize),
+        "weight_col": str(weight_col),
+    }
+
+
+def plot_spatial_heatmaps_by_cluster_and_time_result(
+    result: dict[str, object],
+    *,
+    vmax_percentile: float = 99.0,
+    cmap: str = "magma",
+    title: str = "Interaction locations by cluster and time",
+    colorbar_label: str | None = None,
+):
+    labels = [str(label) for label in result["labels"]]
+    time_labels = [str(label) for label in result["time_labels"]]
+    x_edges = np.asarray(result["x_edges"], dtype=np.float64)
+    y_edges = np.asarray(result["y_edges"], dtype=np.float64)
+    hists = result["hists"]
+    average_over_days = bool(result.get("average_over_days", True))
+    normalize = bool(result.get("normalize", False))
+    weight_col = str(result.get("weight_col", "interaction_count"))
+    nonzero_values = []
+    for hist in hists.values():
+        hist = np.asarray(hist, dtype=np.float64)
+        nonzero_values.extend(hist[hist > 0].ravel().tolist())
     vmax = None
     if nonzero_values:
         vmax = float(np.percentile(np.asarray(nonzero_values), float(vmax_percentile)))
+    if colorbar_label is None:
+        if normalize:
+            colorbar_label = "fraction of cluster/time total"
+        elif average_over_days and _is_per_ant_weight(weight_col):
+            colorbar_label = "mean interactions / ant / day"
+        elif average_over_days:
+            colorbar_label = "mean interactions / day"
+        elif _is_per_ant_weight(weight_col):
+            colorbar_label = "directed interactions / ant"
+        else:
+            colorbar_label = "directed interactions"
 
     fig, axes = plt.subplots(
         len(labels),
@@ -955,7 +1338,7 @@ def plot_spatial_heatmaps_by_cluster_and_time(
     for row_idx, label in enumerate(labels):
         for col_idx, time_label in enumerate(time_labels):
             ax = axes[row_idx, col_idx]
-            hist = hists[(label, time_label)]
+            hist = np.asarray(hists[(label, time_label)], dtype=np.float64)
             image = ax.imshow(
                 hist,
                 extent=[x_edges[0], x_edges[-1], y_edges[0], y_edges[-1]],
@@ -965,14 +1348,46 @@ def plot_spatial_heatmaps_by_cluster_and_time(
                 cmap=cmap,
                 vmax=vmax,
             )
-            ax.set_title(f"{label} {time_label} n={hist.sum():.0f}")
+            total = float(hist.sum())
+            total_name = "strength" if _is_per_ant_weight(weight_col) else "n"
+            total_fmt = ".3g" if (_is_per_ant_weight(weight_col) or normalize) else ".0f"
+            ax.set_title(f"{label} {time_label} {total_name}={total:{total_fmt}}")
             ax.set_xlabel("x (mm)")
             ax.set_ylabel("y (mm)")
-            colorbar_label = "mean interactions / day" if average_over_days else "directed interactions"
             fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04, label=colorbar_label)
     fig.suptitle(title)
     fig.tight_layout()
     return hists
+
+
+def plot_spatial_heatmaps_by_cluster_and_time(
+    events: pd.DataFrame,
+    *,
+    bin_size_mm: float = 10.0,
+    max_clusters: int | None = 4,
+    max_time_bins: int | None = None,
+    average_over_days: bool = True,
+    normalize: bool = False,
+    weight_col: str = "interaction_count",
+    vmax_percentile: float = 99.0,
+    cmap: str = "magma",
+    title: str = "Interaction locations by cluster and time",
+):
+    result = spatial_heatmaps_by_cluster_and_time(
+        events,
+        bin_size_mm=bin_size_mm,
+        max_clusters=max_clusters,
+        max_time_bins=max_time_bins,
+        average_over_days=average_over_days,
+        normalize=normalize,
+        weight_col=weight_col,
+    )
+    return plot_spatial_heatmaps_by_cluster_and_time_result(
+        result,
+        vmax_percentile=vmax_percentile,
+        cmap=cmap,
+        title=title,
+    )
 
 
 def speed_metadata_paths(speed_root: Path) -> list[Path]:
