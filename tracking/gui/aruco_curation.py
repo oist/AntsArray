@@ -70,6 +70,10 @@ SLEAP_SKELETON_EDGES = (
     (8, 9),
 )
 SLEAP_UNMATCHED_COLOR = (170, 170, 170)
+INTERACTION_COLOR = (0, 215, 255)
+INTERACTION_CONTACT_COLOR = (0, 80, 255)
+SLEEP_BOUT_COLOR = (255, 90, 30)
+ANTENNA_BODYPOINTS = (4, 5, 6, 7, 8, 9)
 ARUCO_PARAM_CORNER_CHOICES = ("contour", "subpix", "none", "apriltag")
 ARUCO_PARAM_DEFAULTS = {
     "corner_refinement": "contour",
@@ -88,6 +92,26 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+DEFAULT_BLOCK_DIR = Path("/home/sam-reiter/bucket/ReiterU/Ants/basler/20260515/block02")
+DEFAULT_HMATS_CANDIDATES = (
+    Path(
+        "/home/sam-reiter/bucket/ReiterU/Ants/basler/cameraArray_calib/"
+        "20260414_calibration_dataset/set0_patterns_elevated_by_2mm/frame0/initial_H_mats.npz"
+    ),
+    Path(
+        "/home/sam-reiter/bucket/ReiterU/Ants/basler/cameraArray_calib/"
+        "20260414_calibration_dataset/set0_patterns_elevated_by_2mm/frame0/aruco_stitch/aruco_H_mats.npz"
+    ),
+    Path(
+        "/home/sam-reiter/bucket/ReiterU/Ants/basler/2025_Sep_no_pertubation/"
+        "calibration_dataset/set0_patterns_elevated_by_2mm/initial_H_mats.npz"
+    ),
+    Path(
+        "/bucket/ReiterU/Ants/basler/2025_Sep_no_pertubation/"
+        "calibration_dataset/set0_patterns_elevated_by_2mm/initial_H_mats.npz"
+    ),
+)
+
 
 def clamp(value: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, value))
@@ -101,6 +125,206 @@ def color_for_id(instance: int) -> Tuple[int, int, int]:
 
 def finite_xy(x: float, y: float) -> bool:
     return math.isfinite(float(x)) and math.isfinite(float(y))
+
+
+def parse_camera_index(path_or_name: str | Path) -> Optional[int]:
+    name = str(path_or_name)
+    match = re.search(r"(?:^|[_/\\.-])cam(?P<cam>\d+)(?:[_/\\.-]|$)", name)
+    if match is None:
+        return None
+    cam_one_based = int(match.group("cam"))
+    return cam_one_based - 1 if cam_one_based > 0 else cam_one_based
+
+
+def load_homography_stack(path: Path) -> List[np.ndarray]:
+    data = np.load(path)
+    if "H" not in data:
+        raise KeyError(f"{path} does not contain key 'H'")
+    H = data["H"]
+    if H.ndim != 3 or H.shape[1:] != (3, 3):
+        raise ValueError(f"{path} key 'H' must have shape (n_cam, 3, 3); got {H.shape}")
+    return [np.asarray(H[i], dtype=np.float64) for i in range(H.shape[0])]
+
+
+def apply_homography_points(xy: np.ndarray, H: np.ndarray) -> np.ndarray:
+    if xy.size == 0:
+        return np.empty((0, 2), dtype=np.float64)
+    pts = np.column_stack([xy[:, 0], xy[:, 1], np.ones(len(xy), dtype=np.float64)])
+    proj = pts @ H.T
+    valid = np.isfinite(proj).all(axis=1) & (np.abs(proj[:, 2]) > 1e-12)
+    out = np.full((len(xy), 2), np.nan, dtype=np.float64)
+    out[valid] = proj[valid, :2] / proj[valid, 2:3]
+    return out
+
+
+def read_table(path: Path, *, columns: Optional[List[str]] = None) -> pd.DataFrame:
+    path = Path(path)
+    suffix = path.suffix.lower()
+    if suffix in {".parquet", ".pq"}:
+        try:
+            return pd.read_parquet(path, columns=columns)
+        except Exception:
+            return pd.read_parquet(path)
+    if suffix == ".csv":
+        return pd.read_csv(path, usecols=(lambda c: columns is None or c in set(columns)))
+    if suffix in {".h5", ".hdf5"}:
+        for key in ("bouts", "labels", "sleep_bouts", "data"):
+            try:
+                df = pd.read_hdf(path, key=key)
+                if columns is not None:
+                    keep = [col for col in columns if col in df.columns]
+                    return df[keep].copy() if keep else df
+                return df
+            except Exception:
+                continue
+    raise ValueError(f"Unsupported table file: {path}")
+
+
+def parquet_columns(path: Path) -> List[str]:
+    import pyarrow.parquet as pq
+
+    return list(pq.ParquetFile(path).schema_arrow.names)
+
+
+def infer_chunk_offset(path: Path, specs: List["ChunkSpec"]) -> int:
+    if not specs:
+        return 0
+    name = Path(path).name
+    matches = re.findall(r"(?:chunk|_)(\d{3})(?=_|\.|$)", name)
+    if not matches:
+        return 0
+    chunk = int(matches[-1])
+    for spec in specs:
+        if int(spec.chunk) == chunk:
+            return int(spec.start)
+    return 0
+
+
+def infer_chunk_span(path: Path, specs: List["ChunkSpec"]) -> Optional[Tuple[int, int]]:
+    if not specs:
+        return None
+    name = Path(path).name
+    matches = re.findall(r"(?:chunk|_)(\d{3})(?=_|\.|$)", name)
+    if not matches:
+        return None
+    chunk = int(matches[-1])
+    for spec in specs:
+        if int(spec.chunk) == chunk:
+            return int(spec.start), int(spec.stop)
+    return None
+
+
+def path_if_exists(path: Optional[Path]) -> Optional[Path]:
+    if path is None:
+        return None
+    path = Path(path)
+    return path if path.exists() else None
+
+
+def resolve_video_path(video: Optional[Path], block_dir: Optional[Path]) -> Optional[Path]:
+    if video is None:
+        return None
+    video = Path(video)
+    if video.is_absolute() or block_dir is None:
+        return video
+    candidate = Path(block_dir) / video
+    return candidate if candidate.exists() else video
+
+
+def infer_block_dir_from_path(path: Optional[Path]) -> Optional[Path]:
+    if path is None:
+        return None
+    path = Path(path)
+    candidates = [path] if path.is_dir() else [path.parent]
+    candidates.extend(Path(parent) for parent in path.parents)
+    for candidate in candidates:
+        if (candidate / "data").is_dir() and ((candidate / "tracks").is_dir() or (candidate / "interactions").is_dir()):
+            return candidate
+    return None
+
+
+def resolve_block_dir(args: argparse.Namespace, *paths: Optional[Path]) -> Optional[Path]:
+    if getattr(args, "block_dir", None) is not None:
+        block_dir = Path(args.block_dir)
+        return block_dir if block_dir.exists() else block_dir
+    for path in paths:
+        block_dir = infer_block_dir_from_path(path)
+        if block_dir is not None:
+            return block_dir
+    return None
+
+
+def infer_block_label_dir(block_dir: Optional[Path]) -> Optional[Path]:
+    return path_if_exists(Path(block_dir) / "data") if block_dir is not None else None
+
+
+def infer_block_parquet_paths(block_dir: Optional[Path], subdir: str) -> List[Path]:
+    if block_dir is None:
+        return []
+    root = Path(block_dir) / subdir
+    if not root.is_dir():
+        return []
+    return sorted(root.glob("*.parquet"))
+
+
+def infer_default_hmats_path(block_dir: Optional[Path]) -> Optional[Path]:
+    candidates: List[Path] = []
+    if block_dir is not None:
+        block_dir = Path(block_dir)
+        candidates.extend(
+            [
+                block_dir / "initial_H_mats.npz",
+                block_dir / "H_mats.npz",
+                block_dir.parent / "initial_H_mats.npz",
+                block_dir.parent / "H_mats.npz",
+            ]
+        )
+    candidates.extend(DEFAULT_HMATS_CANDIDATES)
+    for candidate in candidates:
+        found = path_if_exists(candidate)
+        if found is not None:
+            return found
+    return None
+
+
+def infer_sleep_bouts_path(block_dir: Optional[Path]) -> Optional[Path]:
+    if block_dir is None:
+        return None
+    block_dir = Path(block_dir)
+    exact_candidates = [
+        block_dir / "stitched" / "analysis_cache" / "tables" / "low_quiescent_sleep_bouts.parquet",
+        block_dir / "stitched" / "analysis_cache" / "tables" / "low_interaction_quiescent_bouts.parquet",
+        block_dir / "stitched" / "analysis_cache" / "tables" / "sleep_bouts.parquet",
+        block_dir / "stitched" / "outputs" / "low_quiescent_sleep_bouts.parquet",
+        block_dir / "stitched" / "outputs" / "low_interaction_quiescent_bouts.parquet",
+        block_dir / "stitched" / "outputs" / "sleep_bouts.parquet",
+    ]
+    for candidate in exact_candidates:
+        found = path_if_exists(candidate)
+        if found is not None:
+            return found
+
+    search_roots = [
+        block_dir / "stitched" / "analysis_cache" / "tables",
+        block_dir / "stitched" / "outputs",
+        block_dir / "stitched" / "sleep_labels",
+    ]
+    patterns = (
+        "*low*quiescent*bout*.parquet",
+        "*low*interaction*bout*.parquet",
+        "*sleep*bout*.parquet",
+        "*low*quiescent*bout*.csv",
+        "*low*interaction*bout*.csv",
+        "*sleep*bout*.csv",
+    )
+    for root in search_roots:
+        if not root.is_dir():
+            continue
+        for pattern in patterns:
+            matches = sorted(root.glob(pattern))
+            if matches:
+                return matches[0]
+    return None
 
 
 def local_custom_aruco_dict(label: str) -> Optional[Path]:
@@ -1139,6 +1363,304 @@ class ChunkedSleapSkeletonStore:
         return self._load(spec).rows_for_frame(spec.to_local(frame))
 
 
+class PanoramaTrackStore:
+    def __init__(
+        self,
+        paths: Iterable[Path],
+        *,
+        frame_offsets: Optional[Dict[Path, int]] = None,
+        frame_spans: Optional[Dict[Path, Tuple[int, int]]] = None,
+        frame_col: str = "Frame",
+        track_col: str = "TrackID",
+    ):
+        self.paths = [Path(path) for path in paths]
+        self.frame_offsets = {Path(path): int(offset) for path, offset in (frame_offsets or {}).items()}
+        self.frame_spans = {Path(path): tuple(span) for path, span in (frame_spans or {}).items()}
+        self.frame_col = frame_col
+        self.track_col = track_col
+        self.cache: Dict[int, pd.DataFrame] = {}
+        self.cache_limit = 256
+        self.path_columns: Dict[Path, List[str]] = {}
+
+    def columns_for_path(self, path: Path) -> List[str]:
+        path = Path(path)
+        if path not in self.path_columns:
+            self.path_columns[path] = parquet_columns(path)
+        return self.path_columns[path]
+
+    def rows_for_frame(self, frame: int) -> pd.DataFrame:
+        frame = int(frame)
+        if frame in self.cache:
+            return self.cache[frame]
+        parts: List[pd.DataFrame] = []
+        wanted = ["Frame", "TrackID", "Bodypoint", "X", "Y", "TrackX", "TrackY", "ArucoX", "ArucoY", "SleapAnchorX", "SleapAnchorY"]
+        for path in self.paths:
+            if not path.exists() or path.suffix.lower() not in {".parquet", ".pq"}:
+                continue
+            span = self.frame_spans.get(path)
+            if span is not None and not (int(span[0]) <= frame < int(span[1])):
+                continue
+            cols = self.columns_for_path(path)
+            if self.frame_col not in cols:
+                continue
+            offset = int(self.frame_offsets.get(path, 0))
+            raw_frame = int(frame) - offset
+            if raw_frame < 0:
+                continue
+            existing = [col for col in wanted if col in cols]
+            try:
+                df = pd.read_parquet(
+                    path,
+                    engine="pyarrow",
+                    columns=existing,
+                    filters=[(self.frame_col, "==", int(raw_frame))],
+                )
+            except Exception:
+                df_all = pd.read_parquet(path, columns=existing)
+                df_all[self.frame_col] = pd.to_numeric(df_all[self.frame_col], errors="coerce")
+                df = df_all[df_all[self.frame_col] == int(raw_frame)].copy()
+            if df.empty:
+                continue
+            if "TrackID" not in df.columns and self.track_col in df.columns:
+                df["TrackID"] = df[self.track_col]
+            for col in wanted:
+                if col not in df.columns:
+                    df[col] = np.nan
+            df["Frame"] = pd.to_numeric(df["Frame"], errors="coerce") + offset
+            parts.append(df[wanted])
+        out = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=wanted)
+        for col in wanted:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+        out = out.dropna(subset=["Frame", "TrackID"]).copy()
+        if not out.empty:
+            out["Frame"] = out["Frame"].astype(np.int64)
+            out["TrackID"] = out["TrackID"].astype(np.int64)
+            out["Bodypoint"] = out["Bodypoint"].fillna(-1).astype(np.int64)
+            out = out.sort_values(["TrackID", "Bodypoint"], kind="mergesort").reset_index(drop=True)
+        self.cache[frame] = out
+        if len(self.cache) > self.cache_limit:
+            self.cache.pop(next(iter(self.cache)))
+        return out
+
+
+class InteractionBoutStore:
+    def __init__(
+        self,
+        paths: Iterable[Path],
+        *,
+        frame_offsets: Optional[Dict[Path, int]] = None,
+        max_gap_frames: int = 3,
+    ):
+        self.paths = [Path(path) for path in paths]
+        self.frame_offsets = {Path(path): int(offset) for path, offset in (frame_offsets or {}).items()}
+        self.max_gap_frames = int(max_gap_frames)
+        self.bouts = self._load_bouts()
+
+    def _load_one(self, path: Path) -> pd.DataFrame:
+        if not path.exists():
+            return pd.DataFrame()
+        df = read_table(path)
+        if df.empty:
+            return pd.DataFrame()
+        required = {"antenna_track_id", "body_track_id"}
+        if not required.issubset(df.columns):
+            return pd.DataFrame()
+        if "global_frame" in df.columns:
+            frame = pd.to_numeric(df["global_frame"], errors="coerce")
+        elif "Frame" in df.columns:
+            frame = pd.to_numeric(df["Frame"], errors="coerce") + int(self.frame_offsets.get(path, 0))
+        else:
+            return pd.DataFrame()
+        out = pd.DataFrame(
+            {
+                "Frame": frame,
+                "antenna_track_id": pd.to_numeric(df["antenna_track_id"], errors="coerce"),
+                "body_track_id": pd.to_numeric(df["body_track_id"], errors="coerce"),
+            }
+        ).dropna()
+        if out.empty:
+            return out
+        out[["Frame", "antenna_track_id", "body_track_id"]] = out[["Frame", "antenna_track_id", "body_track_id"]].astype(np.int64)
+        return out
+
+    def _load_bouts(self) -> pd.DataFrame:
+        parts = [self._load_one(path) for path in self.paths]
+        data = pd.concat([part for part in parts if not part.empty], ignore_index=True) if parts else pd.DataFrame()
+        if data.empty:
+            return pd.DataFrame(
+                columns=["bout_start_frame", "bout_end_frame", "antenna_track_id", "body_track_id", "n_interaction_frames"]
+            )
+        rows: List[Dict[str, object]] = []
+        data = data.drop_duplicates(["Frame", "antenna_track_id", "body_track_id"]).sort_values(
+            ["antenna_track_id", "body_track_id", "Frame"],
+            kind="mergesort",
+        )
+        for (antenna_id, body_id), group in data.groupby(["antenna_track_id", "body_track_id"], sort=False):
+            frames = group["Frame"].to_numpy(np.int64)
+            if len(frames) == 0:
+                continue
+            start = int(frames[0])
+            prev = int(frames[0])
+            count = 1
+            for frame in frames[1:]:
+                frame = int(frame)
+                if frame - prev <= max(1, self.max_gap_frames):
+                    prev = frame
+                    count += 1
+                    continue
+                rows.append(
+                    {
+                        "bout_start_frame": start,
+                        "bout_end_frame": prev,
+                        "antenna_track_id": int(antenna_id),
+                        "body_track_id": int(body_id),
+                        "n_interaction_frames": int(count),
+                    }
+                )
+                start = prev = frame
+                count = 1
+            rows.append(
+                {
+                    "bout_start_frame": start,
+                    "bout_end_frame": prev,
+                    "antenna_track_id": int(antenna_id),
+                    "body_track_id": int(body_id),
+                    "n_interaction_frames": int(count),
+                }
+            )
+        return pd.DataFrame(rows).sort_values(["bout_start_frame", "bout_end_frame"], kind="mergesort").reset_index(drop=True)
+
+    def active_bouts(self, frame: int) -> pd.DataFrame:
+        if self.bouts.empty:
+            return self.bouts
+        frame = int(frame)
+        return self.bouts[
+            (self.bouts["bout_start_frame"] <= frame) & (self.bouts["bout_end_frame"] >= frame)
+        ].copy()
+
+
+class SleepBoutStore:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        frame_offset: int = 0,
+        sleep_label: str = "sleep",
+    ):
+        self.path = Path(path)
+        self.frame_offset = int(frame_offset)
+        self.sleep_label = str(sleep_label)
+        self.bouts = self._load_bouts()
+
+    def _track_id_series(self, df: pd.DataFrame) -> pd.Series:
+        for col in ("track_id", "TrackID", "track", "ant_track_id"):
+            if col in df.columns:
+                return pd.to_numeric(df[col], errors="coerce")
+        if "track_name" in df.columns:
+            extracted = df["track_name"].astype(str).str.extract(r"(\d+)(?!.*\d)", expand=False)
+            return pd.to_numeric(extracted, errors="coerce")
+        return pd.Series(np.nan, index=df.index)
+
+    def _from_bout_columns(self, df: pd.DataFrame, start_col: str, end_col: str) -> pd.DataFrame:
+        out = pd.DataFrame(
+            {
+                "track_id": self._track_id_series(df),
+                "bout_start_frame": pd.to_numeric(df[start_col], errors="coerce") + self.frame_offset,
+                "bout_end_frame": pd.to_numeric(df[end_col], errors="coerce") + self.frame_offset,
+            }
+        )
+        if "track_name" in df.columns:
+            out["track_name"] = df["track_name"].astype(str)
+        else:
+            out["track_name"] = ""
+        if "label" in df.columns:
+            out["label"] = df["label"].astype(str)
+        else:
+            out["label"] = self.sleep_label
+        return out
+
+    def _load_bouts(self) -> pd.DataFrame:
+        if not self.path.exists():
+            return pd.DataFrame(columns=["track_id", "track_name", "bout_start_frame", "bout_end_frame", "label"])
+        df = read_table(self.path)
+        if df.empty:
+            return pd.DataFrame(columns=["track_id", "track_name", "bout_start_frame", "bout_end_frame", "label"])
+
+        if {"bout_start_frame", "bout_end_frame"}.issubset(df.columns):
+            out = self._from_bout_columns(df, "bout_start_frame", "bout_end_frame")
+        elif {"frame_start", "frame_end"}.issubset(df.columns):
+            out = self._from_bout_columns(df, "frame_start", "frame_end")
+        elif {"start_frame", "end_frame"}.issubset(df.columns):
+            out = self._from_bout_columns(df, "start_frame", "end_frame")
+        elif "Frame" in df.columns:
+            frame = pd.to_numeric(df["Frame"], errors="coerce") + self.frame_offset
+            track_id = self._track_id_series(df)
+            if "label" in df.columns:
+                is_sleep = df["label"].astype(str).str.lower() == self.sleep_label.lower()
+            elif "is_sleep" in df.columns:
+                raw_sleep = df["is_sleep"]
+                if pd.api.types.is_bool_dtype(raw_sleep):
+                    is_sleep = raw_sleep.fillna(False)
+                else:
+                    is_sleep = raw_sleep.astype(str).str.lower().isin({"1", "true", "t", "yes", "y", "sleep"})
+            elif "sleep" in df.columns:
+                is_sleep = pd.to_numeric(df["sleep"], errors="coerce").fillna(0) > 0
+            else:
+                is_sleep = pd.Series(True, index=df.index)
+            work = pd.DataFrame({"Frame": frame, "track_id": track_id, "is_sleep": is_sleep}).dropna()
+            work = work[work["is_sleep"]].copy()
+            if work.empty:
+                out = pd.DataFrame(columns=["track_id", "track_name", "bout_start_frame", "bout_end_frame", "label"])
+            else:
+                rows = []
+                work[["Frame", "track_id"]] = work[["Frame", "track_id"]].astype(np.int64)
+                for track_id_value, group in work.sort_values(["track_id", "Frame"], kind="mergesort").groupby("track_id"):
+                    frames = group["Frame"].to_numpy(np.int64)
+                    breaks = np.flatnonzero(np.diff(frames) > 1) + 1
+                    starts = np.r_[0, breaks]
+                    stops = np.r_[breaks, len(frames)]
+                    for start, stop in zip(starts, stops):
+                        rows.append(
+                            {
+                                "track_id": int(track_id_value),
+                                "track_name": "",
+                                "bout_start_frame": int(frames[start]),
+                                "bout_end_frame": int(frames[stop - 1]),
+                                "label": self.sleep_label,
+                            }
+                        )
+                out = pd.DataFrame(rows)
+        else:
+            out = pd.DataFrame(columns=["track_id", "track_name", "bout_start_frame", "bout_end_frame", "label"])
+
+        if out.empty:
+            return pd.DataFrame(columns=["track_id", "track_name", "bout_start_frame", "bout_end_frame", "label"])
+        out["track_id"] = pd.to_numeric(out["track_id"], errors="coerce")
+        out["bout_start_frame"] = pd.to_numeric(out["bout_start_frame"], errors="coerce")
+        out["bout_end_frame"] = pd.to_numeric(out["bout_end_frame"], errors="coerce")
+        out = out.dropna(subset=["track_id", "bout_start_frame", "bout_end_frame"]).copy()
+        out[["track_id", "bout_start_frame", "bout_end_frame"]] = out[
+            ["track_id", "bout_start_frame", "bout_end_frame"]
+        ].astype(np.int64)
+        if "label" not in out.columns:
+            out["label"] = self.sleep_label
+        if "track_name" not in out.columns:
+            out["track_name"] = ""
+        out["label"] = out["label"].astype(str)
+        out["track_name"] = out["track_name"].astype(str)
+        out = out[out["label"].str.lower() == self.sleep_label.lower()].copy()
+        out = out[out["bout_end_frame"] >= out["bout_start_frame"]]
+        return out.sort_values(["bout_start_frame", "bout_end_frame", "track_id"], kind="mergesort").reset_index(drop=True)
+
+    def active_bouts(self, frame: int) -> pd.DataFrame:
+        if self.bouts.empty:
+            return self.bouts
+        frame = int(frame)
+        return self.bouts[
+            (self.bouts["bout_start_frame"] <= frame) & (self.bouts["bout_end_frame"] >= frame)
+        ].copy()
+
+
 def infer_detections_from_video(video_path: Path) -> Path:
     return video_path.with_name(f"{video_path.stem}_aruco_detections.csv")
 
@@ -1675,15 +2197,17 @@ def resolve_frame_count(video_path: Path, reader: Optional[OpenCvVideoReader] = 
 
 
 def pick_path_with_dialogs(args: argparse.Namespace) -> Tuple[Path, Path]:
+    block_arg = Path(args.block_dir) if getattr(args, "block_dir", None) is not None else None
+    video_arg = resolve_video_path(args.video, block_arg)
     if args.video is not None and args.label_dir is not None and args.detections is None:
-        return Path(args.video), Path(args.label_dir)
+        return Path(video_arg), Path(args.label_dir)
     if args.video is not None and args.detections is not None:
-        return Path(args.video), Path(args.detections)
+        return Path(video_arg), Path(args.detections)
 
     chooser = tk.Tk()
     chooser.withdraw()
 
-    video_path: Optional[Path] = Path(args.video) if args.video else None
+    video_path: Optional[Path] = Path(video_arg) if video_arg is not None else None
     detections_path: Optional[Path] = Path(args.detections) if args.detections else None
 
     if video_path is None and detections_path is not None:
@@ -1702,8 +2226,12 @@ def pick_path_with_dialogs(args: argparse.Namespace) -> Tuple[Path, Path]:
         video_path = Path(selected)
 
     if detections_path is None:
+        block_dir = resolve_block_dir(args, video_path)
+        label_dir = infer_block_label_dir(block_dir)
         inferred = infer_detections_from_video(video_path)
-        if inferred.exists():
+        if label_dir is not None:
+            detections_path = label_dir
+        elif inferred.exists():
             detections_path = inferred
         else:
             selected = filedialog.askopenfilename(
@@ -1731,6 +2259,16 @@ class ArucoCurationApp:
         start_frame: int,
         playback_fps: float,
         chunk_specs: Optional[List[ChunkSpec]] = None,
+        hmats_path: Optional[Path] = None,
+        camera_index: Optional[int] = None,
+        tracks_paths: Optional[List[Path]] = None,
+        interaction_paths: Optional[List[Path]] = None,
+        sleep_bouts_path: Optional[Path] = None,
+        track_frame_offset: int = 0,
+        interaction_frame_offset: int = 0,
+        sleep_frame_offset: int = 0,
+        interaction_bout_gap_frames: int = 3,
+        sleep_label: str = "sleep",
     ):
         self.root = root
         self.video_path = Path(video_path)
@@ -1748,6 +2286,13 @@ class ArucoCurationApp:
         self.sleap_skeleton_store: Optional[SleapSkeletonStore] = None
         self.sleap_skeleton_loading = False
         self.sleap_skeleton_error: Optional[str] = None
+        self.hmats_path = Path(hmats_path) if hmats_path is not None else None
+        self.camera_index = int(camera_index) if camera_index is not None else parse_camera_index(self.video_path)
+        self.panorama_to_video_H: Optional[np.ndarray] = None
+        self.panorama_track_store: Optional[PanoramaTrackStore] = None
+        self.interaction_bout_store: Optional[InteractionBoutStore] = None
+        self.sleep_bout_store: Optional[SleepBoutStore] = None
+        self.behavior_overlay_error: Optional[str] = None
 
         self.store = (
             ChunkedArucoDetectionStore(self.chunk_specs)
@@ -1859,10 +2404,24 @@ class ArucoCurationApp:
         self.param_test_comparisons: Dict[int, Dict[str, object]] = {}
         self.param_test_config_payload: Optional[Dict[str, object]] = None
         self.param_test_running = False
+        self.show_interaction_bouts_var = tk.BooleanVar(value=bool(interaction_paths))
+        self.show_sleep_bouts_var = tk.BooleanVar(value=bool(sleep_bouts_path))
+        self.behavior_overlay_status_var = tk.StringVar(value="Behavior overlay: not loaded")
 
         self.canvas_item_id: Optional[int] = None
         self.trajectory_canvas_item_id: Optional[int] = None
         self.selected_detection: Optional[Tuple[int, int]] = None
+
+        self._load_behavior_overlay_inputs(
+            tracks_paths=list(tracks_paths or []),
+            interaction_paths=list(interaction_paths or []),
+            sleep_bouts_path=sleep_bouts_path,
+            track_frame_offset=int(track_frame_offset),
+            interaction_frame_offset=int(interaction_frame_offset),
+            sleep_frame_offset=int(sleep_frame_offset),
+            interaction_bout_gap_frames=int(interaction_bout_gap_frames),
+            sleep_label=str(sleep_label),
+        )
 
         self._build_ui()
         self.refresh_param_test_status()
@@ -1895,6 +2454,79 @@ class ArucoCurationApp:
         style.configure("Treeview.Heading", font=heading_font)
         style.configure("Transport.TButton", padding=(18, 12), font=heading_font)
         self.root.option_add("*Font", default_font)
+
+    def _path_offsets(self, paths: Iterable[Path], base_offset: int) -> Dict[Path, int]:
+        offsets: Dict[Path, int] = {}
+        for path in paths:
+            path = Path(path)
+            offsets[path] = int(base_offset) + infer_chunk_offset(path, self.chunk_specs)
+        return offsets
+
+    def _path_spans(self, paths: Iterable[Path]) -> Dict[Path, Tuple[int, int]]:
+        spans: Dict[Path, Tuple[int, int]] = {}
+        for path in paths:
+            path = Path(path)
+            span = infer_chunk_span(path, self.chunk_specs)
+            if span is not None:
+                spans[path] = span
+        return spans
+
+    def _load_behavior_overlay_inputs(
+        self,
+        *,
+        tracks_paths: List[Path],
+        interaction_paths: List[Path],
+        sleep_bouts_path: Optional[Path],
+        track_frame_offset: int,
+        interaction_frame_offset: int,
+        sleep_frame_offset: int,
+        interaction_bout_gap_frames: int,
+        sleep_label: str,
+    ) -> None:
+        status_parts: List[str] = []
+        try:
+            if self.hmats_path is not None:
+                if self.camera_index is None:
+                    raise ValueError("Could not infer camera index; pass --camera for panorama overlays")
+                H = load_homography_stack(self.hmats_path)
+                if self.camera_index < 0 or self.camera_index >= len(H):
+                    raise ValueError(
+                        f"Camera index {self.camera_index} is outside homography stack with {len(H)} cameras"
+                    )
+                self.panorama_to_video_H = np.linalg.inv(H[self.camera_index])
+                status_parts.append(f"H cam{self.camera_index + 1:02d}")
+            elif tracks_paths or interaction_paths or sleep_bouts_path is not None:
+                status_parts.append("no homography")
+
+            if tracks_paths:
+                self.panorama_track_store = PanoramaTrackStore(
+                    tracks_paths,
+                    frame_offsets=self._path_offsets(tracks_paths, track_frame_offset),
+                    frame_spans=self._path_spans(tracks_paths),
+                )
+                status_parts.append(f"tracks {len(tracks_paths)}")
+            if interaction_paths:
+                self.interaction_bout_store = InteractionBoutStore(
+                    interaction_paths,
+                    frame_offsets=self._path_offsets(interaction_paths, interaction_frame_offset),
+                    max_gap_frames=int(interaction_bout_gap_frames),
+                )
+                status_parts.append(f"interaction bouts {len(self.interaction_bout_store.bouts):,}")
+            if sleep_bouts_path is not None:
+                self.sleep_bout_store = SleepBoutStore(
+                    sleep_bouts_path,
+                    frame_offset=int(sleep_frame_offset),
+                    sleep_label=str(sleep_label),
+                )
+                status_parts.append(f"sleep bouts {len(self.sleep_bout_store.bouts):,}")
+        except Exception as exc:
+            self.behavior_overlay_error = str(exc)
+            status_parts.append(f"load failed: {exc}")
+
+        if not status_parts:
+            self.behavior_overlay_status_var.set("Behavior overlay: no interactions/sleep inputs")
+        else:
+            self.behavior_overlay_status_var.set("Behavior overlay: " + " | ".join(status_parts))
 
     def _build_ui(self) -> None:
         self.root.title(f"ArUco Curation - {self.video_path.name}")
@@ -2082,6 +2714,27 @@ class ArucoCurationApp:
             command=self.undo_latest_bridge_command,
         )
         self.undo_bridge_button.pack(side=tk.RIGHT)
+
+        behavior_box = ttk.LabelFrame(right, text="Behavior Overlay")
+        behavior_box.pack(fill=tk.X, pady=(0, 10))
+        ttk.Label(
+            behavior_box,
+            textvariable=self.behavior_overlay_status_var,
+            wraplength=320,
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W, padx=8, pady=(8, 6))
+        ttk.Checkbutton(
+            behavior_box,
+            text="Show Interaction Bouts",
+            variable=self.show_interaction_bouts_var,
+            command=self.on_behavior_overlay_changed,
+        ).pack(anchor=tk.W, padx=8, pady=(0, 4))
+        ttk.Checkbutton(
+            behavior_box,
+            text="Show Sleep Bouts",
+            variable=self.show_sleep_bouts_var,
+            command=self.on_behavior_overlay_changed,
+        ).pack(anchor=tk.W, padx=8, pady=(0, 8))
 
         param_box = ttk.LabelFrame(right, text="ArUco Parameter Test")
         param_box.pack(fill=tk.X, pady=(0, 10))
@@ -2352,6 +3005,18 @@ class ArucoCurationApp:
         else:
             self.status_note = "SLEAP skeleton overlay hidden"
             self.refresh_sleap_status_label()
+        if not self.is_playing:
+            self.render_current_frame()
+        else:
+            self.refresh_status(force=True)
+
+    def on_behavior_overlay_changed(self) -> None:
+        enabled = []
+        if self.show_interaction_bouts_var.get():
+            enabled.append("interaction bouts")
+        if self.show_sleep_bouts_var.get():
+            enabled.append("sleep bouts")
+        self.status_note = "Behavior overlay: " + (", ".join(enabled) if enabled else "hidden")
         if not self.is_playing:
             self.render_current_frame()
         else:
@@ -3184,6 +3849,196 @@ class ArucoCurationApp:
             thickness=2,
         )
 
+    def project_panorama_xy(self, x: float, y: float) -> Optional[Tuple[int, int]]:
+        if self.panorama_to_video_H is None or not finite_xy(x, y):
+            return None
+        pts = apply_homography_points(np.asarray([[float(x), float(y)]], dtype=np.float64), self.panorama_to_video_H)
+        if pts.size == 0 or not np.isfinite(pts[0]).all():
+            return None
+        px = int(round(float(pts[0, 0])))
+        py = int(round(float(pts[0, 1])))
+        if px < -50 or py < -50 or px >= self.video_width + 50 or py >= self.video_height + 50:
+            return None
+        return px, py
+
+    def track_anchor_xy(self, rows: pd.DataFrame) -> Optional[Tuple[float, float]]:
+        if rows.empty:
+            return None
+        for x_col, y_col in (("TrackX", "TrackY"), ("SleapAnchorX", "SleapAnchorY"), ("ArucoX", "ArucoY")):
+            if x_col in rows.columns and y_col in rows.columns:
+                xy = rows[[x_col, y_col]].dropna()
+                if not xy.empty:
+                    x, y = xy.iloc[0]
+                    if finite_xy(x, y):
+                        return float(x), float(y)
+        bp0 = rows[pd.to_numeric(rows.get("Bodypoint", -1), errors="coerce") == 0]
+        xy = bp0[["X", "Y"]].dropna() if not bp0.empty else rows[["X", "Y"]].dropna()
+        if xy.empty:
+            return None
+        x = float(xy["X"].mean())
+        y = float(xy["Y"].mean())
+        return (x, y) if finite_xy(x, y) else None
+
+    def nearest_interaction_contact_xy(
+        self,
+        antenna_rows: pd.DataFrame,
+        body_rows: pd.DataFrame,
+    ) -> Optional[Tuple[Tuple[float, float], Tuple[float, float]]]:
+        if antenna_rows.empty or body_rows.empty:
+            return None
+        antenna = antenna_rows[pd.to_numeric(antenna_rows["Bodypoint"], errors="coerce").isin(ANTENNA_BODYPOINTS)]
+        if antenna.empty:
+            antenna = antenna_rows
+        antenna_xy = antenna[["X", "Y"]].dropna().to_numpy(np.float64)
+        body_xy = body_rows[["X", "Y"]].dropna().to_numpy(np.float64)
+        if len(antenna_xy) == 0 or len(body_xy) == 0:
+            return None
+        delta = antenna_xy[:, None, :] - body_xy[None, :, :]
+        dist_sq = np.einsum("ijk,ijk->ij", delta, delta, optimize=True)
+        idx = np.unravel_index(int(np.argmin(dist_sq)), dist_sq.shape)
+        a_xy = antenna_xy[idx[0]]
+        b_xy = body_xy[idx[1]]
+        return (float(a_xy[0]), float(a_xy[1])), (float(b_xy[0]), float(b_xy[1]))
+
+    def draw_behavior_overlay(self, image: np.ndarray) -> None:
+        show_interactions = self.show_interaction_bouts_var.get() and self.interaction_bout_store is not None
+        show_sleep = self.show_sleep_bouts_var.get() and self.sleep_bout_store is not None
+        if not show_interactions and not show_sleep:
+            return
+        if self.behavior_overlay_error is not None:
+            self.draw_text_with_outline(
+                image,
+                "Behavior overlay load failed",
+                (10, 144),
+                (0, 200, 255),
+                scale=0.85,
+                thickness=2,
+            )
+            return
+
+        try:
+            track_rows = (
+                self.panorama_track_store.rows_for_frame(self.current_frame)
+                if self.panorama_track_store is not None
+                else pd.DataFrame()
+            )
+        except Exception as exc:
+            self.draw_text_with_outline(
+                image,
+                f"Behavior track load failed: {exc}",
+                (10, 144),
+                (0, 200, 255),
+                scale=0.72,
+                thickness=2,
+            )
+            return
+        rows_by_track = {
+            int(track_id): group
+            for track_id, group in track_rows.groupby("TrackID", sort=False)
+        } if not track_rows.empty else {}
+
+        missing_track_store = self.panorama_track_store is None
+        active_interactions = (
+            self.interaction_bout_store.active_bouts(self.current_frame)
+            if show_interactions
+            else pd.DataFrame()
+        )
+        active_sleep = self.sleep_bout_store.active_bouts(self.current_frame) if show_sleep else pd.DataFrame()
+
+        y_text = 144
+        if self.panorama_to_video_H is None and (show_interactions or show_sleep):
+            self.draw_text_with_outline(
+                image,
+                "Behavior overlay needs --hmats and --camera for panorama projection",
+                (10, y_text),
+                (0, 200, 255),
+                scale=0.72,
+                thickness=2,
+            )
+            y_text += 26
+        if missing_track_store:
+            self.draw_text_with_outline(
+                image,
+                "Behavior overlay needs --tracks for per-ant locations",
+                (10, y_text),
+                (0, 200, 255),
+                scale=0.72,
+                thickness=2,
+            )
+            y_text += 26
+
+        if show_sleep and not active_sleep.empty:
+            for bout in active_sleep.itertuples(index=False):
+                track_id = int(getattr(bout, "track_id"))
+                rows = rows_by_track.get(track_id, pd.DataFrame())
+                anchor = self.track_anchor_xy(rows)
+                point = self.project_panorama_xy(*anchor) if anchor is not None else None
+                if point is None:
+                    continue
+                duration = int(getattr(bout, "bout_end_frame")) - int(getattr(bout, "bout_start_frame")) + 1
+                cv2.circle(image, point, 24, SLEEP_BOUT_COLOR, 4, cv2.LINE_AA)
+                self.draw_text_with_outline(
+                    image,
+                    f"sleep T{track_id} {duration / max(self.video_reader.fps, 1e-6):.1f}s",
+                    (point[0] + 20, point[1] + 34),
+                    SLEEP_BOUT_COLOR,
+                    scale=0.75,
+                    thickness=2,
+                )
+
+        if show_interactions and not active_interactions.empty:
+            for bout in active_interactions.itertuples(index=False):
+                antenna_id = int(getattr(bout, "antenna_track_id"))
+                body_id = int(getattr(bout, "body_track_id"))
+                antenna_rows = rows_by_track.get(antenna_id, pd.DataFrame())
+                body_rows = rows_by_track.get(body_id, pd.DataFrame())
+                antenna_anchor = self.track_anchor_xy(antenna_rows)
+                body_anchor = self.track_anchor_xy(body_rows)
+                antenna_point = self.project_panorama_xy(*antenna_anchor) if antenna_anchor is not None else None
+                body_point = self.project_panorama_xy(*body_anchor) if body_anchor is not None else None
+                contact = self.nearest_interaction_contact_xy(antenna_rows, body_rows)
+                contact_points = None
+                if contact is not None:
+                    contact_a = self.project_panorama_xy(*contact[0])
+                    contact_b = self.project_panorama_xy(*contact[1])
+                    if contact_a is not None and contact_b is not None:
+                        contact_points = (contact_a, contact_b)
+
+                if antenna_point is None or body_point is None:
+                    continue
+                cv2.line(image, antenna_point, body_point, INTERACTION_COLOR, 3, cv2.LINE_AA)
+                cv2.circle(image, antenna_point, 15, INTERACTION_COLOR, 3, cv2.LINE_AA)
+                cv2.circle(image, body_point, 15, (255, 255, 255), 2, cv2.LINE_AA)
+                if contact_points is not None:
+                    cv2.line(image, contact_points[0], contact_points[1], INTERACTION_CONTACT_COLOR, 4, cv2.LINE_AA)
+                    cv2.circle(image, contact_points[0], 7, INTERACTION_CONTACT_COLOR, -1, cv2.LINE_AA)
+                    cv2.circle(image, contact_points[1], 7, (255, 255, 255), -1, cv2.LINE_AA)
+                duration = int(getattr(bout, "bout_end_frame")) - int(getattr(bout, "bout_start_frame")) + 1
+                midpoint = ((antenna_point[0] + body_point[0]) // 2, (antenna_point[1] + body_point[1]) // 2)
+                self.draw_text_with_outline(
+                    image,
+                    f"{antenna_id}->{body_id} {duration / max(self.video_reader.fps, 1e-6):.1f}s",
+                    (midpoint[0] + 8, midpoint[1] - 8),
+                    INTERACTION_COLOR,
+                    scale=0.72,
+                    thickness=2,
+                )
+
+        summary = []
+        if show_interactions:
+            summary.append(f"interaction bouts active {0 if active_interactions.empty else len(active_interactions)}")
+        if show_sleep:
+            summary.append(f"sleep bouts active {0 if active_sleep.empty else len(active_sleep)}")
+        if summary:
+            self.draw_text_with_outline(
+                image,
+                " | ".join(summary),
+                (10, y_text),
+                (0, 200, 255),
+                scale=0.8,
+                thickness=2,
+            )
+
     def draw_param_test_overlay(self, image: np.ndarray, current_dets: List[Detection]) -> None:
         if not self.show_param_test_overlay_var.get():
             return
@@ -3298,6 +4153,7 @@ class ArucoCurationApp:
                 thickness=4 if det.instance == selected_instance else 3,
             )
 
+        self.draw_behavior_overlay(frame)
         self.draw_param_test_overlay(frame, current_dets)
 
         mode_text = "ADD/UPDATE" if self.add_mode_var.get() else "SELECT/MOVE"
@@ -4414,6 +5270,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Interactive ArUco detections curation GUI.")
     parser.add_argument("--video", type=Path, default=None, help="Path to source video.")
     parser.add_argument(
+        "--block-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Block root with data/, tracks/, and interactions/. "
+            f"If omitted, infer from --video. Example: {DEFAULT_BLOCK_DIR}"
+        ),
+    )
+    parser.add_argument(
         "--detections",
         type=Path,
         default=None,
@@ -4431,6 +5296,67 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Directory for curated CSV/H5/JSON outputs. Default: <detections_dir>/curation",
     )
+    parser.add_argument(
+        "--hmats",
+        type=Path,
+        default=None,
+        help="Homography .npz containing key H for panorama-to-video behavior overlays.",
+    )
+    parser.add_argument(
+        "--camera",
+        type=int,
+        default=None,
+        help="One-based camera index for --hmats. If omitted, infer from video filename like cam01.",
+    )
+    parser.add_argument(
+        "--tracks",
+        type=Path,
+        nargs="+",
+        default=None,
+        help="Panorama track parquet file(s) with TrackID and bodypoint or anchor coordinates.",
+    )
+    parser.add_argument(
+        "--interactions",
+        type=Path,
+        nargs="+",
+        default=None,
+        help="Interaction table(s). Frame-level rows are collapsed into interaction bouts for display.",
+    )
+    parser.add_argument(
+        "--sleep-bouts",
+        type=Path,
+        default=None,
+        help="Sleep/low-quiescent bout table. Frame-level label tables are collapsed into distinct bouts.",
+    )
+    parser.add_argument(
+        "--track-frame-offset",
+        type=int,
+        default=0,
+        help="Add this offset to track Frame values before overlaying them on the video.",
+    )
+    parser.add_argument(
+        "--interaction-frame-offset",
+        type=int,
+        default=0,
+        help="Add this offset to interaction Frame values when no global_frame column is present.",
+    )
+    parser.add_argument(
+        "--sleep-frame-offset",
+        type=int,
+        default=0,
+        help="Add this offset to sleep bout/frame values before overlaying them on the video.",
+    )
+    parser.add_argument(
+        "--interaction-bout-gap-frames",
+        type=int,
+        default=3,
+        help="Merge interaction frames into one displayed bout when gaps are at most this many frames.",
+    )
+    parser.add_argument(
+        "--sleep-label",
+        default="sleep",
+        help="Label value to treat as sleep when converting a frame-level label table into bouts.",
+    )
     parser.add_argument("--dictionary-size", type=int, default=1000, help="Dense H5 marker dimension.")
     parser.add_argument("--start-frame", type=int, default=0, help="Initial frame.")
     parser.add_argument("--fps", type=float, default=20.0, help="Playback FPS inside the GUI.")
@@ -4445,9 +5371,10 @@ def main() -> None:
     if not video_path.exists():
         raise FileNotFoundError(video_path)
     chunk_specs: Optional[List[ChunkSpec]] = None
+    block_dir = resolve_block_dir(args, video_path, detections_path)
     label_dir = Path(args.label_dir) if args.label_dir is not None else None
     if label_dir is None and args.detections is None:
-        label_dir = infer_chunked_label_dir(video_path)
+        label_dir = infer_block_label_dir(block_dir) or infer_chunked_label_dir(video_path)
     if label_dir is not None:
         chunk_specs = resolve_chunk_specs(video_path, label_dir)
         detections_path = chunk_specs[0].aruco_path
@@ -4460,6 +5387,13 @@ def main() -> None:
         )
 
     output_dir = Path(args.output_dir) if args.output_dir is not None else detections_path.parent / "curation"
+    camera_index = None
+    if args.camera is not None:
+        camera_index = int(args.camera) - 1 if int(args.camera) > 0 else int(args.camera)
+    hmats_path = args.hmats or infer_default_hmats_path(block_dir)
+    tracks_paths = list(args.tracks or infer_block_parquet_paths(block_dir, "tracks"))
+    interaction_paths = list(args.interactions or infer_block_parquet_paths(block_dir, "interactions"))
+    sleep_bouts_path = args.sleep_bouts or infer_sleep_bouts_path(block_dir)
 
     root = tk.Tk()
     app = ArucoCurationApp(
@@ -4471,6 +5405,16 @@ def main() -> None:
         start_frame=int(args.start_frame),
         playback_fps=float(args.fps),
         chunk_specs=chunk_specs,
+        hmats_path=hmats_path,
+        camera_index=camera_index,
+        tracks_paths=tracks_paths,
+        interaction_paths=interaction_paths,
+        sleep_bouts_path=sleep_bouts_path,
+        track_frame_offset=int(args.track_frame_offset),
+        interaction_frame_offset=int(args.interaction_frame_offset),
+        sleep_frame_offset=int(args.sleep_frame_offset),
+        interaction_bout_gap_frames=int(args.interaction_bout_gap_frames),
+        sleep_label=str(args.sleep_label),
     )
     print(SHORTCUTS_TEXT, flush=True)
     app.refresh_status()

@@ -62,14 +62,22 @@ QUIESCENCE_SPEED_THRESHOLD_MM_S = 0.1
 MIN_QUIESCENT_BOUT_SECONDS = 10.0
 SPEED_YLIM = None
 INTERACTION_YLIM = None
+INTERACTION_BOUT_GAP_SECONDS = 2.0
 
 POSTURE_LOW_INTERACTION_MAX = 0
 POSTURE_HIGH_INTERACTION_MIN = None  # None uses POSTURE_HIGH_INTERACTION_QUANTILE.
 POSTURE_HIGH_INTERACTION_QUANTILE = 0.75
 POSTURE_INCLUDE_NON_QUIESCENT = True
-POSTURE_MAX_FRAMES_PER_GROUP = 20000
+POSTURE_MAX_FRAMES_PER_GROUP = 200000
 POSTURE_RANDOM_STATE = 0
 POSTURE_JOINT_MAX_POINTS_PER_GROUP = 5000
+POSTURE_HEATPLOT_CLASSIFIER_SPLIT = None  # None uses train+test predictions; "test" restricts to held-out bins.
+POSTURE_HEATPLOT_MAX_FRAMES_PER_STATE = 8000
+POSTURE_HEATPLOT_BINS = 160
+POSTURE_HEATPLOT_EXTENT_MM = None
+POSTURE_HEATPLOT_BODY_BODYPOINT = 0
+POSTURE_HEATPLOT_HEAD_BODYPOINT = 1
+POSTURE_HEATPLOT_BODYPOINTS = (0, 1, 4, 5, 6, 7, 8, 9)
 POSTURE_FEATURE_COLUMNS = [
     "angle_in_left_deg",
     "angle_out_left_deg",
@@ -149,11 +157,16 @@ CLASSIFIER_TEST_SIZE = 0.5
 CLASSIFIER_RANDOM_STATE = POSTURE_RANDOM_STATE
 CLASSIFIER_MAX_WEIGHT_FEATURES = 12
 
-LOW_INTERACTION_CLUSTER_SPLIT = "test"  # Use held-out bouts/ants by default.
-LOW_INTERACTION_CLUSTER_SCORE_THRESHOLD = 0.5
-LOW_INTERACTION_CLUSTER_MIN_FRAME_FRACTION = 0.5
-LOW_INTERACTION_CLUSTER_CORRELATION_X = "n_interactions_total"
-LOW_INTERACTION_CLUSTER_CORRELATION_Y = "bout_duration_seconds"
+FORMER_HIGH_INTERACTION_SLEEP_SPLIT = "test"  # Use held-out bouts/ants by default.
+FORMER_HIGH_INTERACTION_SLEEP_SCORE_THRESHOLD = 0.5
+FORMER_HIGH_INTERACTION_SLEEP_MIN_FRAME_FRACTION = 0.5
+FORMER_HIGH_INTERACTION_SLEEP_CORRELATION_X = "n_interactions_total"
+FORMER_HIGH_INTERACTION_SLEEP_CORRELATION_Y = "bout_duration_seconds"
+LOW_INTERACTION_CLUSTER_SPLIT = FORMER_HIGH_INTERACTION_SLEEP_SPLIT  # Backward-compatible aliases.
+LOW_INTERACTION_CLUSTER_SCORE_THRESHOLD = FORMER_HIGH_INTERACTION_SLEEP_SCORE_THRESHOLD
+LOW_INTERACTION_CLUSTER_MIN_FRAME_FRACTION = FORMER_HIGH_INTERACTION_SLEEP_MIN_FRAME_FRACTION
+LOW_INTERACTION_CLUSTER_CORRELATION_X = FORMER_HIGH_INTERACTION_SLEEP_CORRELATION_X
+LOW_INTERACTION_CLUSTER_CORRELATION_Y = FORMER_HIGH_INTERACTION_SLEEP_CORRELATION_Y
 
 CROSS_ANT_TRACK_IDS = None  # None uses the first CROSS_ANT_MAX_TRACKS selected tracks on SINGLE_ANT_SIDE.
 CROSS_ANT_MAX_TRACKS = 20
@@ -186,10 +199,13 @@ if SINGLE_ANT_TRACK_ID is None and SINGLE_ANT_ROW is None:
     SINGLE_ANT_TRACK_ID = int(speed_tracks_side.iloc[0]["track_id"])
 
 interactions_raw = ia.load_interactions_for_chunks(chunks)
-interaction_counts_by_track = ia.interaction_frame_counts_by_track(
+interaction_bout_counts_by_track = ia.interaction_bout_counts_by_track(
     interactions_raw,
     chunk_global_frame_offset=0,
+    fps=FPS,
+    event_gap_seconds=INTERACTION_BOUT_GAP_SECONDS,
 )
+interaction_counts_by_track = interaction_bout_counts_by_track  # Backward-compatible alias for interactive use.
 
 chunk_table = pd.DataFrame(
     [
@@ -207,7 +223,12 @@ chunk_table = pd.DataFrame(
 
 print(f"Chunk selection: {chunk_summary} ({SIDE})")
 print(f"Loaded speed tracks: {len(speed_tracks):,}/{len(speed_tracks_all):,} passing present_frac > {MIN_PRESENT_FRAC:g}")
-print(f"Interaction rows loaded: {len(interactions_raw):,}")
+print(f"Frame-level interaction rows loaded: {len(interactions_raw):,}")
+print(
+    "Interaction bouts counted: "
+    f"{sum(int(counts['n_interactions_total'].sum()) for counts in interaction_bout_counts_by_track.values()):,} "
+    f"(gap {INTERACTION_BOUT_GAP_SECONDS:g}s)"
+)
 print(f"Selected ant: row={SINGLE_ANT_ROW}, track_id={SINGLE_ANT_TRACK_ID}, side={SINGLE_ANT_SIDE}")
 display(chunk_table)
 display(
@@ -233,7 +254,7 @@ single_ant_speed_interactions = sleep_utils.plot_single_ant_speed_interactions(
     analysis_frame_stop=ANALYSIS_FRAME_STOP,
     speed_ylim=SPEED_YLIM,
     interaction_ylim=INTERACTION_YLIM,
-    counts_by_track=interaction_counts_by_track,
+    counts_by_track=interaction_bout_counts_by_track,
 )
 display(single_ant_speed_interactions.head(20))
 
@@ -249,7 +270,7 @@ single_ant_track_row = sleep_utils.selected_speed_track(
 single_ant_quiescent_bouts = single_ant_speed_interactions.attrs.get("quiescent_bouts", pd.DataFrame()).copy()
 single_ant_non_quiescent_bouts = sleep_utils.non_quiescent_threshold_bouts_for_track_row(
     single_ant_track_row,
-    interaction_counts_by_track,
+    interaction_bout_counts_by_track,
     speed_smooth_seconds=SPEED_SMOOTH_SECONDS,
     quiescence_speed_threshold_mm_s=QUIESCENCE_SPEED_THRESHOLD_MM_S,
     min_non_quiescent_seconds=MIN_QUIESCENT_BOUT_SECONDS,
@@ -276,8 +297,8 @@ else:
             total_bout_duration_s=("bout_duration_seconds", "sum"),
             median_bout_duration_s=("bout_duration_seconds", "median"),
             fraction_bouts_with_interaction=("has_interaction", "mean"),
-            mean_interactions_per_bout=("n_interactions_total", "mean"),
-            median_interactions_per_bout=("n_interactions_total", "median"),
+            mean_interaction_bouts_per_bout=("n_interactions_total", "mean"),
+            median_interaction_bouts_per_bout=("n_interactions_total", "median"),
         )
         .reset_index()
     )
@@ -293,7 +314,7 @@ posture_samples, posture_bout_summary = sleep_utils.quiescent_posture_samples_by
     row_number=SINGLE_ANT_ROW,
     track_id=SINGLE_ANT_TRACK_ID,
     side=SINGLE_ANT_SIDE,
-    counts_by_track=interaction_counts_by_track,
+    counts_by_track=interaction_bout_counts_by_track,
     per_track_root=PER_TRACK_ROOT,
     fps=FPS,
     mm_per_px=MM_PER_PX,
@@ -351,23 +372,54 @@ display(same_ant_classifier_weights)
 
 
 # %%
-# Treat classifier-low quiescent bouts as their own state and ask how interactions relate to that state.
-same_ant_low_quiescent_bins, same_ant_low_quiescent_summary, same_ant_low_quiescent_bouts, same_ant_low_quiescent_corr = (
+# Treat the former high-interaction quiescent classifier side as sleep and ask how interactions relate to that state.
+same_ant_sleep_bins, same_ant_sleep_summary, same_ant_sleep_bouts, same_ant_sleep_corr = (
     sleep_utils.plot_low_interaction_quiescent_cluster_analysis(
         same_ant_classifier_predictions,
         groups=("little_or_no_interaction", "more_interaction"),
-        split=LOW_INTERACTION_CLUSTER_SPLIT,
+        split=FORMER_HIGH_INTERACTION_SLEEP_SPLIT,
         bin_seconds=BIN_SECONDS,
-        low_score_threshold=LOW_INTERACTION_CLUSTER_SCORE_THRESHOLD,
-        min_predicted_low_fraction=LOW_INTERACTION_CLUSTER_MIN_FRAME_FRACTION,
-        correlation_x_col=LOW_INTERACTION_CLUSTER_CORRELATION_X,
-        correlation_y_col=LOW_INTERACTION_CLUSTER_CORRELATION_Y,
-        title=f"Selected ant {SINGLE_ANT_SIDE} TrackID {SINGLE_ANT_TRACK_ID}: low-interaction quiescent classifier state",
+        low_score_threshold=FORMER_HIGH_INTERACTION_SLEEP_SCORE_THRESHOLD,
+        min_predicted_low_fraction=FORMER_HIGH_INTERACTION_SLEEP_MIN_FRAME_FRACTION,
+        correlation_x_col=FORMER_HIGH_INTERACTION_SLEEP_CORRELATION_X,
+        correlation_y_col=FORMER_HIGH_INTERACTION_SLEEP_CORRELATION_Y,
+        title=f"Selected ant {SINGLE_ANT_SIDE} TrackID {SINGLE_ANT_TRACK_ID}: former high-interaction quiescent sleep state",
     )
 )
-display(same_ant_low_quiescent_summary)
-display(same_ant_low_quiescent_corr.to_frame().T)
-display(same_ant_low_quiescent_bouts.head(30))
+same_ant_low_quiescent_bins = same_ant_sleep_bins  # Backward-compatible aliases for interactive use.
+same_ant_low_quiescent_summary = same_ant_sleep_summary
+same_ant_low_quiescent_bouts = same_ant_sleep_bouts
+same_ant_low_quiescent_corr = same_ant_sleep_corr
+display(same_ant_sleep_summary)
+display(same_ant_sleep_corr.to_frame().T)
+display(same_ant_sleep_bouts.head(30))
+
+
+# %%
+# Aligned posture heatmaps for sleep, non-sleep quiescent, and non-quiescent frames.
+same_ant_posture_state_bins = sleep_utils.low_interaction_quiescent_classifier_bins(
+    same_ant_classifier_predictions,
+    groups=("little_or_no_interaction", "more_interaction"),
+    split=POSTURE_HEATPLOT_CLASSIFIER_SPLIT,
+    low_score_threshold=FORMER_HIGH_INTERACTION_SLEEP_SCORE_THRESHOLD,
+    min_predicted_low_fraction=FORMER_HIGH_INTERACTION_SLEEP_MIN_FRAME_FRACTION,
+)
+posture_state_aligned_points, posture_state_bodypoint_summary, posture_state_summary = (
+    sleep_utils.plot_aligned_posture_state_heatmaps(
+        posture_samples,
+        same_ant_posture_state_bins,
+        mm_per_px=MM_PER_PX,
+        body_bodypoint=POSTURE_HEATPLOT_BODY_BODYPOINT,
+        head_bodypoint=POSTURE_HEATPLOT_HEAD_BODYPOINT,
+        bodypoints=POSTURE_HEATPLOT_BODYPOINTS,
+        max_frames_per_state=POSTURE_HEATPLOT_MAX_FRAMES_PER_STATE,
+        random_state=POSTURE_RANDOM_STATE,
+        bins=POSTURE_HEATPLOT_BINS,
+        extent_mm=POSTURE_HEATPLOT_EXTENT_MM,
+    )
+)
+display(posture_state_summary)
+display(posture_state_bodypoint_summary.head(30))
 
 
 # %%
@@ -416,7 +468,7 @@ cross_ant_posture_samples, cross_ant_bout_summary, cross_ant_speed_interactions 
         include_non_quiescent=False,
         max_frames_per_group=CROSS_ANT_MAX_FRAMES_PER_GROUP,
         random_state=CLASSIFIER_RANDOM_STATE,
-        counts_by_track=interaction_counts_by_track,
+        counts_by_track=interaction_bout_counts_by_track,
     )
 )
 display(cross_ant_bout_summary)
@@ -470,22 +522,26 @@ display(cross_ant_classifier_weights)
 
 
 # %%
-# Same low-interaction-quiescent state analysis on held-out ants from the cross-ant classifier.
-cross_ant_low_quiescent_bins, cross_ant_low_quiescent_summary, cross_ant_low_quiescent_bouts, cross_ant_low_quiescent_corr = (
+# Same former high-interaction quiescent sleep analysis on held-out ants from the cross-ant classifier.
+cross_ant_sleep_bins, cross_ant_sleep_summary, cross_ant_sleep_bouts, cross_ant_sleep_corr = (
     sleep_utils.plot_low_interaction_quiescent_cluster_analysis(
         cross_ant_classifier_predictions,
         groups=("little_or_no_interaction", "more_interaction"),
-        split=LOW_INTERACTION_CLUSTER_SPLIT,
+        split=FORMER_HIGH_INTERACTION_SLEEP_SPLIT,
         bin_seconds=BIN_SECONDS,
-        low_score_threshold=LOW_INTERACTION_CLUSTER_SCORE_THRESHOLD,
-        min_predicted_low_fraction=LOW_INTERACTION_CLUSTER_MIN_FRAME_FRACTION,
-        correlation_x_col=LOW_INTERACTION_CLUSTER_CORRELATION_X,
-        correlation_y_col=LOW_INTERACTION_CLUSTER_CORRELATION_Y,
-        title=f"Cross-ant held-out ants: low-interaction quiescent classifier state",
+        low_score_threshold=FORMER_HIGH_INTERACTION_SLEEP_SCORE_THRESHOLD,
+        min_predicted_low_fraction=FORMER_HIGH_INTERACTION_SLEEP_MIN_FRAME_FRACTION,
+        correlation_x_col=FORMER_HIGH_INTERACTION_SLEEP_CORRELATION_X,
+        correlation_y_col=FORMER_HIGH_INTERACTION_SLEEP_CORRELATION_Y,
+        title=f"Cross-ant held-out ants: former high-interaction quiescent sleep state",
     )
 )
-display(cross_ant_low_quiescent_summary)
-display(cross_ant_low_quiescent_corr.to_frame().T)
-display(cross_ant_low_quiescent_bouts.head(30))
+cross_ant_low_quiescent_bins = cross_ant_sleep_bins  # Backward-compatible aliases for interactive use.
+cross_ant_low_quiescent_summary = cross_ant_sleep_summary
+cross_ant_low_quiescent_bouts = cross_ant_sleep_bouts
+cross_ant_low_quiescent_corr = cross_ant_sleep_corr
+display(cross_ant_sleep_summary)
+display(cross_ant_sleep_corr.to_frame().T)
+display(cross_ant_sleep_bouts.head(30))
 
 # %%

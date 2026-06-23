@@ -417,19 +417,21 @@ The GUI saves per-frame label vectors beside the crop videos by default:
 ```text
 sleep_crop_videos/<window>/label_vectors/
   <crop_video>_labels.npy
+  <crop_video>_label_text.npy
   <crop_video>_labels.parquet
   <crop_video>_metadata.json
 ```
 
-Label values are `-1` for unlabeled, `0` for wake, and `1` for sleep. The bar under the seek slider shows unlabeled frames in gray, wake in blue, and sleep in orange. Clicking the bar seeks to that part of the video.
+The GUI now stores text labels per frame in `<crop_video>_label_text.npy` and in the `label` column of `<crop_video>_labels.parquet`. The legacy `<crop_video>_labels.npy` is still written for sleep/wake compatibility, with values `-1` for unlabeled or non-sleep/wake custom labels, `0` for wake, and `1` for sleep. The bar under the seek slider shows unlabeled frames in gray, wake in blue, sleep in orange, and custom labels in deterministic additional colors. Clicking the bar seeks to that part of the video.
 
 Basic labeling workflow:
 
 - Press `s` or the `Sleep` button to start labeling sleep from the current frame.
 - Press `w`, `n`, or the `Wake` button to start labeling wake from the current frame.
+- Type another state in the `Label` text box, then press Enter or `Apply` to start labeling that text label.
 - While a label is active, normal playback paints each frame the playhead reaches. Seeking to a different frame resets the active label anchor, so skipped frames are not filled.
 - Press the same label again, `e`, or `End` to stop the active label at the current frame.
-- Press `[` to set a range start, then press `s` or `w` at another frame to label that whole interval once.
+- Press `[` to set a range start, then press `s`, `w`, or apply the text label at another frame to label that whole interval once.
 - Press `c` or `Clear` to clear the current frame, or to clear the selected interval after setting a range start.
 - Use `Save` or `ctrl+s` to save manually. Labels are also saved when changing videos or closing the GUI.
 
@@ -441,6 +443,7 @@ Useful hotkeys:
 - `A`/`D`: play backward/forward at 2x, then faster up to 30x on repeated presses;
 - `s`: start/switch/end `sleep`;
 - `w` or `n`: start/switch/end `wake`;
+- Enter in the `Label` box: start/switch/end the typed label;
 - `c`: clear the current frame or selected range;
 - `e`: end the active label at the current frame;
 - `[`: set range start for a one-shot interval label;
@@ -573,15 +576,15 @@ Expensive intermediate tables are cached under:
 stitched/analysis_cache/interaction_analysis/
 ```
 
-Set `FORCE_REBUILD_CACHE = True` in the script to recompute them.
+Set `FORCE_REBUILD_CACHE = True` in the script to recompute them. The script also caches derived pair tables, per-ant event tables, time-count tables, time-series tables, and spatial histogram arrays so display-only changes can rerun without rebuilding the heavy summaries.
 
 It plots:
 
-- directed cluster-pair interaction counts;
-- antenna/source interaction locations by occupancy cluster;
-- body/receiver interaction locations by occupancy cluster;
-- interaction counts by time since light on, averaged over light-cycle days by default;
-- spatial interaction heatmaps tiled by cluster and time-of-day bin, averaged over light-cycle days by default;
+- directed cluster-pair interaction strengths, normalized by possible directed ant pairs by default;
+- antenna/source interaction locations by occupancy cluster, normalized per ant by default;
+- body/receiver interaction locations by occupancy cluster, normalized per ant by default;
+- per-ant interaction strengths by time since light on, averaged over light-cycle days by default;
+- per-ant spatial interaction heatmaps tiled by cluster and time-of-day bin, averaged over light-cycle days by default;
 - immobile-bout tests that threshold speed, count interactions involving each immobile ant, and correlate interaction count with time to mobility or bout length.
 - wake-prediction regressions that compare elapsed immobility time, cumulative interaction count, and their weighted combination as predictors of waking from immobility.
 

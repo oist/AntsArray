@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 import sys
 sys.path.append(str(Path(__file__).resolve().parents[1]))
-from analysis.sleep_analysis import classify_sleep_wake_from_sleap
+from analysis.sleep_analysis_utils import classify_sleep_wake_from_sleap
 
 #%% Testing parquet files. I have converted the tracking pkl
 # output to parquet for faster loading. Can change to just save parquet directly in future.
@@ -21,7 +21,7 @@ from tqdm import tqdm
 import sys
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
-from analysis.sleep_analysis import classify_sleep_wake_from_sleap, get_event_trig_avg
+from analysis.sleep_analysis_utils import classify_sleep_wake_from_sleap, get_event_trig_avg
 
 # -----------------------
 # CONFIG

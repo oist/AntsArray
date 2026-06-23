@@ -1590,6 +1590,73 @@ def interaction_frame_counts_by_track(
     }
 
 
+def interaction_bout_counts_by_track(
+    interactions: pd.DataFrame,
+    *,
+    chunk_global_frame_offset: int,
+    fps: float = 24.0,
+    event_gap_seconds: float = 2.0,
+) -> dict[int, pd.DataFrame]:
+    """Count directed interaction bouts instead of every frame-level detection.
+
+    A directed pair that remains in contact for consecutive frames contributes
+    one count at the first frame. A new bout starts after a gap longer than
+    `event_gap_seconds`.
+    """
+    if interactions.empty:
+        return {}
+    if "global_frame" in interactions.columns:
+        work = interactions[["global_frame", "antenna_track_id", "body_track_id"]].copy()
+    else:
+        work = interactions[["Frame", "antenna_track_id", "body_track_id"]].copy()
+        work["global_frame"] = pd.to_numeric(work["Frame"], errors="coerce") + int(chunk_global_frame_offset)
+    for col in ["global_frame", "antenna_track_id", "body_track_id"]:
+        work[col] = pd.to_numeric(work[col], errors="coerce")
+    work = work.dropna(subset=["global_frame", "antenna_track_id", "body_track_id"]).copy()
+    if work.empty:
+        return {}
+    work["global_frame"] = np.rint(work["global_frame"]).astype(np.int64)
+    work["antenna_track_id"] = work["antenna_track_id"].astype(int)
+    work["body_track_id"] = work["body_track_id"].astype(int)
+    work = work[work["antenna_track_id"] != work["body_track_id"]].drop_duplicates(
+        ["antenna_track_id", "body_track_id", "global_frame"]
+    )
+    if work.empty:
+        return {}
+
+    gap_frames = max(1, int(round(float(event_gap_seconds) * float(fps))))
+    work = work.sort_values(["antenna_track_id", "body_track_id", "global_frame"], kind="mergesort")
+    frame_gap = work.groupby(["antenna_track_id", "body_track_id"], sort=False)["global_frame"].diff()
+    onsets = work[frame_gap.isna() | (frame_gap > gap_frames)].copy()
+    if onsets.empty:
+        return {}
+
+    antenna_counts = (
+        onsets.groupby(["antenna_track_id", "global_frame"], sort=True)
+        .size()
+        .rename("n_interactions_as_antenna")
+        .reset_index()
+        .rename(columns={"antenna_track_id": "track_id"})
+    )
+    body_counts = (
+        onsets.groupby(["body_track_id", "global_frame"], sort=True)
+        .size()
+        .rename("n_interactions_as_body")
+        .reset_index()
+        .rename(columns={"body_track_id": "track_id"})
+    )
+    counts = antenna_counts.merge(body_counts, on=["track_id", "global_frame"], how="outer")
+    counts["n_interactions_as_antenna"] = counts["n_interactions_as_antenna"].fillna(0).astype(np.int64)
+    counts["n_interactions_as_body"] = counts["n_interactions_as_body"].fillna(0).astype(np.int64)
+    counts["n_interactions_total"] = counts["n_interactions_as_antenna"] + counts["n_interactions_as_body"]
+    counts["interaction_count_measure"] = "directed_bout_onset"
+    counts["interaction_bout_gap_seconds"] = float(event_gap_seconds)
+    return {
+        int(track_id): group.sort_values("global_frame", kind="mergesort").reset_index(drop=True)
+        for track_id, group in counts.groupby("track_id", sort=False)
+    }
+
+
 def add_interaction_counts_to_bouts(
     bouts: pd.DataFrame,
     interactions: pd.DataFrame,

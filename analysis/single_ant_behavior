@@ -9,7 +9,7 @@ import sys
 
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
-from analysis.sleep_analysis import classify_sleep_wake_from_sleap
+from analysis.sleep_analysis_utils import classify_sleep_wake_from_sleap
 
 # --------------------
 # Parameters
