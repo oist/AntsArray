@@ -87,11 +87,23 @@ def find_camera_images(in_dir: Path) -> list[Path]:
     return files
 
 
-def build_detector() -> aruco.ArucoDetector:
+def build_detector(args) -> aruco.ArucoDetector:
     params = aruco.DetectorParameters()
     if hasattr(aruco, "CORNER_REFINE_SUBPIX"):
         params.cornerRefinementMethod = aruco.CORNER_REFINE_SUBPIX
-    return aruco.ArucoDetector(aruco.getPredefinedDictionary(ARUCO_DICT), params)
+    # Robustness knobs (defaults reproduce the legacy behaviour). Small,
+    # ink-bled markers (e.g. the 2.5 mm board) need permissive decoding:
+    # sample only each cell centre and tolerate more bit/border errors.
+    params.errorCorrectionRate = args.error_correction_rate
+    params.maxErroneousBitsInBorderRate = args.max_border_err
+    params.perspectiveRemoveIgnoredMarginPerCell = args.ignored_margin
+    params.minMarkerPerimeterRate = args.min_perimeter_rate
+    if args.wide_thresh:
+        params.adaptiveThreshWinSizeMin = 5
+        params.adaptiveThreshWinSizeMax = 51
+        params.adaptiveThreshWinSizeStep = 4
+    dict_id = getattr(aruco, args.dict) if isinstance(args.dict, str) else args.dict
+    return aruco.ArucoDetector(aruco.getPredefinedDictionary(dict_id), params)
 
 
 def detect(img: np.ndarray, det: aruco.ArucoDetector):
@@ -224,16 +236,26 @@ def run(args) -> None:
     n_cams = max(cam_files)
     print(f"Found {len(cam_files)} cameras (max cam number {n_cams})")
 
-    det = build_detector()
+    det = build_detector(args)
     per_cam_dets: dict[int, dict] = {}
     per_cam_img: dict[int, np.ndarray] = {}
     montage_color: dict[int, np.ndarray] = {}
+
+    if args.dilate > 0:
+        print(f"Pre-detection white dilation: {args.dilate}px ellipse "
+              f"(counters black ink-bleed on tiny markers; centres unbiased)")
+    dilate_kernel = (
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (args.dilate, args.dilate))
+        if args.dilate > 0 else None
+    )
 
     print("\n--- Detection ---")
     for cam in sorted(cam_files):
         img = cv2.imread(str(cam_files[cam]), cv2.IMREAD_GRAYSCALE)
         per_cam_img[cam] = img
-        dets = detect(img, det)
+        # Detect on a dilated copy when requested; keep the original for warping.
+        det_img = cv2.dilate(img, dilate_kernel) if dilate_kernel is not None else img
+        dets = detect(det_img, det)
         per_cam_dets[cam] = dets
         color = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
         if dets:
@@ -307,7 +329,32 @@ def main() -> None:
     ap.add_argument("--board-w", type=int, default=BOARD_W, dest="board_w", help="Board width in markers (cols). Default 46.")
     ap.add_argument("--scale", type=float, default=110.0, help="Output px per board grid unit. Default 110.")
     ap.add_argument("--max-preview", type=int, default=4000, dest="max_preview", help="Downscale preview if wider than this.")
+    ap.add_argument("--dict", default="DICT_APRILTAG_36h10", help="ArUco dictionary name. Default DICT_APRILTAG_36h10.")
+    # Detection robustness (defaults = OpenCV/legacy behaviour).
+    ap.add_argument("--dilate", type=int, default=0,
+                    help="White-dilation kernel (px) applied before detection to counter "
+                         "black ink-bleed on tiny markers. 0=off. Try 7 for the 2.5mm board.")
+    ap.add_argument("--error-correction-rate", type=float, default=0.6, dest="error_correction_rate")
+    ap.add_argument("--max-border-err", type=float, default=0.35, dest="max_border_err",
+                    help="maxErroneousBitsInBorderRate. Default 0.35.")
+    ap.add_argument("--ignored-margin", type=float, default=0.13, dest="ignored_margin",
+                    help="perspectiveRemoveIgnoredMarginPerCell. Raise (~0.33) to skip bled cell edges.")
+    ap.add_argument("--min-perimeter-rate", type=float, default=0.03, dest="min_perimeter_rate")
+    ap.add_argument("--wide-thresh", action="store_true",
+                    help="Use a wide adaptive-threshold window range (5..51).")
+    ap.add_argument("--small-markers", action="store_true",
+                    help="Preset for tiny ink-bled markers: dilate=7, ecr=2.0, max-border-err=0.6, "
+                         "ignored-margin=0.33, min-perimeter-rate=0.005, wide-thresh.")
     args = ap.parse_args()
+
+    if args.small_markers:
+        if args.dilate == 0:
+            args.dilate = 7
+        args.error_correction_rate = max(args.error_correction_rate, 2.0)
+        args.max_border_err = max(args.max_border_err, 0.6)
+        args.ignored_margin = max(args.ignored_margin, 0.33)
+        args.min_perimeter_rate = min(args.min_perimeter_rate, 0.005)
+        args.wide_thresh = True
 
     out_dir = Path(args.out) if args.out else Path(args.input) / "aruco_stitch"
     out_dir.mkdir(parents=True, exist_ok=True)
