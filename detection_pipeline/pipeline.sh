@@ -68,9 +68,11 @@ Roots:
 
 Backup:
   --no-backup                       Do not submit the automatic raw-video backup
-  --backup-root PATH                default: /bucket/<unit>/Backup
+  --backup-root PATH                default: /bucket/<unit>/Backup/<collection>
+                                    (collection = exp path minus date/block,
+                                    e.g. Ants_basler)
   --backup-archive NAME             archive filename under --backup-root;
-                                    default: <relative_exp_path>_raw_videos.zip
+                                    default: <date>_<block>_raw_videos.zip
   --backup-owner TEXT               description file name: line. default: $USER
   --backup-project TEXT             description file project: line
   --backup-partition NAME           default: datacp
@@ -176,12 +178,26 @@ if (( RUN_BACKUP == 1 )); then
 	unit_name="${bucket_tail%%/*}"
 	BACKUP_UNIT_ROOT="/bucket/$unit_name"
 	BACKUP_REL_DIR="${DIR#$BACKUP_UNIT_ROOT/}"
-	BACKUP_ROOT="${BACKUP_ROOT:-$BACKUP_UNIT_ROOT/Backup}"
+
+	# Group archives under Backup/<collection>/ rather than one flat directory.
+	# Split the experiment's relative path into a collection (every component
+	# except the last two, e.g. Ants/basler) and a per-block tail (the last two,
+	# e.g. 20260520/block02): the collection becomes a subfolder under Backup/
+	# and the tail becomes the archive filename. Paths shallower than three
+	# components fall back to the old flat Backup/ naming.
+	sanitize_token() { printf '%s' "${1//\//_}" | sed -e 's/[^A-Za-z0-9._-]/_/g' -e 's/___*/_/g' -e 's/^_//' -e 's/_$//'; }
+	IFS='/' read -ra _rel_parts <<< "$BACKUP_REL_DIR"
+	if (( ${#_rel_parts[@]} >= 3 )); then
+		backup_collection="${BACKUP_REL_DIR%/*/*}"
+		backup_tail="${BACKUP_REL_DIR#"$backup_collection"/}"
+	else
+		backup_collection=""
+		backup_tail="$BACKUP_REL_DIR"
+	fi
+	collection_token=$(sanitize_token "$backup_collection")
+	BACKUP_ROOT="${BACKUP_ROOT:-$BACKUP_UNIT_ROOT/Backup${collection_token:+/$collection_token}}"
 	if [[ -z "$BACKUP_ARCHIVE" ]]; then
-		safe_rel="${BACKUP_REL_DIR//\//_}"
-		safe_rel="${safe_rel// /_}"
-		safe_rel=$(printf '%s' "$safe_rel" | sed -e 's/[^A-Za-z0-9._-]/_/g' -e 's/___*/_/g' -e 's/^_//' -e 's/_$//')
-		BACKUP_ARCHIVE="${safe_rel}_raw_videos.zip"
+		BACKUP_ARCHIVE="$(sanitize_token "$backup_tail")_raw_videos.zip"
 	fi
 	[[ "$BACKUP_ARCHIVE" != */* ]] || { echo "[ERR] --backup-archive must be a filename, not a path" >&2; exit 2; }
 	[[ "$BACKUP_ARCHIVE" == *.zip ]] || BACKUP_ARCHIVE="${BACKUP_ARCHIVE}.zip"

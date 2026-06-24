@@ -65,7 +65,7 @@ detection_pipeline/
     perms.sh                       # best-effort chgrp/setgid helpers for shared outputs
     worklist.py                    # chunk-ordered (chunk_idx ASC, vname ASC) TSV builder
   templates/
-    backup.sbatch                  # update stable raw-video archive under /bucket/<unit>/Backup
+    backup.sbatch                  # update stable raw-video archive under /bucket/<unit>/Backup/<collection>
     chunk.sbatch                   # ffmpeg -c copy segment (no re-encode)
     chunk_finalize.sbatch          # build worklist + submit downstream sbatches
     aruco_array.sbatch             # run_aruco.py per chunk with --custom-dict
@@ -125,8 +125,8 @@ defaults:
 | `--datacp-concurrency` | `4`              | array `%N` cap (deigo has 4 mover nodes)                                                            |
 | `--group`              | `reiteruni`      | group owner for shared outputs; created dirs are chgrp'd and setgid where permitted                 |
 | `--no-backup`          | off              | skip the automatic raw-video backup                                                                 |
-| `--backup-root`        | `/bucket/<unit>/Backup` | OIST Bucket Backup destination directory                                                     |
-| `--backup-archive`     | `<relative_exp_path>_raw_videos.zip` | stable per-block archive filename; reruns update this same file                  |
+| `--backup-root`        | `/bucket/<unit>/Backup/<collection>` | destination dir; `<collection>` = exp path minus date/block (e.g. `Ants_basler`) |
+| `--backup-archive`     | `<date>_<block>_raw_videos.zip` | stable per-block archive filename; reruns update this same file                       |
 
 ## Shared group permissions
 
@@ -148,14 +148,17 @@ abort a run if the current user cannot change a path they do not own.
 ## Bucket Backups
 
 By default, normal pipeline runs submit one `datacp` backup job after chunking
-finishes. The job updates a stable per-block archive under the unit Backup
-folder, for example:
+finishes. The job updates a stable per-block archive grouped by collection under
+the unit Backup folder, for example:
 
 ```bash
-/bucket/ReiterU/Backup/Ants_basler_20260520_block02_raw_videos.zip
+/bucket/ReiterU/Backup/Ants_basler/20260520_block02_raw_videos.zip
 ```
 
-The archive contains the raw source videos listed in `manifest.csv` plus all
+The `<collection>` subfolder (here `Ants_basler`) is the experiment's path under
+the unit bucket with the trailing date/block stripped, so every basler block's
+zip and `.txt` sidecar land together under `Backup/Ants_basler/` instead of flat
+in `Backup/`. The archive contains the raw source videos listed in `manifest.csv` plus all
 top-level `.txt` and `.json` metadata files in the experiment directory. A
 matching `.txt` description file is written next to the archive with the
 required `name:` and `project:` lines for OIST Bucket Backup.
