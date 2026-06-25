@@ -37,18 +37,19 @@ Chunking:
 SLEAP runtime:
   --sleap-runtime {tensorrt|onnx|pytorch}  default: tensorrt
   --skip-trt-export                 Use 'sleap-nn track' fallback (raw model dirs)
-  --saion-partition NAME            default: largegpu  (short-a100 = 4x GPUs, 2h wall)
+  --saion-partition NAME            default: largegpu. short-a100 = 4x GPUs (2h wall).
+                                    Picking the partition auto-sizes the four knobs
+                                    below; you only set them to hold resources back.
   --sleap-module NAME               saion module name. default: sleap-nn/0.2.0
   --sleap-batch-size N              TRT inference batch; must be <= engine max profile batch. default: 8
-  --sleap-cpus N                    cpus per sleap task. default: 16 (short-a100: 8)
-  --sleap-mem SIZE                  mem per sleap task. default: 128G (short-a100: 64G)
-  --sleap-wall D-HH                 per-task walltime. default: 0-12 (short-a100: 0-1)
-                                    short-a100 preset: --saion-partition short-a100 \
-                                      --sleap-concurrency 32 --sleap-cpus 8 --sleap-mem 64G --sleap-wall 0-1
+  --sleap-cpus N                    cpus per sleap task. default: auto = cpu_cap/concurrency
+  --sleap-mem SIZE                  mem per sleap task.  default: auto = mem_cap/concurrency
+  --sleap-wall D-HH                 per-task walltime.   default: auto = partition wall
+                                                         (largegpu 0-12, short-a100 0-2)
 
 Concurrency:
   --aruco-concurrency N             default: 16
-  --sleap-concurrency N             default: 8 (largegpu GPU cap). short-a100: 32
+  --sleap-concurrency N             default: auto = partition GPU cap (largegpu 8, short-a100 32)
   --datacp-concurrency N            default: 4
 
 Batching (minimize submitted job count):
@@ -111,13 +112,16 @@ SLEAP_MODULE="sleap-nn/0.2.0"
 # engine was exported with a larger max batch.
 SLEAP_BATCH_SIZE=8
 ARUCO_CONCURRENCY=100   # compute assoc cap=2000 cpu; at -c 16 that's ~125 concurrent max, so 100 leaves headroom for the bridge (also on compute)
-SLEAP_CONCURRENCY=8     # largegpu GPU cap=8. short-a100 GPU cap=32 -> use --sleap-concurrency 32
-# Per-sleap-task resources. Defaults = largegpu (cpu_cap/8, mem_cap/8, 12h wall).
-# short-a100 preset (32 GPU cap): --sleap-cpus 8 --sleap-mem 64G --sleap-wall 0-1
-# (256/32 cpu, 2048/32 GB; 0-1 keeps each task inside the 1h non-preemptible window).
-SLEAP_CPUS=16
-SLEAP_MEM=128G
-SLEAP_WALL=0-12
+# Sleap GPU concurrency + per-task resources. Empty = auto-derived from the
+# selected --saion-partition after arg parsing (see saion_caps below):
+#   concurrency -> partition per-user GPU cap (largegpu=8, short-a100=32)
+#   cpus / mem  -> cpu_cap / mem_cap divided by concurrency (saturates the caps)
+#   wall        -> partition default wall (largegpu=0-12, short-a100=0-2)
+# Set any of these explicitly only to hold resources back for other jobs.
+SLEAP_CONCURRENCY=""
+SLEAP_CPUS=""
+SLEAP_MEM=""
+SLEAP_WALL=""
 DATACP_CONCURRENCY=4
 BATCH_SIZE=1         # default: one chunk per array task (set "" to auto-size under MAX_ARRAY_TASKS)
 MAX_ARRAY_TASKS=500
@@ -225,6 +229,43 @@ if (( ONLY_CHUNK != 1 && ONLY_ARUCO != 1 && ONLY_BACKUP != 1 )); then
 	[[ -d "$SLEAP_MODEL_CENTROID" ]] || { echo "[ERR] --sleap-model-centroid must exist (dir)" >&2; exit 2; }
 	[[ -d "$SLEAP_MODEL_INSTANCE" ]] || { echo "[ERR] --sleap-model-instance must exist (dir)" >&2; exit 2; }
 fi
+
+# --- Auto-size sleap GPU resources from the selected partition ----------------
+# Per-user association caps differ by partition, and the cpu/mem-per-GPU ratio
+# is NOT constant (largegpu: 16 cpu + 128 GB per GPU; short-a100: 8 cpu + 64 GB
+# per GPU). Derive concurrency/cpus/mem/wall from the partition unless the user
+# set them explicitly (empty = unset). Override any one to hold resources back.
+saion_caps() {
+	# echo: <gpu_cap> <cpu_cap> <mem_cap_GB> <default_wall>
+	case "$1" in
+		largegpu)   echo "8 128 1024 0-12" ;;
+		short-a100) echo "32 256 2048 0-2"  ;;
+		gpu-a100)   echo "8 128 1024 0-8"   ;;
+		*)          echo "" ;;
+	esac
+}
+read -r _GPU_CAP _CPU_CAP _MEM_CAP _DEF_WALL <<<"$(saion_caps "$SAION_PARTITION")" || true
+if [[ -n "$_GPU_CAP" ]]; then
+	: "${SLEAP_CONCURRENCY:=$_GPU_CAP}"
+	if (( SLEAP_CONCURRENCY > _GPU_CAP )); then
+		echo "[WARN] --sleap-concurrency $SLEAP_CONCURRENCY exceeds $SAION_PARTITION per-user GPU cap $_GPU_CAP; extra tasks will pend (AssocGrpGRES)" >&2
+	fi
+	if [[ -z "$SLEAP_CPUS" ]]; then
+		SLEAP_CPUS=$(( _CPU_CAP / SLEAP_CONCURRENCY ))
+		(( SLEAP_CPUS >= 1 )) || SLEAP_CPUS=1
+	fi
+	if [[ -z "$SLEAP_MEM" ]]; then
+		SLEAP_MEM="$(( _MEM_CAP / SLEAP_CONCURRENCY ))G"
+	fi
+	: "${SLEAP_WALL:=$_DEF_WALL}"
+else
+	# Unknown partition: fall back to the legacy largegpu-shaped defaults.
+	: "${SLEAP_CONCURRENCY:=8}"
+	: "${SLEAP_CPUS:=16}"
+	: "${SLEAP_MEM:=128G}"
+	: "${SLEAP_WALL:=0-12}"
+fi
+echo "[INFO] sleap: partition=$SAION_PARTITION concurrency=$SLEAP_CONCURRENCY per-task '-c $SLEAP_CPUS --mem=$SLEAP_MEM -t $SLEAP_WALL'"
 
 # Resolve aruco dict
 ARUCO_DICT_ROOT="/bucket/ReiterU/Ants/aruco_dicts"
