@@ -64,6 +64,10 @@ RENDERED_DATACP="$JOBS_ROOT/sleap_datacp_array.rendered.sh"
 
 SLEAP_MODULE="${SLEAP_MODULE:-sleap-nn/0.2.0}"
 SAION_DATACP_PARTITION="${SAION_DATACP_PARTITION:-test-gpu}"
+# Per-task sleap resources (default = proven largegpu profile so old env files render).
+SLEAP_WALL="${SLEAP_WALL:-0-12}"
+SLEAP_CPUS="${SLEAP_CPUS:-16}"
+SLEAP_MEM="${SLEAP_MEM:-128G}"
 
 sed -e "s#__REMOTE_JOBS__#$REMOTE_JOBS#g" \
     -e "s#__REMOTE_INPUT__#$REMOTE_INPUT#g" \
@@ -76,6 +80,9 @@ sed -e "s#__REMOTE_JOBS__#$REMOTE_JOBS#g" \
     -e "s#__SLEAP_MODEL_INSTANCE__#$SLEAP_MODEL_INSTANCE#g" \
     -e "s#__SKIP_TRT_EXPORT__#$SKIP_TRT_EXPORT#g" \
     -e "s#__SLEAP_MODULE__#$SLEAP_MODULE#g" \
+    -e "s#__SLEAP_WALL__#$SLEAP_WALL#g" \
+    -e "s#__SLEAP_CPUS__#$SLEAP_CPUS#g" \
+    -e "s#__SLEAP_MEM__#$SLEAP_MEM#g" \
     -e "s#__BATCH_SIZE__#${BATCH_SIZE:-1}#g" \
     -e "s#__DEIGO_FLASH_SAION_PREFIX__#$DEIGO_FLASH_SAION_PREFIX#g" \
     -e "s#__DATA_DIR__#$DATA_DIR#g" \

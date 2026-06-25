@@ -37,13 +37,18 @@ Chunking:
 SLEAP runtime:
   --sleap-runtime {tensorrt|onnx|pytorch}  default: tensorrt
   --skip-trt-export                 Use 'sleap-nn track' fallback (raw model dirs)
-  --saion-partition NAME            default: largegpu
+  --saion-partition NAME            default: largegpu  (short-a100 = 4x GPUs, 2h wall)
   --sleap-module NAME               saion module name. default: sleap-nn/0.2.0
   --sleap-batch-size N              TRT inference batch; must be <= engine max profile batch. default: 8
+  --sleap-cpus N                    cpus per sleap task. default: 16 (short-a100: 8)
+  --sleap-mem SIZE                  mem per sleap task. default: 128G (short-a100: 64G)
+  --sleap-wall D-HH                 per-task walltime. default: 0-12 (short-a100: 0-1)
+                                    short-a100 preset: --saion-partition short-a100 \
+                                      --sleap-concurrency 32 --sleap-cpus 8 --sleap-mem 64G --sleap-wall 0-1
 
 Concurrency:
   --aruco-concurrency N             default: 16
-  --sleap-concurrency N             default: 8
+  --sleap-concurrency N             default: 8 (largegpu GPU cap). short-a100: 32
   --datacp-concurrency N            default: 4
 
 Batching (minimize submitted job count):
@@ -106,7 +111,13 @@ SLEAP_MODULE="sleap-nn/0.2.0"
 # engine was exported with a larger max batch.
 SLEAP_BATCH_SIZE=8
 ARUCO_CONCURRENCY=100   # compute assoc cap=2000 cpu; at -c 16 that's ~125 concurrent max, so 100 leaves headroom for the bridge (also on compute)
-SLEAP_CONCURRENCY=8     # bounded by saion largegpu having only 4 A100 nodes anyway
+SLEAP_CONCURRENCY=8     # largegpu GPU cap=8. short-a100 GPU cap=32 -> use --sleap-concurrency 32
+# Per-sleap-task resources. Defaults = largegpu (cpu_cap/8, mem_cap/8, 12h wall).
+# short-a100 preset (32 GPU cap): --sleap-cpus 8 --sleap-mem 64G --sleap-wall 0-1
+# (256/32 cpu, 2048/32 GB; 0-1 keeps each task inside the 1h non-preemptible window).
+SLEAP_CPUS=16
+SLEAP_MEM=128G
+SLEAP_WALL=0-12
 DATACP_CONCURRENCY=4
 BATCH_SIZE=1         # default: one chunk per array task (set "" to auto-size under MAX_ARRAY_TASKS)
 MAX_ARRAY_TASKS=500
@@ -140,6 +151,9 @@ while [[ $# -gt 0 ]]; do
 		--sleap-batch-size) SLEAP_BATCH_SIZE="$2"; shift 2 ;;
 		--aruco-concurrency) ARUCO_CONCURRENCY="$2"; shift 2 ;;
 		--sleap-concurrency) SLEAP_CONCURRENCY="$2"; shift 2 ;;
+		--sleap-cpus) SLEAP_CPUS="$2"; shift 2 ;;
+		--sleap-mem) SLEAP_MEM="$2"; shift 2 ;;
+		--sleap-wall) SLEAP_WALL="$2"; shift 2 ;;
 		--datacp-concurrency) DATACP_CONCURRENCY="$2"; shift 2 ;;
 		--batch-size) BATCH_SIZE="$2"; shift 2 ;;
 		--max-array-tasks) MAX_ARRAY_TASKS="$2"; shift 2 ;;
@@ -268,6 +282,9 @@ export ARUCO_DICT_PATH="$ARUCO_DICT_PATH"
 export ARUCO_EXTRA_ARGS="$ARUCO_EXTRA_ARGS"
 export ARUCO_CONCURRENCY="$ARUCO_CONCURRENCY"
 export SLEAP_CONCURRENCY="$SLEAP_CONCURRENCY"
+export SLEAP_CPUS="$SLEAP_CPUS"
+export SLEAP_MEM="$SLEAP_MEM"
+export SLEAP_WALL="$SLEAP_WALL"
 export DATACP_CONCURRENCY="$DATACP_CONCURRENCY"
 export BATCH_SIZE="$BATCH_SIZE"
 export MAX_ARRAY_TASKS="$MAX_ARRAY_TASKS"
