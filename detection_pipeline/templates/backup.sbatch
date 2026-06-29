@@ -2,7 +2,7 @@
 #SBATCH -t 2-0
 #SBATCH -c 2
 #SBATCH --partition=datacp
-#SBATCH --mem=4G
+#SBATCH --mem=16G
 #SBATCH -J backup
 #SBATCH -o __JOBS_ROOT__/backup_%j.out
 #SBATCH -e __JOBS_ROOT__/backup_%j.err
@@ -58,7 +58,11 @@ echo "[$(date)] updating backup archive: $BACKUP_ARCHIVE_PATH"
 	else
 		zip -0 "$BACKUP_ARCHIVE_PATH" -@ < "$BACKUP_FILELIST"
 	fi
-	zip -T "$BACKUP_ARCHIVE_PATH"
+	# Disable unzip's zip-bomb detection during the integrity test: it allocates
+	# memory proportional to the archive and OOMs on multi-TB backups ("not enough
+	# memory for bomb detection" -> spurious failure on block03's 1.9 TB zip). This
+	# is our own archive, not untrusted input, so bomb detection adds no value.
+	UNZIP_DISABLE_ZIPBOMB_DETECTION=TRUE zip -T "$BACKUP_ARCHIVE_PATH"
 )
 
 cat > "$BACKUP_DESC_PATH" <<EOF
