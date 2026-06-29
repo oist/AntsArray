@@ -58,3 +58,31 @@ python group_labelling/build_training_chunks.py \
 ```
 
 See the `--help` of each script for the full option list.
+
+## Reviewing returned corrections
+
+When labelers return their corrected `*.pkg.slp` chunks, union them into one
+self-contained package so the whole round can be checked from a single source:
+
+```bash
+python group_labelling/sleap_salvage_project.py combine \
+    --corrected-dir /bucket/.../Group_labelling/<date> \
+    --pattern       '*_chunk[0-9][0-9]_*.pkg.slp' \
+    --out           /bucket/.../Group_labelling/<date>/<prefix>_ALL_corrected.pkg.slp
+```
+
+`combine` needs no master and overlays nothing (unlike `merge`): every labeled
+frame from every input is carried over verbatim and its embedded images are
+re-embedded into the output. The `--pattern` above selects only the
+labeler-corrected chunks (which carry a name suffix after `chunkNN`) and skips
+the bare originals.
+
+Every labeled frame is also added as a SLEAP suggestion (disable with
+`--no-suggestions`) so the GUI's suggestion navigation steps through exactly the
+annotated frames. SLEAP has no per-frame "author" field, so provenance is kept
+three ways: each suggestion gets a `group` integer = its source chunk (the GUI
+clusters annotated frames by who returned them); the integer -> filename legend
+is written to `provenance["sleap_salvage_project"]["suggestion_groups"]` inside
+the package; and `combine_report.csv` (beside the output, with
+`combine_summary.json`) maps every `(video, frame_idx)` to its source file and
+group.
