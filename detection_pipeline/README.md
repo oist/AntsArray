@@ -165,7 +165,15 @@ Notes:
   (`submit_blocks_pipeline.sh` `DEFAULT_PYTHON_BIN`). Build it once (self-contained, no conda):
 
   ```bash
-  module load uv/0.11.19
+  module load uv
+  # The uv module's default cache (/flash/ReiterU/tmp/uv-cache) is not group-writable;
+  # override cache + managed-python install dir with paths you own. The standalone
+  # python must live under the unit tree so the venv is self-contained (tracking jobs
+  # run the venv python with NO `module load`, so its base interpreter cannot depend
+  # on your home or a module's LD_LIBRARY_PATH).
+  export UV_CACHE_DIR=/flash/ReiterU/$USER/uv-cache
+  export UV_PYTHON_INSTALL_DIR=/apps/unit/ReiterU/ant_tracking/python
+  mkdir -p "$UV_CACHE_DIR" "$UV_PYTHON_INSTALL_DIR"
   uv venv --python 3.11 /apps/unit/ReiterU/ant_tracking/venv
   uv pip install --python /apps/unit/ReiterU/ant_tracking/venv/bin/python \
       numpy pandas pyarrow h5py tables opencv-python-headless tqdm
