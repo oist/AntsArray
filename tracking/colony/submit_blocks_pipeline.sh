@@ -33,9 +33,15 @@ if [[ -d "${HOME_DIR}/flash/ant_tmp" ]]; then
 else
   DEFAULT_FLASH_TMP="/flash/ReiterU/ant_tmp"
 fi
+# Conda kept only as a dead fallback: when PYTHON_BIN is a real path,
+# combine_batch.py/interaction_batch.py never invoke conda (python_cmd = python_bin).
 DEFAULT_CONDA_ENV="aruco_env"
 DEFAULT_CONDA_BIN="${DEFAULT_BUCKET_ROOT}/ReiterU/sam/miniforge3/bin/conda"
-DEFAULT_PYTHON_BIN="${DEFAULT_BUCKET_ROOT}/ReiterU/sam/miniforge3/envs/aruco_env/bin/python"
+# Conda-free default: the self-contained unit ant_tracking venv python. Combined with
+# the PYTHONNOUSERSITE=1 the generated sbatch scripts already export, this venv is
+# authoritative in every job (orchestrator + per-chunk workers). Override with
+# --python_bin (e.g. a versioned path like .../ant_tracking/2026.07/venv/bin/python).
+DEFAULT_PYTHON_BIN="/apps/unit/ReiterU/ant_tracking/venv/bin/python"
 
 # ----------------------------- CONFIGURATION -----------------------------
 # Main input paths. These are the only paths you usually need to edit.

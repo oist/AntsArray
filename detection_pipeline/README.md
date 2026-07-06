@@ -100,10 +100,15 @@ ls /flash/ReiterU/$USER/jobs/<exp>/         # rendered sbatches + jid_*.txt + ma
 ssh saion squeue -u $USER                   # saion side
 ```
 
-Outputs land in `<exp>/data/`:
+Outputs land in `<exp>/data/`, per grid camera per chunk:
 
-- `<vname>_NNN_aruco_tracks_.h5` (from deigo aruco array)
-- `<vname>_NNN.slp`               (from saion sleap predict)
+- `<vname>_NNN_aruco_tracks.h5`     dense `(frames, instances, 2)` arrays (deigo aruco array)
+- `<vname>_NNN_aruco_detections.h5` DataFrame `(Frame, Instance, X, Y, Confidence)` (deigo aruco array)
+- `<vname>_NNN.slp`                 SLEAP predictions (saion sleap predict)
+- `<vname>_NNN_sleap_data.h5`       SLEAP DataFrame via `sleap2h5.py` (saion, inline post-process)
+
+The colony tracking map stage consumes the `.h5` files (`_aruco_tracks.h5` / `_aruco_detections.h5`
+and `_sleap_data.h5`); it does **not** read `.slp` directly.
 
 ## CLI
 
@@ -127,6 +132,51 @@ defaults:
 | `--no-backup`          | off              | skip the automatic raw-video backup                                                                 |
 | `--backup-root`        | `/bucket/<unit>/Backup/<collection>` | destination dir; `<collection>` = exp path minus date/block (e.g. `Ants_basler`) |
 | `--backup-archive`     | `<date>_<block>_raw_videos.zip` | stable per-block archive filename; reruns update this same file                       |
+
+## Auto-trigger colony tracking (optional)
+
+Pass `--run-tracking` to chain [colony tracking](../tracking/colony/submit_blocks_pipeline.sh)
+onto this block automatically. Because SLEAP runs on saion with no cross-cluster Slurm
+dependency, detection cannot `afterok:` the sleap array; instead `pipeline.sh` starts a
+login-side poller (`templates/track_trigger.sh`, `nohup`, survives logout) that watches
+`<exp>/data/` until every expected `_aruco_tracks.h5` and `_sleap_data.h5` is present (the
+expected count is the `aruco_worklist.txt` line count), then runs the tracking submit for
+this one block:
+
+```bash
+bash detection_pipeline/pipeline.sh \
+  --dir /bucket/ReiterU/Ants/basler/20260515/block02 \
+  --sleap-model-centroid ... --sleap-model-instance ... \
+  --run-tracking \
+  --tracking-hmats /bucket/ReiterU/Ants/basler/cameraArray_calib/.../initial_H_mats.npz
+```
+
+Notes:
+
+- **Gates on `_sleap_data.h5`, not `.slp`.** The map stage reads `_sleap_data.h5`; the inline
+  `slp -> h5` conversion is best-effort, so a silent conversion failure (only `.slp` present)
+  correctly counts as "not ready" instead of firing tracking on invisible SLEAP data.
+- **Deadline is generous** (`--tracking-timeout`, default 48h). On deadline with a partial set
+  it still fires — tracking processes the contiguous complete chunk prefix and skips the rest;
+  with zero SLEAP outputs it aborts instead of firing.
+- **Cluster: deigo.** Tracking is CPU-only and reads `/bucket`; it runs on `compute` (the same
+  login as detection). saion has no general CPU partition.
+- **Conda-free by default.** Tracking jobs run under the unit `ant_tracking` venv
+  (`submit_blocks_pipeline.sh` `DEFAULT_PYTHON_BIN`). Build it once (self-contained, no conda):
+
+  ```bash
+  module load uv/0.11.19
+  uv venv --python 3.11 /apps/unit/ReiterU/ant_tracking/venv
+  uv pip install --python /apps/unit/ReiterU/ant_tracking/venv/bin/python \
+      numpy pandas pyarrow h5py tables opencv-python-headless tqdm
+  ```
+
+  Override per run with `--tracking-python-bin <path-to-venv>/bin/python`. `tables` (PyTables)
+  is required — the map stage reads `_aruco_detections.h5` via `pd.read_hdf(key="detections")`.
+- Progress log: `<exp>/hpc_logs/pipeline/track_trigger.log`.
+
+Nothing is shared between `detection_pipeline/` and `tracking/` beyond invoking the tracking
+entry script by path.
 
 ## Shared group permissions
 
