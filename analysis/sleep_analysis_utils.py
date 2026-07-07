@@ -88,6 +88,86 @@ POSTURE_GROUP_DISPLAY_LABELS = {
 }
 
 
+def side_from_track_name(track_name: str) -> str | None:
+    name = str(track_name)
+    if name.endswith("_left.parquet") or name.endswith("_left"):
+        return "left"
+    if name.endswith("_right.parquet") or name.endswith("_right"):
+        return "right"
+    return None
+
+
+def sleep_prediction_metadata_paths(sleep_root: Path) -> list[Path]:
+    root = Path(sleep_root)
+    paths = sorted((root / "per_track").glob("*/sleep_prediction_metadata.json"))
+    if not paths:
+        paths = sorted(root.glob("*/sleep_prediction_metadata.json"))
+    return paths
+
+
+def load_sleep_prediction_tracks(sleep_root: Path) -> pd.DataFrame:
+    rows = []
+    for metadata_path in sleep_prediction_metadata_paths(Path(sleep_root)):
+        meta = json.loads(metadata_path.read_text())
+        track_name = str(meta.get("track_name", metadata_path.parent.name))
+        side = meta.get("side") or side_from_track_name(track_name)
+        if side is None:
+            continue
+        n_frames = int(meta.get("n_frames", 0))
+        n_predicted = int(meta.get("n_predicted_frames", 0))
+        local_dir = metadata_path.parent
+        rows.append(
+            {
+                "track_name": track_name,
+                "track_id": meta.get("track_id"),
+                "side": side,
+                "sleep_metadata_path": metadata_path,
+                "sleep_predictions_path": local_dir / "sleep_predictions.parquet",
+                "sleep_bouts_path": local_dir / "sleep_bouts.parquet",
+                "predicted_sleep_path": local_dir / "predicted_sleep_i1.npy",
+                "sleep_probability_path": local_dir / "sleep_probability_f4.npy",
+                "wake_probability_path": local_dir / "wake_probability_f4.npy",
+                "sleep_frame_min": int(meta.get("frame_min", 0)) if meta.get("frame_min") is not None else 0,
+                "sleep_frame_max": int(meta.get("frame_max", -1)) if meta.get("frame_max") is not None else -1,
+                "sleep_n_frames": n_frames,
+                "n_predicted_sleep_frames": int(meta.get("n_sleep_frames", 0)),
+                "n_predicted_wake_frames": int(meta.get("n_wake_frames", 0)),
+                "n_predicted_frames": n_predicted,
+                "sleep_prediction_present_frac": n_predicted / n_frames if n_frames else np.nan,
+                "sleep_fraction_predicted_frames": meta.get("sleep_fraction_predicted_frames"),
+                "mean_sleep_probability": meta.get("mean_sleep_probability"),
+                "sleep_fps": float(meta.get("fps", 24.0)),
+                "sleep_model_path": meta.get("model_path"),
+                "sleep_model_feature_set": meta.get("model_feature_set"),
+                "sleep_prediction_status": meta.get("status", "ok"),
+            }
+        )
+    out = pd.DataFrame(rows)
+    if out.empty:
+        raise FileNotFoundError(f"No sleep_prediction_metadata.json files found under {sleep_root}")
+    return out.sort_values(["side", "track_id", "track_name"], kind="mergesort").reset_index(drop=True)
+
+
+def attach_sleep_predictions_to_tracks(
+    tracks: pd.DataFrame,
+    sleep_root: Path,
+    *,
+    require_all: bool = False,
+) -> pd.DataFrame:
+    sleep_tracks = load_sleep_prediction_tracks(sleep_root)
+    out = tracks.merge(sleep_tracks, on=["track_name", "track_id", "side"], how="left", validate="one_to_one")
+    out["has_sleep_predictions"] = out["predicted_sleep_path"].map(
+        lambda path: Path(path).exists() if pd.notna(path) else False
+    )
+    missing = int((~out["has_sleep_predictions"]).sum())
+    if missing and require_all:
+        examples = out.loc[~out["has_sleep_predictions"], "track_name"].head(10).to_list()
+        raise FileNotFoundError(f"Missing sleep predictions for {missing} tracks, examples: {examples}")
+    if missing:
+        print(f"WARNING: missing sleep predictions for {missing}/{len(out)} selected tracks")
+    return out
+
+
 def angle_between(v1: np.ndarray, v2: np.ndarray) -> np.ndarray:
     ang1 = np.arctan2(v1[:, 1], v1[:, 0])
     ang2 = np.arctan2(v2[:, 1], v2[:, 0])
@@ -891,6 +971,379 @@ def selected_speed_track(
         sort_tracks=False,
     )
     return chosen.iloc[0]
+
+
+def binned_track_sleep_predictions(row: pd.Series, bin_seconds: float) -> pd.DataFrame:
+    states = np.load(row["predicted_sleep_path"], mmap_mode="r")
+    fps = float(row.get("sleep_fps", row.get("fps", 24.0)))
+    frame_min = int(row.get("sleep_frame_min", row.get("frame_min", 0)))
+
+    bin_frames = max(1, int(round(fps * float(bin_seconds))))
+    first_bin = frame_min // bin_frames
+    n_bins = int(np.ceil((frame_min + len(states)) / bin_frames)) - first_bin
+    sleep_fraction = np.full(n_bins, np.nan, dtype=np.float32)
+    wake_fraction = np.full(n_bins, np.nan, dtype=np.float32)
+    n_predicted = np.zeros(n_bins, dtype=np.int64)
+    n_sleep = np.zeros(n_bins, dtype=np.int64)
+    n_wake = np.zeros(n_bins, dtype=np.int64)
+
+    valid = states >= 0
+    if valid.any():
+        valid_idx = np.flatnonzero(valid)
+        local_bin_idx = ((frame_min + valid_idx) // bin_frames) - first_bin
+        n_predicted = np.bincount(local_bin_idx, minlength=n_bins)[:n_bins].astype(np.int64)
+        n_sleep = np.bincount(
+            local_bin_idx,
+            weights=(states[valid_idx] == 1).astype(np.int64),
+            minlength=n_bins,
+        )[:n_bins].astype(np.int64)
+        n_wake = np.bincount(
+            local_bin_idx,
+            weights=(states[valid_idx] == 0).astype(np.int64),
+            minlength=n_bins,
+        )[:n_bins].astype(np.int64)
+        keep = n_predicted > 0
+        sleep_fraction[keep] = n_sleep[keep] / n_predicted[keep]
+        wake_fraction[keep] = n_wake[keep] / n_predicted[keep]
+
+    out = pd.DataFrame(
+        {
+            "time_h": ((first_bin + np.arange(n_bins)) * bin_frames) / fps / 3600.0,
+            "sleep_fraction": sleep_fraction,
+            "wake_fraction": wake_fraction,
+            "n_sleep_frames": n_sleep,
+            "n_wake_frames": n_wake,
+            "n_predicted_sleep_state_frames": n_predicted,
+            "side": row["side"],
+            "track_id": row["track_id"],
+            "track_name": row["track_name"],
+            "track_row": row.name,
+        }
+    )
+    return out
+
+
+def _sleep_prediction_row_for_track(
+    sleep_tracks: pd.DataFrame,
+    *,
+    row_number: Optional[int] = None,
+    track_id: Optional[int] = None,
+    side: Optional[str] = "left",
+) -> pd.Series:
+    from analysis import colony_speed_utils as cs
+
+    row_numbers = [int(row_number)] if row_number is not None else None
+    track_ids = [track_id] if track_id is not None else None
+    chosen = cs.choose_tracks(
+        sleep_tracks,
+        side=side,
+        row_numbers=row_numbers,
+        track_ids=track_ids,
+        max_tracks=1,
+        sort_tracks=False,
+    )
+    chosen = chosen[chosen.get("has_sleep_predictions", True).astype(bool)] if "has_sleep_predictions" in chosen else chosen
+    if chosen.empty:
+        raise ValueError("Selected track has no sleep prediction outputs")
+    return chosen.iloc[0]
+
+
+def predicted_sleep_bouts_for_track_row(
+    track_row: pd.Series,
+    counts_by_track: Optional[dict[int, pd.DataFrame]] = None,
+    *,
+    frame_start: Optional[int] = None,
+    frame_stop: Optional[int] = None,
+) -> pd.DataFrame:
+    path = Path(track_row["sleep_bouts_path"])
+    if not path.exists():
+        raise FileNotFoundError(f"Missing sleep_bouts.parquet for {track_row.get('track_name')}: {path}")
+    bouts = pd.read_parquet(path)
+    if bouts.empty:
+        return pd.DataFrame()
+
+    label_value = pd.to_numeric(bouts.get("predicted_label_value"), errors="coerce")
+    if "predicted_label" in bouts.columns:
+        label_text = bouts["predicted_label"].astype(str).str.lower()
+        sleep_mask = (label_value == 1) | (label_text == "sleep")
+    else:
+        sleep_mask = label_value == 1
+    bouts = bouts[sleep_mask].copy()
+    if bouts.empty:
+        return pd.DataFrame()
+
+    bouts["bout_start_frame"] = pd.to_numeric(bouts["frame_start"], errors="coerce")
+    bouts["bout_end_frame"] = pd.to_numeric(bouts["frame_end"], errors="coerce")
+    bouts = bouts.dropna(subset=["bout_start_frame", "bout_end_frame"]).copy()
+    bouts["bout_start_frame"] = np.rint(bouts["bout_start_frame"]).astype(np.int64)
+    bouts["bout_end_frame"] = np.rint(bouts["bout_end_frame"]).astype(np.int64)
+
+    if frame_start is not None:
+        bouts = bouts[bouts["bout_end_frame"] >= int(frame_start)].copy()
+        bouts["bout_start_frame"] = np.maximum(bouts["bout_start_frame"].to_numpy(np.int64), int(frame_start))
+    if frame_stop is not None:
+        bouts = bouts[bouts["bout_start_frame"] < int(frame_stop)].copy()
+        bouts["bout_end_frame"] = np.minimum(bouts["bout_end_frame"].to_numpy(np.int64), int(frame_stop) - 1)
+    bouts = bouts[bouts["bout_end_frame"] >= bouts["bout_start_frame"]].copy()
+    if bouts.empty:
+        return bouts
+
+    fps = float(track_row.get("sleep_fps", track_row.get("fps", 24.0)))
+    bouts["bout_duration_frames"] = bouts["bout_end_frame"] - bouts["bout_start_frame"] + 1
+    bouts["bout_duration_seconds"] = bouts["bout_duration_frames"] / fps
+    bouts["time_h"] = bouts["bout_start_frame"] / fps / 3600.0
+    bouts["bout_start_time_h"] = bouts["time_h"]
+    bouts["bout_end_time_h"] = (bouts["bout_end_frame"] + 1) / fps / 3600.0
+    bouts["track_name"] = track_row.get("track_name")
+    bouts["track_id"] = track_row.get("track_id")
+    bouts["side"] = track_row.get("side")
+    bouts["track_row"] = track_row.name
+    bouts["sleep_source"] = "sleep_prediction"
+    bouts["classifier_bin"] = (
+        bouts["track_name"].astype(str)
+        + ":"
+        + bouts["bout_start_frame"].astype(str)
+        + "-"
+        + bouts["bout_end_frame"].astype(str)
+    )
+
+    track_counts = None
+    if counts_by_track is not None and pd.notna(track_row.get("track_id")):
+        track_counts = counts_by_track.get(int(track_row["track_id"]))
+    rows = []
+    for bout_id, bout in enumerate(bouts.itertuples(index=False)):
+        n_antenna, n_body, n_total = _interaction_counts_for_frame_interval(
+            track_counts,
+            start_frame=int(bout.bout_start_frame),
+            end_frame=int(bout.bout_end_frame),
+        )
+        row = bout._asdict()
+        row.update(
+            {
+                "bout_id": int(bout_id),
+                "n_interactions_as_antenna": n_antenna,
+                "n_interactions_as_body": n_body,
+                "n_interactions_total": n_total,
+                "n_interaction_onsets": n_total,
+                "n_interaction_onsets_as_antenna": n_antenna,
+                "n_interaction_onsets_as_body": n_body,
+            }
+        )
+        rows.append(row)
+    return pd.DataFrame(rows).sort_values("bout_start_frame", kind="mergesort").reset_index(drop=True)
+
+
+def load_predicted_sleep_bouts(
+    sleep_tracks: pd.DataFrame,
+    counts_by_track: Optional[dict[int, pd.DataFrame]] = None,
+    *,
+    frame_start: Optional[int] = None,
+    frame_stop: Optional[int] = None,
+) -> pd.DataFrame:
+    rows = []
+    selected = sleep_tracks.copy()
+    if "has_sleep_predictions" in selected.columns:
+        selected = selected[selected["has_sleep_predictions"].astype(bool)].copy()
+    for _, row in selected.iterrows():
+        bouts = predicted_sleep_bouts_for_track_row(
+            row,
+            counts_by_track,
+            frame_start=frame_start,
+            frame_stop=frame_stop,
+        )
+        if not bouts.empty:
+            rows.append(bouts)
+    if not rows:
+        return pd.DataFrame()
+    return pd.concat(rows, ignore_index=True).sort_values(
+        ["side", "track_id", "bout_start_frame"],
+        kind="mergesort",
+    ).reset_index(drop=True)
+
+
+def single_ant_sleep_prediction_timeseries(
+    sleep_tracks: pd.DataFrame,
+    speed_tracks: pd.DataFrame,
+    interactions: pd.DataFrame,
+    *,
+    row_number: Optional[int] = None,
+    track_id: Optional[int] = None,
+    side: Optional[str] = "left",
+    bin_seconds: float = 60.0,
+    speed_smooth_seconds: float = 5 * 60.0,
+    chunk_global_frame_offset: int = 0,
+    counts_by_track: Optional[dict[int, pd.DataFrame]] = None,
+) -> pd.DataFrame:
+    from analysis import interaction_analysis_utils as ia
+
+    sleep_row = _sleep_prediction_row_for_track(
+        sleep_tracks,
+        row_number=row_number,
+        track_id=track_id,
+        side=side,
+    )
+    speed_row = selected_speed_track(
+        speed_tracks,
+        track_id=int(sleep_row["track_id"]) if pd.notna(sleep_row.get("track_id")) else track_id,
+        side=sleep_row.get("side", side),
+    )
+    if counts_by_track is None:
+        counts_by_track = ia.interaction_bout_counts_by_track(
+            interactions,
+            chunk_global_frame_offset=int(chunk_global_frame_offset),
+            fps=float(speed_row.get("fps", 24.0)),
+        )
+    speed_df = _speed_interaction_timeseries_for_track_row(
+        speed_row,
+        counts_by_track,
+        bin_seconds=bin_seconds,
+        speed_smooth_seconds=speed_smooth_seconds,
+    )
+    sleep_df = binned_track_sleep_predictions(sleep_row, bin_seconds)
+    merge_cols = ["time_h", "side", "track_id", "track_name", "track_row"]
+    out = speed_df.merge(
+        sleep_df.drop(columns=[col for col in ["side", "track_id", "track_name", "track_row"] if col in sleep_df]),
+        on="time_h",
+        how="outer",
+    ).sort_values("time_h", kind="mergesort")
+    out["is_sleep"] = pd.to_numeric(out["sleep_fraction"], errors="coerce") >= 0.5
+    bouts = predicted_sleep_bouts_for_track_row(
+        sleep_row,
+        counts_by_track,
+    )
+    out.attrs["sleep_bouts"] = bouts
+    return out.reset_index(drop=True)
+
+
+def plot_single_ant_sleep_predictions_interactions(
+    sleep_tracks: pd.DataFrame,
+    speed_tracks: pd.DataFrame,
+    interactions: pd.DataFrame,
+    *,
+    row_number: Optional[int] = None,
+    track_id: Optional[int] = None,
+    side: Optional[str] = "left",
+    bin_seconds: float = 60.0,
+    speed_smooth_seconds: float = 5 * 60.0,
+    chunk_global_frame_offset: int = 0,
+    analysis_frame_start: Optional[int] = None,
+    analysis_frame_stop: Optional[int] = None,
+    speed_ylim: Optional[tuple[float, float]] = None,
+    interaction_ylim: Optional[tuple[float, float]] = None,
+    counts_by_track: Optional[dict[int, pd.DataFrame]] = None,
+) -> pd.DataFrame:
+    import matplotlib.pyplot as plt
+
+    plot_df = single_ant_sleep_prediction_timeseries(
+        sleep_tracks,
+        speed_tracks,
+        interactions,
+        row_number=row_number,
+        track_id=track_id,
+        side=side,
+        bin_seconds=bin_seconds,
+        speed_smooth_seconds=speed_smooth_seconds,
+        chunk_global_frame_offset=chunk_global_frame_offset,
+        counts_by_track=counts_by_track,
+    )
+    sleep_row = _sleep_prediction_row_for_track(
+        sleep_tracks,
+        row_number=row_number,
+        track_id=track_id,
+        side=side,
+    )
+    sleep_bouts = predicted_sleep_bouts_for_track_row(
+        sleep_row,
+        counts_by_track,
+        frame_start=analysis_frame_start,
+        frame_stop=analysis_frame_stop,
+    )
+    plot_df.attrs["sleep_bouts"] = sleep_bouts
+
+    label = f"{sleep_row['side']} track {sleep_row['track_id']}"
+    bin_width_h = float(bin_seconds) / 3600.0
+    time_h = plot_df["time_h"].to_numpy(float)
+
+    fig, axes = plt.subplots(
+        3,
+        1,
+        figsize=(12, 7.5),
+        sharex=True,
+        gridspec_kw={"height_ratios": [2.5, 1.4, 1.2]},
+    )
+    speed_ax, sleep_ax, interaction_ax = axes
+    speed_ax.plot(
+        plot_df["time_h"],
+        plot_df["speed_mm_s"],
+        lw=0.8,
+        alpha=0.25,
+        color="0.35",
+        label=f"{bin_seconds:g} s binned speed",
+    )
+    speed_ax.plot(
+        plot_df["time_h"],
+        plot_df["smoothed_speed_mm_s"],
+        lw=1.5,
+        color="tab:blue",
+        label=f"{speed_smooth_seconds / 60:g} min smoothed speed",
+    )
+    for bout in sleep_bouts.itertuples(index=False):
+        start_h = float(bout.bout_start_frame) / float(sleep_row["sleep_fps"]) / 3600.0
+        stop_h = float(bout.bout_end_frame + 1) / float(sleep_row["sleep_fps"]) / 3600.0
+        speed_ax.axvspan(start_h, stop_h, color="tab:blue", alpha=0.10, lw=0)
+        sleep_ax.axvspan(start_h, stop_h, color="tab:blue", alpha=0.10, lw=0)
+        interaction_ax.axvspan(start_h, stop_h, color="tab:blue", alpha=0.10, lw=0)
+
+    speed_ax.set_ylabel("Speed (mm/s)")
+    speed_ax.set_title(f"Classifier sleep predictions and directed interactions: {label}")
+    if speed_ylim is not None:
+        speed_ax.set_ylim(*speed_ylim)
+    speed_ax.legend(fontsize=8, loc="best")
+    speed_ax.grid(True, alpha=0.25)
+
+    sleep_ax.plot(
+        plot_df["time_h"],
+        plot_df["sleep_fraction"],
+        lw=1.3,
+        color="tab:blue",
+        label="predicted sleep fraction",
+    )
+    sleep_ax.set_ylim(-0.05, 1.05)
+    sleep_ax.set_ylabel("Sleep fraction")
+    sleep_ax.grid(True, alpha=0.25)
+    sleep_ax.legend(fontsize=8, loc="best")
+
+    antenna = plot_df["n_interactions_as_antenna"].fillna(0).to_numpy(np.float64)
+    body = plot_df["n_interactions_as_body"].fillna(0).to_numpy(np.float64)
+    interaction_ax.bar(
+        time_h,
+        antenna,
+        width=bin_width_h * 0.92,
+        align="edge",
+        color="tab:orange",
+        alpha=0.85,
+        label="as antenna/source",
+    )
+    interaction_ax.bar(
+        time_h,
+        body,
+        bottom=antenna,
+        width=bin_width_h * 0.92,
+        align="edge",
+        color="tab:purple",
+        alpha=0.80,
+        label="as body/receiver",
+    )
+    interaction_ax.set_ylabel(f"Interaction bouts / {bin_seconds:g} s")
+    interaction_ax.set_xlabel("Elapsed time (h)")
+    if interaction_ylim is not None:
+        interaction_ax.set_ylim(*interaction_ylim)
+    interaction_ax.legend(fontsize=8, loc="best")
+    interaction_ax.grid(True, axis="y", alpha=0.25)
+
+    fig.tight_layout()
+    plt.show()
+    return plot_df
 
 
 def resolve_track_path_for_speed_row(

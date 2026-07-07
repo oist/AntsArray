@@ -23,13 +23,13 @@ from analysis.export_sleep_crop_videos import (
     build_track_specs,
     export_batch,
     export_h264_stream_batch,
+    aruco_curation_tools,
     log,
     make_writer,
+    multicam_tracking_tools,
     open_video_reader,
     read_window_points,
 )
-from tracking.gui.aruco_curation import AviH264ElementaryReader
-from tracking.gui.multicam_tracking_viewer import load_homography_stack, parse_camera_index
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -92,6 +92,8 @@ def main() -> None:
     rng = np.random.default_rng(int(args.seed))
     track_index = ChunkTrackIndex(tracks_dir, chunk_frames=DEFAULT_CHUNK_FRAMES, chunk_offset_mode="metadata")
     estimated_frame_count = int(track_index.frame_count_estimate())
+    AviH264ElementaryReader, _OpenCvVideoReader, _resolve_frame_count = aruco_curation_tools()
+    _apply_homography_points, _discover_media, load_homography_stack, parse_camera_index = multicam_tracking_tools()
     homographies = load_homography_stack(args.hmats)
 
     probe_reader = open_video_reader(videos[0], estimated_frame_count, backend=args.video_backend)

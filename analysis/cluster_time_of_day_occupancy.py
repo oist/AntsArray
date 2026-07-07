@@ -30,6 +30,7 @@ if str(repo_root) not in sys.path:
     sys.path.insert(0, str(repo_root))
 
 import analysis.grid_occupancy_utils as go
+from analysis.figure_saving import install_auto_savefig
 
 
 # %%
@@ -40,6 +41,9 @@ GRID_ROOT = Path(
 PER_TRACK_ROOT = GRID_ROOT.parent / "per_track"
 CLUSTER_TABLE_PATH = GRID_ROOT / "track_cluster_ids.csv"
 OUT_ROOT = GRID_ROOT / "time_of_day_cluster_occupancy"
+FIGURE_ROOT = OUT_ROOT / "figures"
+SAVE_FIGURES = True
+FIGURE_DPI = 180
 
 FPS = 24.0
 TOD_BIN_MINUTES = 60
@@ -49,6 +53,13 @@ FRAME_COL = "Frame"
 X_COL = "TrackX"
 Y_COL = "TrackY"
 RECOMPUTE = False
+
+install_auto_savefig(
+    FIGURE_ROOT,
+    prefix="cluster_time_of_day_occupancy",
+    dpi=FIGURE_DPI,
+    enabled=SAVE_FIGURES,
+)
 
 
 # %%

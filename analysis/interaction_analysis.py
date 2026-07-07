@@ -28,6 +28,7 @@ if str(repo_root) not in sys.path:
     sys.path.insert(0, str(repo_root))
 
 import analysis.interaction_analysis_utils as ia
+from analysis.figure_saving import install_auto_savefig
 
 importlib.reload(ia)
 
@@ -41,6 +42,9 @@ GRID_ROOT = DATASET_ROOT / "stitched" / "grid_occupancy_histograms"
 CLUSTER_TABLE_PATH = GRID_ROOT / "track_cluster_ids.csv"
 SPEED_ROOT = DATASET_ROOT / "stitched" / "speed_vectors"
 CACHE_ROOT = DATASET_ROOT / "stitched" / "analysis_cache" / "interaction_analysis"
+FIGURE_ROOT = DATASET_ROOT / "analysis_outputs" / "interaction_analysis_figures"
+SAVE_FIGURES = True
+FIGURE_DPI = 180
 
 # Use "all" for every chunk on this side, "000" for one chunk, or ["000", "001"].
 CHUNKS = "all"
@@ -91,6 +95,12 @@ cache_settings = {
 }
 cache_key = ia.interaction_analysis_cache_key(chunks, cache_settings)
 cache_dir = CACHE_ROOT / f"{SIDE}_{cache_key}"
+install_auto_savefig(
+    FIGURE_ROOT / f"{SIDE}_{cache_key}",
+    prefix=f"interaction_analysis_{SIDE}",
+    dpi=FIGURE_DPI,
+    enabled=SAVE_FIGURES,
+)
 
 
 def derived_cache_key(stage: str, **settings) -> str:

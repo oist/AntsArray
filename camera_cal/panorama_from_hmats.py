@@ -24,7 +24,9 @@ typically under the key 'H' if using np.savez.
 from __future__ import annotations
 
 import argparse
+import json
 import re
+import subprocess
 from pathlib import Path
 from typing import List, Tuple
 
@@ -262,31 +264,184 @@ def extract_frame_from_video(
     """
     Extract a single grayscale frame from a video.
 
-    If frame_index is None, the middle frame is used.
+    If frame_index is None, the middle frame is used when the container exposes
+    a frame count. Some MKV files report an unknown count; for those, the first
+    readable frame is used.
     """
+    video_path = Path(video_path)
+
+    sidecar_frame_count, sidecar_fps = _read_video_sidecar_metadata(video_path)
+
     cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        raise IOError(f"Could not open video: {video_path}")
+    cv2_error: Exception | None = None
+    fps = sidecar_fps
+    target_frame = _choose_video_frame_index(
+        frame_index=frame_index,
+        cv2_frame_count=None,
+        sidecar_frame_count=sidecar_frame_count,
+    )
 
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    if frame_count <= 0:
-        cap.release()
-        raise RuntimeError(f"Video has no readable frames: {video_path}")
+    if cap.isOpened():
+        try:
+            cv2_frame_count = _positive_int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            cv2_fps = _positive_float(cap.get(cv2.CAP_PROP_FPS))
+            fps = cv2_fps if cv2_fps is not None else sidecar_fps
 
-    if frame_index is None:
-        frame_index = frame_count // 2
+            target_frame = _choose_video_frame_index(
+                frame_index=frame_index,
+                cv2_frame_count=cv2_frame_count,
+                sidecar_frame_count=sidecar_frame_count,
+            )
 
-    frame_index = max(0, min(frame_index, frame_count - 1))
-    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+            if target_frame > 0:
+                seek_ok = cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+                reported_pos = cap.get(cv2.CAP_PROP_POS_FRAMES)
+                if not seek_ok or reported_pos < max(1, target_frame - 1):
+                    raise RuntimeError(
+                        f"OpenCV could not seek to frame {target_frame}; "
+                        f"reported position {reported_pos}"
+                    )
 
-    ok, frame = cap.read()
-    cap.release()
+            ok, frame = cap.read()
+            if ok and frame is not None:
+                return _as_grayscale(frame)
 
-    if not ok or frame is None:
-        raise RuntimeError(
-            f"Failed to read frame {frame_index} from {video_path}"
+            cv2_error = RuntimeError(
+                f"Failed to read frame {target_frame} with OpenCV"
+            )
+        except Exception as e:
+            cv2_error = e
+        finally:
+            cap.release()
+    else:
+        fps = sidecar_fps
+        cv2_error = IOError(f"Could not open video with OpenCV")
+
+    try:
+        return _extract_frame_from_video_ffmpeg(
+            video_path,
+            frame_index=target_frame,
+            fps=fps,
         )
+    except Exception as ffmpeg_error:
+        raise RuntimeError(
+            f"Failed to read frame {target_frame} from {video_path}; "
+            f"OpenCV error: {cv2_error}; ffmpeg error: {ffmpeg_error}"
+        ) from ffmpeg_error
 
+
+def _positive_int(value: float | int | None) -> int | None:
+    if value is None:
+        return None
+    try:
+        i = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return i if i > 0 else None
+
+
+def _positive_float(value: float | int | None) -> float | None:
+    if value is None:
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return f if f > 0 else None
+
+
+def _choose_video_frame_index(
+    frame_index: int | None,
+    cv2_frame_count: int | None,
+    sidecar_frame_count: int | None,
+) -> int:
+    if frame_index is None:
+        if cv2_frame_count is not None:
+            return cv2_frame_count // 2
+        return 0
+
+    frame_index = max(0, int(frame_index))
+    frame_count = cv2_frame_count if cv2_frame_count is not None else sidecar_frame_count
+    if frame_count is not None:
+        frame_index = min(frame_index, frame_count - 1)
+    return frame_index
+
+
+def _read_video_sidecar_metadata(video_path: Path) -> tuple[int | None, float | None]:
+    """
+    Read optional Basler recorder diagnostics next to an MKV.
+
+    The MKV container may omit duration/frame-count metadata, but the recorder
+    writes camXX...mkv.diag.json with frame and fps fields.
+    """
+    diag_path = video_path.with_name(f"{video_path.name}.diag.json")
+    if not diag_path.exists():
+        return None, None
+
+    try:
+        with diag_path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None, None
+
+    recorder = data.get("recorder", {})
+    capture = data.get("capture", {})
+    context = data.get("context", {})
+
+    frame_count = (
+        _positive_int(recorder.get("framesEncoded"))
+        or _positive_int(capture.get("framesEmitted"))
+    )
+
+    fps = _positive_float(context.get("fps"))
+    duration_ms = _positive_float(context.get("durationMs"))
+    if fps is None and frame_count is not None and duration_ms is not None:
+        fps = frame_count / (duration_ms / 1000.0)
+
+    return frame_count, fps
+
+
+def _extract_frame_from_video_ffmpeg(
+    video_path: Path,
+    frame_index: int,
+    fps: float | None,
+) -> np.ndarray:
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
+
+    if frame_index > 0 and fps is not None:
+        cmd += ["-ss", f"{frame_index / fps:.6f}"]
+
+    cmd += ["-i", str(video_path)]
+
+    if frame_index > 0 and fps is None:
+        cmd += ["-vf", f"select=eq(n\\,{frame_index})"]
+
+    cmd += [
+        "-frames:v",
+        "1",
+        "-f",
+        "image2pipe",
+        "-pix_fmt",
+        "gray",
+        "-vcodec",
+        "png",
+        "-",
+    ]
+
+    proc = subprocess.run(cmd, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if proc.returncode != 0 or not proc.stdout:
+        stderr = proc.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(stderr or f"ffmpeg exited with code {proc.returncode}")
+
+    arr = np.frombuffer(proc.stdout, dtype=np.uint8)
+    frame = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
+    if frame is None:
+        raise RuntimeError("ffmpeg produced an unreadable frame image")
+
+    return frame
+
+
+def _as_grayscale(frame: np.ndarray) -> np.ndarray:
     if frame.ndim == 3:
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
@@ -486,7 +641,8 @@ def parse_args() -> argparse.Namespace:
         "--frame-index",
         type=int,
         default=None,
-        help="Frame index to sample from each video (default: middle frame). "
+        help="Frame index to sample from each video. Default: middle frame "
+             "when frame count is known, otherwise first readable frame. "
              "Only used with --videos.",
     )
     return parser.parse_args()

@@ -54,11 +54,20 @@ CONFIG = dict(
     output_dir="/bucket/ReiterU/Ants/basler/20251117_2_stim/",
 )
 
-X_THRESHOLD: float = 1740.0
+DEFAULT_X_THRESHOLD: float = 2630.0
+X_THRESHOLD: float = DEFAULT_X_THRESHOLD
 
 # -----------------------------------------------------------------------------#
 #                                   HELPERS                                    #
 # -----------------------------------------------------------------------------#
+
+
+def set_x_threshold(value: float) -> None:
+    global X_THRESHOLD
+    threshold = float(value)
+    if not np.isfinite(threshold):
+        raise ValueError(f"X threshold must be finite, got {value!r}")
+    X_THRESHOLD = threshold
 
 
 def load_homographies(npz_file: Path | str) -> List[np.ndarray]:
@@ -642,10 +651,19 @@ def main() -> None:
             "after all cameras in a chunk are merged. Default: 0.25"
         ),
     )
+    p.add_argument(
+        "--x_threshold",
+        "--x-threshold",
+        dest="x_threshold",
+        type=float,
+        default=DEFAULT_X_THRESHOLD,
+        help=f"Panorama X coordinate used to split left/right outputs. Default: {DEFAULT_X_THRESHOLD:g}",
+    )
     p.add_argument("--skip_existing", action="store_true", help="Do not overwrite existing panorama PKLs.")
 
     args = p.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    set_x_threshold(args.x_threshold)
 
     out_dir = Path(args.outdir)
     out_dir.mkdir(parents=True, exist_ok=True)

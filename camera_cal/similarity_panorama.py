@@ -34,7 +34,7 @@ import matplotlib.pyplot as plt
 # CONFIG                                                                      #
 ###############################################################################
 
-IM_PATH = "/home/sam-reiter/bucket/ReiterU/Ants/basler/20260414_20260417_CustomAruco/calibration_dataset/set0_patterns_elevated_by_2mm/frame0/"  # folder with camXX images or videos
+IM_PATH = "/home/sam-reiter/bucket/ReiterU/Ants/basler/20260623/block02"  # folder with camXX images or videos
 ARRAY_SIZE = (5, 5)          # camera grid (rows, cols)
 MATCH_THRESHOLD = 20          # discard edges with fewer inliers
 DEBUG = True                 # write debug artefacts

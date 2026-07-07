@@ -12,7 +12,6 @@ from pathlib import Path
 import sys
 import time
 
-import cv2
 import numpy as np
 import pandas as pd
 
@@ -38,7 +37,7 @@ HOTKEY_HELP = "\n".join(
         "s: start/switch/end sleep",
         "w or n: start/switch/end wake",
         "enter in Label box or Apply: start/switch/end the text label",
-        "c: clear the current frame or selected range",
+        "c: start/switch to clearing as unlabeled, or clear the selected range",
         "e: end the active label at the current frame",
         "[: set range start for a one-shot interval label",
         ",/.: previous/next crop video",
@@ -52,6 +51,14 @@ def log(message: str) -> None:
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}", flush=True)
 
 
+def require_cv2():
+    try:
+        import cv2
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError("OpenCV is required to label crop videos; install the cv2 package.") from exc
+    return cv2
+
+
 def clamp(value: int, low: int, high: int) -> int:
     return max(int(low), min(int(high), int(value)))
 
@@ -60,11 +67,7 @@ def format_rate(rate: float) -> str:
     return str(int(rate)) if float(rate).is_integer() else f"{rate:.1f}"
 
 
-def discover_crop_videos(video: Path | None, video_dir: Path | None) -> list[Path]:
-    if video is not None:
-        return [Path(video)]
-    if video_dir is None:
-        raise ValueError("Provide --video or --video_dir")
+def list_crop_videos(video_dir: Path) -> list[Path]:
     video_dir = Path(video_dir)
     videos = [p for p in sorted(video_dir.iterdir()) if p.is_file() and p.suffix.lower() in VIDEO_SUFFIXES]
     if not videos:
@@ -72,8 +75,42 @@ def discover_crop_videos(video: Path | None, video_dir: Path | None) -> list[Pat
     return videos
 
 
-def default_labels_dir(video_paths: list[Path]) -> Path:
-    return Path(video_paths[0]).resolve().parent / "label_vectors"
+def same_path(left: Path, right: Path) -> bool:
+    try:
+        return left.resolve() == right.resolve()
+    except OSError:
+        return left.absolute() == right.absolute()
+
+
+def discover_crop_videos(
+    video: Path | None,
+    video_dir: Path | None,
+    *,
+    single_video: bool = False,
+) -> tuple[list[Path], int]:
+    if video is not None:
+        video_path = Path(video)
+        if not video_path.exists():
+            raise FileNotFoundError(video_path)
+        if single_video:
+            return [video_path], 0
+
+        search_dir = Path(video_dir) if video_dir is not None else video_path.parent
+        videos = list_crop_videos(search_dir)
+        for index, path in enumerate(videos):
+            if same_path(path, video_path):
+                return videos, index
+
+        if video_path.suffix.lower() not in VIDEO_SUFFIXES:
+            raise ValueError(f"Unsupported video suffix for {video_path}")
+        return [video_path, *videos], 0
+    if video_dir is None:
+        raise ValueError("Provide --video or --video_dir")
+    return list_crop_videos(video_dir), 0
+
+
+def default_labels_dir(video_paths: list[Path], video_index: int = 0) -> Path:
+    return Path(video_paths[video_index]).resolve().parent / "label_vectors"
 
 
 def label_paths(labels_dir: Path, video_path: Path) -> tuple[Path, Path, Path]:
@@ -247,14 +284,15 @@ def save_label_vector(
 
 class OpenCvSequentialReader:
     def __init__(self, video_path: Path):
+        self.cv2 = require_cv2()
         self.video_path = Path(video_path)
-        self.cap = cv2.VideoCapture(str(self.video_path))
+        self.cap = self.cv2.VideoCapture(str(self.video_path))
         if not self.cap.isOpened():
             raise FileNotFoundError(f"Could not open video: {self.video_path}")
-        self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1
-        self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1
-        self.fps = float(self.cap.get(cv2.CAP_PROP_FPS)) or 24.0
-        self.frame_count = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+        self.width = int(self.cap.get(self.cv2.CAP_PROP_FRAME_WIDTH)) or 1
+        self.height = int(self.cap.get(self.cv2.CAP_PROP_FRAME_HEIGHT)) or 1
+        self.fps = float(self.cap.get(self.cv2.CAP_PROP_FPS)) or 24.0
+        self.frame_count = int(self.cap.get(self.cv2.CAP_PROP_FRAME_COUNT)) or 0
         self.decoded_frame_index: int | None = None
 
     def read_frame(self, frame_idx: int) -> np.ndarray:
@@ -280,10 +318,10 @@ class OpenCvSequentialReader:
                     return frame
             need_seek = True
         if need_seek:
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            self.cap.set(self.cv2.CAP_PROP_POS_FRAMES, frame_idx)
         ok, frame = self.cap.read()
         if (not ok or frame is None) and not need_seek:
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            self.cap.set(self.cv2.CAP_PROP_POS_FRAMES, frame_idx)
             ok, frame = self.cap.read()
         if not ok or frame is None:
             raise RuntimeError(f"Could not read frame {frame_idx} from {self.video_path}")
@@ -301,6 +339,7 @@ class CropLabelWindow:
         video_paths: list[Path],
         labels_dir: Path,
         start_frame: int,
+        start_video_index: int = 0,
     ) -> None:
         import tkinter as tk
         import tkinter.font as tkfont
@@ -313,13 +352,14 @@ class CropLabelWindow:
         self.Image = Image
         self.ImageTk = ImageTk
         self.tkfont = tkfont
+        self.cv2 = require_cv2()
         self.video_paths = [Path(path) for path in video_paths]
         self.labels_dir = Path(labels_dir)
         self.initial_start_frame = int(start_frame)
 
-        self.video_index = 0
+        self.video_index = clamp(start_video_index, 0, len(self.video_paths) - 1)
         self.reader: OpenCvSequentialReader | None = None
-        self.video_path = self.video_paths[0]
+        self.video_path = self.video_paths[self.video_index]
         self.frame_count = 0
         self.video_width = 1
         self.video_height = 1
@@ -366,7 +406,7 @@ class CropLabelWindow:
         self.status_var = tk.StringVar(value="")
         self.play_pause_button = None
 
-        self.open_video(0, start_frame=self.initial_start_frame, save_previous=False)
+        self.open_video(self.video_index, start_frame=self.initial_start_frame, save_previous=False)
         self.build_ui()
         self.bind_keys()
         self.root.protocol("WM_DELETE_WINDOW", self.close)
@@ -506,6 +546,7 @@ class CropLabelWindow:
 
     def open_video(self, index: int, *, start_frame: int = 0, save_previous: bool = True) -> None:
         if save_previous and self.reader is not None:
+            self.paint_active_label_to_frame(self.current_frame)
             self.save_labels()
         if self.reader is not None:
             self.reader.close()
@@ -534,10 +575,15 @@ class CropLabelWindow:
 
     def change_video(self, delta: int) -> None:
         if len(self.video_paths) <= 1:
+            self.status_note = "Only one crop video loaded"
+            self.redraw_status(force=True)
             return
         self.pause_playback()
         new_index = clamp(self.video_index + int(delta), 0, len(self.video_paths) - 1)
         if new_index == self.video_index:
+            edge = "last" if int(delta) > 0 else "first"
+            self.status_note = f"Already at {edge} crop video"
+            self.redraw_status(force=True)
             return
         self.open_video(new_index, start_frame=0, save_previous=True)
         self.redraw(full_refresh=True)
@@ -774,16 +820,47 @@ class CropLabelWindow:
             start = self.range_start_frame
             end = self.current_frame
             self.range_start_frame = None
-        else:
-            start = end = self.current_frame
-        start = clamp(int(start), 0, self.frame_count - 1)
-        end = clamp(int(end), 0, self.frame_count - 1)
-        if end < start:
-            start, end = end, start
-        self.label_vector[start : end + 1] = UNLABELED_LABEL
-        self.label_bar_dirty = True
-        self.status_note = f"Cleared frames {start}-{end}"
+            self.active_label_text = None
+            self.active_start_frame = None
+            self.active_last_painted_frame = None
+            start = clamp(int(start), 0, self.frame_count - 1)
+            end = clamp(int(end), 0, self.frame_count - 1)
+            if end < start:
+                start, end = end, start
+            self.label_vector[start : end + 1] = UNLABELED_LABEL
+            self.label_bar_dirty = True
+            self.save_labels()
+            self.status_note = f"Cleared frames {start}-{end}"
+            self.redraw(full_refresh=False)
+            return
+
+        current = int(self.current_frame)
+        if self.active_label_text == UNLABELED_LABEL:
+            self.paint_active_label_to_frame(current, redraw_bar=True)
+            self.active_label_text = None
+            self.active_start_frame = None
+            self.active_last_painted_frame = None
+            self.save_labels()
+            self.status_note = f"Stopped clearing at frame {current}"
+            self.redraw(full_refresh=False)
+            return
+
+        if self.active_label_text is not None:
+            start = int(self.active_start_frame if self.active_start_frame is not None else current)
+            if current > start:
+                self.fill_interval(start, current - 1, self.active_label_text)
+            elif current < start:
+                self.fill_interval(current + 1, start, self.active_label_text)
+
+        self.active_label_text = UNLABELED_LABEL
+        self.active_start_frame = current
+        self.active_last_painted_frame = None
+        self.paint_active_label_to_frame(current, redraw_bar=True)
         self.save_labels()
+        if self.current_label() == UNLABELED_LABEL:
+            self.status_note = f"Started clearing at frame {current}"
+        else:
+            self.status_note = f"Started clearing at frame {current}; current frame not cleared"
         self.redraw(full_refresh=False)
 
     def save_labels(self) -> None:
@@ -814,16 +891,25 @@ class CropLabelWindow:
         self.display_offset_y = max(0, (canvas_h - self.render_height) // 2)
         if self.render_width == w and self.render_height == h:
             return img
-        interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
-        return cv2.resize(img, (self.render_width, self.render_height), interpolation=interpolation)
+        interpolation = self.cv2.INTER_AREA if scale < 1.0 else self.cv2.INTER_LINEAR
+        return self.cv2.resize(img, (self.render_width, self.render_height), interpolation=interpolation)
 
     def redraw_video(self) -> None:
         try:
             img = self.read_video_frame(self.current_frame)
         except Exception as exc:
             img = np.zeros((max(1, self.video_height), max(1, self.video_width), 3), dtype=np.uint8)
-            cv2.putText(img, str(exc), (12, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
-        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            self.cv2.putText(
+                img,
+                str(exc),
+                (12, 30),
+                self.cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (255, 255, 255),
+                1,
+                self.cv2.LINE_AA,
+            )
+        rgb = self.cv2.cvtColor(img, self.cv2.COLOR_BGR2RGB)
         shown = self.resize_frame_to_canvas(rgb)
         photo = self.ImageTk.PhotoImage(image=self.Image.fromarray(shown))
         self.current_photo = photo
@@ -957,14 +1043,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video_dir", type=Path, default=None, help="Directory of crop videos to label.")
     parser.add_argument("--labels_dir", type=Path, default=None, help="Output label-vector directory. Default: <video_dir>/label_vectors.")
     parser.add_argument("--start_frame", type=int, default=0, help="Initial frame for the first video.")
+    parser.add_argument(
+        "--single_video",
+        action="store_true",
+        help="With --video, load only that file instead of starting within its sibling crop-video folder.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    video_paths = discover_crop_videos(args.video, args.video_dir)
-    labels_dir = Path(args.labels_dir) if args.labels_dir is not None else default_labels_dir(video_paths)
-    window = CropLabelWindow(video_paths=video_paths, labels_dir=labels_dir, start_frame=args.start_frame)
+    video_paths, video_index = discover_crop_videos(args.video, args.video_dir, single_video=args.single_video)
+    labels_dir = Path(args.labels_dir) if args.labels_dir is not None else default_labels_dir(video_paths, video_index)
+    window = CropLabelWindow(
+        video_paths=video_paths,
+        labels_dir=labels_dir,
+        start_frame=args.start_frame,
+        start_video_index=video_index,
+    )
     window.show()
 
 

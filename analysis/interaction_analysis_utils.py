@@ -18,6 +18,15 @@ import pandas as pd
 SIDES = ("left", "right")
 
 
+def _save_current_figures_if_enabled() -> None:
+    try:
+        from analysis.figure_saving import save_new_figures
+
+        save_new_figures(plt)
+    except Exception as exc:
+        print(f"Warning: failed to save interaction analysis figure: {exc}")
+
+
 @dataclass(frozen=True)
 class InteractionChunk:
     interaction_path: Path
@@ -788,6 +797,7 @@ def plot_cluster_pair_matrix_from_table(
             colorbar_label = "interactions / possible directed ant-pair"
     fig.colorbar(image, ax=ax, label=colorbar_label)
     fig.tight_layout()
+    _save_current_figures_if_enabled()
     return matrix
 
 
@@ -899,6 +909,7 @@ def plot_spatial_heatmaps_by_cluster_result(
         ax.axis("off")
     fig.suptitle(title)
     fig.tight_layout()
+    _save_current_figures_if_enabled()
     return histograms
 
 
@@ -1010,6 +1021,7 @@ def plot_time_counts_table(
     ax.set_title(title)
     fig.colorbar(image, ax=ax, label=color_label)
     fig.tight_layout()
+    _save_current_figures_if_enabled()
     return pivot
 
 
@@ -1204,6 +1216,7 @@ def plot_interaction_timeseries_table(
     ax.legend(title="cluster", loc="best", fontsize="small")
     ax.grid(True, alpha=0.25)
     fig.tight_layout()
+    _save_current_figures_if_enabled()
     return plot_df
 
 
@@ -1357,6 +1370,7 @@ def plot_spatial_heatmaps_by_cluster_and_time_result(
             fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04, label=colorbar_label)
     fig.suptitle(title)
     fig.tight_layout()
+    _save_current_figures_if_enabled()
     return hists
 
 
@@ -2079,6 +2093,7 @@ def plot_wake_regression_model_comparison(model_table: pd.DataFrame, *, metric: 
     ax.tick_params(axis="x", rotation=30)
     ax.grid(True, axis="y", alpha=0.25)
     fig.tight_layout()
+    _save_current_figures_if_enabled()
     return plot_df
 
 
@@ -2150,4 +2165,5 @@ def plot_immobility_interaction_correlation(
     )
     ax.grid(True, alpha=0.25)
     fig.tight_layout()
+    _save_current_figures_if_enabled()
     return plot_df, stats

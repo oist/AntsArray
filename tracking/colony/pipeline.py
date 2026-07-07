@@ -32,6 +32,7 @@ def run_mapping(
     panorama_dir: Path,
     map_mode: str,
     min_instance_frame_frac: float,
+    x_threshold: float,
     skip_existing: bool,
     chunks: set[str] | None = None,
 ) -> None:
@@ -40,8 +41,10 @@ def run_mapping(
         load_homographies,
         process_aruco_chunks,
         process_sleap_chunks,
+        set_x_threshold,
     )
 
+    set_x_threshold(x_threshold)
     hmats = load_homographies(hmats_path)
     exp = infer_experiment_name(data_dir)
     panorama_dir.mkdir(parents=True, exist_ok=True)
@@ -194,6 +197,14 @@ def main() -> None:
         default=0.25,
         help="Drop ArUco IDs below this all-camera merged chunk frame fraction.",
     )
+    parser.add_argument(
+        "--x_threshold",
+        "--x-threshold",
+        dest="x_threshold",
+        type=float,
+        default=2630.0,
+        help="Panorama X coordinate used by map_combine to split left/right PKLs.",
+    )
 
     parser.add_argument("--side", choices=("left", "right", "both"), default="both")
     parser.add_argument("--combine_runner", choices=("local", "slurm"), default="local")
@@ -276,6 +287,7 @@ def main() -> None:
             panorama_dir=panorama_dir,
             map_mode=args.map_mode,
             min_instance_frame_frac=args.min_instance_frame_frac,
+            x_threshold=args.x_threshold,
             skip_existing=args.skip_existing,
             chunks=set(complete_chunks),
         )

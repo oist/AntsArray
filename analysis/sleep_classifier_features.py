@@ -183,6 +183,13 @@ def posture_features(wide: pd.DataFrame, anchor: pd.DataFrame, *, mm_per_px: flo
     return out.reset_index(drop=True)
 
 
+def frame_anchor_features(wide: pd.DataFrame, anchor: pd.DataFrame) -> pd.DataFrame:
+    out = pd.DataFrame(index=wide.index)
+    out["Frame"] = wide.index.to_numpy(np.int64)
+    out = out.join(anchor, how="left")
+    return out.reset_index(drop=True)
+
+
 def find_speed_metadata(speed_root: Path, track_path: Path) -> dict[str, object] | None:
     speed_root = Path(speed_root)
     candidates = [
@@ -221,6 +228,15 @@ def load_speed_for_track(speed_root: Path | None, track_path: Path) -> tuple[np.
     return np.load(speed_path, mmap_mode="r"), meta
 
 
+def add_track_identity(features: pd.DataFrame, track_path: Path) -> pd.DataFrame:
+    out = features.copy()
+    out["track_name"] = track_path.name
+    out["track_path"] = str(track_path)
+    out["track_id"] = track_id_from_name(track_path)
+    out["side"] = side_from_name(track_path)
+    return out
+
+
 def _rolling_stats_at_indices(values: np.ndarray, indices: np.ndarray, window: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     values = np.asarray(values, dtype=np.float64)
     indices = np.asarray(indices, dtype=np.int64)
@@ -246,6 +262,87 @@ def _rolling_stats_at_indices(values: np.ndarray, indices: np.ndarray, window: i
     std[valid] = np.sqrt(np.maximum(var[valid], 0.0))
     frac = count.astype(np.float64) / np.maximum(stops - starts, 1)
     return mean, std, frac
+
+
+def _rolling_series_features(
+    values: pd.Series,
+    *,
+    windows_seconds: tuple[float, ...],
+    fps: float,
+    prefix: str,
+) -> pd.DataFrame:
+    out = pd.DataFrame(index=values.index)
+    values = pd.to_numeric(values, errors="coerce").astype(float)
+    for seconds in windows_seconds:
+        suffix = f"{seconds:g}s".replace(".", "p")
+        window = max(1, int(round(float(seconds) * float(fps))))
+        rolling = values.rolling(window=window, center=True, min_periods=max(1, min(3, window)))
+        out[f"{prefix}_mean_{suffix}"] = rolling.mean()
+        out[f"{prefix}_median_{suffix}"] = rolling.median()
+        out[f"{prefix}_std_{suffix}"] = rolling.std()
+        out[f"{prefix}_q90_{suffix}"] = rolling.quantile(0.90)
+        out[f"{prefix}_max_{suffix}"] = rolling.max()
+        out[f"{prefix}_valid_frac_{suffix}"] = rolling.count() / float(window)
+    return out
+
+
+def add_bodypoint_motion_features(
+    features: pd.DataFrame,
+    wide: pd.DataFrame,
+    *,
+    fps: float,
+    mm_per_px: float,
+    windows_seconds: tuple[float, ...] = (1.0, 5.0, 30.0),
+) -> pd.DataFrame:
+    out = features.copy()
+    if wide.empty or "Frame" not in out.columns:
+        return out
+
+    frames = wide.index.to_numpy(np.int64)
+    consecutive = np.concatenate([[False], np.diff(frames) == 1])
+    speed_cols = []
+    bodypoints = sorted(set(wide.columns.get_level_values(1).astype(int)))
+    for bodypoint in bodypoints:
+        if ("X", bodypoint) not in wide.columns or ("Y", bodypoint) not in wide.columns:
+            continue
+        x = wide[("X", bodypoint)].astype(float)
+        y = wide[("Y", bodypoint)].astype(float)
+        dx = x.diff().to_numpy(np.float64)
+        dy = y.diff().to_numpy(np.float64)
+        speed = np.sqrt(dx * dx + dy * dy) * float(mm_per_px) * float(fps)
+        valid = consecutive & np.isfinite(speed)
+        speed = np.where(valid, speed, np.nan)
+        col = f"bp{int(bodypoint)}_speed_mm_s"
+        out[col] = speed
+        speed_cols.append(col)
+
+    if not speed_cols:
+        return out
+
+    speed_frame = out[speed_cols].astype(float)
+    out["posture_bp_speed_mean_mm_s"] = speed_frame.mean(axis=1, skipna=True)
+    out["posture_bp_speed_median_mm_s"] = speed_frame.median(axis=1, skipna=True)
+    out["posture_bp_speed_max_mm_s"] = speed_frame.max(axis=1, skipna=True)
+    out["posture_bp_speed_q90_mm_s"] = speed_frame.quantile(0.90, axis=1)
+    out["posture_bp_speed_valid_frac"] = speed_frame.notna().mean(axis=1)
+    out["posture_bp_speed_log1p_mean"] = np.log1p(np.clip(out["posture_bp_speed_mean_mm_s"], 0.0, None))
+    out["posture_bp_speed_log1p_q90"] = np.log1p(np.clip(out["posture_bp_speed_q90_mm_s"], 0.0, None))
+
+    for source_col, prefix in [
+        ("posture_bp_speed_mean_mm_s", "posture_bp_speed_mean"),
+        ("posture_bp_speed_median_mm_s", "posture_bp_speed_median"),
+        ("posture_bp_speed_q90_mm_s", "posture_bp_speed_q90"),
+        ("posture_bp_speed_max_mm_s", "posture_bp_speed_max"),
+    ]:
+        out = out.join(
+            _rolling_series_features(
+                out[source_col],
+                windows_seconds=windows_seconds,
+                fps=fps,
+                prefix=prefix,
+            )
+        )
+    return out
 
 
 def add_speed_features(
@@ -291,6 +388,50 @@ def add_speed_features(
     return out
 
 
+def extract_speed_features(
+    track_path: Path,
+    *,
+    speed_root: Path | None,
+    fps: float = 24.0,
+    frame_min: int | None = None,
+    frame_max: int | None = None,
+    speed_windows_seconds: tuple[float, ...] = (1.0, 5.0, 30.0),
+) -> pd.DataFrame:
+    speed, speed_meta = load_speed_for_track(speed_root, track_path)
+    if speed is None or speed_meta is None:
+        raise FileNotFoundError(f"No speed vector found for {track_path.name}; pass --speed_root")
+
+    speed_frame_min = int(speed_meta.get("frame_min", 0))
+    speed_frame_max = speed_frame_min + len(speed) - 1
+    start = speed_frame_min if frame_min is None else max(speed_frame_min, int(frame_min))
+    stop = speed_frame_max if frame_max is None else min(speed_frame_max, int(frame_max))
+    if stop < start:
+        return pd.DataFrame()
+
+    frames = np.arange(start, stop + 1, dtype=np.int64)
+    indices = frames - speed_frame_min
+    speed_values = np.asarray(speed[indices], dtype=np.float32)
+    finite_speed = np.isfinite(speed_values)
+    frames = frames[finite_speed]
+    indices = indices[finite_speed]
+    speed_values = speed_values[finite_speed]
+    if len(frames) == 0:
+        return pd.DataFrame()
+    out = pd.DataFrame({"Frame": frames})
+    out["speed_mm_s"] = speed_values
+    out["speed_log1p_mm_s"] = np.log1p(np.clip(speed_values.astype(np.float64), 0.0, None))
+
+    speed_float = np.asarray(speed, dtype=np.float64)
+    for seconds in speed_windows_seconds:
+        suffix = f"{seconds:g}s".replace(".", "p")
+        window = max(1, int(round(float(seconds) * float(fps))))
+        mean, std, frac = _rolling_stats_at_indices(speed_float, indices, window)
+        out[f"speed_mean_{suffix}"] = mean.astype(np.float32)
+        out[f"speed_std_{suffix}"] = std.astype(np.float32)
+        out[f"speed_valid_frac_{suffix}"] = frac.astype(np.float32)
+    return add_track_identity(out, track_path)
+
+
 def extract_track_features(
     track_path: Path,
     *,
@@ -300,20 +441,39 @@ def extract_track_features(
     frame_min: int | None = None,
     frame_max: int | None = None,
     speed_windows_seconds: tuple[float, ...] = (1.0, 5.0, 30.0),
+    feature_mode: str = "all",
 ) -> pd.DataFrame:
     track_path = Path(track_path)
+    if feature_mode == "speed_only":
+        return extract_speed_features(
+            track_path,
+            speed_root=speed_root,
+            fps=fps,
+            frame_min=frame_min,
+            frame_max=frame_max,
+            speed_windows_seconds=speed_windows_seconds,
+        )
+
     rows = read_track_rows(track_path, frame_min=frame_min, frame_max=frame_max)
     wide, anchor = pose_wide(rows)
     if wide.empty:
         return pd.DataFrame()
 
-    features = posture_features(wide, anchor, mm_per_px=mm_per_px)
-    speed, speed_meta = load_speed_for_track(speed_root, track_path) if speed_root is not None else (None, None)
-    features = add_speed_features(features, speed, speed_meta, fps=fps, windows_seconds=speed_windows_seconds)
-    features["track_name"] = track_path.name
-    features["track_path"] = str(track_path)
-    features["track_id"] = track_id_from_name(track_path)
-    features["side"] = side_from_name(track_path)
+    if feature_mode == "posture_motion":
+        features = frame_anchor_features(wide, anchor)
+    else:
+        features = posture_features(wide, anchor, mm_per_px=mm_per_px)
+    features = add_bodypoint_motion_features(
+        features,
+        wide,
+        fps=fps,
+        mm_per_px=mm_per_px,
+        windows_seconds=speed_windows_seconds,
+    )
+    if feature_mode == "all":
+        speed, speed_meta = load_speed_for_track(speed_root, track_path) if speed_root is not None else (None, None)
+        features = add_speed_features(features, speed, speed_meta, fps=fps, windows_seconds=speed_windows_seconds)
+    features = add_track_identity(features, track_path)
     return features.sort_values("Frame", kind="mergesort").reset_index(drop=True)
 
 
@@ -326,10 +486,15 @@ def default_feature_columns(df: pd.DataFrame) -> list[str]:
         "side",
         "label",
         "label_value",
+        "label_file",
+        "video_path",
+        "local_frame",
+        "local_frame_start",
+        "local_frame_end",
+        "crop_frame_start",
     }
     return [
         col
         for col in df.columns
         if col not in exclude and pd.api.types.is_numeric_dtype(df[col])
     ]
-

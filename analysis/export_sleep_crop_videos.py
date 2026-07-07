@@ -14,22 +14,12 @@ import sys
 import threading
 import time
 
-import cv2
 import numpy as np
 import pandas as pd
 
 repo_root = Path(__file__).resolve().parents[1]
 if str(repo_root) not in sys.path:
     sys.path.insert(0, str(repo_root))
-
-from tracking.gui.aruco_curation import AviH264ElementaryReader, OpenCvVideoReader, resolve_frame_count
-from tracking.gui.multicam_tracking_viewer import (
-    apply_homography_points,
-    discover_media,
-    load_homography_stack,
-    parse_camera_index,
-)
-
 
 DEFAULT_HMATS = Path(
     "/home/sam-reiter/bucket/ReiterU/Ants/basler/cameraArray_calib/"
@@ -43,12 +33,38 @@ def log(message: str) -> None:
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}", flush=True)
 
 
+def require_cv2():
+    try:
+        import cv2
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError("OpenCV is required to write crop videos; install the cv2 package.") from exc
+    return cv2
+
+
+def aruco_curation_tools():
+    from tracking.gui.aruco_curation import AviH264ElementaryReader, OpenCvVideoReader, resolve_frame_count
+
+    return AviH264ElementaryReader, OpenCvVideoReader, resolve_frame_count
+
+
+def multicam_tracking_tools():
+    from tracking.gui.multicam_tracking_viewer import (
+        apply_homography_points,
+        discover_media,
+        load_homography_stack,
+        parse_camera_index,
+    )
+
+    return apply_homography_points, discover_media, load_homography_stack, parse_camera_index
+
+
 def project_xy(xy: np.ndarray, inv_h: np.ndarray) -> np.ndarray:
     if xy.size == 0:
         return np.empty((0, 2), dtype=np.float64)
     finite = np.isfinite(xy).all(axis=1)
     out = np.full((len(xy), 2), np.nan, dtype=np.float64)
     if np.any(finite):
+        apply_homography_points, _discover_media, _load_homography_stack, _parse_camera_index = multicam_tracking_tools()
         out[finite] = apply_homography_points(xy[finite], inv_h)
     return out
 
@@ -179,6 +195,7 @@ class ChunkTrackIndex:
 
 
 def open_video_reader(path: Path, frame_count: int, *, backend: str = "opencv"):
+    AviH264ElementaryReader, OpenCvVideoReader, _resolve_frame_count = aruco_curation_tools()
     path = Path(path)
     backend = str(backend).lower()
     if backend in {"opencv", "auto"}:
@@ -261,6 +278,7 @@ def infer_tracks_dir(video: Path | None, video_dir: Path | None, block_root: Pat
 def choose_video(video: Path | None, video_dir: Path, cameras: list[int] | None) -> Path:
     if video is not None:
         return Path(video)
+    _apply_homography_points, discover_media, _load_homography_stack, _parse_camera_index = multicam_tracking_tools()
     media = discover_media(video_dir, cameras)
     if not media:
         raise FileNotFoundError(f"No camera videos found in {video_dir}")
@@ -502,6 +520,7 @@ def crop_centered(frame: np.ndarray, cx: float, cy: float, size: int) -> np.ndar
 
 
 def make_writer(path: Path, fps: float, crop_size: int, codec: str) -> cv2.VideoWriter:
+    cv2 = require_cv2()
     path.parent.mkdir(parents=True, exist_ok=True)
     fourcc = cv2.VideoWriter_fourcc(*codec)
     writer = cv2.VideoWriter(str(path), fourcc, float(fps), (int(crop_size), int(crop_size)))
@@ -630,6 +649,7 @@ def export_batch(
     crop_size: int,
     codec: str,
 ) -> None:
+    AviH264ElementaryReader, _OpenCvVideoReader, _resolve_frame_count = aruco_curation_tools()
     reader = open_video_reader(video_path, estimated_frame_count, backend=backend)
     writers: list[cv2.VideoWriter] = []
     try:
@@ -706,6 +726,7 @@ def main() -> None:
 
     reader = open_video_reader(video_path, estimated_frame_count, backend=args.video_backend)
     try:
+        _AviH264ElementaryReader, _OpenCvVideoReader, resolve_frame_count = aruco_curation_tools()
         frame_count = int(resolve_frame_count(video_path, reader) or estimated_frame_count)
         fps = float(getattr(reader, "fps", 24.0) or 24.0)
         video_width = int(getattr(reader, "width", 0)) or 1
@@ -736,6 +757,7 @@ def main() -> None:
     sides = {"left", "right"} if args.side == "both" else {str(args.side)}
     track_ids = parse_int_csv(args.track_ids)
 
+    _apply_homography_points, _discover_media, load_homography_stack, parse_camera_index = multicam_tracking_tools()
     cam_index = parse_camera_index(video_path)
     homographies = load_homography_stack(args.hmats)
     if cam_index < 0 or cam_index >= len(homographies):
