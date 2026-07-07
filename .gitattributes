@@ -1,0 +1,10 @@
+# Scripts and text configs in this repo run on the Linux cluster (deigo/saion).
+# They MUST stay LF regardless of core.autocrlf on Windows checkouts, or bash's
+# `set -o pipefail` and SLURM's sbatch reject them ("DOS line breaks (\r\n)").
+*.sh        text eol=lf
+*.sbatch    text eol=lf
+*.bash      text eol=lf
+*.py        text eol=lf
+*.env       text eol=lf
+*.template  text eol=lf
+*.template.sh text eol=lf

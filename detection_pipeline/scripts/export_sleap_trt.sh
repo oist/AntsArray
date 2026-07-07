@@ -80,10 +80,13 @@ case "$RUNTIME" in
 	both)     fmt=both ;;
 esac
 
-MAX_BATCH="${MAX_BATCH:-16}"   # override with MAX_BATCH=N before invoking
+MAX_BATCH="${MAX_BATCH:-8}"    # override with MAX_BATCH=N before invoking
 # Note: sleap-nn's TRT export bakes a 2x h/w margin into the max profile, so
 # the engine's activation memory scales as ~4x_resolution * batch_size.
-# At 4024x3036 / fp16 with default 2.1 GB workspace, MAX_BATCH=16 fits; 32 does not.
+# At 4024x3036 / fp16 with default 2.1 GB workspace, MAX_BATCH=8 builds reliably;
+# MAX_BATCH=16 intermittently fails autotuning ("insufficient memory ... no tactics
+# to implement ... GridSample") on contended nodes. Keep MAX_BATCH >= SLEAP_BATCH_SIZE
+# (the inference batch, default 8); raise both together only if 8 is too slow.
 sleap-nn export "$CENTROID" "$INSTANCE" \
 	-o "$OUT" \
 	-f "$fmt" \

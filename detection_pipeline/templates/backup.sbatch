@@ -2,7 +2,7 @@
 #SBATCH -t 2-0
 #SBATCH -c 2
 #SBATCH --partition=datacp
-#SBATCH --mem=4G
+#SBATCH --mem=8G
 #SBATCH -J backup
 #SBATCH -o __JOBS_ROOT__/backup_%j.out
 #SBATCH -e __JOBS_ROOT__/backup_%j.err
@@ -58,7 +58,21 @@ echo "[$(date)] updating backup archive: $BACKUP_ARCHIVE_PATH"
 	else
 		zip -0 "$BACKUP_ARCHIVE_PATH" -@ < "$BACKUP_FILELIST"
 	fi
-	zip -T "$BACKUP_ARCHIVE_PATH"
+	# Integrity test via python zipfile, NOT `zip -T`: the datacp node's unzip is
+	# 6.00 (2009), which mis-parses ZIP64 archives that have many >4GB entries
+	# (reports a bogus "End-of-centdir-64 ... prepended bytes" / 1 TiB offset) and
+	# whose backported zip-bomb detection OOMs on multi-TB inputs. python's zipfile
+	# is ZIP64-correct and low-memory; testzip() CRC-checks every entry and returns
+	# the first bad name (or None). block03 (1.9 TB, 25 entries >4GB) hit this.
+	python3 - "$BACKUP_ARCHIVE_PATH" <<'PYTEST'
+import sys, zipfile
+z = zipfile.ZipFile(sys.argv[1])
+bad = z.testzip()
+if bad is not None:
+    print(f"[ERR] CRC check failed for: {bad}", file=sys.stderr)
+    sys.exit(1)
+print(f"[OK] {len(z.infolist())} entries passed CRC")
+PYTEST
 )
 
 cat > "$BACKUP_DESC_PATH" <<EOF

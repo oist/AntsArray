@@ -34,19 +34,51 @@ ssh_retry saion "
 "
 
 # --- Lazy TRT export ----------------------------------------------------------
+# Require the runtime's REAL artifact: model.trt for tensorrt (a stray model.onnx
+# from a failed/partial build must NOT count as "done", or predict would launch
+# against a missing engine). The A100 partitions (largegpu/short-a100/gpu-a100)
+# are all SM80, so their engines are interchangeable -- adopt a sibling A100
+# partition's engine before paying for a rebuild (which is flaky on contended
+# nodes: the full-res profile can exhaust the TRT workspace).
 if (( SKIP_TRT_EXPORT == 0 )) && [[ "$SLEAP_RUNTIME" != "pytorch" ]]; then
-	if ssh_retry saion "[[ -f '$EXPORT_DIR/model.trt' || -f '$EXPORT_DIR/model.onnx' ]]"; then
-		echo "[OK] export already at $EXPORT_DIR"
+	case "$SLEAP_RUNTIME" in
+		onnx) ENGINE_FILE="model.onnx" ;;
+		*)    ENGINE_FILE="model.trt" ;;
+	esac
+	A100_PARTS="largegpu short-a100 gpu-a100"
+
+	if ssh_retry saion "[[ -f '$EXPORT_DIR/$ENGINE_FILE' ]]"; then
+		echo "[OK] engine already at $EXPORT_DIR/$ENGINE_FILE"
 	else
-		echo "[INFO] export missing; running $SCRIPTS_DIR/export_sleap_trt.sh on saion (home is shared with deigo)"
-		# export_sleap_trt.sh srun's itself onto $SAION_PARTITION and blocks until done
-		ssh_retry saion "bash '$SCRIPTS_DIR/export_sleap_trt.sh' \
-			--centroid '$SLEAP_MODEL_CENTROID' \
-			--instance '$SLEAP_MODEL_INSTANCE' \
-			--out '$EXPORT_DIR' \
-			--runtime '$SLEAP_RUNTIME' \
-			--partition '$SAION_PARTITION'" \
-			|| { echo "[ERR] TRT export failed" >&2; exit 3; }
+		# Try to adopt a same-model engine from a sibling A100 partition dir.
+		MODEL_BASE="${MODEL_ID%__*}"   # strip trailing __<partition>
+		ADOPTED=""
+		if [[ " $A100_PARTS " == *" $SAION_PARTITION "* ]]; then
+			for _p in $A100_PARTS; do
+				_cand="$EXPORT_ROOT/${MODEL_BASE}__${_p}"
+				[[ "$_cand" == "$EXPORT_DIR" ]] && continue
+				if ssh_retry saion "[[ -f '$_cand/$ENGINE_FILE' ]]"; then ADOPTED="$_cand"; break; fi
+			done
+		fi
+
+		if [[ -n "$ADOPTED" ]]; then
+			echo "[OK] reusing SM80 engine from $ADOPTED (same arch as $SAION_PARTITION)"
+			ssh_retry saion "mkdir -p '$EXPORT_DIR' &&
+				for f in model.trt model.trt.metadata.json model.onnx export_metadata.json training_config_centroid.yaml training_config_centered_instance.yaml; do
+					[[ -f '$ADOPTED/'\$f ]] && ln -sf '$ADOPTED/'\$f '$EXPORT_DIR/'\$f
+				done; true" \
+				|| { echo "[ERR] engine adoption failed" >&2; exit 3; }
+		else
+			echo "[INFO] no sibling engine; building on $SAION_PARTITION via $SCRIPTS_DIR/export_sleap_trt.sh"
+			# export_sleap_trt.sh srun's itself onto $SAION_PARTITION and blocks until done
+			ssh_retry saion "bash '$SCRIPTS_DIR/export_sleap_trt.sh' \
+				--centroid '$SLEAP_MODEL_CENTROID' \
+				--instance '$SLEAP_MODEL_INSTANCE' \
+				--out '$EXPORT_DIR' \
+				--runtime '$SLEAP_RUNTIME' \
+				--partition '$SAION_PARTITION'" \
+				|| { echo "[ERR] TRT export failed" >&2; exit 3; }
+		fi
 	fi
 fi
 
@@ -64,6 +96,10 @@ RENDERED_DATACP="$JOBS_ROOT/sleap_datacp_array.rendered.sh"
 
 SLEAP_MODULE="${SLEAP_MODULE:-sleap-nn/0.2.0}"
 SAION_DATACP_PARTITION="${SAION_DATACP_PARTITION:-test-gpu}"
+# Per-task sleap resources (default = proven largegpu profile so old env files render).
+SLEAP_WALL="${SLEAP_WALL:-0-12}"
+SLEAP_CPUS="${SLEAP_CPUS:-16}"
+SLEAP_MEM="${SLEAP_MEM:-128G}"
 
 sed -e "s#__REMOTE_JOBS__#$REMOTE_JOBS#g" \
     -e "s#__REMOTE_INPUT__#$REMOTE_INPUT#g" \
@@ -76,6 +112,9 @@ sed -e "s#__REMOTE_JOBS__#$REMOTE_JOBS#g" \
     -e "s#__SLEAP_MODEL_INSTANCE__#$SLEAP_MODEL_INSTANCE#g" \
     -e "s#__SKIP_TRT_EXPORT__#$SKIP_TRT_EXPORT#g" \
     -e "s#__SLEAP_MODULE__#$SLEAP_MODULE#g" \
+    -e "s#__SLEAP_WALL__#$SLEAP_WALL#g" \
+    -e "s#__SLEAP_CPUS__#$SLEAP_CPUS#g" \
+    -e "s#__SLEAP_MEM__#$SLEAP_MEM#g" \
     -e "s#__BATCH_SIZE__#${BATCH_SIZE:-1}#g" \
     -e "s#__DEIGO_FLASH_SAION_PREFIX__#$DEIGO_FLASH_SAION_PREFIX#g" \
     -e "s#__DATA_DIR__#$DATA_DIR#g" \

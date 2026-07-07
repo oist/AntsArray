@@ -37,13 +37,19 @@ Chunking:
 SLEAP runtime:
   --sleap-runtime {tensorrt|onnx|pytorch}  default: tensorrt
   --skip-trt-export                 Use 'sleap-nn track' fallback (raw model dirs)
-  --saion-partition NAME            default: largegpu
+  --saion-partition NAME            default: largegpu. short-a100 = 4x GPUs (2h wall).
+                                    Picking the partition auto-sizes the four knobs
+                                    below; you only set them to hold resources back.
   --sleap-module NAME               saion module name. default: sleap-nn/0.2.0
   --sleap-batch-size N              TRT inference batch; must be <= engine max profile batch. default: 8
+  --sleap-cpus N                    cpus per sleap task. default: auto = cpu_cap/concurrency
+  --sleap-mem SIZE                  mem per sleap task.  default: auto = mem_cap/concurrency
+  --sleap-wall D-HH                 per-task walltime.   default: auto = partition wall
+                                                         (largegpu 0-12, short-a100 0-2)
 
 Concurrency:
   --aruco-concurrency N             default: 16
-  --sleap-concurrency N             default: 8
+  --sleap-concurrency N             default: auto = partition GPU cap (largegpu 8, short-a100 32)
   --datacp-concurrency N            default: 4
 
 Batching (minimize submitted job count):
@@ -68,9 +74,11 @@ Roots:
 
 Backup:
   --no-backup                       Do not submit the automatic raw-video backup
-  --backup-root PATH                default: /bucket/<unit>/Backup
+  --backup-root PATH                default: /bucket/<unit>/Backup/<collection>
+                                    (collection = exp path minus date/block,
+                                    e.g. Ants_basler)
   --backup-archive NAME             archive filename under --backup-root;
-                                    default: <relative_exp_path>_raw_videos.zip
+                                    default: <date>_<block>_raw_videos.zip
   --backup-owner TEXT               description file name: line. default: $USER
   --backup-project TEXT             description file project: line
   --backup-partition NAME           default: datacp
@@ -104,7 +112,16 @@ SLEAP_MODULE="sleap-nn/0.2.0"
 # engine was exported with a larger max batch.
 SLEAP_BATCH_SIZE=8
 ARUCO_CONCURRENCY=100   # compute assoc cap=2000 cpu; at -c 16 that's ~125 concurrent max, so 100 leaves headroom for the bridge (also on compute)
-SLEAP_CONCURRENCY=8     # bounded by saion largegpu having only 4 A100 nodes anyway
+# Sleap GPU concurrency + per-task resources. Empty = auto-derived from the
+# selected --saion-partition after arg parsing (see saion_caps below):
+#   concurrency -> partition per-user GPU cap (largegpu=8, short-a100=32)
+#   cpus / mem  -> cpu_cap / mem_cap divided by concurrency (saturates the caps)
+#   wall        -> partition default wall (largegpu=0-12, short-a100=0-2)
+# Set any of these explicitly only to hold resources back for other jobs.
+SLEAP_CONCURRENCY=""
+SLEAP_CPUS=""
+SLEAP_MEM=""
+SLEAP_WALL=""
 DATACP_CONCURRENCY=4
 BATCH_SIZE=1         # default: one chunk per array task (set "" to auto-size under MAX_ARRAY_TASKS)
 MAX_ARRAY_TASKS=500
@@ -138,6 +155,9 @@ while [[ $# -gt 0 ]]; do
 		--sleap-batch-size) SLEAP_BATCH_SIZE="$2"; shift 2 ;;
 		--aruco-concurrency) ARUCO_CONCURRENCY="$2"; shift 2 ;;
 		--sleap-concurrency) SLEAP_CONCURRENCY="$2"; shift 2 ;;
+		--sleap-cpus) SLEAP_CPUS="$2"; shift 2 ;;
+		--sleap-mem) SLEAP_MEM="$2"; shift 2 ;;
+		--sleap-wall) SLEAP_WALL="$2"; shift 2 ;;
 		--datacp-concurrency) DATACP_CONCURRENCY="$2"; shift 2 ;;
 		--batch-size) BATCH_SIZE="$2"; shift 2 ;;
 		--max-array-tasks) MAX_ARRAY_TASKS="$2"; shift 2 ;;
@@ -176,12 +196,26 @@ if (( RUN_BACKUP == 1 )); then
 	unit_name="${bucket_tail%%/*}"
 	BACKUP_UNIT_ROOT="/bucket/$unit_name"
 	BACKUP_REL_DIR="${DIR#$BACKUP_UNIT_ROOT/}"
-	BACKUP_ROOT="${BACKUP_ROOT:-$BACKUP_UNIT_ROOT/Backup}"
+
+	# Group archives under Backup/<collection>/ rather than one flat directory.
+	# Split the experiment's relative path into a collection (every component
+	# except the last two, e.g. Ants/basler) and a per-block tail (the last two,
+	# e.g. 20260520/block02): the collection becomes a subfolder under Backup/
+	# and the tail becomes the archive filename. Paths shallower than three
+	# components fall back to the old flat Backup/ naming.
+	sanitize_token() { printf '%s' "${1//\//_}" | sed -e 's/[^A-Za-z0-9._-]/_/g' -e 's/___*/_/g' -e 's/^_//' -e 's/_$//'; }
+	IFS='/' read -ra _rel_parts <<< "$BACKUP_REL_DIR"
+	if (( ${#_rel_parts[@]} >= 3 )); then
+		backup_collection="${BACKUP_REL_DIR%/*/*}"
+		backup_tail="${BACKUP_REL_DIR#"$backup_collection"/}"
+	else
+		backup_collection=""
+		backup_tail="$BACKUP_REL_DIR"
+	fi
+	collection_token=$(sanitize_token "$backup_collection")
+	BACKUP_ROOT="${BACKUP_ROOT:-$BACKUP_UNIT_ROOT/Backup${collection_token:+/$collection_token}}"
 	if [[ -z "$BACKUP_ARCHIVE" ]]; then
-		safe_rel="${BACKUP_REL_DIR//\//_}"
-		safe_rel="${safe_rel// /_}"
-		safe_rel=$(printf '%s' "$safe_rel" | sed -e 's/[^A-Za-z0-9._-]/_/g' -e 's/___*/_/g' -e 's/^_//' -e 's/_$//')
-		BACKUP_ARCHIVE="${safe_rel}_raw_videos.zip"
+		BACKUP_ARCHIVE="$(sanitize_token "$backup_tail")_raw_videos.zip"
 	fi
 	[[ "$BACKUP_ARCHIVE" != */* ]] || { echo "[ERR] --backup-archive must be a filename, not a path" >&2; exit 2; }
 	[[ "$BACKUP_ARCHIVE" == *.zip ]] || BACKUP_ARCHIVE="${BACKUP_ARCHIVE}.zip"
@@ -195,6 +229,43 @@ if (( ONLY_CHUNK != 1 && ONLY_ARUCO != 1 && ONLY_BACKUP != 1 )); then
 	[[ -d "$SLEAP_MODEL_CENTROID" ]] || { echo "[ERR] --sleap-model-centroid must exist (dir)" >&2; exit 2; }
 	[[ -d "$SLEAP_MODEL_INSTANCE" ]] || { echo "[ERR] --sleap-model-instance must exist (dir)" >&2; exit 2; }
 fi
+
+# --- Auto-size sleap GPU resources from the selected partition ----------------
+# Per-user association caps differ by partition, and the cpu/mem-per-GPU ratio
+# is NOT constant (largegpu: 16 cpu + 128 GB per GPU; short-a100: 8 cpu + 64 GB
+# per GPU). Derive concurrency/cpus/mem/wall from the partition unless the user
+# set them explicitly (empty = unset). Override any one to hold resources back.
+saion_caps() {
+	# echo: <gpu_cap> <cpu_cap> <mem_cap_GB> <default_wall>
+	case "$1" in
+		largegpu)   echo "8 128 1024 0-12" ;;
+		short-a100) echo "32 256 2048 0-2"  ;;
+		gpu-a100)   echo "8 128 1024 0-8"   ;;
+		*)          echo "" ;;
+	esac
+}
+read -r _GPU_CAP _CPU_CAP _MEM_CAP _DEF_WALL <<<"$(saion_caps "$SAION_PARTITION")" || true
+if [[ -n "$_GPU_CAP" ]]; then
+	: "${SLEAP_CONCURRENCY:=$_GPU_CAP}"
+	if (( SLEAP_CONCURRENCY > _GPU_CAP )); then
+		echo "[WARN] --sleap-concurrency $SLEAP_CONCURRENCY exceeds $SAION_PARTITION per-user GPU cap $_GPU_CAP; extra tasks will pend (AssocGrpGRES)" >&2
+	fi
+	if [[ -z "$SLEAP_CPUS" ]]; then
+		SLEAP_CPUS=$(( _CPU_CAP / SLEAP_CONCURRENCY ))
+		(( SLEAP_CPUS >= 1 )) || SLEAP_CPUS=1
+	fi
+	if [[ -z "$SLEAP_MEM" ]]; then
+		SLEAP_MEM="$(( _MEM_CAP / SLEAP_CONCURRENCY ))G"
+	fi
+	: "${SLEAP_WALL:=$_DEF_WALL}"
+else
+	# Unknown partition: fall back to the legacy largegpu-shaped defaults.
+	: "${SLEAP_CONCURRENCY:=8}"
+	: "${SLEAP_CPUS:=16}"
+	: "${SLEAP_MEM:=128G}"
+	: "${SLEAP_WALL:=0-12}"
+fi
+echo "[INFO] sleap: partition=$SAION_PARTITION concurrency=$SLEAP_CONCURRENCY per-task '-c $SLEAP_CPUS --mem=$SLEAP_MEM -t $SLEAP_WALL'"
 
 # Resolve aruco dict
 ARUCO_DICT_ROOT="/bucket/ReiterU/Ants/aruco_dicts"
@@ -252,6 +323,9 @@ export ARUCO_DICT_PATH="$ARUCO_DICT_PATH"
 export ARUCO_EXTRA_ARGS="$ARUCO_EXTRA_ARGS"
 export ARUCO_CONCURRENCY="$ARUCO_CONCURRENCY"
 export SLEAP_CONCURRENCY="$SLEAP_CONCURRENCY"
+export SLEAP_CPUS="$SLEAP_CPUS"
+export SLEAP_MEM="$SLEAP_MEM"
+export SLEAP_WALL="$SLEAP_WALL"
 export DATACP_CONCURRENCY="$DATACP_CONCURRENCY"
 export BATCH_SIZE="$BATCH_SIZE"
 export MAX_ARRAY_TASKS="$MAX_ARRAY_TASKS"

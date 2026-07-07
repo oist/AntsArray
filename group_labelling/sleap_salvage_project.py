@@ -775,6 +775,104 @@ def command_merge(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_combine(args: argparse.Namespace) -> int:
+    """Union standalone corrected .pkg.slp files into one self-contained review
+    package. Unlike ``merge``, this needs no master and overlays nothing: every
+    labeled frame from every input is carried over verbatim (user + predicted
+    instances), re-pointed to one canonical skeleton, with its embedded images
+    re-embedded into a single output .pkg.slp.
+    """
+    files = sorted(args.corrected_dir.glob(args.pattern))
+    if not files:
+        raise FileNotFoundError(f"No files matching {args.pattern} in {args.corrected_dir}")
+
+    loaded: list[tuple[Path, sio.Labels]] = []
+    for path in files:
+        print(f"loading {path.name}", file=sys.stderr)
+        loaded.append((path, sio.load_slp(str(path), open_videos=True)))
+
+    canonical = loaded[0][1].skeleton
+    combined = sio.Labels(skeletons=[canonical])
+    seen: dict[tuple[str, int], Path] = {}
+    report: list[dict[str, object]] = []
+    duplicates = 0
+
+    # Each input file becomes one suggestion "group" so the GUI clusters the
+    # annotated frames by who returned them. SLEAP only persists the integer
+    # group; the index -> filename legend is recorded in provenance below.
+    group_legend = {group_idx: path.name for group_idx, (path, _) in enumerate(loaded)}
+
+    for group_idx, (path, labels) in enumerate(loaded):
+        if not labels.skeleton.matches(canonical, require_same_order=False):
+            raise ValueError(f"Skeleton mismatch in {path}")
+        for lf in labels:
+            key = (video_identity(lf.video), lf.frame_idx)
+            # Best-effort duplicate flag: SLEAP GUI re-saves can collapse
+            # source_video names, so this only catches same-named clashes.
+            is_dup = key in seen
+            if is_dup:
+                duplicates += 1
+                print(
+                    f"warning: duplicate frame {key} in {path.name} "
+                    f"(also in {seen[key].name})",
+                    file=sys.stderr,
+                )
+            combined.append(clone_labeled_frame(lf, video=lf.video, skeleton=canonical))
+            if not args.no_suggestions:
+                combined.suggestions.append(
+                    SuggestionFrame(
+                        video=lf.video,
+                        frame_idx=lf.frame_idx,
+                        metadata={"group": group_idx},
+                    )
+                )
+            seen[key] = path
+            report.append(
+                {
+                    "file": str(path),
+                    "group": group_idx,
+                    "video": key[0],
+                    "frame_idx": key[1],
+                    "duplicate": is_dup,
+                    "predicted_instances": len(lf.predicted_instances),
+                    "user_instances": len(lf.user_instances),
+                }
+            )
+
+    combined.update()
+    combined.provenance["sleap_salvage_project"] = {
+        "command": "combine",
+        "corrected_dir": str(args.corrected_dir),
+        "pattern": args.pattern,
+        "n_inputs": len(files),
+        "n_duplicate_frames": duplicates,
+        "suggestion_groups": group_legend,
+    }
+
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    embed = [(lf.video, lf.frame_idx) for lf in combined]
+    combined.save(str(args.out), embed=embed, verbose=not args.quiet)
+
+    write_csv(
+        args.out.parent / "combine_report.csv",
+        report,
+        ["file", "group", "video", "frame_idx", "duplicate", "predicted_instances", "user_instances"],
+    )
+    summary = summarize_labels(combined)
+    summary.update(
+        {
+            "inputs": [str(p) for p in files],
+            "n_inputs": len(files),
+            "n_duplicate_frames": duplicates,
+            "suggestion_groups": group_legend,
+            "out": str(args.out),
+        }
+    )
+    write_json(args.out.parent / "combine_summary.json", summary)
+    print(json.dumps(summary, indent=2), file=sys.stderr)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -860,6 +958,33 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--quiet", action="store_true")
     p.set_defaults(func=command_merge)
+
+    p = sub.add_parser(
+        "combine",
+        help="Union corrected .pkg.slp files into one self-contained review package.",
+    )
+    p.add_argument("--corrected-dir", type=Path, required=True)
+    p.add_argument(
+        "--pattern",
+        default="*.pkg.slp",
+        help=(
+            "Glob (relative to --corrected-dir) selecting the inputs. To pick only "
+            "labeler-corrected chunks and skip the bare originals, use something like "
+            "'*_chunk[0-9][0-9]_*.pkg.slp'."
+        ),
+    )
+    p.add_argument("--out", type=Path, required=True)
+    p.add_argument(
+        "--no-suggestions",
+        action="store_true",
+        help=(
+            "By default every labeled frame is also added as a SLEAP suggestion so "
+            "the GUI's suggestion navigation steps through exactly the annotated "
+            "frames. Pass this to skip adding suggestions."
+        ),
+    )
+    p.add_argument("--quiet", action="store_true")
+    p.set_defaults(func=command_combine)
 
     return parser
 

@@ -65,7 +65,7 @@ detection_pipeline/
     perms.sh                       # best-effort chgrp/setgid helpers for shared outputs
     worklist.py                    # chunk-ordered (chunk_idx ASC, vname ASC) TSV builder
   templates/
-    backup.sbatch                  # update stable raw-video archive under /bucket/<unit>/Backup
+    backup.sbatch                  # update stable raw-video archive under /bucket/<unit>/Backup/<collection>
     chunk.sbatch                   # ffmpeg -c copy segment (no re-encode)
     chunk_finalize.sbatch          # build worklist + submit downstream sbatches
     aruco_array.sbatch             # run_aruco.py per chunk with --custom-dict
@@ -125,8 +125,8 @@ defaults:
 | `--datacp-concurrency` | `4`              | array `%N` cap (deigo has 4 mover nodes)                                                            |
 | `--group`              | `reiteruni`      | group owner for shared outputs; created dirs are chgrp'd and setgid where permitted                 |
 | `--no-backup`          | off              | skip the automatic raw-video backup                                                                 |
-| `--backup-root`        | `/bucket/<unit>/Backup` | OIST Bucket Backup destination directory                                                     |
-| `--backup-archive`     | `<relative_exp_path>_raw_videos.zip` | stable per-block archive filename; reruns update this same file                  |
+| `--backup-root`        | `/bucket/<unit>/Backup/<collection>` | destination dir; `<collection>` = exp path minus date/block (e.g. `Ants_basler`) |
+| `--backup-archive`     | `<date>_<block>_raw_videos.zip` | stable per-block archive filename; reruns update this same file                       |
 
 ## Shared group permissions
 
@@ -148,14 +148,17 @@ abort a run if the current user cannot change a path they do not own.
 ## Bucket Backups
 
 By default, normal pipeline runs submit one `datacp` backup job after chunking
-finishes. The job updates a stable per-block archive under the unit Backup
-folder, for example:
+finishes. The job updates a stable per-block archive grouped by collection under
+the unit Backup folder, for example:
 
 ```bash
-/bucket/ReiterU/Backup/Ants_basler_20260520_block02_raw_videos.zip
+/bucket/ReiterU/Backup/Ants_basler/20260520_block02_raw_videos.zip
 ```
 
-The archive contains the raw source videos listed in `manifest.csv` plus all
+The `<collection>` subfolder (here `Ants_basler`) is the experiment's path under
+the unit bucket with the trailing date/block stripped, so every basler block's
+zip and `.txt` sidecar land together under `Backup/Ants_basler/` instead of flat
+in `Backup/`. The archive contains the raw source videos listed in `manifest.csv` plus all
 top-level `.txt` and `.json` metadata files in the experiment directory. A
 matching `.txt` description file is written next to the archive with the
 required `name:` and `project:` lines for OIST Bucket Backup.
@@ -216,15 +219,40 @@ Practical implications:
 
 ### saion (Reiter unit, `stephensuni` account)
 
-| Partition    | cpu cap | gpu cap     | mem cap | MaxWall | Notes                                                                                                                                                                         |
-| ------------ | ------- | ----------- | ------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `largegpu` | 128     | **8** | 1 T     | 12 h    | A100 80GB.**8-GPU cap is the binding limit** for sleap_predict. With `-c 16 --mem=128G --gres=gpu:1` per task and 8 concurrent, all three caps are saturated exactly. |
-| `gpu`      | 72      | 8           | (none)  | 2 days  | V100/P100 mix; usable for aruco GPU detector if quality validation passes                                                                                                     |
-| `test-gpu` | 18      | 2           | (none)  | 8 h     | small testing partition                                                                                                                                                       |
+| Partition      | cpu cap | gpu cap      | mem cap  | MaxWall              | Notes                                                                                                                                                                         |
+| -------------- | ------- | ------------ | -------- | -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `largegpu`   | 128     | **8**  | 1 T      | 12 h                 | A100 80GB.**8-GPU cap is the binding limit** for sleap_predict. With `-c 16 --mem=128G --gres=gpu:1` per task and 8 concurrent, all three caps are saturated exactly. |
+| `short-a100` | 256     | **32** | 2048 G   | **2 h (1 h non-preempt)** | Same A100 nodes (gpu23-26) as `largegpu`, low priority (tier 1). **4x the GPUs** for sleap_predict, but preemptible→requeued after 1 h. See preset below.            |
+| `gpu`        | 72      | 8            | (none)   | 2 days               | V100/P100 mix; usable for aruco GPU detector if quality validation passes                                                                                                     |
+| `test-gpu`   | 18      | 2            | (none)   | 8 h                  | small testing partition                                                                                                                                                       |
 
-Each `largegpu` node has 128 cpus / 2 TB RAM / **8x A100 80GB**. Four nodes total → 32 A100s in the partition, but a single user can only hold 8 of them at once (`gres/gpu=8`). So `SLEAP_CONCURRENCY=8` is the practical maximum — anything higher just queues PD against your own QOS.
+Each `largegpu` node has 128 cpus / 2 TB RAM / **8x A100 80GB**. Four nodes total → 32 A100s in the partition. On `largegpu` a single user can only hold 8 (`gres/gpu=8`), so `SLEAP_CONCURRENCY=8` is the max there. The new `short-a100` partition (same 4 nodes) lifts the per-user cap to **32 GPU / 256 cpu / 2048 GB** — the whole partition — at the cost of a 2 h walltime and low priority.
 
-Each saion sleap task at `-c 16 --mem=128G --gres=gpu:1` uses 1/8 of the user quota. The TRT inference is GPU-light (~30 % average utilization per A100, bursty between forward pass and CPU postproc); the bottleneck is CPU-side postprocess (peak finding, instance assembly), which scales with the `-c` count. That's why we give each task the max 16 cores allowed by `cpu/8` math.
+Each `largegpu` sleap task at `-c 16 --mem=128G --gres=gpu:1` uses 1/8 of the quota. The TRT inference is GPU-light (~30 % average utilization per A100, bursty between forward pass and CPU postproc); the bottleneck is CPU-side postprocess (peak finding, instance assembly), which scales with the `-c` count. That's why we give each task the max 16 cores allowed by `cpu/8` math.
+
+#### `short-a100` preset (4x concurrency)
+
+Selecting the partition **auto-sizes** concurrency, cpus, mem, and walltime from the
+per-user caps (see `saion_caps` in `pipeline.sh`) — so the minimal invocation is just:
+
+```bash
+./pipeline.sh --dir ... \
+  --saion-partition short-a100 \      # -> conc=32, -c 8, --mem=64G, -t 0-2 (auto)
+  --chunk-sec 1800                    # smaller chunks: each task fits the wall AND >=32 tasks fill the slots
+```
+
+The auto-derived knobs are equivalent to spelling out
+`--sleap-concurrency 32 --sleap-cpus 8 --sleap-mem 64G --sleap-wall 0-2`. Override any
+one only to hold resources back — e.g. `--sleap-concurrency 16` (uses 16 of 32 GPUs but
+keeps the full `-c 16 --mem=128G` per task), or `--sleap-wall 0-1` to stay strictly inside
+the 1 h non-preemptible window once you've confirmed chunks finish in time.
+
+Notes / caveats:
+
+- **At 32 GPUs the cpu cap binds:** auto-sizing gives `256/32 = 8` cpu and `2048/32 = 64 GB` per task (vs. 16/128G on largegpu). Half the cores per task means CPU postproc is somewhat slower per chunk, but 4x the GPUs still nets ~2-3x throughput.
+- **Calibrate `--chunk-sec` first.** No TRT (`sleap-nn/0.2.0`) throughput has been measured yet — the `[FPS]` log line exists precisely to capture it. The default `CHUNK_SEC=7200` (2 h of video/chunk) likely will *not* finish inside a 1 h wall at `-c 8`, and a colony may produce <32 such chunks (under-filling the 32 slots). Run a tiny array first, read the `[FPS]`/`Elapsed` lines, then pick a `--chunk-sec` that lands each task at ~30-45 min.
+- **Preemption is handled by idempotency.** `PreemptMode=REQUEUE` + the `[[ -f "$out_slp" ]] && continue` skip means a requeued/re-run task resumes without redoing finished chunks. Keep the default (do **not** pass `--no-requeue`). Staying at `--sleap-wall 0-1` avoids preemption entirely.
+- **Availability is opportunistic.** `short-a100` is low priority on the *same* nodes as `largegpu`/`gpu-a100`; you get up to 32 GPUs only when they're physically free. The TRT engine is SM80-identical to largegpu's, so it runs unchanged — but switching `--saion-partition` triggers one harmless re-export (the engine cache key includes the partition name).
 
 **Gotcha — `ssh saion-gpu26 nvidia-smi` only shows ONE GPU.** Saion uses pam_slurm_adopt, so ssh sessions get wrapped in one of your running jobs' cgroup and `nvidia-smi` is filtered by `CUDA_VISIBLE_DEVICES`. To check all GPUs on a node, use either:
 

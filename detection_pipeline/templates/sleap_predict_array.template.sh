@@ -1,10 +1,13 @@
 #!/bin/bash -l
-# saion largegpu user cap: cpu=128, gres/gpu=8, mem=1T, MaxWall=12h
-# With 8 concurrent tasks (GPU-capped), each task = 16 cpus, 128 GB, 1 GPU.
-#SBATCH -t 0-12
-#SBATCH -c 16
+# Per-task resources are rendered by bridge.sbatch from pipeline.sh knobs so one
+# template serves both A100 partitions (same SM80 hardware, gpu23-26):
+#   largegpu   (8 GPU cap):  -c 16 --mem=128G -t 0-12  -> 8 concurrent saturate cpu/mem/gpu
+#   short-a100 (32 GPU cap): -c 8  --mem=64G  -t 0-1   -> 32 concurrent; 0-1 stays inside
+#                                                         the 1h non-preemptible window
+#SBATCH -t __SLEAP_WALL__
+#SBATCH -c __SLEAP_CPUS__
 #SBATCH --partition=__SAION_PARTITION__
-#SBATCH --mem=128G
+#SBATCH --mem=__SLEAP_MEM__
 #SBATCH --gres=gpu:1
 #SBATCH -J sleap
 #SBATCH -o __REMOTE_JOBS__/sleap_%A_%a.out
