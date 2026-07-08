@@ -202,7 +202,7 @@ def main() -> None:
         "--x-threshold",
         dest="x_threshold",
         type=float,
-        default=2630.0,
+        default=2500.0,  # keep in sync with map_combine.DEFAULT_X_THRESHOLD
         help="Panorama X coordinate used by map_combine to split left/right PKLs.",
     )
 

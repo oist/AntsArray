@@ -54,7 +54,7 @@ CONFIG = dict(
     output_dir="/bucket/ReiterU/Ants/basler/20251117_2_stim/",
 )
 
-DEFAULT_X_THRESHOLD: float = 2630.0
+DEFAULT_X_THRESHOLD: float = 2500.0
 X_THRESHOLD: float = DEFAULT_X_THRESHOLD
 
 # -----------------------------------------------------------------------------#
