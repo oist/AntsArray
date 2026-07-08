@@ -112,6 +112,14 @@ fi
 log "exec: bash $TRACKING_SUBMIT ${submit_args[*]}"
 if bash "$TRACKING_SUBMIT" "${submit_args[@]}"; then
 	log "tracking submitted for block=$block"
+	# Cluster/log hint: tracking runs on deigo, and outputs copy back to the bucket
+	# only after ALL stages finish (stitch is the long pole). Point the user at the
+	# right cluster + log so 'no outputs yet' is not mistaken for a failure.
+	transfer_log="${TRACKING_OUTPUT_ROOT:+$TRACKING_OUTPUT_ROOT/jobs/$block/logs/transfer_to_bucket_$block.log}"
+	log "tracking runs on DEIGO (compute); bucket copy-back happens only after stitch+interaction finish."
+	log "watch progress ON deigo:  squeue -u \$USER | grep -Ei 'map_|track_|stitch_|inter_'"
+	[[ -n "$transfer_log" ]] && log "  and: tail -f $transfer_log"
+	log "NOTE: these /flash paths are on deigo; from saion they are /deigo_flash (read-only) and the jobs are not in saion's squeue."
 else
 	rc=$?
 	log "ERROR: tracking submit failed (rc=$rc) for block=$block"

@@ -657,6 +657,11 @@ file_mtime() {
   stat -c %Y "\${path}" 2>/dev/null || printf '0\n'
 }
 
+fmt_elapsed() {
+  local s="\$1"
+  printf '%dh%02dm' "\$(( s / 3600 ))" "\$(( (s % 3600) / 60 ))"
+}
+
 acquire_lock() {
   if mkdir "\${lock_dir}" 2>/dev/null; then
     printf '%s\n' "\$\$" > "\${lock_dir}/pid"
@@ -709,6 +714,7 @@ wait_for_fresh_file() {
       fi
       log "Ignoring stale \${label} marker: \${path} mtime=\${mtime}"
     fi
+    log "still waiting for \${label} (elapsed \$(fmt_elapsed \$(( \$(date +%s) - run_epoch )))); next check in \${poll_seconds}s"
     sleep "\${poll_seconds}"
   done
 }
