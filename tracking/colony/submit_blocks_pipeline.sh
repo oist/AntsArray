@@ -79,6 +79,9 @@ SLURM_SETUP=""
 MAP_MODE="both"
 SIDE="both"
 SKIP_EXISTING=1
+# Panorama left/right split centerline (X). Empty = use pipeline.py's default.
+# Calibration-specific: it must match the homography (--hmats) in use.
+X_THRESHOLD=""
 
 # Panorama mapping job resources.
 MAP_CPUS=8
@@ -129,6 +132,16 @@ TRANSFER_TO_BUCKET=1
 TRANSFER_POLL_SECONDS=120
 DELETE_FLASH_AFTER_TRANSFER=0
 
+# Per-track analysis fan-out (colony_presence, speed_vector, grid_occupancy),
+# auto-run after stitching. A login-side watcher waits for the stitch marker,
+# then fans out one job per stitched per-track parquet for each routine,
+# conda-free via the ant_tracking venv (--python_bin). NOTE: speed_vector needs
+# scipy in that venv. Set RUN_ANALYSIS=0 (or --no_analysis) to disable.
+RUN_ANALYSIS=1
+ANALYSIS_CPUS=4
+ANALYSIS_MEM="16G"
+ANALYSIS_TIME="0-12:00:00"
+
 # Set to 1 to write sbatch scripts without submitting jobs.
 DRY_RUN=0
 # -------------------------------------------------------------------------
@@ -150,6 +163,7 @@ slurm_setup="$SLURM_SETUP"
 map_mode="$MAP_MODE"
 side="$SIDE"
 skip_existing="$SKIP_EXISTING"
+x_threshold="$X_THRESHOLD"
 map_cpus="$MAP_CPUS"
 map_mem="$MAP_MEM"
 map_time="$MAP_TIME"
@@ -185,6 +199,10 @@ interaction_max_frames="$INTERACTION_MAX_FRAMES"
 transfer_to_bucket="$TRANSFER_TO_BUCKET"
 transfer_poll_seconds="$TRANSFER_POLL_SECONDS"
 delete_flash_after_transfer="$DELETE_FLASH_AFTER_TRANSFER"
+run_analysis="$RUN_ANALYSIS"
+analysis_cpus="$ANALYSIS_CPUS"
+analysis_mem="$ANALYSIS_MEM"
+analysis_time="$ANALYSIS_TIME"
 dry_run="$DRY_RUN"
 
 usage() {
@@ -220,6 +238,8 @@ Optional:
   --slurm_setup CMD         Command to run before sbatch, e.g. module load slurm.
   --map_mode MODE           aruco, sleap, or both. Default: both
   --side SIDE               left, right, or both. Default: both
+  --x_threshold FLOAT       Panorama left/right split X (must match the hmats
+                            calibration). Empty = pipeline.py default.
   --skip_existing           Do not overwrite existing outputs. Default: on.
   --force_recompute         Overwrite/recompute existing flash outputs.
   --map_cpus N              CPUs for panorama jobs. Default: 8
@@ -258,6 +278,11 @@ Optional:
   --transfer_poll_seconds N Poll interval for transfer watcher. Default: 120
   --delete_flash_after_transfer
                             Delete transferred flash files after successful rsync. Default: off
+  --run_analysis            Fan out per-track analysis after stitching. Default: on
+  --no_analysis             Do not run the per-track analysis fan-out.
+  --analysis_cpus N         CPUs per per-track analysis job. Default: 4
+  --analysis_mem MEM        Memory per per-track analysis job. Default: 16G
+  --analysis_time TIME      Time per per-track analysis job. Default: 0-12:00:00
   --dry_run                 Write scripts but do not submit.
   -h, --help
 EOF
@@ -280,6 +305,7 @@ while [[ $# -gt 0 ]]; do
     --slurm_setup) slurm_setup="$2"; shift 2 ;;
     --map_mode) map_mode="$2"; shift 2 ;;
     --side) side="$2"; shift 2 ;;
+    --x_threshold) x_threshold="$2"; shift 2 ;;
     --skip_existing) skip_existing=1; shift ;;
     --force_recompute) skip_existing=0; shift ;;
     --map_cpus) map_cpus="$2"; shift 2 ;;
@@ -317,6 +343,11 @@ while [[ $# -gt 0 ]]; do
     --no_transfer_to_bucket) transfer_to_bucket=0; shift ;;
     --transfer_poll_seconds) transfer_poll_seconds="$2"; shift 2 ;;
     --delete_flash_after_transfer) delete_flash_after_transfer=1; shift ;;
+    --no_analysis) run_analysis=0; shift ;;
+    --run_analysis) run_analysis=1; shift ;;
+    --analysis_cpus) analysis_cpus="$2"; shift 2 ;;
+    --analysis_mem) analysis_mem="$2"; shift 2 ;;
+    --analysis_time) analysis_time="$2"; shift 2 ;;
     --dry_run) dry_run=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -437,6 +468,11 @@ for block_dir in "${blocks[@]}"; do
     skip_existing_arg=" \\
   --skip_existing"
   fi
+  x_threshold_arg=""
+  if [[ -n "$x_threshold" ]]; then
+    x_threshold_arg=" \\
+  --x_threshold ${x_threshold}"
+  fi
 
   cat > "$map_script" <<EOF
 #!/usr/bin/env bash
@@ -459,7 +495,7 @@ mkdir -p "${panorama_dir}" "${tracks_dir}" "${logs_dir}"
   --work_dir "${work_dir}" \\
   --panorama_dir "${panorama_dir}" \\
   --tracks_dir "${tracks_dir}" \\
-  --map_mode "${map_mode}" \\
+  --map_mode "${map_mode}"${x_threshold_arg} \\
   --skip_combine \\
   --skip_stitch${skip_existing_arg}
 EOF
@@ -772,6 +808,30 @@ EOF
     nohup "$transfer_script" >/dev/null 2>&1 &
     transfer_pid="$!"
     echo "Started transfer watcher for $block_name PID $transfer_pid; log: $transfer_log"
+  fi
+  if [[ "$run_analysis" -eq 1 ]]; then
+    analysis_after_stitch_script="$REPO_ROOT/scripts/analysis_after_stitch.sh"
+    analysis_log="$logs_dir/analysis_after_stitch_${block_name}.log"
+    if [[ -f "$analysis_after_stitch_script" ]]; then
+      mkdir -p "$logs_dir"
+      nohup bash "$analysis_after_stitch_script" \
+        --stitch_ok "$stitch_done_file" \
+        --per_track_dir "$stitched_dir/per_track" \
+        --bucket_stitched "$bucket_stitched_dir" \
+        --python_bin "$python_bin" \
+        --repo "$REPO_ROOT" \
+        --partition "$partition" \
+        --sbatch_bin "$sbatch_bin" \
+        --cpus "$analysis_cpus" \
+        --mem "$analysis_mem" \
+        --time "$analysis_time" \
+        --poll_seconds "$transfer_poll_seconds" \
+        >> "$analysis_log" 2>&1 &
+      analysis_pid="$!"
+      echo "Started analysis fan-out watcher for $block_name PID $analysis_pid; log: $analysis_log"
+    else
+      echo "[WARN] --run_analysis is on but analysis script not found: $analysis_after_stitch_script" >&2
+    fi
   fi
   submitted=$((submitted + 1))
 done
