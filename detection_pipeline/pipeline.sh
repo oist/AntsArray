@@ -221,6 +221,12 @@ done
 [[ -d "$DIR" ]] || { echo "[ERR] --dir is required and must exist" >&2; usage; }
 DIR=$(readlink -f "$DIR")
 EXP_NAME=$(basename "$DIR")
+# Namespace scratch (/flash jobs + /work) by <date>_<block> so same-named blocks
+# from different dates (20260707/block01 vs 20260713/block01) don't collide and
+# overwrite each other's rendered templates / pipeline.env / chunks.
+if [[ "$EXP_NAME" =~ ^block[0-9] ]]; then
+	EXP_NAME="$(basename "$(dirname "$DIR")")_$EXP_NAME"
+fi
 
 BACKUP_UNIT_ROOT=""
 BACKUP_REL_DIR=""
