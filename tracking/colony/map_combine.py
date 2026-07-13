@@ -54,7 +54,7 @@ CONFIG = dict(
     output_dir="/bucket/ReiterU/Ants/basler/20251117_2_stim/",
 )
 
-DEFAULT_X_THRESHOLD: float = 2630.0
+DEFAULT_X_THRESHOLD: float = 2500.0
 X_THRESHOLD: float = DEFAULT_X_THRESHOLD
 
 # -----------------------------------------------------------------------------#
@@ -322,7 +322,24 @@ def _load_aruco_detections_h5_to_df_and_num_frames(
     *,
     ds_name: str = "aruco_tracks",
 ) -> Tuple[pd.DataFrame, int]:
-    df = pd.read_hdf(file, key="detections")
+    # The detections H5 is a pandas HDFStore (key="detections"). Files written by an
+    # older pandas/PyTables (e.g. legacy pre-v2 blocks) can be unreadable by a newer
+    # pandas even when the group exists on disk. Fall back to the sibling dense
+    # _aruco_tracks.h5 (plain h5py, version-stable, identical X/Y detections) so a
+    # detector/tracking pandas-version drift never breaks the map stage.
+    try:
+        df = pd.read_hdf(file, key="detections")
+    except Exception as exc:  # noqa: BLE001 - any HDFStore read failure -> use dense arrays
+        tracks_file = _matching_aruco_tracks_file(file)
+        if tracks_file is not None and tracks_file != file:
+            logging.warning(
+                "Could not read %s as a pandas HDFStore (%s); falling back to dense %s.",
+                file.name,
+                exc,
+                tracks_file.name,
+            )
+            return _load_aruco_h5_to_df_and_num_frames(tracks_file, ds_name=ds_name)
+        raise
     required = ["Frame", "Instance", "X", "Y"]
     missing = [col for col in required if col not in df.columns]
     if missing:
@@ -583,7 +600,7 @@ def process_sleap_chunks(
                     left_out = (
                         left_parts[0]
                         if len(left_parts) == 1
-                        else pd.concat(left_parts, ignore_index=True, copy=False)
+                        else pd.concat(left_parts, ignore_index=True)
                     )
                     _atomic_pickle(left_out, left_file)
                     del left_out
@@ -595,7 +612,7 @@ def process_sleap_chunks(
                     right_out = (
                         right_parts[0]
                         if len(right_parts) == 1
-                        else pd.concat(right_parts, ignore_index=True, copy=False)
+                        else pd.concat(right_parts, ignore_index=True)
                     )
                     _atomic_pickle(right_out, right_file)
                     del right_out
