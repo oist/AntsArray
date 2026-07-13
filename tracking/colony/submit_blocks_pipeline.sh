@@ -5,8 +5,9 @@
 #   1. submit one SLURM job to create panorama PKLs
 #   2. submit a dependent SLURM job that fans out per-chunk/side tracking jobs
 #   3. submit a dependent stitch job that writes stitched/per_track outputs
-#   4. submit a dependent SLURM job that fans out per-chunk interaction jobs
-#   5. transfer completed flash outputs back to bucket
+#   4. submit dependent per-track analysis fanout jobs for speed/presence/occupancy/sleep
+#   5. submit a dependent SLURM job that fans out per-chunk interaction jobs
+#   6. transfer completed flash outputs back to bucket
 #
 # Expected block layout:
 #   <blocks_root>/<block>/data/
@@ -21,6 +22,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 PIPELINE_PY="$SCRIPT_DIR/pipeline.py"
 COMBINE_BATCH_PY="$SCRIPT_DIR/combine_batch.py"
 INTERACTION_BATCH_PY="$SCRIPT_DIR/interaction_batch.py"
+PER_TRACK_FANOUT_SH="$REPO_ROOT/scripts/per_track_slurm_fanout.sh"
 RUN_USER="${USER:-${LOGNAME:-$(id -un)}}"
 HOME_DIR="${HOME:-/home/sam-reiter}"
 if [[ -d "${HOME_DIR}/bucket/ReiterU" ]]; then
@@ -39,11 +41,11 @@ DEFAULT_PYTHON_BIN="${DEFAULT_BUCKET_ROOT}/ReiterU/sam/miniforge3/envs/aruco_env
 
 # ----------------------------- CONFIGURATION -----------------------------
 # Main input paths. These are the only paths you usually need to edit.
-BLOCKS_ROOT="${DEFAULT_BUCKET_ROOT}/ReiterU/Ants/basler/20260515"
-HMATS="${DEFAULT_BUCKET_ROOT}/ReiterU/Ants/basler/cameraArray_calib/20260414_calibration_dataset/set0_patterns_elevated_by_2mm/frame0/initial_H_mats.npz"
+BLOCKS_ROOT="${DEFAULT_BUCKET_ROOT}/ReiterU/Ants/basler/20260702"
+HMATS="${DEFAULT_BUCKET_ROOT}/ReiterU/Ants/basler/cameraArray_calib/20260623_calib_elevated_by_2mm_from_arenafloor/frame0/aruco_stitch/aruco_H_mats.npz"
 
 # Compute nodes cannot write to /bucket. All generated outputs go here.
-OUTPUT_ROOT="${DEFAULT_FLASH_TMP}/${RUN_USER}/colony_pipeline/20260515"
+OUTPUT_ROOT="${DEFAULT_FLASH_TMP}/${RUN_USER}/colony_pipeline/20260702"
 
 # Sbatch scripts and submit-side SLURM logs go here.
 SUBMIT_ROOT="${OUTPUT_ROOT}/jobs"
@@ -72,6 +74,7 @@ SLURM_SETUP=""
 # Pipeline behavior.
 MAP_MODE="both"
 SIDE="both"
+X_THRESHOLD="2500.0"
 SKIP_EXISTING=1
 
 # Panorama mapping job resources.
@@ -101,6 +104,25 @@ STITCH_MEM="32G"
 STITCH_TIME="0-08:00:00"
 FPS="24.0"
 WRITE_TRACK_PNGS=1
+
+# Per-track analysis jobs run after stitched/per_track exists.
+RUN_PER_TRACK_ANALYSIS=1
+PER_TRACK_ANALYSIS_SUBMIT_CPUS=1
+PER_TRACK_ANALYSIS_SUBMIT_MEM="4G"
+PER_TRACK_ANALYSIS_SUBMIT_TIME="0-01:00:00"
+PER_TRACK_ANALYSIS_CPUS=4
+PER_TRACK_ANALYSIS_MEM="16G"
+PER_TRACK_ANALYSIS_TIME="0-12:00:00"
+
+# Sleep prediction jobs run after speed vectors complete. Leave SLEEP_MODEL empty
+# to use analysis/compute_track_sleep_predictions.py's built-in production model.
+RUN_SLEEP_PREDICTIONS=1
+SLEEP_MODEL="${SLEEP_MODEL:-}"
+SLEEP_SKIP_EXISTING="${SLEEP_SKIP_EXISTING:-auto}"
+SLEEP_CONDA_ENV=""
+SLEEP_PREDICTION_CPUS=4
+SLEEP_PREDICTION_MEM="16G"
+SLEEP_PREDICTION_TIME="0-12:00:00"
 
 # Interaction jobs run after all chunk tracking jobs for a block complete.
 RUN_INTERACTIONS=1
@@ -143,6 +165,7 @@ sbatch_bin="$SBATCH_BIN"
 slurm_setup="$SLURM_SETUP"
 map_mode="$MAP_MODE"
 side="$SIDE"
+x_threshold="$X_THRESHOLD"
 skip_existing="$SKIP_EXISTING"
 map_cpus="$MAP_CPUS"
 map_mem="$MAP_MEM"
@@ -162,6 +185,20 @@ stitch_mem="$STITCH_MEM"
 stitch_time="$STITCH_TIME"
 fps="$FPS"
 write_track_pngs="$WRITE_TRACK_PNGS"
+run_per_track_analysis="$RUN_PER_TRACK_ANALYSIS"
+per_track_analysis_submit_cpus="$PER_TRACK_ANALYSIS_SUBMIT_CPUS"
+per_track_analysis_submit_mem="$PER_TRACK_ANALYSIS_SUBMIT_MEM"
+per_track_analysis_submit_time="$PER_TRACK_ANALYSIS_SUBMIT_TIME"
+per_track_analysis_cpus="$PER_TRACK_ANALYSIS_CPUS"
+per_track_analysis_mem="$PER_TRACK_ANALYSIS_MEM"
+per_track_analysis_time="$PER_TRACK_ANALYSIS_TIME"
+run_sleep_predictions="$RUN_SLEEP_PREDICTIONS"
+sleep_model="$SLEEP_MODEL"
+sleep_skip_existing="$SLEEP_SKIP_EXISTING"
+sleep_conda_env="$SLEEP_CONDA_ENV"
+sleep_prediction_cpus="$SLEEP_PREDICTION_CPUS"
+sleep_prediction_mem="$SLEEP_PREDICTION_MEM"
+sleep_prediction_time="$SLEEP_PREDICTION_TIME"
 run_interactions="$RUN_INTERACTIONS"
 interaction_output_name="$INTERACTION_OUTPUT_NAME"
 interaction_submit_cpus="$INTERACTION_SUBMIT_CPUS"
@@ -189,8 +226,9 @@ For each block:
   1. submit one SLURM job to create panorama PKLs
   2. submit a dependent SLURM job that fans out per-chunk/side tracking jobs
   3. submit a dependent stitch job that writes stitched/per_track outputs
-  4. submit a dependent SLURM job that fans out per-chunk interaction jobs
-  5. transfer completed flash outputs back to bucket
+  4. submit dependent per-track analysis fanout jobs for speed/presence/occupancy/sleep
+  5. submit a dependent SLURM job that fans out per-chunk interaction jobs
+  6. transfer completed flash outputs back to bucket
 
 Expected block layout:
   <blocks_root>/<block>/data/
@@ -214,6 +252,7 @@ Optional:
   --slurm_setup CMD         Command to run before sbatch, e.g. module load slurm.
   --map_mode MODE           aruco, sleap, or both. Default: both
   --side SIDE               left, right, or both. Default: both
+  --x_threshold FLOAT       Panorama X split threshold for left/right map outputs. Default: 2630.0
   --skip_existing           Do not overwrite existing outputs. Default: on.
   --force_recompute         Overwrite/recompute existing flash outputs.
   --map_cpus N              CPUs for panorama jobs. Default: 8
@@ -235,6 +274,22 @@ Optional:
   --fps FLOAT               FPS used for stitched global frame offsets. Default: 24.0
   --write_track_pngs        Write trajectory PNGs during stitching. Default: on
   --no_track_pngs           Do not write trajectory PNGs during stitching.
+  --no_per_track_analysis   Do not submit speed/presence/occupancy/sleep jobs after stitching.
+  --per_track_analysis_cpus N
+  --per_track_analysis_mem MEM
+  --per_track_analysis_time TIME
+  --per_track_analysis_submit_cpus N
+  --per_track_analysis_submit_mem MEM
+  --per_track_analysis_submit_time TIME
+  --sleep_predictions       Submit sleep classifier prediction jobs after speed vectors. Default: on
+  --no_sleep_predictions    Do not submit sleep classifier prediction jobs.
+  --sleep_model PATH        Override sleep classifier model. Empty uses compute_track_sleep_predictions.py default.
+  --sleep_skip_existing     Skip existing sleep prediction outputs even when --sleep_model is set.
+  --sleep_force_recompute   Recompute sleep prediction outputs even with the default model.
+  --sleep_conda_env NAME    Conda env for sleep prediction workers. Default: same as --conda_env.
+  --sleep_prediction_cpus N CPUs for each sleep prediction worker. Default: 4
+  --sleep_prediction_mem MEM
+  --sleep_prediction_time TIME
   --no_interactions         Do not submit interaction jobs after tracking.
   --interaction_cpus N      CPUs for each chunk interaction job. Default: 4
   --interaction_mem MEM     Memory for each chunk interaction job. Default: 16G
@@ -274,6 +329,7 @@ while [[ $# -gt 0 ]]; do
     --slurm_setup) slurm_setup="$2"; shift 2 ;;
     --map_mode) map_mode="$2"; shift 2 ;;
     --side) side="$2"; shift 2 ;;
+    --x_threshold|--x-threshold) x_threshold="$2"; shift 2 ;;
     --skip_existing) skip_existing=1; shift ;;
     --force_recompute) skip_existing=0; shift ;;
     --map_cpus) map_cpus="$2"; shift 2 ;;
@@ -295,6 +351,23 @@ while [[ $# -gt 0 ]]; do
     --fps) fps="$2"; shift 2 ;;
     --write_track_pngs) write_track_pngs=1; shift ;;
     --no_track_pngs) write_track_pngs=0; shift ;;
+    --per_track_analysis) run_per_track_analysis=1; shift ;;
+    --no_per_track_analysis) run_per_track_analysis=0; shift ;;
+    --per_track_analysis_cpus) per_track_analysis_cpus="$2"; shift 2 ;;
+    --per_track_analysis_mem) per_track_analysis_mem="$2"; shift 2 ;;
+    --per_track_analysis_time) per_track_analysis_time="$2"; shift 2 ;;
+    --per_track_analysis_submit_cpus) per_track_analysis_submit_cpus="$2"; shift 2 ;;
+    --per_track_analysis_submit_mem) per_track_analysis_submit_mem="$2"; shift 2 ;;
+    --per_track_analysis_submit_time) per_track_analysis_submit_time="$2"; shift 2 ;;
+    --sleep_predictions) run_sleep_predictions=1; shift ;;
+    --no_sleep_predictions) run_sleep_predictions=0; shift ;;
+    --sleep_model) sleep_model="$2"; shift 2 ;;
+    --sleep_skip_existing) sleep_skip_existing=1; shift ;;
+    --sleep_force_recompute) sleep_skip_existing=0; shift ;;
+    --sleep_conda_env) sleep_conda_env="$2"; shift 2 ;;
+    --sleep_prediction_cpus) sleep_prediction_cpus="$2"; shift 2 ;;
+    --sleep_prediction_mem) sleep_prediction_mem="$2"; shift 2 ;;
+    --sleep_prediction_time) sleep_prediction_time="$2"; shift 2 ;;
     --no_interactions) run_interactions=0; shift ;;
     --interaction_cpus) interaction_cpus="$2"; shift 2 ;;
     --interaction_mem) interaction_mem="$2"; shift 2 ;;
@@ -316,6 +389,10 @@ while [[ $# -gt 0 ]]; do
     *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
+
+if [[ -z "$sleep_conda_env" ]]; then
+  sleep_conda_env="$conda_env"
+fi
 
 if [[ ! -d "$blocks_root" ]]; then
   echo "ERROR: blocks root does not exist: $blocks_root" >&2
@@ -393,6 +470,7 @@ for block_dir in "${blocks[@]}"; do
   submit_logs_dir="$logs_dir/submit"
   chunk_logs_dir="$logs_dir/tracking_workers"
   stitch_logs_dir="$logs_dir/stitching"
+  per_track_analysis_logs_dir="$logs_dir/per_track_analysis_submit"
   interaction_logs_dir="$logs_dir/interaction_workers"
   tracking_job_ids_file="$state_dir/tracking_job_ids_${block_name}.txt"
   tracking_complete_script="$script_dir/tracking_complete_${block_name}.sbatch"
@@ -401,6 +479,9 @@ for block_dir in "${blocks[@]}"; do
   stitch_script="$script_dir/stitch_${block_name}.sbatch"
   stitch_done_file="$state_dir/stitch_${block_name}.ok"
   stitch_job_id_file="$state_dir/stitch_job_id_${block_name}.txt"
+  per_track_analysis_submit_script="$script_dir/submit_per_track_analysis_${block_name}.sbatch"
+  per_track_analysis_submit_job_id_file="$state_dir/per_track_analysis_submit_job_id_${block_name}.txt"
+  per_track_analysis_marker_manifest="$state_dir/per_track_analysis_markers_${block_name}.tsv"
   interaction_job_ids_file="$state_dir/interaction_job_ids_${block_name}.txt"
   interaction_complete_job_id_file="$state_dir/interaction_complete_job_id_${block_name}.txt"
   interaction_complete_done_file="$state_dir/interactions_complete_${block_name}.ok"
@@ -414,13 +495,22 @@ for block_dir in "${blocks[@]}"; do
   if [[ "$run_interactions" -eq 1 ]]; then
     interaction_done_file_for_transfer="$interaction_complete_done_file"
   fi
-  mkdir -p "$script_dir" "$submit_logs_dir" "$state_dir"
+  mkdir -p "$script_dir" "$submit_logs_dir" "$per_track_analysis_logs_dir" "$state_dir"
   : > "$transfer_manifest"
+  : > "$per_track_analysis_marker_manifest"
   printf '%s\t%s\n' "$panorama_dir" "$bucket_panorama_dir" >> "$transfer_manifest"
   printf '%s\t%s\n' "$tracks_dir" "$bucket_tracks_dir" >> "$transfer_manifest"
   printf '%s\t%s\n' "$stitched_dir" "$bucket_stitched_dir" >> "$transfer_manifest"
   if [[ "$run_interactions" -eq 1 ]]; then
     printf '%s\t%s\n' "$interaction_dir" "$bucket_interaction_dir" >> "$transfer_manifest"
+  fi
+  if [[ "$run_per_track_analysis" -eq 1 ]]; then
+    printf '%s\t%s\n' "colony_presence" "$stitched_dir/colony_presence_vectors/colony_presence_complete.ok" >> "$per_track_analysis_marker_manifest"
+    printf '%s\t%s\n' "speed_vector" "$stitched_dir/speed_vectors/speed_vector_complete.ok" >> "$per_track_analysis_marker_manifest"
+    printf '%s\t%s\n' "grid_occupancy" "$stitched_dir/grid_occupancy_histograms/grid_occupancy_complete.ok" >> "$per_track_analysis_marker_manifest"
+    if [[ "$run_sleep_predictions" -eq 1 ]]; then
+      printf '%s\t%s\n' "sleep_prediction" "$stitched_dir/sleep_predictions/sleep_prediction_complete.ok" >> "$per_track_analysis_marker_manifest"
+    fi
   fi
 
   map_script="$script_dir/map_${block_name}.sbatch"
@@ -431,6 +521,26 @@ for block_dir in "${blocks[@]}"; do
     skip_existing_arg=" \\
   --skip_existing"
   fi
+  sleep_skip_existing_arg=""
+  case "$sleep_skip_existing" in
+    auto|"")
+      if [[ "$skip_existing" -eq 1 && -z "$sleep_model" ]]; then
+        sleep_skip_existing_arg=" \\
+  --skip_existing"
+      fi
+      ;;
+    1|true|TRUE|yes|YES)
+      sleep_skip_existing_arg=" \\
+  --skip_existing"
+      ;;
+    0|false|FALSE|no|NO)
+      ;;
+    *)
+      echo "ERROR: SLEEP_SKIP_EXISTING must be auto, 1, or 0; got $sleep_skip_existing" >&2
+      exit 2
+      ;;
+  esac
+  sleep_model_q="$(printf '%q' "$sleep_model")"
 
   cat > "$map_script" <<EOF
 #!/usr/bin/env bash
@@ -454,6 +564,7 @@ mkdir -p "${panorama_dir}" "${tracks_dir}" "${logs_dir}"
   --panorama_dir "${panorama_dir}" \\
   --tracks_dir "${tracks_dir}" \\
   --map_mode "${map_mode}" \\
+  --x_threshold "${x_threshold}" \\
   --skip_combine \\
   --skip_stitch${skip_existing_arg}
 EOF
@@ -535,7 +646,7 @@ export PYTHONNOUSERSITE=1
 
 cd "${REPO_ROOT}"
 mkdir -p "${tracks_dir}" "${chunk_logs_dir}"
-rm -f "${tracking_job_ids_file}" "${tracking_complete_done_file}" "${tracking_complete_job_id_file}" "${stitch_done_file}" "${stitch_job_id_file}"
+rm -f "${tracking_job_ids_file}" "${tracking_complete_done_file}" "${tracking_complete_job_id_file}" "${stitch_done_file}" "${stitch_job_id_file}" "${per_track_analysis_submit_job_id_file}"
 "${python_bin}" "${COMBINE_BATCH_PY}" \\
   --input_folder "${panorama_dir}" \\
   --output_path "${tracks_dir}" \\
@@ -578,12 +689,126 @@ echo "Submitted tracking completion marker: \${tracking_complete_job_id}"
 stitch_job_id="\$("${sbatch_bin}" --parsable "\${tracking_dependency_args[@]}" "${stitch_script}")"
 echo "\${stitch_job_id}" > "${stitch_job_id_file}"
 echo "Submitted stitch job: \${stitch_job_id}"
+if [[ "${run_per_track_analysis}" -eq 1 ]]; then
+  per_track_analysis_submit_job_id="\$("${sbatch_bin}" --parsable --dependency=afterok:"\${stitch_job_id}" "${per_track_analysis_submit_script}")"
+  echo "\${per_track_analysis_submit_job_id}" > "${per_track_analysis_submit_job_id_file}"
+  echo "Submitted per-track analysis fan-out submitter: \${per_track_analysis_submit_job_id}"
+fi
 if [[ "${run_interactions}" -eq 1 ]]; then
   interaction_submit_job_id="\$("${sbatch_bin}" --parsable "\${tracking_dependency_args[@]}" "${interaction_submit_script}")"
   echo "Submitted interaction fan-out submitter: \${interaction_submit_job_id}"
 fi
 EOF
   chmod 755 "$track_submit_script"
+
+  cat > "$per_track_analysis_submit_script" <<EOF
+#!/usr/bin/env bash
+#SBATCH -J submit_pta_${block_name}
+#SBATCH -p ${partition}
+#SBATCH -c ${per_track_analysis_submit_cpus}
+#SBATCH --mem=${per_track_analysis_submit_mem}
+#SBATCH -t ${per_track_analysis_submit_time}
+#SBATCH -o ${per_track_analysis_logs_dir}/submit_per_track_analysis_${block_name}_%j.out
+#SBATCH -e ${per_track_analysis_logs_dir}/submit_per_track_analysis_${block_name}_%j.err
+
+set -euo pipefail
+export PYTHONNOUSERSITE=1
+
+cd "${REPO_ROOT}"
+mkdir -p "${per_track_analysis_logs_dir}"
+
+bash "${PER_TRACK_FANOUT_SH}" \\
+  --per_track_dir "${stitched_dir}/per_track" \\
+  --operation_script analysis/compute_track_colony_presence_vector.py \\
+  --operation_name colony_presence \\
+  --output_name colony_presence_vectors \\
+  --run_workdir "${REPO_ROOT}" \\
+  --conda_bin "${conda_bin}" \\
+  --conda_env "${conda_env}" \\
+  --python_bin "${python_bin}" \\
+  --sbatch_bin "${sbatch_bin}" \\
+  --partition "${partition}" \\
+  --cpus "${per_track_analysis_cpus}" \\
+  --mem "${per_track_analysis_mem}" \\
+  --time "${per_track_analysis_time}" \\
+  --no_transfer_to_bucket${skip_existing_arg}
+
+bash "${PER_TRACK_FANOUT_SH}" \\
+  --per_track_dir "${stitched_dir}/per_track" \\
+  --operation_script analysis/compute_track_speed_vector.py \\
+  --operation_name speed_vector \\
+  --output_name speed_vectors \\
+  --run_workdir "${REPO_ROOT}" \\
+  --conda_bin "${conda_bin}" \\
+  --conda_env "${conda_env}" \\
+  --python_bin "${python_bin}" \\
+  --sbatch_bin "${sbatch_bin}" \\
+  --partition "${partition}" \\
+  --cpus "${per_track_analysis_cpus}" \\
+  --mem "${per_track_analysis_mem}" \\
+  --time "${per_track_analysis_time}" \\
+  --no_transfer_to_bucket${skip_existing_arg}
+
+bash "${PER_TRACK_FANOUT_SH}" \\
+  --per_track_dir "${stitched_dir}/per_track" \\
+  --operation_script analysis/compute_track_grid_occupancy.py \\
+  --operation_name grid_occupancy \\
+  --output_name grid_occupancy_histograms \\
+  --run_workdir "${REPO_ROOT}" \\
+  --conda_bin "${conda_bin}" \\
+  --conda_env "${conda_env}" \\
+  --python_bin "${python_bin}" \\
+  --sbatch_bin "${sbatch_bin}" \\
+  --partition "${partition}" \\
+  --cpus "${per_track_analysis_cpus}" \\
+  --mem "${per_track_analysis_mem}" \\
+  --time "${per_track_analysis_time}" \\
+  --no_transfer_to_bucket${skip_existing_arg}
+
+if [[ "${run_sleep_predictions}" -eq 1 ]]; then
+  speed_vector_complete_job_id_file="${stitched_dir}/speed_vectors/jobs/speed_vector_complete_job_id.txt"
+  sleep_dependency_args=()
+  if [[ -s "\${speed_vector_complete_job_id_file}" ]]; then
+    speed_vector_complete_job_id="\$(tr -d '[:space:]' < "\${speed_vector_complete_job_id_file}")"
+    if [[ -n "\${speed_vector_complete_job_id}" ]]; then
+      sleep_dependency_args=(--dependency "afterok:\${speed_vector_complete_job_id}")
+      echo "Sleep prediction dependency: afterok:\${speed_vector_complete_job_id}"
+    fi
+  elif [[ -s "${stitched_dir}/speed_vectors/speed_vector_complete.ok" ]]; then
+    echo "Speed vectors are already complete; submitting sleep predictions without a Slurm dependency."
+  else
+    echo "ERROR: speed vector completion job id file is missing: \${speed_vector_complete_job_id_file}" >&2
+    exit 4
+  fi
+
+  sleep_model=${sleep_model_q}
+  sleep_operation_args=(--speed_root "${stitched_dir}/speed_vectors")
+  if [[ -n "\${sleep_model}" ]]; then
+    sleep_operation_args=(--model "\${sleep_model}" "\${sleep_operation_args[@]}")
+  fi
+  sleep_operation_args_text="\$(printf ' %q' "\${sleep_operation_args[@]}")"
+  sleep_operation_args_text="\${sleep_operation_args_text# }"
+
+  bash "${PER_TRACK_FANOUT_SH}" \\
+    --per_track_dir "${stitched_dir}/per_track" \\
+    --operation_script analysis/compute_track_sleep_predictions.py \\
+    --operation_name sleep_prediction \\
+    --output_name sleep_predictions \\
+    --operation_args "\${sleep_operation_args_text}" \\
+    --run_workdir "${REPO_ROOT}" \\
+    --conda_bin "${conda_bin}" \\
+    --conda_env "${sleep_conda_env}" \\
+    --python_bin "${python_bin}" \\
+    --sbatch_bin "${sbatch_bin}" \\
+    --partition "${partition}" \\
+    --cpus "${sleep_prediction_cpus}" \\
+    --mem "${sleep_prediction_mem}" \\
+    --time "${sleep_prediction_time}" \\
+    "\${sleep_dependency_args[@]}" \\
+    --no_transfer_to_bucket${sleep_skip_existing_arg}
+fi
+EOF
+  chmod 755 "$per_track_analysis_submit_script"
 
   cat > "$interaction_submit_script" <<EOF
 #!/usr/bin/env bash
@@ -634,6 +859,7 @@ set -euo pipefail
 
 stitch_done_file="${stitch_done_file}"
 interaction_done_file="${interaction_done_file_for_transfer}"
+per_track_analysis_marker_manifest="${per_track_analysis_marker_manifest}"
 manifest="${transfer_manifest}"
 transfer_log="${transfer_log}"
 poll_seconds="${transfer_poll_seconds}"
@@ -677,8 +903,15 @@ acquire_lock() {
 log "Transfer watcher start"
 log "stitch_done_file=\${stitch_done_file}"
 log "interaction_done_file=\${interaction_done_file}"
+log "per_track_analysis_marker_manifest=\${per_track_analysis_marker_manifest}"
 log "manifest=\${manifest}"
 log "run_epoch=\${run_epoch}"
+if [[ -s "\${per_track_analysis_marker_manifest}" ]]; then
+  while IFS=\$'\t' read -r label path; do
+    [[ -n "\${label}" && -n "\${path}" ]] || continue
+    log "per_track_analysis_marker \${label}: \${path}"
+  done < "\${per_track_analysis_marker_manifest}"
+fi
 if [[ -s "\${manifest}" ]]; then
   while IFS=\$'\t' read -r src dst; do
     [[ -n "\${src}" && -n "\${dst}" ]] || continue
@@ -708,6 +941,12 @@ wait_for_fresh_file() {
 }
 
 wait_for_fresh_file "\${stitch_done_file}" "stitch"
+if [[ -s "\${per_track_analysis_marker_manifest}" ]]; then
+  while IFS=\$'\t' read -r label path; do
+    [[ -n "\${label}" && -n "\${path}" ]] || continue
+    wait_for_fresh_file "\${path}" "per-track analysis \${label}"
+  done < "\${per_track_analysis_marker_manifest}"
+fi
 wait_for_fresh_file "\${interaction_done_file}" "interaction"
 
 if [[ ! -s "\${manifest}" ]]; then
@@ -739,6 +978,9 @@ EOF
   if [[ "$dry_run" -eq 1 ]]; then
     echo "[dry-run] map script: $map_script"
     echo "[dry-run] tracking submitter script: $track_submit_script"
+    if [[ "$run_per_track_analysis" -eq 1 ]]; then
+      echo "[dry-run] per-track analysis submitter script: $per_track_analysis_submit_script"
+    fi
     if [[ "$run_interactions" -eq 1 ]]; then
       echo "[dry-run] interaction submitter script: $interaction_submit_script"
     fi
@@ -752,9 +994,17 @@ EOF
   map_job_id="$("$sbatch_bin" --parsable "$map_script")"
   track_submit_job_id="$("$sbatch_bin" --parsable --dependency=afterok:"$map_job_id" "$track_submit_script")"
   if [[ "$run_interactions" -eq 1 ]]; then
-    echo "Submitted $block_name: map job $map_job_id, tracking fan-out job $track_submit_job_id; interaction fan-out will be scheduled after tracking workers"
+    if [[ "$run_per_track_analysis" -eq 1 ]]; then
+      echo "Submitted $block_name: map job $map_job_id, tracking fan-out job $track_submit_job_id; per-track analysis will be scheduled after stitch; interaction fan-out will be scheduled after tracking workers"
+    else
+      echo "Submitted $block_name: map job $map_job_id, tracking fan-out job $track_submit_job_id; interaction fan-out will be scheduled after tracking workers"
+    fi
   else
-    echo "Submitted $block_name: map job $map_job_id, tracking fan-out job $track_submit_job_id"
+    if [[ "$run_per_track_analysis" -eq 1 ]]; then
+      echo "Submitted $block_name: map job $map_job_id, tracking fan-out job $track_submit_job_id; per-track analysis will be scheduled after stitch"
+    else
+      echo "Submitted $block_name: map job $map_job_id, tracking fan-out job $track_submit_job_id"
+    fi
   fi
   if [[ "$transfer_to_bucket" -eq 1 ]]; then
     nohup "$transfer_script" >/dev/null 2>&1 &

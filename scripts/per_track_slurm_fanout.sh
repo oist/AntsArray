@@ -30,10 +30,13 @@ CONDA_ENV="aruco_env"
 CONDA_BIN="/bucket/ReiterU/sam/miniforge3/bin/conda"
 WORKER_PYTHON_BIN=""
 BUCKET_DATA_ROOT="/bucket/ReiterU/Ants/basler"
+RUN_USER="${USER:-${LOGNAME:-unknown}}"
+FLASH_PIPELINE_ROOT="/flash/ReiterU/ant_tmp/${RUN_USER}/colony_pipeline"
 
 PARTITION="compute"
 SBATCH_BIN="sbatch"
 PYTHON_BIN="python3"
+SBATCH_DEPENDENCY=""
 CPUS=4
 MEM="16G"
 TIME_LIMIT="0-12:00:00"
@@ -60,6 +63,8 @@ Useful options:
   --flash_output_dir PATH    Flash output root. Default: <per_track_dir>/../<output_name>
   --bucket_output_dir PATH   Bucket destination. Default: ${BUCKET_DATA_ROOT}/<date>/<block>/stitched/<output_name>
   --bucket_data_root PATH    Bucket dataset root. Default: ${BUCKET_DATA_ROOT}
+  --flash_pipeline_root PATH Flash colony_pipeline root used when --per_track_dir is a bucket path.
+                            Default: ${FLASH_PIPELINE_ROOT}
   --jobs_dir PATH            Sbatch/log directory. Default: <flash_output_dir>/jobs
   --worker_setup CMD         Shell setup run inside each worker before CMD.
   --conda_env NAME           Conda env to activate inside each worker. Default: ${CONDA_ENV}
@@ -76,6 +81,7 @@ Useful options:
   --time TIME                Time limit per worker. Default: 0-12:00:00
   --python_bin PATH          Python used to build the worklist. Default: python3
   --sbatch_bin PATH          sbatch executable. Default: sbatch
+  --dependency SPEC          Slurm dependency for worker jobs, e.g. afterok:12345.
   --slurm_setup CMD          Shell setup run before sbatch commands.
   --no_transfer_to_bucket    Do not start the rsync watcher.
   --transfer_poll_seconds N  Poll interval for transfer watcher. Default: 120
@@ -114,6 +120,7 @@ while [[ $# -gt 0 ]]; do
     --no_conda) CONDA_ENV=""; shift ;;
     --worker_python_bin) WORKER_PYTHON_BIN="$2"; shift 2 ;;
     --bucket_data_root) BUCKET_DATA_ROOT="$2"; shift 2 ;;
+    --flash_pipeline_root) FLASH_PIPELINE_ROOT="$2"; shift 2 ;;
     --run_workdir) RUN_WORKDIR="$2"; shift 2 ;;
     --track_glob) TRACK_GLOB="$2"; shift 2 ;;
     --done_marker) DONE_MARKER="$2"; shift 2 ;;
@@ -123,6 +130,7 @@ while [[ $# -gt 0 ]]; do
     --time) TIME_LIMIT="$2"; shift 2 ;;
     --python_bin) PYTHON_BIN="$2"; shift 2 ;;
     --sbatch_bin) SBATCH_BIN="$2"; shift 2 ;;
+    --dependency|--sbatch_dependency) SBATCH_DEPENDENCY="$2"; shift 2 ;;
     --slurm_setup) SLURM_SETUP="$2"; shift 2 ;;
     --transfer_poll_seconds) POLL_SECONDS="$2"; shift 2 ;;
     --skip_existing) SKIP_EXISTING=1; shift ;;
@@ -168,6 +176,10 @@ if [[ -n "$OPERATION_SCRIPT" ]]; then
       default_operation_name="grid_occupancy"
       default_output_name="grid_occupancy_histograms"
       ;;
+    compute_track_sleep_predictions)
+      default_operation_name="sleep_prediction"
+      default_output_name="sleep_predictions"
+      ;;
     *)
       default_operation_name="$operation_script_stem"
       default_output_name="$operation_script_stem"
@@ -188,18 +200,34 @@ if [[ -z "$OPERATION_CMD" ]]; then
     OPERATION_CMD+=" ${OPERATION_ARGS}"
   fi
 fi
+dataset_date=""
+block_name=""
+inferred_bucket_data_root="$BUCKET_DATA_ROOT"
+per_track_layout=""
+if [[ "$PER_TRACK_DIR" =~ /colony_pipeline/([^/]+)/(block[^/]+)/stitched/per_track/?$ ]]; then
+  dataset_date="${BASH_REMATCH[1]}"
+  block_name="${BASH_REMATCH[2]}"
+  per_track_layout="flash"
+elif [[ "$PER_TRACK_DIR" =~ ^(.*/Ants/basler)/([^/]+)/(block[^/]+)/stitched/per_track/?$ ]]; then
+  inferred_bucket_data_root="${BASH_REMATCH[1]}"
+  dataset_date="${BASH_REMATCH[2]}"
+  block_name="${BASH_REMATCH[3]}"
+  per_track_layout="bucket"
+fi
 if [[ -z "$FLASH_OUTPUT_DIR" ]]; then
-  stitched_dir="$(dirname "$PER_TRACK_DIR")"
-  FLASH_OUTPUT_DIR="${stitched_dir}/${OUTPUT_NAME}"
+  if [[ "$per_track_layout" == "bucket" ]]; then
+    FLASH_OUTPUT_DIR="${FLASH_PIPELINE_ROOT}/${dataset_date}/${block_name}/stitched/${OUTPUT_NAME}"
+  else
+    stitched_dir="$(dirname "$PER_TRACK_DIR")"
+    FLASH_OUTPUT_DIR="${stitched_dir}/${OUTPUT_NAME}"
+  fi
 fi
 if [[ -z "$BUCKET_OUTPUT_DIR" ]]; then
-  if [[ "$PER_TRACK_DIR" =~ /colony_pipeline/([^/]+)/(block[^/]+)/stitched/per_track/?$ ]]; then
-    dataset_date="${BASH_REMATCH[1]}"
-    block_name="${BASH_REMATCH[2]}"
-    BUCKET_OUTPUT_DIR="${BUCKET_DATA_ROOT}/${dataset_date}/${block_name}/stitched/${OUTPUT_NAME}"
+  if [[ -n "$dataset_date" && -n "$block_name" ]]; then
+    BUCKET_OUTPUT_DIR="${inferred_bucket_data_root}/${dataset_date}/${block_name}/stitched/${OUTPUT_NAME}"
   else
     echo "ERROR: could not infer bucket output from --per_track_dir: $PER_TRACK_DIR" >&2
-    echo "       Expected .../colony_pipeline/<date>/<block>/stitched/per_track; pass --bucket_output_dir to override." >&2
+    echo "       Expected .../colony_pipeline/<date>/<block>/stitched/per_track or .../Ants/basler/<date>/<block>/stitched/per_track; pass --bucket_output_dir to override." >&2
     exit 2
   fi
 fi
@@ -213,14 +241,14 @@ AUTO_WORKER_SETUP=""
 if [[ -n "$CONDA_ENV" ]]; then
   conda_bin_q="$(printf '%q' "$CONDA_BIN")"
   conda_env_q="$(printf '%q' "$CONDA_ENV")"
-  AUTO_WORKER_SETUP="conda_bin=${conda_bin_q}; conda_base=\$(dirname \"\$(dirname \"\${conda_bin}\")\"); if [[ -f \"\${conda_base}/etc/profile.d/conda.sh\" ]]; then source \"\${conda_base}/etc/profile.d/conda.sh\"; else eval \"\$(\"\${conda_bin}\" shell.bash hook)\"; fi; conda activate ${conda_env_q}"
+  AUTO_WORKER_SETUP="conda_bin=${conda_bin_q}; conda_base=\$(dirname \"\$(dirname \"\${conda_bin}\")\"); if [[ -f \"\${conda_base}/etc/profile.d/conda.sh\" ]]; then source \"\${conda_base}/etc/profile.d/conda.sh\"; else eval \"\$(\"\${conda_bin}\" shell.bash hook)\"; fi; conda activate ${conda_env_q}; export PATH=\"\${CONDA_PREFIX}/bin:\${PATH}\"; hash -r"
 fi
 if [[ -n "$WORKER_PYTHON_BIN" ]]; then
   worker_python_bin_q="$(printf '%q' "$WORKER_PYTHON_BIN")"
   if [[ -n "$AUTO_WORKER_SETUP" ]]; then
     AUTO_WORKER_SETUP+="; "
   fi
-  AUTO_WORKER_SETUP+="worker_python_bin=${worker_python_bin_q}; export PATH=\"\$(dirname \"\${worker_python_bin}\"):\${PATH}\""
+  AUTO_WORKER_SETUP+="worker_python_bin=${worker_python_bin_q}; export PATH=\"\$(dirname \"\${worker_python_bin}\"):\${PATH}\"; hash -r"
 fi
 if [[ -n "$AUTO_WORKER_SETUP" && -n "$WORKER_SETUP" ]]; then
   WORKER_SETUP="${AUTO_WORKER_SETUP}; ${WORKER_SETUP}"
@@ -320,6 +348,10 @@ submit_sbatch() {
 }
 
 worker_job_ids=()
+worker_dependency_args=()
+if [[ -n "$SBATCH_DEPENDENCY" ]]; then
+  worker_dependency_args=(--dependency="$SBATCH_DEPENDENCY")
+fi
 while IFS=$'\t' read -r task_index track_path track_name track_stem track_id task_output_dir; do
   worker="$WORKER_DIR/${safe_name}_task${task_index}.sbatch"
   task_index_q="$(printf '%q' "$task_index")"
@@ -388,7 +420,7 @@ WORKER
     echo "[dry-run] worker script: $worker"
     continue
   fi
-  job_id="$(submit_sbatch "$SBATCH_BIN" --parsable "$worker")"
+  job_id="$(submit_sbatch "$SBATCH_BIN" --parsable "${worker_dependency_args[@]}" "$worker")"
   worker_job_ids+=( "$job_id" )
   printf '%s\t%s\t%s\t%s\n' "$task_index" "$job_id" "$track_path" "$task_output_dir" >> "$JOB_IDS_FILE"
   echo "Submitted ${safe_name} task ${task_index}: job ${job_id}"
