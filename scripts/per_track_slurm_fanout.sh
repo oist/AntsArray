@@ -12,6 +12,7 @@
 #     --operation_script analysis/compute_track_colony_presence_vector.py
 
 set -euo pipefail
+umask 0002  # group-writable outputs (664/775); setgid parents keep group=reiteruni
 
 PER_TRACK_DIR=""
 FLASH_OUTPUT_DIR=""
@@ -377,6 +378,7 @@ while IFS=$'\t' read -r task_index track_path track_name track_stem track_id tas
 #SBATCH -e ${LOGS_DIR}/${safe_name}_task${task_index}_%j.err
 
 set -euo pipefail
+umask 0002  # group-writable outputs (664/775); setgid parents keep group=reiteruni
 export PYTHONNOUSERSITE=1
 
 TRACK_INDEX=${task_index_q}
@@ -439,6 +441,7 @@ cat > "$FINAL_SCRIPT" <<MARKER
 #SBATCH -e ${LOGS_DIR}/${safe_name}_complete_%j.err
 
 set -euo pipefail
+umask 0002  # group-writable outputs (664/775); setgid parents keep group=reiteruni
 printf 'completed %s\n' "\$(date '+%Y-%m-%d %H:%M:%S')" > "${DONE_FILE}"
 MARKER
 chmod 755 "$FINAL_SCRIPT"
@@ -446,6 +449,7 @@ chmod 755 "$FINAL_SCRIPT"
 cat > "$TRANSFER_SCRIPT" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
+umask 0002  # group-writable outputs (664/775); setgid parents keep group=reiteruni
 
 done_file="${DONE_FILE}"
 src_dir="${FLASH_OUTPUT_DIR}"

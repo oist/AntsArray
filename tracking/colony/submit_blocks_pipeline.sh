@@ -16,6 +16,7 @@
 #   bash tracking/colony/submit_blocks_pipeline.sh
 
 set -euo pipefail
+umask 0002  # group-writable outputs (664/775); setgid parents keep group=reiteruni
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -588,6 +589,7 @@ for block_dir in "${blocks[@]}"; do
 #SBATCH -e ${submit_logs_dir}/map_${block_name}_%j.err
 
 set -euo pipefail
+umask 0002  # group-writable outputs (664/775); setgid parents keep group=reiteruni
 export PYTHONNOUSERSITE=1
 
 cd "${REPO_ROOT}"
@@ -630,6 +632,7 @@ EOF
 #SBATCH -e ${submit_logs_dir}/tracking_complete_${block_name}_%j.err
 
 set -euo pipefail
+umask 0002  # group-writable outputs (664/775); setgid parents keep group=reiteruni
 printf 'completed %s\n' "\$(date '+%Y-%m-%d %H:%M:%S')" > "${tracking_complete_done_file}"
 EOF
   chmod 755 "$tracking_complete_script"
@@ -645,6 +648,7 @@ EOF
 #SBATCH -e ${submit_logs_dir}/stitch_${block_name}_%j.err
 
 set -euo pipefail
+umask 0002  # group-writable outputs (664/775); setgid parents keep group=reiteruni
 export PYTHONNOUSERSITE=1
 
 cd "${REPO_ROOT}"
@@ -676,6 +680,7 @@ EOF
 #SBATCH -e ${submit_logs_dir}/submit_tracking_${block_name}_%j.err
 
 set -euo pipefail
+umask 0002  # group-writable outputs (664/775); setgid parents keep group=reiteruni
 export PYTHONNOUSERSITE=1
 
 cd "${REPO_ROOT}"
@@ -746,6 +751,7 @@ EOF
 #SBATCH -e ${per_track_analysis_logs_dir}/submit_per_track_analysis_${block_name}_%j.err
 
 set -euo pipefail
+umask 0002  # group-writable outputs (664/775); setgid parents keep group=reiteruni
 export PYTHONNOUSERSITE=1
 
 cd "${REPO_ROOT}"
@@ -855,6 +861,7 @@ EOF
 #SBATCH -e ${submit_logs_dir}/submit_interactions_${block_name}_%j.err
 
 set -euo pipefail
+umask 0002  # group-writable outputs (664/775); setgid parents keep group=reiteruni
 export PYTHONNOUSERSITE=1
 
 cd "${REPO_ROOT}"
@@ -890,6 +897,7 @@ EOF
   cat > "$transfer_script" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
+umask 0002  # group-writable outputs (664/775); setgid parents keep group=reiteruni
 
 stitch_done_file="${stitch_done_file}"
 interaction_done_file="${interaction_done_file_for_transfer}"

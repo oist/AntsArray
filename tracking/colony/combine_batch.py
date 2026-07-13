@@ -169,6 +169,7 @@ def submit_slurm(
                     f"#SBATCH -e {logs_dir}/{job_name}_{job.side}_{job.key}_%j.err",
                     "",
                     "set -euo pipefail",
+                    "umask 0002",  # group-writable outputs; setgid parents keep group
                     "export PYTHONNOUSERSITE=1",
                     "",
                     'echo "Running on host: $(hostname)"',

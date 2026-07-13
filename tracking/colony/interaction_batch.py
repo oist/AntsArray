@@ -162,6 +162,7 @@ def write_worker_script(
                 f"#SBATCH -e {logs_dir}/{safe_chunk}_%j.err",
                 "",
                 "set -euo pipefail",
+                "umask 0002",  # group-writable outputs; setgid parents keep group
                 "export PYTHONNOUSERSITE=1",
                 "",
                 'echo "Running on host: $(hostname)"',
@@ -219,6 +220,7 @@ def submit_completion_job(
                 f"#SBATCH -e {logs_dir}/{safe_label(name)}_complete_%j.err",
                 "",
                 "set -euo pipefail",
+                "umask 0002",  # group-writable outputs; setgid parents keep group
                 f'mkdir -p "{done_file.parent}"',
                 f'printf "completed %s\\n" "$(date "+%Y-%m-%d %H:%M:%S")" > "{done_file}"',
                 "",
@@ -257,6 +259,7 @@ def submit_transfer_job(
                 f"#SBATCH -e {logs_dir}/{safe_label(job_name)}_transfer_%j.err",
                 "",
                 "set -euo pipefail",
+                "umask 0002",  # group-writable outputs; setgid parents keep group
                 f'mkdir -p "{bucket_output_path}"',
                 f'echo "rsync {output_path}/ -> {bucket_output_path}/"',
                 f'rsync -a --partial --protect-args "{output_path}/" "{bucket_output_path}/"',
