@@ -557,6 +557,10 @@ for block_dir in "${blocks[@]}"; do
     skip_existing_arg=" \\
   --skip_existing"
   fi
+  x_threshold_arg=""
+  if [[ -n "$x_threshold" ]]; then
+    x_threshold_arg=" --x_threshold ${x_threshold}"
+  fi
   sleep_skip_existing_arg=""
   case "$sleep_skip_existing" in
     auto|"")
