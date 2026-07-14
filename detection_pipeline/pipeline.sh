@@ -332,6 +332,20 @@ case "$CHUNK_EXT" in
 	*) echo "[ERR] --chunk-ext must be mkv|mp4|avi" >&2; exit 2 ;;
 esac
 
+# Auto-select the SLEAP inference path from the model dir contents: sleap-nn
+# checkpoints (best.ckpt) can be TRT/ONNX-exported; legacy TF models
+# (best_model.h5 only, no best.ckpt) cannot, so fall back to 'sleap-nn track'
+# automatically. Skips if the user already forced --skip-trt-export or pytorch.
+if (( SKIP_TRT_EXPORT == 0 )) && [[ "$SLEAP_RUNTIME" != "pytorch" ]]; then
+	_legacy_model=0
+	[[ -n "$SLEAP_MODEL_CENTROID" && -d "$SLEAP_MODEL_CENTROID" && ! -f "$SLEAP_MODEL_CENTROID/best.ckpt" ]] && _legacy_model=1
+	[[ -n "$SLEAP_MODEL_INSTANCE"  && -d "$SLEAP_MODEL_INSTANCE"  && ! -f "$SLEAP_MODEL_INSTANCE/best.ckpt"  ]] && _legacy_model=1
+	if (( _legacy_model == 1 )); then
+		echo "[INFO] SLEAP model dir has no best.ckpt (legacy TF model); auto-enabling --skip-trt-export ('sleap-nn track' fallback)" >&2
+		SKIP_TRT_EXPORT=1
+	fi
+fi
+
 # Roots
 JOBS_ROOT="${JOBS_ROOT:-/flash/ReiterU/$USER/jobs/$EXP_NAME}"
 FLASH_ROOT="${FLASH_ROOT:-/flash/ReiterU/$USER/$EXP_NAME}"
