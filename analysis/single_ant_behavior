@@ -8,6 +8,13 @@ from tqdm import tqdm
 import sys
 
 
+def _enable_qt_matplotlib() -> None:
+    try:
+        get_ipython().run_line_magic("matplotlib", "qt")  # type: ignore[name-defined]
+    except Exception:
+        pass
+
+
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 from analysis.sleep_analysis_utils import classify_sleep_wake_from_sleap
 
@@ -255,13 +262,13 @@ id_df.to_csv(out_dir / "track_ids_index.csv", index=False)
 
 
 #%%
-%matplotlib qt
+_enable_qt_matplotlib()
 import matplotlib.pyplot as plt
 speed_tensor = np.load(out_dir / "speed_tensor.npy")
 sleep_tensor = np.load(out_dir / "sleep_tensor.npy")
 
 #%%
-%matplotlib qt
+_enable_qt_matplotlib()
 import matplotlib.pyplot as plt
 def nan_zscore(x, axis=None, eps=1e-12):
     """

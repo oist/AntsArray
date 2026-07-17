@@ -33,7 +33,7 @@ importlib.reload(cs)
 # %%
 # Edit these settings first.
 SPEED_ROOT = Path(
-    "/home/sam-reiter/bucket/ReiterU/Ants/basler/20260702/block01/stitched/speed_vectors"
+    "/home/sam-reiter/bucket/ReiterU/Ants/basler/20260713/block01/stitched/speed_vectors"
 )
 PRESENCE_ROOT = cs.infer_presence_root(SPEED_ROOT)
 SLEEP_ROOT = cs.infer_sleep_prediction_root(SPEED_ROOT)
@@ -47,7 +47,7 @@ IMAGE_SMOOTH_SECONDS = 0
 
 PRE_PULSE_SECONDS = 120.0
 POST_PULSE_SECONDS = 800.0
-PULSE_RESPONSE_SIDE = "both"  # "left", "right", or "both"
+PULSE_RESPONSE_SIDE = "left"  # "left", "right", or "both"
 PULSE_RESPONSE_SMOOTH_SECONDS = 0.0
 PULSE_RESPONSE_YLIM = None
 PULSE_RESPONSE_VMIN = 0.0
@@ -57,6 +57,25 @@ PULSE_RESPONSE_CMAP = "viridis"
 PULSE_RESPONSE_SORT_BY_STIMULUS_STRENGTH = True
 PULSE_RESPONSE_STIMULUS_STRENGTH_COL = "auto"  # "auto" prefers duty, duty_pct, then sensor magnitudes.
 PULSE_RESPONSE_STIMULUS_SORT_ASCENDING = True
+
+SLEEP_PERCENT_SIDE = "left"  # "left", "right", or "both"
+SLEEP_PERCENT_BIN_SECONDS = 20.0
+SLEEP_PERCENT_SMOOTH_SECONDS = 5.0
+SLEEP_PERCENT_SLEEP_THRESHOLD = 0.5
+SLEEP_PERCENT_YLIM = (0.0, 100.0)
+
+PULSE_SLEEP_PERCENT_SIDE = PULSE_RESPONSE_SIDE
+PULSE_SLEEP_PERCENT_BIN_SECONDS = SLEEP_PERCENT_BIN_SECONDS
+PULSE_SLEEP_PERCENT_SMOOTH_SECONDS = SLEEP_PERCENT_SMOOTH_SECONDS
+PULSE_SLEEP_PERCENT_SLEEP_THRESHOLD = SLEEP_PERCENT_SLEEP_THRESHOLD
+PULSE_SLEEP_PERCENT_YLIM = (0.0, 100.0)
+PULSE_SLEEP_PERCENT_VMIN = 0.0
+PULSE_SLEEP_PERCENT_VMAX = 100.0
+PULSE_SLEEP_PERCENT_VMAX_PERCENTILE = None
+PULSE_SLEEP_PERCENT_CMAP = "magma"
+PULSE_SLEEP_PERCENT_SORT_BY_STIMULUS_STRENGTH = PULSE_RESPONSE_SORT_BY_STIMULUS_STRENGTH
+PULSE_SLEEP_PERCENT_STIMULUS_STRENGTH_COL = PULSE_RESPONSE_STIMULUS_STRENGTH_COL
+PULSE_SLEEP_PERCENT_STIMULUS_SORT_ASCENDING = PULSE_RESPONSE_STIMULUS_SORT_ASCENDING
 
 SLEEP_SPLIT_PULSE_RESPONSE_SIDE = PULSE_RESPONSE_SIDE
 SLEEP_SPLIT_PULSE_RESPONSE_SMOOTH_SECONDS = PULSE_RESPONSE_SMOOTH_SECONDS
@@ -69,7 +88,7 @@ SLEEP_SPLIT_PULSE_RESPONSE_SORT_BY_STIMULUS_STRENGTH = PULSE_RESPONSE_SORT_BY_ST
 SLEEP_SPLIT_PULSE_RESPONSE_STIMULUS_STRENGTH_COL = PULSE_RESPONSE_STIMULUS_STRENGTH_COL
 SLEEP_SPLIT_PULSE_RESPONSE_STIMULUS_SORT_ASCENDING = PULSE_RESPONSE_STIMULUS_SORT_ASCENDING
 
-LIGHT_OFF_HOUR = 18.0
+LIGHT_OFF_HOUR = 19.5
 LIGHT_ON_HOUR = 5.5
 
 # %%
@@ -118,6 +137,22 @@ display(smoothed_colony_speed_timeseries.head())
 
 
 # %%
+# Plot percent of selected ants predicted sleeping over time.
+sleep_percent_timeseries = cs.plot_sleep_percent_timeseries(
+    tracks,
+    bin_seconds=SLEEP_PERCENT_BIN_SECONDS,
+    smooth_seconds=SLEEP_PERCENT_SMOOTH_SECONDS,
+    side=SLEEP_PERCENT_SIDE,
+    sleep_threshold=SLEEP_PERCENT_SLEEP_THRESHOLD,
+    start_clock_seconds=experiment_start_clock_seconds,
+    light_off_hour=LIGHT_OFF_HOUR,
+    light_on_hour=LIGHT_ON_HOUR,
+    ylim=SLEEP_PERCENT_YLIM,
+)
+display(sleep_percent_timeseries.head())
+
+
+# %%
 # Pulse-triggered colony speed around the last recording's CSV_PULSE camFrameStart values.
 csv_pulses = cs.load_last_session_csv_pulses(CONDUCTOR_PATH)
 display(csv_pulses.head())
@@ -159,12 +194,55 @@ display(
 
 
 # %%
+# Pulse-triggered percent of ants predicted sleeping around CSV_PULSE camFrameStart values.
+pulse_sleep_percent_response = cs.plot_pulse_triggered_sleep_percent(
+    tracks,
+    csv_pulses,
+    pre_seconds=1000,
+    post_seconds=5000,
+    side=PULSE_SLEEP_PERCENT_SIDE,
+    frame_col="camFrameStart",
+    bin_seconds=PULSE_SLEEP_PERCENT_BIN_SECONDS,
+    smooth_seconds=PULSE_SLEEP_PERCENT_SMOOTH_SECONDS,
+    sleep_threshold=PULSE_SLEEP_PERCENT_SLEEP_THRESHOLD,
+    vmin=PULSE_SLEEP_PERCENT_VMIN,
+    vmax=PULSE_SLEEP_PERCENT_VMAX,
+    vmax_percentile=PULSE_SLEEP_PERCENT_VMAX_PERCENTILE,
+    cmap=PULSE_SLEEP_PERCENT_CMAP,
+    ylim=PULSE_SLEEP_PERCENT_YLIM,
+    sort_by_stimulus_strength=PULSE_SLEEP_PERCENT_SORT_BY_STIMULUS_STRENGTH,
+    stimulus_strength_col=PULSE_SLEEP_PERCENT_STIMULUS_STRENGTH_COL,
+    stimulus_sort_ascending=PULSE_SLEEP_PERCENT_STIMULUS_SORT_ASCENDING,
+)
+display(pulse_sleep_percent_response["average"].head())
+display(
+    pulse_sleep_percent_response["pulse_table"][
+        [col for col in [
+            "response_row",
+            "trial",
+            "stimulus_strength",
+            "stimulus_strength_col",
+            "duty",
+            "dur_s",
+            "camFrameStart",
+            "camFrameEnd",
+            "valid_fraction",
+            "mean_percent_sleeping_ants",
+            "n_sleeping_tracks_at_pulse",
+            "n_classified_sleep_tracks_at_pulse",
+            "n_unknown_sleep_tracks_at_pulse",
+        ] if col in pulse_sleep_percent_response["pulse_table"].columns]
+    ]
+)
+
+
+# %%
 # Pulse-triggered speed split by sleep state at each CSV_PULSE camFrameStart.
 sleep_split_pulse_speed_response = cs.plot_sleep_split_pulse_triggered_colony_speed(
     tracks,
     csv_pulses,
     pre_seconds=PRE_PULSE_SECONDS,
-    post_seconds=POST_PULSE_SECONDS,
+    post_seconds=4800,
     side=SLEEP_SPLIT_PULSE_RESPONSE_SIDE,
     frame_col="camFrameStart",
     smooth_seconds=SLEEP_SPLIT_PULSE_RESPONSE_SMOOTH_SECONDS,

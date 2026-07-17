@@ -390,6 +390,226 @@ def plot_colony_speed(
     return plot_df
 
 
+def _sleep_prediction_frame_min(row: pd.Series) -> int:
+    value = row.get("sleep_frame_min", np.nan)
+    if pd.notna(value):
+        return int(value)
+    return int(row.get("frame_min", 0))
+
+
+def _existing_sleep_prediction_tracks(tracks: pd.DataFrame, side: str | None) -> pd.DataFrame:
+    required_cols = {"predicted_sleep_path"}
+    missing_cols = required_cols.difference(tracks.columns)
+    if missing_cols:
+        raise ValueError(
+            "Tracks are missing sleep prediction columns "
+            f"{sorted(missing_cols)}; call attach_sleep_predictions_to_tracks first."
+        )
+
+    chosen = tracks if side in (None, "both") else tracks[tracks["side"] == side]
+    if "has_sleep_predictions" in chosen.columns:
+        chosen = chosen[chosen["has_sleep_predictions"].astype(bool)]
+    else:
+        chosen = chosen[
+            chosen["predicted_sleep_path"].map(lambda path: Path(path).exists() if pd.notna(path) else False)
+        ]
+    if chosen.empty:
+        raise ValueError(f"No sleep prediction vectors found for side={side!r}")
+    return chosen.copy()
+
+
+def compute_sleep_percent_timeseries(
+    tracks: pd.DataFrame,
+    *,
+    bin_seconds: float = 60.0,
+    side: str | None = "both",
+    sleep_threshold: float = 0.5,
+    start_clock_seconds: int | None = None,
+    chunk_frames: int = 2_000_000,
+) -> pd.DataFrame:
+    """Bin predicted sleep vectors into percent of classified ants sleeping over time."""
+    chosen = _existing_sleep_prediction_tracks(tracks, side)
+
+    fps_values = chosen["fps"].dropna().unique()
+    if len(fps_values) == 0:
+        raise ValueError("No finite fps values available in selected tracks")
+    fps = float(fps_values[0])
+    if len(fps_values) > 1:
+        print(f"WARNING: multiple FPS values for sleep predictions: {fps_values}; using {fps}")
+
+    bin_frames = max(1, int(round(fps * float(bin_seconds))))
+    sleep_rows = []
+    max_stop_frame = 0
+    for row_idx, row in chosen.iterrows():
+        sleep_path = Path(row["predicted_sleep_path"])
+        if not sleep_path.exists():
+            continue
+        state = np.load(sleep_path, mmap_mode="r")
+        frame_min = _sleep_prediction_frame_min(row)
+        n_frames = int(len(state))
+        max_stop_frame = max(max_stop_frame, frame_min + n_frames)
+        sleep_rows.append((row_idx, row, sleep_path, frame_min, n_frames))
+
+    if not sleep_rows:
+        raise ValueError(f"No readable sleep prediction vectors found for side={side!r}")
+
+    n_bins = int(np.ceil(max_stop_frame / bin_frames))
+    n_sleeping_tracks = np.zeros(n_bins, dtype=np.uint16)
+    n_classified_tracks = np.zeros(n_bins, dtype=np.uint16)
+    n_sleep_frames = np.zeros(n_bins, dtype=np.uint64)
+    n_predicted_frames = np.zeros(n_bins, dtype=np.uint64)
+    chunk_frames = max(1, int(chunk_frames))
+
+    for i, (_, row, sleep_path, frame_min, n_frames) in enumerate(sleep_rows, start=1):
+        if i == 1 or i == len(sleep_rows) or i % 10 == 0:
+            print(f"sleep percent: loading {i}/{len(sleep_rows)} {row['track_name']}")
+
+        state = np.load(sleep_path, mmap_mode="r")
+        track_sleep_frames = np.zeros(n_bins, dtype=np.uint32)
+        track_predicted_frames = np.zeros(n_bins, dtype=np.uint32)
+        for start in range(0, n_frames, chunk_frames):
+            stop = min(start + chunk_frames, n_frames)
+            values = np.asarray(state[start:stop])
+            valid = values >= 0
+            if not valid.any():
+                continue
+
+            local_idx = np.flatnonzero(valid)
+            bin_idx = (frame_min + start + local_idx) // bin_frames
+            valid_values = values[local_idx]
+            track_predicted_frames += np.bincount(bin_idx, minlength=n_bins).astype(np.uint32, copy=False)
+            track_sleep_frames += np.bincount(
+                bin_idx[valid_values == 1],
+                minlength=n_bins,
+            ).astype(np.uint32, copy=False)
+
+        classified = track_predicted_frames > 0
+        if not classified.any():
+            continue
+        sleep_fraction = np.zeros(n_bins, dtype=np.float32)
+        sleep_fraction[classified] = track_sleep_frames[classified] / track_predicted_frames[classified]
+
+        n_classified_tracks[classified] += 1
+        n_sleeping_tracks[classified & (sleep_fraction >= float(sleep_threshold))] += 1
+        n_sleep_frames += track_sleep_frames.astype(np.uint64, copy=False)
+        n_predicted_frames += track_predicted_frames.astype(np.uint64, copy=False)
+
+    percent_sleeping = np.full(n_bins, np.nan, dtype=np.float32)
+    classified = n_classified_tracks > 0
+    percent_sleeping[classified] = 100.0 * n_sleeping_tracks[classified] / n_classified_tracks[classified]
+
+    sleep_frame_percent = np.full(n_bins, np.nan, dtype=np.float32)
+    predicted = n_predicted_frames > 0
+    sleep_frame_percent[predicted] = 100.0 * n_sleep_frames[predicted] / n_predicted_frames[predicted]
+
+    out = pd.DataFrame(
+        {
+            "time_h": np.arange(n_bins) * bin_frames / fps / 3600.0,
+            "percent_sleeping_ants": percent_sleeping,
+            "n_sleeping_tracks": n_sleeping_tracks,
+            "n_classified_sleep_tracks": n_classified_tracks,
+            "n_unclassified_sleep_tracks": len(sleep_rows) - n_classified_tracks,
+            "sleep_frame_percent": sleep_frame_percent,
+            "n_sleep_frames": n_sleep_frames,
+            "n_predicted_sleep_frames": n_predicted_frames,
+            "n_sleep_prediction_tracks": len(sleep_rows),
+        }
+    )
+    if start_clock_seconds is not None:
+        out = add_clock_columns(out, start_clock_seconds)
+    return out
+
+
+def smooth_sleep_percent_timeseries(
+    timeseries: pd.DataFrame,
+    smooth_seconds: float,
+    bin_seconds: float,
+) -> pd.DataFrame:
+    out = timeseries.copy()
+    window_bins = max(1, int(round(float(smooth_seconds) / float(bin_seconds))))
+    out["smoothed_percent_sleeping_ants"] = rolling_nanmean(
+        out["percent_sleeping_ants"].to_numpy(dtype=np.float32),
+        window_bins,
+    )
+    out["smoothed_sleep_frame_percent"] = rolling_nanmean(
+        out["sleep_frame_percent"].to_numpy(dtype=np.float32),
+        window_bins,
+    )
+    return out
+
+
+def plot_sleep_percent_timeseries(
+    tracks: pd.DataFrame,
+    *,
+    bin_seconds: float = 60.0,
+    smooth_seconds: float = 10 * 60.0,
+    side: str | None = "both",
+    sleep_threshold: float = 0.5,
+    start_clock_seconds: int | None = None,
+    light_off_hour: float = 18.0,
+    light_on_hour: float = 6.0,
+    ylim: tuple[float, float] | None = (0.0, 100.0),
+    chunk_frames: int = 2_000_000,
+) -> pd.DataFrame:
+    timeseries = compute_sleep_percent_timeseries(
+        tracks,
+        bin_seconds=bin_seconds,
+        side=side,
+        sleep_threshold=sleep_threshold,
+        start_clock_seconds=start_clock_seconds,
+        chunk_frames=chunk_frames,
+    )
+    plot_df = smooth_sleep_percent_timeseries(timeseries, smooth_seconds, bin_seconds)
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+    x = plot_df["time_h"].to_numpy(float)
+    y = plot_df["smoothed_percent_sleeping_ants"].to_numpy(float)
+    ax.plot(x, y, color="tab:purple", lw=1.8, label="sleeping ants")
+    ax.fill_between(x, 0.0, np.nan_to_num(y, nan=0.0), color="tab:purple", alpha=0.16)
+    ax.set_ylabel("Sleeping ants (%)")
+    if ylim is not None:
+        ax.set_ylim(*ylim)
+    else:
+        ax.set_ylim(bottom=0.0)
+
+    count_ax = ax.twinx()
+    count_ax.plot(
+        plot_df["time_h"],
+        plot_df["n_classified_sleep_tracks"],
+        color="0.45",
+        lw=1.0,
+        alpha=0.55,
+        label="classified ants",
+    )
+    count_ax.set_ylabel("Classified ants")
+    count_ax.set_ylim(bottom=0.0)
+
+    if start_clock_seconds is not None:
+        add_light_lines(
+            ax,
+            start_clock_seconds,
+            float(plot_df["time_h"].max()),
+            light_off_hour=light_off_hour,
+            light_on_hour=light_on_hour,
+        )
+        ax.set_xlabel(f"Elapsed time from {format_clock_time(start_clock_seconds)} (h)")
+    else:
+        ax.set_xlabel("Elapsed time (h)")
+
+    side_label = "all ants" if side in (None, "both") else f"{side} ants"
+    ax.set_title(
+        f"Predicted sleep over time, {side_label}, "
+        f"{smooth_seconds / 60:g} min smoothing"
+    )
+    lines, labels = ax.get_legend_handles_labels()
+    count_lines, count_labels = count_ax.get_legend_handles_labels()
+    ax.legend(lines + count_lines, labels + count_labels, loc="best")
+    ax.grid(True, alpha=0.25)
+    fig.tight_layout()
+    plt.show()
+    return plot_df
+
+
 def choose_tracks(
     tracks: pd.DataFrame,
     side: str | None = "left",
@@ -695,12 +915,12 @@ def infer_conductor_path(path: Path) -> Path:
     """Find the conductor log for a block from a block, stitched, or speed root."""
     root = Path(path)
     if root.is_file():
-        if root.name.startswith("conductor_") and root.suffix == ".txt":
+        if root.name.startswith("sess_") and root.suffix == ".txt":
             return root
         root = root.parent
 
     for base in [root, *root.parents]:
-        matches = sorted(base.glob("conductor_*.txt"))
+        matches = sorted(base.glob("sess_*.txt"))
         if matches:
             return matches[-1]
 
@@ -1071,6 +1291,201 @@ def build_pulse_triggered_colony_speed(
     }
 
 
+def _average_sleep_percent_pulse_response(
+    response: np.ndarray,
+    classified_count: np.ndarray,
+    relative_time_s: np.ndarray,
+) -> pd.DataFrame:
+    finite = np.isfinite(response)
+    n_pulses_per_frame = finite.sum(axis=0)
+    mean_percent = np.full(response.shape[1], np.nan, dtype=np.float32)
+    std_percent = np.full(response.shape[1], np.nan, dtype=np.float32)
+    keep = n_pulses_per_frame > 0
+    if keep.any():
+        response_sum = np.where(finite, response, 0.0).sum(axis=0, dtype=np.float64)
+        mean_percent[keep] = (response_sum[keep] / n_pulses_per_frame[keep]).astype(np.float32)
+        centered = np.where(finite, response - mean_percent, 0.0)
+        variance = (centered * centered).sum(axis=0, dtype=np.float64)
+        std_percent[keep] = np.sqrt(variance[keep] / n_pulses_per_frame[keep]).astype(np.float32)
+    sem_percent = np.full_like(mean_percent, np.nan, dtype=np.float32)
+    sem_percent[keep] = (std_percent[keep] / np.sqrt(n_pulses_per_frame[keep])).astype(np.float32)
+
+    classified_values = np.where(classified_count > 0, classified_count, np.nan)
+    finite_classified = np.isfinite(classified_values)
+    mean_classified_ants = np.full(response.shape[1], np.nan, dtype=np.float32)
+    classified_keep = finite_classified.sum(axis=0) > 0
+    if classified_keep.any():
+        classified_sum = np.where(finite_classified, classified_values, 0.0).sum(axis=0, dtype=np.float64)
+        mean_classified_ants[classified_keep] = (
+            classified_sum[classified_keep] / finite_classified.sum(axis=0)[classified_keep]
+        ).astype(np.float32)
+
+    return pd.DataFrame(
+        {
+            "relative_time_s": relative_time_s,
+            "mean_percent_sleeping_ants": mean_percent,
+            "sem_percent_sleeping_ants": sem_percent,
+            "n_pulses": n_pulses_per_frame,
+            "mean_classified_ants": mean_classified_ants,
+        }
+    )
+
+
+def build_pulse_triggered_sleep_percent(
+    tracks: pd.DataFrame,
+    pulses: pd.DataFrame,
+    *,
+    pre_seconds: float,
+    post_seconds: float,
+    side: str | None = "both",
+    frame_col: str | None = "camFrameStart",
+    bin_seconds: float | None = None,
+    smooth_seconds: float = 0.0,
+    sleep_threshold: float = 0.5,
+    sort_by_stimulus_strength: bool = False,
+    stimulus_strength_col: str | None = "auto",
+    stimulus_sort_ascending: bool = True,
+) -> dict[str, object]:
+    """Build pulse x time responses for percent of classified ants predicted sleeping."""
+    resolved_frame_col = _pulse_frame_column(pulses, frame_col)
+    pulse_table = pulses.copy()
+    pulse_table["pulse_frame"] = pd.to_numeric(
+        pulse_table[resolved_frame_col],
+        errors="coerce",
+    )
+    pulse_table = pulse_table[pulse_table["pulse_frame"].notna()].copy()
+    if pulse_table.empty:
+        raise ValueError(f"No finite pulse frames found in {resolved_frame_col}")
+    pulse_table["pulse_frame"] = pulse_table["pulse_frame"].round().astype("int64")
+    resolved_stimulus_strength_col = None
+    if sort_by_stimulus_strength:
+        pulse_table, resolved_stimulus_strength_col = sort_pulses_by_stimulus_strength(
+            pulse_table,
+            stimulus_strength_col=stimulus_strength_col,
+            ascending=stimulus_sort_ascending,
+        )
+    pulse_table = pulse_table.reset_index(drop=True)
+    pulse_table.insert(0, "response_row", np.arange(len(pulse_table), dtype=np.int64))
+
+    chosen = _existing_sleep_prediction_tracks(tracks, side).reset_index(drop=True)
+    fps_values = chosen["fps"].dropna().unique()
+    if len(fps_values) == 0:
+        raise ValueError("Selected tracks do not have FPS metadata")
+    fps = float(fps_values[0])
+    if len(fps_values) > 1:
+        print(f"WARNING: multiple FPS values in selected sleep tracks: {fps_values}; using {fps}")
+
+    pre_frames = int(round(float(pre_seconds) * fps))
+    post_frames = int(round(float(post_seconds) * fps))
+    if bin_seconds is not None:
+        bin_frames = max(1, int(round(float(bin_seconds) * fps)))
+        relative_start_frames = np.arange(-pre_frames, post_frames + 1, bin_frames, dtype=np.int64)
+        relative_stop_frames = np.minimum(relative_start_frames + bin_frames, post_frames + 1)
+        relative_frames = np.rint((relative_start_frames + relative_stop_frames - 1) / 2.0).astype(np.int64)
+        relative_time_s = (
+            relative_start_frames.astype(np.float64)
+            + (relative_stop_frames - relative_start_frames).astype(np.float64) / 2.0
+        ) / float(fps)
+    else:
+        relative_start_frames = None
+        relative_stop_frames = None
+        relative_frames = np.arange(-pre_frames, post_frames + 1, dtype=np.int64)
+        relative_time_s = relative_frames.astype(np.float64) / float(fps)
+    pulse_frames = pulse_table["pulse_frame"].to_numpy(dtype=np.int64)
+
+    sleeping_count = np.zeros((len(pulse_table), len(relative_frames)), dtype=np.uint32)
+    classified_count = np.zeros((len(pulse_table), len(relative_frames)), dtype=np.uint32)
+
+    for i, row in enumerate(chosen.itertuples(index=False), start=1):
+        if i == 1 or i == len(chosen) or i % 25 == 0:
+            print(f"sleep percent pulse response: loading {i}/{len(chosen)} {row.track_name}")
+
+        sleep_path = Path(row.predicted_sleep_path) if pd.notna(row.predicted_sleep_path) else None
+        if sleep_path is None or not sleep_path.exists():
+            continue
+        sleep_state = np.load(sleep_path, mmap_mode="r")
+        sleep_frame_min_value = getattr(row, "sleep_frame_min", np.nan)
+        if pd.notna(sleep_frame_min_value):
+            sleep_frame_min = int(sleep_frame_min_value)
+        else:
+            sleep_frame_min = int(getattr(row, "frame_min", 0))
+
+        for pulse_idx, pulse_frame in enumerate(pulse_frames):
+            if relative_start_frames is None or relative_stop_frames is None:
+                local_idx = pulse_frame + relative_frames - sleep_frame_min
+                in_bounds = (local_idx >= 0) & (local_idx < len(sleep_state))
+                if not in_bounds.any():
+                    continue
+                response_cols = np.flatnonzero(in_bounds)
+                values = sleep_state[local_idx[in_bounds]]
+                classified = (values == 0) | (values == 1)
+                if not classified.any():
+                    continue
+                response_cols = response_cols[classified]
+                classified_count[pulse_idx, response_cols] += 1
+                sleeping_count[pulse_idx, response_cols] += (values[classified] == 1).astype(np.uint32)
+                continue
+
+            for response_col, (rel_start, rel_stop) in enumerate(zip(relative_start_frames, relative_stop_frames)):
+                local_start = int(pulse_frame + rel_start - sleep_frame_min)
+                local_stop = int(pulse_frame + rel_stop - sleep_frame_min)
+                start = max(0, local_start)
+                stop = min(len(sleep_state), local_stop)
+                if stop <= start:
+                    continue
+                values = sleep_state[start:stop]
+                classified = (values == 0) | (values == 1)
+                if not classified.any():
+                    continue
+                classified_values = values[classified]
+                classified_count[pulse_idx, response_col] += 1
+                sleep_fraction = float(np.mean(classified_values == 1))
+                sleeping_count[pulse_idx, response_col] += sleep_fraction >= float(sleep_threshold)
+
+    response = np.full(sleeping_count.shape, np.nan, dtype=np.float32)
+    classified = classified_count > 0
+    response[classified] = (100.0 * sleeping_count[classified] / classified_count[classified]).astype(np.float32)
+
+    if smooth_seconds > 0:
+        sample_seconds = float(bin_seconds) if bin_seconds is not None else 1.0 / float(fps)
+        window_samples = max(1, int(round(float(smooth_seconds) / sample_seconds)))
+        if window_samples > 1:
+            for row_idx in range(response.shape[0]):
+                response[row_idx] = rolling_nanmean(response[row_idx], window_samples)
+
+    if relative_start_frames is None or relative_stop_frames is None:
+        zero_cols = np.flatnonzero(relative_frames == 0)
+    else:
+        zero_cols = np.flatnonzero((relative_start_frames <= 0) & (relative_stop_frames > 0))
+    zero_col = int(zero_cols[0]) if zero_cols.size else None
+    pulse_table["valid_fraction"] = np.isfinite(response).mean(axis=1)
+    pulse_table["mean_percent_sleeping_ants"] = _nanmean_rows(response)
+    if zero_col is not None:
+        pulse_table["n_sleeping_tracks_at_pulse"] = sleeping_count[:, zero_col]
+        pulse_table["n_classified_sleep_tracks_at_pulse"] = classified_count[:, zero_col]
+        pulse_table["n_unknown_sleep_tracks_at_pulse"] = len(chosen) - classified_count[:, zero_col]
+
+    average = _average_sleep_percent_pulse_response(response, classified_count, relative_time_s)
+
+    return {
+        "average": average,
+        "matrix": response,
+        "matrix_sleeping_counts": sleeping_count,
+        "matrix_classified_counts": classified_count,
+        "relative_time_s": relative_time_s,
+        "pulse_table": pulse_table,
+        "track_table": chosen,
+        "fps": fps,
+        "side": side,
+        "frame_col": resolved_frame_col,
+        "bin_seconds": bin_seconds,
+        "sleep_threshold": sleep_threshold,
+        "sort_by_stimulus_strength": sort_by_stimulus_strength,
+        "stimulus_strength_col": resolved_stimulus_strength_col,
+        "stimulus_sort_ascending": stimulus_sort_ascending,
+    }
+
+
 def build_sleep_split_pulse_triggered_colony_speed(
     tracks: pd.DataFrame,
     pulses: pd.DataFrame,
@@ -1337,6 +1752,122 @@ def plot_pulse_triggered_colony_speed(
         matrix_title += f" (rows sorted by {result['stimulus_strength_col']})"
     matrix_ax.set_title(matrix_title)
     fig.colorbar(im, cax=colorbar_ax, label="Speed (mm/s)")
+    fig.subplots_adjust(left=0.08, right=0.96, top=0.92, bottom=0.08)
+    plt.show()
+    return result
+
+
+def plot_pulse_triggered_sleep_percent(
+    tracks: pd.DataFrame,
+    pulses: pd.DataFrame,
+    *,
+    pre_seconds: float,
+    post_seconds: float,
+    side: str | None = "both",
+    frame_col: str | None = "camFrameStart",
+    bin_seconds: float | None = None,
+    smooth_seconds: float = 0.0,
+    sleep_threshold: float = 0.5,
+    vmin: float | None = 0.0,
+    vmax: float | None = 100.0,
+    vmax_percentile: float | None = None,
+    cmap: str = "magma",
+    ylim: tuple[float, float] | None = (0.0, 100.0),
+    sort_by_stimulus_strength: bool = False,
+    stimulus_strength_col: str | None = "auto",
+    stimulus_sort_ascending: bool = True,
+) -> dict[str, object]:
+    result = build_pulse_triggered_sleep_percent(
+        tracks,
+        pulses,
+        pre_seconds=pre_seconds,
+        post_seconds=post_seconds,
+        side=side,
+        frame_col=frame_col,
+        bin_seconds=bin_seconds,
+        smooth_seconds=smooth_seconds,
+        sleep_threshold=sleep_threshold,
+        sort_by_stimulus_strength=sort_by_stimulus_strength,
+        stimulus_strength_col=stimulus_strength_col,
+        stimulus_sort_ascending=stimulus_sort_ascending,
+    )
+
+    average = result["average"]
+    matrix = result["matrix"]
+    pulse_table = result["pulse_table"]
+    relative_time_s = result["relative_time_s"]
+
+    if vmax is None and vmax_percentile is not None:
+        finite_values = matrix[np.isfinite(matrix)]
+        if finite_values.size:
+            vmax = float(np.nanpercentile(finite_values, vmax_percentile))
+
+    fig = plt.figure(figsize=(12, 8))
+    grid = fig.add_gridspec(
+        2,
+        2,
+        height_ratios=[2, 3],
+        width_ratios=[1, 0.035],
+        hspace=0.08,
+        wspace=0.04,
+    )
+    avg_ax = fig.add_subplot(grid[0, 0])
+    matrix_ax = fig.add_subplot(grid[1, 0], sharex=avg_ax)
+    colorbar_ax = fig.add_subplot(grid[1, 1])
+    avg_ax.tick_params(labelbottom=False)
+
+    x = average["relative_time_s"].to_numpy(dtype=float)
+    y = average["mean_percent_sleeping_ants"].to_numpy(dtype=float)
+    sem = average["sem_percent_sleeping_ants"].to_numpy(dtype=float)
+    avg_ax.plot(x, y, color="tab:purple", lw=1.8, label="mean over pulses")
+    avg_ax.fill_between(x, y - sem, y + sem, color="tab:purple", alpha=0.20, lw=0)
+    avg_ax.axvline(0, color="black", lw=1.0, alpha=0.8)
+
+    if "dur_s" in pulse_table.columns and pulse_table["dur_s"].notna().any():
+        pulse_duration = float(pd.to_numeric(pulse_table["dur_s"], errors="coerce").median())
+        avg_ax.axvspan(0, pulse_duration, color="tab:red", alpha=0.12, label="pulse duration")
+    else:
+        pulse_duration = None
+
+    avg_ax.set_ylabel("Sleeping ants (%)")
+    title = (
+        f"Pulse-triggered predicted sleep ({side}, "
+        f"{len(pulse_table)} pulses, {len(result['track_table'])} tracks)"
+    )
+    if result["sort_by_stimulus_strength"]:
+        direction = "ascending" if result["stimulus_sort_ascending"] else "descending"
+        title += f", sorted by {result['stimulus_strength_col']} ({direction})"
+    if result["bin_seconds"] is not None:
+        title += f", {float(result['bin_seconds']):g}s bins"
+    if smooth_seconds > 0:
+        title += f", {smooth_seconds:g}s smoothing"
+    avg_ax.set_title(title)
+    if ylim is not None:
+        avg_ax.set_ylim(*ylim)
+    avg_ax.legend(fontsize=8)
+    avg_ax.grid(True, alpha=0.25)
+
+    time_left, time_right = _centered_time_extent(relative_time_s)
+    extent = [time_left, time_right, matrix.shape[0] - 0.5, -0.5]
+    im = matrix_ax.imshow(
+        matrix,
+        aspect="auto",
+        interpolation="none",
+        extent=extent,
+        vmin=vmin,
+        vmax=vmax,
+        cmap=cmap,
+    )
+    matrix_ax.axvline(0, color="white", lw=1.0, alpha=0.9)
+    if pulse_duration is not None:
+        matrix_ax.axvline(pulse_duration, color="white", lw=0.8, alpha=0.65, linestyle="--")
+    matrix_ax.set_xlabel(f"Time from CSV_PULSE {result['frame_col']} (s)")
+    matrix_ax.set_ylabel("Pulse")
+    matrix_title = "Single-pulse responses, each percent over classified ant sleep tracks"
+    if result["sort_by_stimulus_strength"]:
+        matrix_title += f" (rows sorted by {result['stimulus_strength_col']})"
+    matrix_ax.set_title(matrix_title)
+    fig.colorbar(im, cax=colorbar_ax, label="Sleeping ants (%)")
     fig.subplots_adjust(left=0.08, right=0.96, top=0.92, bottom=0.08)
     plt.show()
     return result

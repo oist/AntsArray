@@ -28,7 +28,7 @@ Login-side transfer watchers copy completed outputs back to the matching bucket 
 
 ## Production Block Pipeline
 
-Use `tracking/colony/submit_blocks_pipeline.sh` for production colony tracking and chunk-level interactions.
+Use `tracking/colony/submit_blocks_pipeline.sh` for production colony tracking, per-track analyses, and chunk-level interactions.
 
 Typical block run:
 
@@ -53,6 +53,7 @@ OUTPUT_ROOT/
         submit/
         tracking_workers/
         stitching/
+        per_track_analysis_submit/
         interaction_workers/
       state/
 ```
@@ -97,8 +98,9 @@ The pipeline uses small submitter jobs to create many independent Slurm workers,
 1. The block map job creates all panorama PKLs for the block.
 2. A tracking submitter job runs after mapping and submits one worker per chunk/side.
 3. A stitch job runs after all tracking workers finish and writes block-level per-track outputs.
-4. An interaction submitter job runs after all tracking workers finish and submits one worker per chunk/side interaction parquet.
-5. A login-side transfer watcher waits for fresh stitch and interaction completion markers, then rsyncs the block output folders back to bucket.
+4. A per-track analysis submitter runs after stitching and submits speed, colony-presence, grid-occupancy, and sleep-prediction workers. Sleep-prediction workers wait for the speed-vector completion job.
+5. An interaction submitter job runs after all tracking workers finish and submits one worker per chunk/side interaction parquet.
+6. A login-side transfer watcher waits for fresh stitch, per-track analysis, and interaction completion markers, then rsyncs the block output folders back to bucket.
 
 The same pattern is used for generic per-track analysis with `scripts/per_track_slurm_fanout.sh`: one worker per `TrackID_*.parquet`, one completion marker after all workers, then a login-side transfer watcher.
 
@@ -150,7 +152,20 @@ block02/stitched/
 
 Stitched parquets preserve time gaps using frame counts and chunk timing metadata.
 
-### 4. Chunk Interaction Analysis
+### 4. Per-Track Analysis
+
+After stitching, `scripts/per_track_slurm_fanout.sh` runs the standard per-track operations over `stitched/per_track/`:
+
+```text
+block02/stitched/colony_presence_vectors/
+block02/stitched/speed_vectors/
+block02/stitched/grid_occupancy_histograms/
+block02/stitched/sleep_predictions/
+```
+
+Disable this stage with `--no_per_track_analysis`, or disable only sleep prediction with `--no_sleep_predictions`. Override the sleep classifier model with `--sleep_model /path/to/sleep_random_forest.joblib`; leaving it empty uses the production default in `analysis/compute_track_sleep_predictions.py`.
+
+### 5. Chunk Interaction Analysis
 
 `tracking/colony/interaction_batch.py` submits one worker per chunk/side track parquet. Each worker runs `tracking/colony/interaction_one_chunk.py`.
 
@@ -172,7 +187,7 @@ Frame, antenna_track_id, body_track_id
 
 The completion marker lives in `jobs/block02/state/interactions_complete_block02.ok`, not in the interaction output folder.
 
-### 5. Transfer Back To Bucket
+### 6. Transfer Back To Bucket
 
 The transfer watcher is started from the login shell. It waits for fresh completion markers and then runs `rsync` from flash to bucket for:
 
@@ -400,7 +415,7 @@ uv run --no-project --with numpy --with pandas --with pyarrow --with opencv-pyth
   --video_dir "<CROP_VIDEO_FOLDER>"
 ```
 
-To label one crop video directly:
+To start at one crop video directly while still allowing previous/next navigation through the other crop videos in the same folder:
 
 ```bash
 uv run --no-project --with numpy --with pandas --with pyarrow --with opencv-python --with pillow python analysis/sleep_label_gui.py \
@@ -411,6 +426,7 @@ Optional arguments:
 
 - `--labels_dir /path/to/label_vectors`: write labels somewhere other than the crop video's `label_vectors/` folder.
 - `--start_frame 1234`: open the first video at a specific frame.
+- `--single_video`: with `--video`, load only that file instead of the surrounding folder.
 
 The GUI saves per-frame label vectors beside the crop videos by default:
 
@@ -432,7 +448,7 @@ Basic labeling workflow:
 - While a label is active, normal playback paints each frame the playhead reaches. Seeking to a different frame resets the active label anchor, so skipped frames are not filled.
 - Press the same label again, `e`, or `End` to stop the active label at the current frame.
 - Press `[` to set a range start, then press `s`, `w`, or apply the text label at another frame to label that whole interval once.
-- Press `c` or `Clear` to clear the current frame, or to clear the selected interval after setting a range start.
+- Press `c` or `Clear` to start clearing as `unlabeled`; playback will keep clearing frames until you press `End` or choose another label. After setting a range start, `Clear` clears that selected interval once.
 - Use `Save` or `ctrl+s` to save manually. Labels are also saved when changing videos or closing the GUI.
 
 Useful hotkeys:
@@ -444,7 +460,7 @@ Useful hotkeys:
 - `s`: start/switch/end `sleep`;
 - `w` or `n`: start/switch/end `wake`;
 - Enter in the `Label` box: start/switch/end the typed label;
-- `c`: clear the current frame or selected range;
+- `c`: start/switch to clearing as `unlabeled`, or clear the selected range;
 - `e`: end the active label at the current frame;
 - `[`: set range start for a one-shot interval label;
 - `,`/`.`: previous/next crop video;
@@ -456,22 +472,48 @@ Train the random-forest classifier:
 
 ```bash
 /home/sam-reiter/miniforge3/envs/ants/bin/python analysis/sleep_classifier.py train \
-  --labels /home/sam-reiter/bucket/ReiterU/Ants/basler/20260515/block02/stitched/sleep_labels/*_sleep_labels.parquet \
+  --labels_dir /home/sam-reiter/bucket/ReiterU/Ants/basler/20260515/block02/stitched/sleep_crop_videos/random_100_600s_min75pct_480px_20260622_161247/label_vectors \
   --per_track_dir /home/sam-reiter/bucket/ReiterU/Ants/basler/20260515/block02/stitched/per_track \
   --speed_root /home/sam-reiter/bucket/ReiterU/Ants/basler/20260515/block02/stitched/speed_vectors \
-  --out /home/sam-reiter/bucket/ReiterU/Ants/basler/20260515/block02/stitched/sleep_classifier
+  --out /home/sam-reiter/bucket/ReiterU/Ants/basler/20260515/block02/stitched/sleep_crop_videos/random_100_600s_min75pct_480px_20260622_161247/sleep_wake_speed_only_classifier \
+  --feature_set speed_only \
+  --n_estimators 100 \
+  --max_depth 8
 ```
 
-The model is intentionally simple and interpretable: a balanced random forest trained from speed summaries, posture angles, bodypoint distances, and pose bounding-box cues. Outputs include `sleep_random_forest.joblib`, `feature_importance.csv`, `training_report.txt`, and the labeled `training_features.parquet`.
+The fast production fanout model is intentionally small: a balanced random forest trained from the existing `speed_vectors` output using `speed_mm_s`, `speed_log1p_mm_s`, and 1/5/30 second rolling speed mean/std/valid-fraction features. Use `--feature_set posture_motion` if you want the slower posture-bodypoint model. Outputs include `sleep_random_forest.joblib`, `feature_importance.csv`, `training_report.txt`, `training_predictions.parquet`, and summary PNGs.
 
 Apply the classifier to tracks:
 
 ```bash
 /home/sam-reiter/miniforge3/envs/ants/bin/python analysis/sleep_classifier.py predict \
-  --model /home/sam-reiter/bucket/ReiterU/Ants/basler/20260515/block02/stitched/sleep_classifier/sleep_random_forest.joblib \
+  --model /home/sam-reiter/bucket/ReiterU/Ants/basler/20260515/block02/stitched/sleep_crop_videos/random_100_600s_min75pct_480px_20260622_161247/sleep_wake_speed_only_classifier/sleep_random_forest.joblib \
   --per_track_dir /home/sam-reiter/bucket/ReiterU/Ants/basler/20260515/block02/stitched/per_track \
   --speed_root /home/sam-reiter/bucket/ReiterU/Ants/basler/20260515/block02/stitched/speed_vectors \
   --out /home/sam-reiter/bucket/ReiterU/Ants/basler/20260515/block02/stitched/sleep_predictions
+```
+
+For cluster-scale fanout, use the per-track operation script. It writes one folder per ant track with `sleep_predictions.parquet`, dense `sleep_probability_f4.npy`, `wake_probability_f4.npy`, `predicted_sleep_i1.npy`, `sleep_bouts.parquet`, and `sleep_prediction_metadata.json`.
+
+```bash
+bash scripts/per_track_slurm_fanout.sh \
+  --per_track_dir /bucket/ReiterU/Ants/basler/20260515/block02/stitched/per_track \
+  --operation_script analysis/compute_track_sleep_predictions.py \
+  --run_workdir /home/s/samuel-reiter/AntsArray \
+  --conda_bin /bucket/ReiterU/sam/miniforge3/bin/conda \
+  --conda_env aruco_env \
+  --skip_existing
+```
+
+With a bucket `--per_track_dir`, the wrapper writes work to `/flash/ReiterU/ant_tmp/$USER/colony_pipeline/<date>/<block>/stitched/sleep_predictions` and copies results back to `/bucket/ReiterU/Ants/basler/<date>/<block>/stitched/sleep_predictions`. The operation defaults to the production speed-only model and the sibling `stitched/speed_vectors` folder. If worker Python lacks `joblib`/`sklearn`, it automatically uses the model's `*_portable.npz` sidecar. Override paths with `--operation_args "--model MODEL --speed_root SPEED_ROOT"` if needed.
+
+The block pipeline now submits this sleep-prediction fanout after speed vectors by default. Set `SLEEP_MODEL` in `tracking/colony/submit_blocks_pipeline.sh` or pass `--sleep_model MODEL` to override the classifier for that run.
+
+If `speed_vectors` already exist, `analysis/commands.sh` can submit the same sleep-prediction fanout with:
+
+```bash
+RUN_SLEEP_PREDICTIONS=1 \
+bash analysis/commands.sh /flash/ReiterU/ant_tmp/$USER/colony_pipeline/20260515/block02/stitched/per_track
 ```
 
 ### Colony Presence Vectors
@@ -697,6 +739,7 @@ For current tracking outputs, the main overlay follows `TrackX/TrackY`; toggles 
 | `analysis/compute_track_speed_vector.py` | Per-track speed vector operation. |
 | `analysis/compute_track_colony_presence_vector.py` | Per-track colony in/out vector operation. |
 | `analysis/compute_track_grid_occupancy.py` | Per-track normalized grid occupancy operation. |
+| `analysis/compute_track_sleep_predictions.py` | Per-track sleep/wake classifier prediction operation. |
 | `analysis/sleep_label_gui.py` | Tk GUI for crop-video per-frame sleep/wake label vectors. |
 | `analysis/export_sleep_crop_videos.py` | Export per-ant crop videos for fast sleep/wake labeling. |
 | `analysis/sleep_classifier.py` | Train/apply random-forest supervised sleep classifier. |

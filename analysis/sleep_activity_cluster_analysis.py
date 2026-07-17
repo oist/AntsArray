@@ -1,6 +1,6 @@
 # %%
 # VS Code/Jupyter interactive script:
-# spatiotemporal activity clusters, former high-interaction quiescent sleep timing, and
+# spatiotemporal activity clusters, predicted sleep timing, and
 # within-cluster work/sleep shifts.
 try:
     get_ipython().run_line_magic("matplotlib", "qt")  # type: ignore[name-defined]
@@ -34,6 +34,7 @@ import analysis.colony_speed_utils as cs
 import analysis.grid_occupancy_utils as go
 import analysis.interaction_analysis_utils as ia
 import analysis.sleep_analysis_utils as sleep_utils
+from analysis.figure_saving import install_auto_savefig
 
 importlib.reload(cs)
 importlib.reload(go)
@@ -48,7 +49,7 @@ INTERACTION_ROOT = DATASET_ROOT / "interactions"
 TRACKS_ROOT = DATASET_ROOT / "tracks"
 GRID_ROOT = DATASET_ROOT / "stitched" / "grid_occupancy_histograms"
 SPEED_ROOT = DATASET_ROOT / "stitched" / "speed_vectors"
-PER_TRACK_ROOT = DATASET_ROOT / "stitched" / "per_track"
+SLEEP_PREDICTIONS_ROOT = DATASET_ROOT / "stitched" / "sleep_predictions"
 
 SIDE = "left"  # Run left/right separately unless the grid edges are known to match.
 CHUNKS = "all"
@@ -72,30 +73,6 @@ ACTIVITY_N_NEIGHBORS = 15
 ACTIVITY_LEIDEN_RESOLUTION = 0.9
 ACTIVITY_FALLBACK_N_CLUSTERS = 6
 ACTIVITY_RANDOM_STATE = 0
-
-SLEEP_SPEED_SMOOTH_SECONDS = 30
-SLEEP_QUIESCENCE_SPEED_THRESHOLD_MM_S = 0.1
-SLEEP_MIN_QUIESCENT_BOUT_SECONDS = 10.0
-# Sleep is the classifier-positive side of the former high-interaction quiescent class.
-SLEEP_NON_SLEEP_QUIESCENT_GROUP = "little_or_no_interaction"
-SLEEP_TARGET_QUIESCENT_GROUP = "more_interaction"
-SLEEP_LOW_INTERACTION_MAX = 0
-SLEEP_HIGH_INTERACTION_MIN = None
-SLEEP_HIGH_INTERACTION_QUANTILE = 0.75
-SLEEP_INTERACTION_GROUP_COUNT_COL = "n_interactions_as_body"
-SLEEP_MAX_TRACKS = None  # Set None to use every selected activity-cluster track.
-SLEEP_MAX_FRAMES_PER_GROUP = 5000
-SLEEP_RANDOM_STATE = ACTIVITY_RANDOM_STATE
-
-CLASSIFIER_FEATURE_COLUMNS = None  # None uses sleep_utils default posture feature set.
-CLASSIFIER_SPLIT_BY = "random_bout"
-CLASSIFIER_TEST_SIZE = 0.5
-FORMER_HIGH_INTERACTION_SLEEP_SCORE_THRESHOLD = 0.5
-FORMER_HIGH_INTERACTION_SLEEP_MIN_FRAME_FRACTION = 0.5
-FORMER_HIGH_INTERACTION_SLEEP_SPLIT = None  # None = train+test predictions; "test" = held-out only.
-LOW_QUIESCENT_SLEEP_SCORE_THRESHOLD = FORMER_HIGH_INTERACTION_SLEEP_SCORE_THRESHOLD  # Backward-compatible aliases.
-LOW_QUIESCENT_SLEEP_MIN_FRAME_FRACTION = FORMER_HIGH_INTERACTION_SLEEP_MIN_FRAME_FRACTION
-LOW_QUIESCENT_SLEEP_SPLIT = FORMER_HIGH_INTERACTION_SLEEP_SPLIT
 
 MAX_PAIRWISE_ANTS_PER_CLUSTER = 35
 MAX_PAIRWISE_LAG_HOURS = 8.0
@@ -133,12 +110,17 @@ INTERACTION_EVENT_GAP_SECONDS = 2.0
 INTERACTION_WAKE_EVENT_ROLE = "body"  # Sleeping ant as receiver/body: another ant's antenna contacts it.
 
 OUTPUT_ROOT = DATASET_ROOT / "analysis_outputs" / "sleep_activity_cluster_analysis"
-SAVE_FORMER_HIGH_INTERACTION_SLEEP_BOUTS = True
-FORMER_HIGH_INTERACTION_SLEEP_BOUTS_PARQUET = (
-    OUTPUT_ROOT / f"{SIDE}_former_high_interaction_quiescent_sleep_bouts.parquet"
+FIGURE_ROOT = OUTPUT_ROOT / "figures"
+SAVE_FIGURES = True
+FIGURE_DPI = 180
+install_auto_savefig(
+    FIGURE_ROOT / SIDE,
+    prefix=f"sleep_activity_cluster_analysis_{SIDE}",
+    dpi=FIGURE_DPI,
+    enabled=SAVE_FIGURES,
 )
-SAVE_LOW_QUIESCENT_SLEEP_BOUTS = SAVE_FORMER_HIGH_INTERACTION_SLEEP_BOUTS
-LOW_QUIESCENT_SLEEP_BOUTS_PARQUET = FORMER_HIGH_INTERACTION_SLEEP_BOUTS_PARQUET
+SAVE_SLEEP_BOUTS = True
+SLEEP_BOUTS_PARQUET = OUTPUT_ROOT / f"{SIDE}_predicted_sleep_bouts.parquet"
 
 SLEEP_END_TRIGGER_TRACK_ID = None  # Set to an int track_id for a specific ant; None picks the ant with most sleep bouts.
 SLEEP_END_TRIGGER_TRACK_NAME = None
@@ -402,78 +384,6 @@ def plot_activity_cluster_time_profiles(track_activity_long: pd.DataFrame) -> pd
     return summary
 
 
-def sample_quiescent_posture_for_tracks(
-    speed_tracks: pd.DataFrame,
-    interactions_raw: pd.DataFrame,
-    counts_by_track: dict[int, pd.DataFrame],
-    activity_cluster_table: pd.DataFrame,
-    *,
-    analysis_frame_start: int,
-    analysis_frame_stop: int,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    selected = activity_cluster_table.dropna(subset=["track_id"]).copy()
-    if SLEEP_MAX_TRACKS is not None:
-        selected = selected.head(int(SLEEP_MAX_TRACKS)).copy()
-
-    samples = []
-    summaries = []
-    skipped = []
-    for ant_number, row in selected.reset_index(drop=True).iterrows():
-        track_id = int(row["track_id"])
-        try:
-            speed_interactions = sleep_utils.single_ant_speed_interaction_timeseries(
-                speed_tracks,
-                interactions_raw,
-                track_id=track_id,
-                side=SIDE,
-                bin_seconds=TIME_BIN_MINUTES * 60.0,
-                speed_smooth_seconds=SLEEP_SPEED_SMOOTH_SECONDS,
-                counts_by_track=counts_by_track,
-            )
-            track_samples, track_summary = sleep_utils.quiescent_posture_samples_by_interaction(
-                speed_interactions,
-                speed_tracks,
-                track_id=track_id,
-                side=SIDE,
-                counts_by_track=counts_by_track,
-                per_track_root=PER_TRACK_ROOT,
-                fps=FPS,
-                mm_per_px=MM_PER_PX,
-                speed_smooth_seconds=SLEEP_SPEED_SMOOTH_SECONDS,
-                quiescence_speed_threshold_mm_s=SLEEP_QUIESCENCE_SPEED_THRESHOLD_MM_S,
-                min_quiescent_seconds=SLEEP_MIN_QUIESCENT_BOUT_SECONDS,
-                analysis_frame_start=analysis_frame_start,
-                analysis_frame_stop=analysis_frame_stop,
-                low_interaction_max=SLEEP_LOW_INTERACTION_MAX,
-                high_interaction_min=SLEEP_HIGH_INTERACTION_MIN,
-                high_interaction_quantile=SLEEP_HIGH_INTERACTION_QUANTILE,
-                include_non_quiescent=False,
-                max_frames_per_group=SLEEP_MAX_FRAMES_PER_GROUP,
-                random_state=SLEEP_RANDOM_STATE + ant_number,
-                interaction_count_col=SLEEP_INTERACTION_GROUP_COUNT_COL,
-            )
-        except Exception as exc:
-            skipped.append({"track_id": track_id, "track_name": row["track_name"], "reason": str(exc)})
-            continue
-
-        for col in [ACTIVITY_CLUSTER_COL, "umap1", "umap2"]:
-            track_samples[col] = row[col]
-            track_summary[col] = row[col]
-        samples.append(track_samples)
-        summaries.append(track_summary)
-
-    skipped_table = pd.DataFrame(skipped)
-    if skipped:
-        print(f"Skipped {len(skipped)} tracks during sleep/posture sampling")
-        display(skipped_table.head(20))
-    if not samples:
-        raise ValueError("No sleep/posture samples were produced")
-    return (
-        add_interaction_onset_aliases(pd.concat(samples, ignore_index=True)),
-        add_interaction_onset_aliases(pd.concat(summaries, ignore_index=True)),
-    )
-
-
 def add_interaction_onset_aliases(table: pd.DataFrame) -> pd.DataFrame:
     out = table.copy()
     aliases = {
@@ -487,63 +397,68 @@ def add_interaction_onset_aliases(table: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def classify_former_high_interaction_quiescent_sleep_bouts(
-    posture_samples: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    predictions, metrics, weights, _model = sleep_utils.train_test_quiescent_posture_classifier(
-        posture_samples,
-        feature_cols=CLASSIFIER_FEATURE_COLUMNS,
-        groups=(SLEEP_NON_SLEEP_QUIESCENT_GROUP, SLEEP_TARGET_QUIESCENT_GROUP),
-        split_by=CLASSIFIER_SPLIT_BY,
-        test_size=CLASSIFIER_TEST_SIZE,
-        random_state=SLEEP_RANDOM_STATE,
+def load_activity_cluster_sleep_predictions(
+    activity_tracks: pd.DataFrame,
+    activity_cluster_table: pd.DataFrame,
+    counts_by_track: dict[int, pd.DataFrame],
+    *,
+    analysis_frame_start: int,
+    analysis_frame_stop: int,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    sleep_prediction_tracks = sleep_utils.attach_sleep_predictions_to_tracks(
+        activity_tracks,
+        SLEEP_PREDICTIONS_ROOT,
+        require_all=False,
     )
-    scored = sleep_utils.low_interaction_quiescent_classifier_bins(
-        predictions,
-        groups=(SLEEP_NON_SLEEP_QUIESCENT_GROUP, SLEEP_TARGET_QUIESCENT_GROUP),
-        split=FORMER_HIGH_INTERACTION_SLEEP_SPLIT,
-        low_score_threshold=FORMER_HIGH_INTERACTION_SLEEP_SCORE_THRESHOLD,
-        min_predicted_low_fraction=FORMER_HIGH_INTERACTION_SLEEP_MIN_FRAME_FRACTION,
+    clustered_keys = activity_cluster_table[["track_name", "track_id", "side"]].drop_duplicates()
+    sleep_prediction_tracks = sleep_prediction_tracks.merge(
+        clustered_keys,
+        on=["track_name", "track_id", "side"],
+        how="inner",
+        validate="one_to_one",
     )
-    target_groups = set(scored["sleep_classifier_target_group"].dropna().astype(str).unique())
-    if target_groups and target_groups != {SLEEP_TARGET_QUIESCENT_GROUP}:
-        raise AssertionError(
-            "Sleep classifier target must be the high-interaction quiescent group "
-            f"{SLEEP_TARGET_QUIESCENT_GROUP!r}; got {sorted(target_groups)}"
-        )
-    sleep_clusters = set(
-        scored.loc[scored["is_sleep_quiescent_cluster"], "classifier_quiescent_cluster"]
-        .dropna()
-        .astype(str)
-        .unique()
+    sleep_prediction_tracks = sleep_prediction_tracks[
+        sleep_prediction_tracks["has_sleep_predictions"].astype(bool)
+    ].reset_index(drop=True)
+    if sleep_prediction_tracks.empty:
+        raise ValueError(f"No sleep prediction outputs matched activity-cluster tracks under {SLEEP_PREDICTIONS_ROOT}")
+
+    cluster_cols = [
+        col
+        for col in [
+            "track_name",
+            "track_id",
+            "side",
+            ACTIVITY_CLUSTER_COL,
+            "activity_cluster_id",
+            "umap1",
+            "umap2",
+        ]
+        if col in activity_cluster_table.columns
+    ]
+    cluster_lookup = activity_cluster_table[cluster_cols].drop_duplicates(["track_name", "track_id", "side"])
+    sleep_prediction_tracks = sleep_prediction_tracks.merge(
+        cluster_lookup,
+        on=["track_name", "track_id", "side"],
+        how="left",
+        validate="one_to_one",
     )
-    bad_sleep_clusters = sleep_clusters.difference({"former_high_interaction_quiescent_sleep"})
-    if bad_sleep_clusters:
-        raise AssertionError(f"Unexpected sleep cluster labels: {sorted(bad_sleep_clusters)}")
-    cluster_cols = posture_samples[
-        ["track_name", "track_id", "side", ACTIVITY_CLUSTER_COL]
-    ].drop_duplicates(["track_name"])
-    scored = scored.merge(
-        cluster_cols,
+    predicted_sleep_bouts = sleep_utils.load_predicted_sleep_bouts(
+        sleep_prediction_tracks,
+        counts_by_track,
+        frame_start=analysis_frame_start,
+        frame_stop=analysis_frame_stop,
+    )
+    if predicted_sleep_bouts.empty:
+        return sleep_prediction_tracks, pd.DataFrame()
+    predicted_sleep_bouts = add_interaction_onset_aliases(predicted_sleep_bouts)
+    predicted_sleep_bouts = predicted_sleep_bouts.merge(
+        cluster_lookup,
         on=["track_name", "track_id", "side"],
         how="left",
         validate="many_to_one",
-        suffixes=("", "_from_samples"),
     )
-    sleep_bouts = sleep_utils.low_interaction_quiescent_bouts_from_bins(
-        scored,
-        bin_seconds=TIME_BIN_MINUTES * 60.0,
-    )
-    scored = add_interaction_onset_aliases(scored)
-    sleep_bouts = add_interaction_onset_aliases(sleep_bouts)
-    return scored, sleep_bouts, metrics, weights
-
-
-def classify_low_quiescent_sleep_bouts(
-    posture_samples: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Backward-compatible wrapper for the former high-interaction sleep definition."""
-    return classify_former_high_interaction_quiescent_sleep_bouts(posture_samples)
+    return sleep_prediction_tracks, predicted_sleep_bouts.reset_index(drop=True)
 
 
 def split_bout_durations_to_time_bins(
@@ -595,39 +510,26 @@ def split_bout_durations_to_time_bins(
                         "n_interaction_onsets",
                         getattr(bout, "n_interactions_total", np.nan),
                     ),
-                    "mean_prob_sleep_quiescent": getattr(
-                        bout,
-                        "mean_prob_sleep_quiescent",
-                        np.nan,
-                    ),
-                    "mean_prob_former_high_interaction_quiescent_sleep": getattr(
-                        bout,
-                        "mean_prob_former_high_interaction_quiescent_sleep",
-                        np.nan,
-                    ),
-                    "mean_prob_low_interaction_quiescent": getattr(
-                        bout,
-                        "mean_prob_low_interaction_quiescent",
-                        np.nan,
-                    ),
+                    "mean_sleep_probability": getattr(bout, "mean_sleep_probability", np.nan),
+                    "median_sleep_probability": getattr(bout, "median_sleep_probability", np.nan),
                 }
             )
     return pd.DataFrame(rows)
 
 
 def build_sleep_time_tables(
-    low_quiescent_sleep_bouts: pd.DataFrame,
+    sleep_bouts: pd.DataFrame,
     track_activity_long: pd.DataFrame,
     *,
     recording_start_clock_seconds: float,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     sleep_duration_bins = split_bout_durations_to_time_bins(
-        low_quiescent_sleep_bouts,
+        sleep_bouts,
         recording_start_clock_seconds=recording_start_clock_seconds,
         fps=FPS,
         bin_minutes=TIME_BIN_MINUTES,
     )
-    sleep_track_names = set(low_quiescent_sleep_bouts["track_name"].dropna().astype(str))
+    sleep_track_names = set(sleep_bouts["track_name"].dropna().astype(str))
     denom = track_activity_long[track_activity_long["track_name"].astype(str).isin(sleep_track_names)].copy()
 
     ant_valid = (
@@ -727,21 +629,8 @@ def split_bout_durations_to_elapsed_bins(
                         "n_interaction_onsets",
                         getattr(bout, "n_interactions_total", np.nan),
                     ),
-                    "mean_prob_sleep_quiescent": getattr(
-                        bout,
-                        "mean_prob_sleep_quiescent",
-                        np.nan,
-                    ),
-                    "mean_prob_former_high_interaction_quiescent_sleep": getattr(
-                        bout,
-                        "mean_prob_former_high_interaction_quiescent_sleep",
-                        np.nan,
-                    ),
-                    "mean_prob_low_interaction_quiescent": getattr(
-                        bout,
-                        "mean_prob_low_interaction_quiescent",
-                        np.nan,
-                    ),
+                    "mean_sleep_probability": getattr(bout, "mean_sleep_probability", np.nan),
+                    "median_sleep_probability": getattr(bout, "median_sleep_probability", np.nan),
                 }
             )
     return pd.DataFrame(rows)
@@ -832,7 +721,7 @@ def elapsed_activity_time_table(
 
 
 def build_elapsed_sleep_time_tables(
-    low_quiescent_sleep_bouts: pd.DataFrame,
+    sleep_bouts: pd.DataFrame,
     activity_tracks: pd.DataFrame,
     activity_cluster_table: pd.DataFrame,
     *,
@@ -849,13 +738,13 @@ def build_elapsed_sleep_time_tables(
         quiet_speed_threshold_mm_s=ACTIVITY_QUIET_SPEED_THRESHOLD_MM_S,
     )
     sleep_duration_bins = split_bout_durations_to_elapsed_bins(
-        low_quiescent_sleep_bouts,
+        sleep_bouts,
         analysis_frame_start=analysis_frame_start,
         analysis_frame_stop=analysis_frame_stop,
         fps=FPS,
         bin_minutes=ELAPSED_SLEEP_BIN_MINUTES,
     )
-    sleep_track_names = set(low_quiescent_sleep_bouts["track_name"].dropna().astype(str))
+    sleep_track_names = set(sleep_bouts["track_name"].dropna().astype(str))
     denom = elapsed_activity[elapsed_activity["track_name"].astype(str).isin(sleep_track_names)].copy()
     ant_valid = (
         denom.groupby([ACTIVITY_CLUSTER_COL, "track_name", "track_id", "elapsed_bin"], as_index=False)
@@ -920,7 +809,7 @@ def plot_cluster_sleep_timing(cluster_sleep_time: pd.DataFrame, intra_cluster_in
             group["sleep_fraction_valid_time"],
             color="tab:blue",
             lw=2.0,
-            label="former high-interaction quiescent sleep fraction",
+            label="predicted sleep fraction",
         )
         ax.plot(
             group["hours_since_light_on"],
@@ -1224,7 +1113,7 @@ def plot_sleep_interaction_time_correlation(
         ax.set_axis_off()
     if scatter is not None:
         fig.colorbar(scatter, ax=axes.ravel().tolist(), label=f"hours since lights on at {LIGHT_ON_HOUR:g}:00")
-    fig.suptitle("Former high-interaction quiescent sleep vs directed interaction amount")
+    fig.suptitle("Predicted sleep vs directed interaction amount")
     plt.show()
 
 
@@ -1960,7 +1849,7 @@ def plot_sleep_activity_modulation(sleep_activity_modulation: pd.DataFrame) -> N
             x - width / 2,
             summary[f"sleep_{suffix}"],
             width=width,
-            label="former high-interaction quiescent sleep",
+            label="predicted sleep",
         )
         ax.bar(x + width / 2, summary[f"active_{suffix}"], width=width, label="activity")
         ax.set_xticks(x)
@@ -1968,7 +1857,7 @@ def plot_sleep_activity_modulation(sleep_activity_modulation: pd.DataFrame) -> N
         ax.set_ylabel(ylabel)
         ax.grid(True, axis="y", alpha=0.25)
     axes[0].legend(fontsize=8)
-    fig.suptitle("Time-of-day modulation: former high-interaction quiescent sleep vs activity")
+    fig.suptitle("Time-of-day modulation: predicted sleep vs activity")
     fig.tight_layout()
     plt.show()
 
@@ -1992,7 +1881,7 @@ def plot_elapsed_cluster_sleep_timing(cluster_elapsed_sleep_time: pd.DataFrame) 
             group["sleep_fraction_valid_time"],
             color="tab:blue",
             lw=1.7,
-            label="former high-interaction quiescent sleep",
+            label="predicted sleep",
         )
         ax.plot(x, group["mean_ant_active_fraction"], color="tab:orange", lw=1.2, alpha=0.85, label="activity")
         n_ants = int(group["n_ants"].max()) if group["n_ants"].notna().any() else 0
@@ -2063,7 +1952,7 @@ def plot_elapsed_sleep_heatmap(ant_elapsed_sleep_time: pd.DataFrame) -> None:
     ax.set_xticks(tick_idx)
     ax.set_xticklabels([f"{elapsed_hours[i]:.0f}" for i in tick_idx], rotation=45, ha="right")
     ax.set_xlabel("elapsed recording time (h)")
-    ax.set_title("Former high-interaction quiescent sleep over recording time, sorted by cluster and first peak")
+    ax.set_title("Predicted sleep over recording time, sorted by cluster and first peak")
     fig.colorbar(im, ax=ax, label="sleep fraction of valid observed time")
     fig.tight_layout()
     plt.show()
@@ -2256,7 +2145,7 @@ def plot_repeating_sleep_ant_examples(
             ax.grid(True, alpha=0.25)
             ax.legend(fontsize=8, loc="upper right")
         axes[-1, 0].set_xlabel("elapsed recording time (h)")
-        fig.suptitle(f"activity cluster {cluster}: repeated former high-interaction quiescent sleep timing examples")
+        fig.suptitle(f"activity cluster {cluster}: repeated predicted sleep timing examples")
         fig.tight_layout()
         plt.show()
 
@@ -2362,7 +2251,7 @@ def plot_ant_sleep_heatmap(ant_sleep_time: pd.DataFrame, ant_phase: pd.DataFrame
     ax.set_xticks(tick_idx)
     ax.set_xticklabels([f"{centers_h[i]:.1f}" for i in tick_idx], rotation=45, ha="right")
     ax.set_xlabel(f"Hours since lights on at {LIGHT_ON_HOUR:g}:00")
-    ax.set_title("Low-quiescent sleep fraction by ant, sorted within activity cluster")
+    ax.set_title("Predicted sleep fraction by ant, sorted within activity cluster")
     fig.colorbar(im, ax=ax, label="sleep fraction of valid observed time")
     fig.tight_layout()
     plt.show()
@@ -2606,7 +2495,7 @@ def plot_sleep_cross_correlations(sleep_cross_correlations: pd.DataFrame) -> Non
     plot_cross_correlations(
         sleep_cross_correlations,
         output_prefix="sleep",
-        title_prefix="former high-interaction quiescent sleep",
+        title_prefix="predicted sleep",
         color="tab:blue",
     )
 
@@ -2704,7 +2593,7 @@ def plot_sleep_activity_synchrony_comparison(paired_synchrony: pd.DataFrame) -> 
         ax.set_xticklabels(labels, rotation=45, ha="right")
         ax.grid(True, axis="y", alpha=0.25)
     axes[0].legend(fontsize=8)
-    fig.suptitle("Within-cluster ant-ant synchrony: former high-interaction quiescent sleep vs activity")
+    fig.suptitle("Within-cluster ant-ant synchrony: predicted sleep vs activity")
     fig.tight_layout()
     plt.show()
 
@@ -2839,7 +2728,7 @@ def plot_sleep_shift_lag_distributions(
                 axes[row_idx, 0].legend(fontsize=8)
     axes[-1, 0].set_xlabel("best lag hours, B vs A")
     axes[-1, 1].set_xlabel("absolute best lag hours")
-    fig.suptitle("Shifted former high-interaction quiescent sleep candidates: lag distributions and lag benefit")
+    fig.suptitle("Shifted predicted sleep candidates: lag distributions and lag benefit")
     fig.tight_layout()
     plt.show()
 
@@ -2984,7 +2873,7 @@ def plot_sleep_phase_shift_heatmaps(ant_sleep_time: pd.DataFrame, ant_phase: pd.
             ax.set_xlabel(f"hours since lights on at {LIGHT_ON_HOUR:g}:00")
             ax.set_title(title)
             ax.set_ylabel("ants ordered by sleep phase")
-        fig.colorbar(im0, ax=axes, label="former high-interaction quiescent sleep fraction")
+        fig.colorbar(im0, ax=axes, label="predicted sleep fraction")
         fig.suptitle(f"activity cluster {cluster}: stable shifted sleep schedule check")
         plt.show()
 
@@ -3097,7 +2986,7 @@ def plot_shifted_sleep_pair_examples(
             ax.grid(True, alpha=0.25)
             ax.legend(fontsize=8, ncols=3, loc="upper right")
         axes[-1, 0].set_xlabel(f"hours since lights on at {LIGHT_ON_HOUR:g}:00")
-        fig.suptitle(f"activity cluster {cluster}: shifted former high-interaction quiescent sleep pair examples")
+        fig.suptitle(f"activity cluster {cluster}: shifted predicted sleep pair examples")
         fig.tight_layout()
         plt.show()
 
@@ -3380,18 +3269,18 @@ def build_activity_cluster_interaction_time_table(
 
 
 def build_sleep_interval_index(
-    low_quiescent_sleep_bouts: pd.DataFrame,
+    sleep_bouts: pd.DataFrame,
     *,
     analysis_frame_start: int,
     analysis_frame_stop: int,
 ) -> dict[int, np.ndarray]:
-    if low_quiescent_sleep_bouts.empty:
+    if sleep_bouts.empty:
         return {}
     required = {"track_id", "bout_start_frame", "bout_end_frame"}
-    missing = required.difference(low_quiescent_sleep_bouts.columns)
+    missing = required.difference(sleep_bouts.columns)
     if missing:
         raise KeyError(f"Sleep bouts are missing columns: {sorted(missing)}")
-    work = low_quiescent_sleep_bouts[list(required)].copy()
+    work = sleep_bouts[list(required)].copy()
     for col in required:
         work[col] = pd.to_numeric(work[col], errors="coerce")
     work = work.dropna(subset=["track_id", "bout_start_frame", "bout_end_frame"]).copy()
@@ -3684,7 +3573,7 @@ def matched_interaction_wake_summary(matched_effects: pd.DataFrame) -> pd.DataFr
 
 
 def interaction_triggered_wake_analysis(
-    low_quiescent_sleep_bouts: pd.DataFrame,
+    sleep_bouts: pd.DataFrame,
     interaction_onset_counts_by_track: dict[int, pd.DataFrame],
     activity_cluster_table: pd.DataFrame,
     *,
@@ -3706,7 +3595,7 @@ def interaction_triggered_wake_analysis(
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     event_role = validate_interaction_role(event_role)
     sleep_intervals = build_sleep_interval_index(
-        low_quiescent_sleep_bouts,
+        sleep_bouts,
         analysis_frame_start=analysis_frame_start,
         analysis_frame_stop=analysis_frame_stop,
     )
@@ -3962,7 +3851,7 @@ def relative_time_edges_from_centers(centers: np.ndarray, step: float) -> np.nda
 
 
 def choose_sleep_end_trigger_track_id(
-    low_quiescent_sleep_bouts: pd.DataFrame,
+    sleep_bouts: pd.DataFrame,
     *,
     track_id: int | None = SLEEP_END_TRIGGER_TRACK_ID,
     track_name: str | None = SLEEP_END_TRIGGER_TRACK_NAME,
@@ -3971,17 +3860,17 @@ def choose_sleep_end_trigger_track_id(
         return int(track_id)
     if track_name is not None:
         name = str(track_name)
-        match = low_quiescent_sleep_bouts[low_quiescent_sleep_bouts["track_name"].astype(str) == name]
+        match = sleep_bouts[sleep_bouts["track_name"].astype(str) == name]
         if not match.empty:
             return int(match["track_id"].iloc[0])
         raise ValueError(f"No ant matched SLEEP_END_TRIGGER_TRACK_NAME={name!r}")
 
-    work = low_quiescent_sleep_bouts.copy()
+    work = sleep_bouts.copy()
     work["track_id"] = pd.to_numeric(work["track_id"], errors="coerce")
     work["bout_duration_seconds"] = pd.to_numeric(work["bout_duration_seconds"], errors="coerce")
     work = work.dropna(subset=["track_id"]).copy()
     if work.empty:
-        raise ValueError("No former high-interaction quiescent sleep bouts are available")
+        raise ValueError("No predicted sleep bouts are available")
     summary = (
         work.groupby("track_id", as_index=False)
         .agg(
@@ -3994,7 +3883,7 @@ def choose_sleep_end_trigger_track_id(
 
 
 def sleep_end_trigger_bouts_for_track(
-    low_quiescent_sleep_bouts: pd.DataFrame,
+    sleep_bouts: pd.DataFrame,
     *,
     track_id: int,
     analysis_frame_start: int,
@@ -4003,11 +3892,11 @@ def sleep_end_trigger_bouts_for_track(
     max_bouts: int | None,
     sort_by: str,
 ) -> pd.DataFrame:
-    bouts = low_quiescent_sleep_bouts[
-        pd.to_numeric(low_quiescent_sleep_bouts["track_id"], errors="coerce") == int(track_id)
+    bouts = sleep_bouts[
+        pd.to_numeric(sleep_bouts["track_id"], errors="coerce") == int(track_id)
     ].copy()
     if bouts.empty:
-        raise ValueError(f"No former high-interaction quiescent sleep bouts found for track_id={track_id}")
+        raise ValueError(f"No predicted sleep bouts found for track_id={track_id}")
     for col in ["bout_start_frame", "bout_end_frame", "bout_duration_seconds"]:
         bouts[col] = pd.to_numeric(bouts[col], errors="coerce")
     bouts = bouts.dropna(subset=["bout_start_frame", "bout_end_frame"]).copy()
@@ -4037,7 +3926,7 @@ def sleep_end_trigger_bouts_for_track(
 
 
 def build_sleep_end_triggered_interaction_rate(
-    low_quiescent_sleep_bouts: pd.DataFrame,
+    sleep_bouts: pd.DataFrame,
     interactions: pd.DataFrame,
     *,
     track_id: int | None = SLEEP_END_TRIGGER_TRACK_ID,
@@ -4057,12 +3946,12 @@ def build_sleep_end_triggered_interaction_rate(
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, np.ndarray | str | int | float]]:
     event_role = validate_interaction_role(event_role)
     selected_track_id = choose_sleep_end_trigger_track_id(
-        low_quiescent_sleep_bouts,
+        sleep_bouts,
         track_id=track_id,
         track_name=track_name,
     )
     bouts = sleep_end_trigger_bouts_for_track(
-        low_quiescent_sleep_bouts,
+        sleep_bouts,
         track_id=selected_track_id,
         analysis_frame_start=analysis_frame_start,
         analysis_frame_stop=analysis_frame_stop,
@@ -4096,7 +3985,7 @@ def build_sleep_end_triggered_interaction_rate(
         interaction_counts = onset_counts["interaction_onset_count"].astype(np.int64).to_numpy()
 
     sleep_intervals_by_track = build_sleep_interval_index(
-        low_quiescent_sleep_bouts,
+        sleep_bouts,
         analysis_frame_start=analysis_frame_start,
         analysis_frame_stop=analysis_frame_stop,
     )
@@ -4510,50 +4399,55 @@ activity_cluster_mean_hists = go.plot_cluster_mean_histograms(
 
 
 # %%
-# Build posture samples from quiescent bouts and train the sleep classifier
-# against the former high-interaction quiescence target.
-posture_samples, posture_bout_summary = sample_quiescent_posture_for_tracks(
-    speed_tracks,
-    interactions_raw,
-    interaction_onset_counts_by_track,
+# Load sleep classifier predictions generated by analysis/compute_track_sleep_predictions.py.
+sleep_prediction_tracks, predicted_sleep_bouts = load_activity_cluster_sleep_predictions(
+    activity_tracks,
     activity_cluster_table,
+    interaction_onset_counts_by_track,
     analysis_frame_start=ANALYSIS_FRAME_START,
     analysis_frame_stop=ANALYSIS_FRAME_STOP,
 )
-display(posture_bout_summary)
-
-sleep_scored_bouts, former_high_interaction_quiescent_sleep_bouts, sleep_classifier_metrics, sleep_classifier_weights = (
-    classify_former_high_interaction_quiescent_sleep_bouts(posture_samples)
-)
-low_quiescent_sleep_bouts = former_high_interaction_quiescent_sleep_bouts  # Backward-compatible alias for interactive use.
-low_sleep_bouts = former_high_interaction_quiescent_sleep_bouts  # Backward-compatible alias for interactive use.
-if SAVE_FORMER_HIGH_INTERACTION_SLEEP_BOUTS:
+sleep_bouts = predicted_sleep_bouts
+if sleep_bouts.empty:
+    raise ValueError(f"No predicted sleep bouts were available under {SLEEP_PREDICTIONS_ROOT}")
+if SAVE_SLEEP_BOUTS:
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
-    former_high_interaction_quiescent_sleep_bouts.to_parquet(
-        FORMER_HIGH_INTERACTION_SLEEP_BOUTS_PARQUET,
-        index=False,
-    )
-    print(f"Saved former_high_interaction_quiescent_sleep_bouts: {FORMER_HIGH_INTERACTION_SLEEP_BOUTS_PARQUET}")
-display(sleep_classifier_metrics)
-display(sleep_classifier_weights.head(20))
-display(
-    sleep_scored_bouts.groupby([ACTIVITY_CLUSTER_COL, "classifier_quiescent_cluster"], dropna=False)
+    sleep_bouts.to_parquet(SLEEP_BOUTS_PARQUET, index=False)
+    print(f"Saved predicted sleep bouts: {SLEEP_BOUTS_PARQUET}")
+
+sleep_prediction_summary = (
+    sleep_bouts.groupby([ACTIVITY_CLUSTER_COL], as_index=False)
     .agg(
-        n_bouts=("classifier_bin", "size"),
-        n_ants=("track_id", "nunique"),
-        mean_prob_sleep=("mean_prob_sleep_quiescent", "mean"),
-        mean_prob_former_high_sleep=("mean_prob_former_high_interaction_quiescent_sleep", "mean"),
+        n_sleep_bouts=("bout_id", "size"),
+        n_ants=("track_name", "nunique"),
+        total_sleep_seconds=("bout_duration_seconds", "sum"),
+        median_sleep_bout_seconds=("bout_duration_seconds", "median"),
+        mean_sleep_probability=("mean_sleep_probability", "mean"),
         median_interaction_onsets=("n_interaction_onsets", "median"),
     )
-    .reset_index()
+    .sort_values(ACTIVITY_CLUSTER_COL, kind="mergesort")
 )
-display(former_high_interaction_quiescent_sleep_bouts.head(20))
+display(
+    sleep_prediction_tracks[
+        [
+            "track_id",
+            "side",
+            "track_name",
+            ACTIVITY_CLUSTER_COL,
+            "sleep_prediction_present_frac",
+            "sleep_fraction_predicted_frames",
+            "mean_sleep_probability",
+        ]
+    ].head(20)
+)
+display(sleep_prediction_summary)
+display(sleep_bouts.head(20))
 
 
 # %%
-# Timing of former high-interaction quiescent sleep by activity cluster.
+# Timing of predicted sleep by activity cluster.
 cluster_sleep_time, ant_sleep_time = build_sleep_time_tables(
-    former_high_interaction_quiescent_sleep_bouts,
+    sleep_bouts,
     track_activity_long,
     recording_start_clock_seconds=RECORDING_START_CLOCK_SECONDS,
 )
@@ -4601,7 +4495,7 @@ display(sleep_interaction_time.head(30))
     interaction_wake_summary,
     interaction_wake_curve,
 ) = interaction_triggered_wake_analysis(
-    former_high_interaction_quiescent_sleep_bouts,
+    sleep_bouts,
     interaction_onset_counts_by_track,
     activity_cluster_table,
     analysis_frame_start=ANALYSIS_FRAME_START,
@@ -4621,7 +4515,7 @@ plot_interaction_triggered_wake_curve(interaction_wake_curve)
 # %%
 # Fine-timescale interaction rates triggered on sleep end for one ant.
 selected_sleep_end_trigger_track_id = choose_sleep_end_trigger_track_id(
-    former_high_interaction_quiescent_sleep_bouts,
+    sleep_bouts,
     track_id=SLEEP_END_TRIGGER_TRACK_ID,
     track_name=SLEEP_END_TRIGGER_TRACK_NAME,
 )
@@ -4630,7 +4524,7 @@ selected_sleep_end_trigger_track_id = choose_sleep_end_trigger_track_id(
     sleep_end_trigger_interaction_rate,
     sleep_end_trigger_matrices,
 ) = build_sleep_end_triggered_interaction_rate(
-    former_high_interaction_quiescent_sleep_bouts,
+    sleep_bouts,
     interactions_raw,
     track_id=selected_sleep_end_trigger_track_id,
     analysis_frame_start=ANALYSIS_FRAME_START,
@@ -4663,7 +4557,7 @@ plot_sleep_end_triggered_interaction_rate(
 # %%
 # Elapsed recording time analysis: no folding by time of day.
 cluster_elapsed_sleep_time, ant_elapsed_sleep_time = build_elapsed_sleep_time_tables(
-    former_high_interaction_quiescent_sleep_bouts,
+    sleep_bouts,
     activity_tracks,
     activity_cluster_table,
     analysis_frame_start=ANALYSIS_FRAME_START,
@@ -4686,7 +4580,7 @@ plot_repeating_sleep_ant_examples(ant_elapsed_sleep_time, repeating_sleep_ants)
 
 
 # %%
-# Test whether former high-interaction quiescent sleep is flatter over time of day than activity.
+# Test whether predicted sleep is flatter over time of day than activity.
 sleep_activity_modulation, sleep_activity_cross_correlations = cluster_sleep_activity_modulation_summary(
     cluster_sleep_time,
     ant_sleep_time,
@@ -4771,9 +4665,8 @@ plot_shifted_sleep_pair_examples(ant_sleep_time, shifted_sleep_pairs)
 # - activity_cluster_table: ant-level spatiotemporal activity cluster assignments.
 # - track_activity_long: ant x time-of-day speed/activity/quiet profiles.
 # - interaction_onset_counts_by_track: per-ant encounter-onset counts; not frame-level contact detections.
-# - posture_samples: sampled posture frames used to train/test the sleep-classifier state.
-# - sleep_scored_bouts: quiescent bouts scored by the former high-interaction quiescent sleep classifier.
-# - low_quiescent_sleep_bouts: classifier-positive former high-interaction quiescence bouts.
+# - sleep_prediction_tracks: activity-cluster tracks with sleep prediction metadata.
+# - predicted_sleep_bouts / sleep_bouts: classifier-predicted sleep bouts.
 # - cluster_sleep_time: cluster x time-of-day sleep/activity timing.
 # - cluster_elapsed_sleep_time, ant_elapsed_sleep_time: sleep/activity over absolute recording time.
 # - sleep_repetition_autocorr, sleep_repetition_summary: non-circular sleep repetition over elapsed time.

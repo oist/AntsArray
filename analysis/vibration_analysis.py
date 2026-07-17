@@ -1,5 +1,12 @@
 #%%
-%matplotlib qt
+def _enable_qt_matplotlib() -> None:
+    try:
+        get_ipython().run_line_magic("matplotlib", "qt")  # type: ignore[name-defined]
+    except Exception:
+        pass
+
+
+_enable_qt_matplotlib()
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -12,7 +19,7 @@ from analysis.sleep_analysis_utils import classify_sleep_wake_from_sleap
 # output to parquet for faster loading. Can change to just save parquet directly in future.
 #then used parquet files to generate single ant data over chunks.
 #Now testing sleep classification on parquet data using the hits.
-%matplotlib qt
+_enable_qt_matplotlib()
 import numpy as np
 import pandas as pd
 import re

@@ -3,18 +3,25 @@ import os
 import sys
 import time
 
-import cv2
-
 
 def fourcc_to_str(fourcc_int: int) -> str:
     # OpenCV returns FOURCC packed in an int; decode to 4 chars.
     return "".join([chr((fourcc_int >> 8 * i) & 0xFF) for i in range(4)])
 
 
+def require_cv2():
+    try:
+        import cv2
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError("OpenCV is required to inspect videos; install the cv2 package.") from exc
+    return cv2
+
+
 def print_video_properties(path: str, scan_if_missing: bool = False, scan_max_seconds: float | None = None) -> None:
     if not os.path.exists(path):
         raise FileNotFoundError(f"Video not found: {path}")
 
+    cv2 = require_cv2()
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
         raise RuntimeError(f"OpenCV failed to open video: {path}")
