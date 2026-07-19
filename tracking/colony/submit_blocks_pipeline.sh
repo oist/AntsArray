@@ -821,8 +821,7 @@ if [[ "${run_sleep_predictions}" -eq 1 ]]; then
   elif [[ -s "${stitched_dir}/speed_vectors/speed_vector_complete.ok" ]]; then
     echo "Speed vectors are already complete; submitting sleep predictions without a Slurm dependency."
   else
-    echo "ERROR: speed vector completion job id file is missing: \${speed_vector_complete_job_id_file}" >&2
-    exit 4
+    echo "WARNING: speed vector completion job id file is missing: \${speed_vector_complete_job_id_file}; submitting sleep predictions WITHOUT a Slurm dependency (speed vectors may still be running)." >&2
   fi
 
   sleep_model=${sleep_model_q}
