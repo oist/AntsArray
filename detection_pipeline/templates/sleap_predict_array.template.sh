@@ -2,8 +2,10 @@
 # Per-task resources are rendered by bridge.sbatch from pipeline.sh knobs so one
 # template serves both A100 partitions (same SM80 hardware, gpu23-26):
 #   largegpu   (8 GPU cap):  -c 16 --mem=128G -t 0-12  -> 8 concurrent saturate cpu/mem/gpu
-#   short-a100 (32 GPU cap): -c 8  --mem=64G  -t 0-1   -> 32 concurrent; 0-1 stays inside
-#                                                         the 1h non-preemptible window
+#   short-a100 (32 GPU cap): -c 8  --mem=64G  -t 0-2   -> 32 concurrent; one chunk/task
+#                                                         (BATCH_SIZE=1) fits well inside 2h;
+#                                                         a run preempted past the 1h
+#                                                         non-preemptible window is REQUEUEd
 #SBATCH -t __SLEAP_WALL__
 #SBATCH -c __SLEAP_CPUS__
 #SBATCH --partition=__SAION_PARTITION__
