@@ -191,6 +191,63 @@ if (( \${#logs[@]} )); then
 		"\${logs[@]}" "saion:$HPC_LOGS_DIR/sleap/" || echo "[WARN] log archive failed; streamed copies remain on bucket"
 fi
 
+# --- Layer 4: verify-before-delete gate --------------------------------------
+# /work may hold the ONLY copy of the sleap outputs: on the gpu25 broken-DNS
+# failure the per-chunk bucket uploads silently fail, and on the sleap2h5
+# KeyError only the .slp uploads. So -- unlike /flash (redundant staging that
+# cleanup.sbatch frees on a chunk-count) -- confirm the UPLOADED products on
+# bucket (\$DATA_DIR) before the rm. Producer set = worklist rows whose sleap
+# .slp actually landed in \$REMOTE_OUTPUT (matches sleap_datacp's -s producer
+# test); the degenerate small tail chunks (n_frames ~2, rows with no .slp) are
+# skipped, so a healthy run is never wedged even though the worklist over-counts
+# real chunks (e.g. 2625 rows vs 2600 produced). Any doubt => KEEP + exit 1.
+WORKLIST="$REMOTE_JOBS/aruco_worklist.txt"
+if [[ ! -r "\$WORKLIST" ]]; then
+	echo "[WARN] no readable worklist at $REMOTE_JOBS/aruco_worklist.txt; KEEPING $REMOTE_ROOT (cannot verify uploads)."
+	echo "       To force-delete after manual verification: rm -rf $REMOTE_ROOT"
+	exit 1
+fi
+if [[ ! -d "$DATA_DIR" ]]; then
+	echo "[WARN] bucket data dir $DATA_DIR absent/unreadable; KEEPING $REMOTE_ROOT (cannot verify uploads)."
+	echo "       To force-delete after manual verification: rm -rf $REMOTE_ROOT"
+	exit 1
+fi
+
+expected=0; present=0; missing=0; miss_slp=0; miss_h5=0
+# '|| [[ -n "\$vname" ]]' still processes a final worklist row that lacks a
+# trailing newline (e.g. a hand-copied recovery worklist), so that row cannot
+# slip past the gate uncounted and let the rm fire on an unverified chunk.
+while IFS=\$'\t' read -r vname chunk _ || [[ -n "\$vname" ]]; do
+	[[ -n "\$vname" ]] || continue
+	local_slp="$REMOTE_OUTPUT/\${vname}_\${chunk}.slp"
+	[[ -s "\$local_slp" ]] || continue      # chunk produced no output -> nothing to preserve
+	expected=\$((expected+1))
+	bslp="$DATA_DIR/\${vname}_\${chunk}.slp"
+	bh5="$DATA_DIR/\${vname}_\${chunk}_sleap_data.h5"
+	if [[ -s "\$bslp" && -s "\$bh5" ]]; then
+		present=\$((present+1))
+	else
+		missing=\$((missing+1))
+		[[ -s "\$bslp" ]] || miss_slp=\$((miss_slp+1))
+		[[ -s "\$bh5" ]]  || miss_h5=\$((miss_h5+1))
+	fi
+done < "\$WORKLIST"
+
+if (( expected == 0 )); then
+	echo "[WARN] no sleap outputs found in $REMOTE_OUTPUT; KEEPING $REMOTE_ROOT (nothing verified as uploaded)."
+	echo "       To force-delete after manual verification: rm -rf $REMOTE_ROOT"
+	exit 1
+fi
+
+if (( missing > 0 )); then
+	echo "[WARN] upload verification FAILED: \$present / \$expected chunk outputs confirmed on bucket ($DATA_DIR)"
+	echo "       \$missing chunk(s) not fully uploaded (missing .slp: \$miss_slp, missing _sleap_data.h5: \$miss_h5)."
+	echo "       KEEPING $REMOTE_ROOT so it stays the only copy (gpu25 broken-DNS strand or sleap2h5 KeyError)."
+	echo "       Re-run sleap_datacp / slp2h5 to backfill bucket, then force-delete: rm -rf $REMOTE_ROOT"
+	exit 1
+fi
+
+echo "[OK] all \$present / \$expected chunk outputs (.slp + _sleap_data.h5) present on bucket; safe to free $REMOTE_ROOT"
 echo "[INFO] removing $REMOTE_ROOT"
 rm -rf "$REMOTE_ROOT"
 CLEAN
