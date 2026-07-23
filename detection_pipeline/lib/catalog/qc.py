@@ -13,22 +13,52 @@ def _parse_date(s):
     return _dt.datetime.strptime(s, "%Y-%m-%d").date()
 
 
+def _is_unclean(vi) -> bool:
+    """Recorder never wrote a clean-close record for this video."""
+    if vi.status and vi.status.lower() != "closed":
+        return True
+    return vi.clean_close is False
+
+
+def _counts_complete(vi) -> bool:
+    """Both independent frame counters are present and agree.
+
+    framesEmitted (capture side) vs framesEncoded (recorder side). Agreement is
+    evidence the recording reached its intended end -- but both are last-heartbeat
+    values, so it is NOT proof the container was finalized or that every frame
+    landed as a decodable cluster. Treated as 'verify', never 'verified'.
+    """
+    return (vi.frames_emitted is not None and vi.frames_encoded is not None
+            and vi.frames_emitted == vi.frames_encoded)
+
+
 def video_health(vi) -> str:
-    """ok | warn | bad | unknown for one VideoInfo."""
+    """ok | warn | bad | unknown for one VideoInfo.
+
+    An unclean close is only 'bad' when we cannot corroborate that the recording
+    finished: if both frame counters are present and agree (and no buffers
+    failed), the footage is almost certainly complete and only container
+    finalization is missing -> 'warn' (remux/verify before use).
+    """
     if not vi.has_sidecar:
         return "unknown"
+
     bad = warn = False
-    if vi.status and vi.status.lower() != "closed":
-        bad = True
-    if vi.clean_close is False:
-        bad = True
     if vi.failed_buffers:
         bad = True
-    if vi.missed_frames:
-        warn = True
     if (vi.frames_emitted is not None and vi.frames_encoded is not None
             and vi.frames_emitted != vi.frames_encoded):
         warn = True
+
+    if _is_unclean(vi):
+        if _counts_complete(vi) and not vi.failed_buffers:
+            warn = True   # complete capture, unfinalized container
+        else:
+            bad = True    # cannot verify how much footage landed
+
+    if vi.missed_frames:
+        warn = True
+
     if bad:
         return "bad"
     if warn:
@@ -103,6 +133,12 @@ def derive_hazards(unit, fp, video_infos) -> list:
 
     if fp.truncated_files:
         flags.append(const.HZ_TRUNCATED_ARTIFACT)
+
+    # Recorder died before finalizing, but both frame counters agree: footage
+    # almost certainly complete, container not finalized -> remux/verify.
+    if any(v.has_sidecar and _is_unclean(v) and _counts_complete(v)
+           for v in video_infos):
+        flags.append(const.HZ_UNCLEAN_CLOSE)
 
     # gpu25-style: compute outputs exist but no HPC logs were uploaded.
     if fp.has_data_dir and (n_slp or n_det) and not fp.has_hpc_logs:

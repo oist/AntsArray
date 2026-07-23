@@ -10,7 +10,8 @@ import os
 import statistics
 
 from . import (cache as cache_mod, const, discover, footprint as fp_mod,
-               probe as probe_mod, provenance, qc, recover, sess_parse, viewer)
+               labels as labels_mod, probe as probe_mod, provenance, qc,
+               recover, sess_parse, viewer)
 from .classify import name_hints_stim
 
 
@@ -225,7 +226,7 @@ def _write_parquet(outdir, catalog_rows, video_rows, trial_rows, log):
 # --------------------------------------------------------------------------
 def run(root, outdir, scanned_at, workers=8, only=None, force=False,
         allow_ffprobe=False, parquet=False, check_sizes=False, mode="all",
-        log=print):
+        labels_file=None, log=print):
     os.makedirs(outdir, exist_ok=True)
     cache_path = os.path.join(outdir, ".scan_cache.jsonl")
     old_cache = cache_mod.Cache(cache_path)
@@ -274,6 +275,15 @@ def run(root, outdir, scanned_at, workers=8, only=None, force=False,
         catalog_rows.append(rec["catalog_row"])
         video_rows += rec["video_rows"]
         trial_rows += rec["trial_rows"]
+
+    # Per-block label overlay: applied post-cache so edits to the file take
+    # effect every run (incl. `build` mode / cache hits) without a rescan.
+    labels_path = labels_file or os.path.join(outdir, labels_mod.LABELS_FILENAME)
+    block_labels = labels_mod.load_block_labels(labels_path, log=log)
+    if block_labels:
+        touched = labels_mod.apply_to_rows(catalog_rows, block_labels)
+        log("[labels] merged per-block labels into %d/%d rows from %s"
+            % (touched, len(catalog_rows), labels_path))
 
     catalog_rows.sort(key=lambda r: (r["session_id"], r["block"]))
     video_rows.sort(key=lambda r: (r["session_id"], r["block"], r["vname"]))

@@ -97,7 +97,7 @@ DEFAULT_EXPECTED_CAMS = 25
 DEFAULT_WORKERS = 8
 TRUNCATED_H5_BYTES = 2048        # below this a data .h5 is almost certainly truncated
 NAME_DATE_TOL_DAYS = 2           # folder-name date vs earliest video date tolerance
-SCAN_VERSION = 5                 # bump to invalidate cache on logic change
+SCAN_VERSION = 6                 # bump to invalidate cache on logic change
 
 # ---------------------------------------------------------------------------
 # Hazard flag names (kept as constants to avoid typos across modules)
@@ -118,6 +118,7 @@ HZ_CHUNK_UNVERIFIABLE = "CHUNK_UNVERIFIABLE"
 HZ_CHUNK_INTERNAL_ONLY = "CHUNK_INTERNAL_ONLY"
 HZ_RAW_CHUNKED = "RAW_CHUNKED"
 HZ_CAM_COUNT_OFF = "CAM_COUNT_OFF"
+HZ_UNCLEAN_CLOSE = "UNCLEAN_CLOSE"   # recorder didn't finalize; counts agree -> remux/verify
 
 TOKEN_JOIN = "|"   # separator for multi-valued cells (Excel-scannable)
 

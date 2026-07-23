@@ -70,6 +70,9 @@ def main(argv=None):
                     help="also emit .parquet mirrors (needs pandas+pyarrow)")
     ap.add_argument("--check-sizes", action="store_true",
                     help="stat data files to flag truncated artifacts (slower)")
+    ap.add_argument("--labels-file", default=None,
+                    help="per-block label overlay CSV keyed by '<date>/block**' "
+                         "(default: <outdir>/block_labels.csv)")
     args = ap.parse_args(argv)
 
     outdir = args.outdir or os.path.join(args.root, "_catalog")
@@ -92,7 +95,8 @@ def main(argv=None):
         build.run(root=args.root, outdir=outdir, scanned_at=scanned_at,
                   workers=args.workers, only=only, force=args.force,
                   allow_ffprobe=args.allow_ffprobe, parquet=args.parquet,
-                  check_sizes=args.check_sizes, mode=args.mode, log=log)
+                  check_sizes=args.check_sizes, mode=args.mode,
+                  labels_file=args.labels_file, log=log)
         log(f"[catalog] done. log: {logpath}")
     except Exception as e:  # never leave a half-written log without a reason
         log(f"[catalog][FATAL] {type(e).__name__}: {e}")

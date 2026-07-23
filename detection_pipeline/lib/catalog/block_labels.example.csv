@@ -1,0 +1,18 @@
+# Per-block label overlay (starter template -- copy to block_labels.csv to use).
+#
+# Put the real file at <outdir>/block_labels.csv  (default outdir is
+# <root>/_catalog, e.g. /bucket/ReiterU/Ants/basler/_catalog/block_labels.csv),
+# or point at it with:  catalog.py all --labels-file /path/to/block_labels.csv
+#
+# One row per block.  Key = the catalog's own block_id, i.e. the '<date>/block**'
+# relative path you can copy straight from the block_id column (or a file path).
+# Slashes may be '/' or '\'; matching is case-insensitive.  Separate multiple
+# labels with '|' or ','.  Lines starting with '#' and blank lines are ignored.
+# Labels merge with any folder-derived labels and do NOT affect is_stim/is_test.
+#
+# Uncomment / edit rows below (remove the leading '# ') once copied to
+# block_labels.csv:
+#
+# block_id,labels
+# 20260717/block01,manipulation
+# 20260717/block02,manipulation|drug

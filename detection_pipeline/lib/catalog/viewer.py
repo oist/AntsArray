@@ -76,6 +76,12 @@ td.num{text-align:right;font-variant-numeric:tabular-nums}
 .recbtn{cursor:pointer;border-radius:6px;font-size:10.5px;padding:1px 7px;border:1px solid;
   color:var(--ink);white-space:nowrap}
 .recbtn:hover{filter:brightness(1.08)}
+.labeledit{background:transparent;border:1px solid transparent;border-radius:6px;
+  padding:2px 6px;min-width:96px;max-width:230px;color:var(--ink);font-size:12px}
+.labeledit::placeholder{color:var(--muted)}
+.labeledit:hover{border-color:var(--border)}
+.labeledit:focus{border-color:var(--info);background:var(--plane);outline:none}
+.labeledit.dirty{border-color:var(--warn);background:color-mix(in srgb,var(--warn) 10%,transparent)}
 .modal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:10;
   align-items:center;justify-content:center;padding:20px}
 .modal .box{background:var(--surface);border:1px solid var(--border);border-radius:12px;
@@ -97,7 +103,13 @@ td.num{text-align:right;font-variant-numeric:tabular-nums}
 <div class="kpis" id="kpis"></div>
 <div class="tabs" id="tabs"></div>
 <div class="toolbar" id="toolbar"></div>
-<div class="tablewrap"><table id="tbl"><thead></thead><tbody></tbody></table></div>
+<div class="tablewrap" id="tblwrap"><table id="tbl"><thead></thead><tbody></tbody></table></div>
+<div class="tablewrap" id="tlwrap" style="display:none">
+  <div style="display:flex;width:max-content">
+    <div id="tlLabels" style="position:sticky;left:0;z-index:2;flex:none;background:var(--surface);border-right:1px solid var(--border)"></div>
+    <div id="tlChart" style="flex:none"></div>
+  </div>
+</div>
 <p class="count" id="count"></p>
 </div>
 <div class="modal" id="modal"><div class="box">
@@ -141,6 +153,8 @@ function pctCell(r){
        +' <span class="muted">'+esc(st)+'</span>';
 }
 function boolCell(v){if(v==='true')return chip('yes','good');if(v==='false')return chip('no','muted');return '<span class="muted">–</span>';}
+function durHours(v){if(v===''||v==null)return '<span class="muted">–</span>';
+  const h=parseFloat(v)/3600;return isNaN(h)?'<span class="muted">–</span>':'<span class="mono">'+h.toFixed(1)+' h</span>';}
 function recoverCell(r){
   if(!r.recover_type)return '<span class="muted">–</span>';
   const cheap=(r.recover_type==='slp2h5'||r.recover_type==='upload');
@@ -156,14 +170,65 @@ function openRec(rec){
   m.style.display='flex';
 }
 
+// --- editable per-block labels -> exports block_labels.csv (overlay format) ---
+const edits={};              // block_id -> edited text (drives the dirty marker)
+const catByBid={};           // block_id -> catalog row (built at init)
+function bidOf(r){return r.block_id||(r.session_id+'/'+(r.block||'-'));}
+function labelCell(v,r){
+  const bid=bidOf(r);
+  return '<input class="labeledit'+(edits[bid]!==undefined?' dirty':'')+'"'
+    +' data-bid="'+esc(bid)+'" value="'+esc(v==null?'':v)+'"'
+    +' placeholder="+ label" spellcheck="false" autocomplete="off">';
+}
+function pathCell(v,r){
+  const bid=bidOf(r);   // '<date>/block**' relative path, click to copy
+  // Cap width to the typical name; long/nested names ellipsize (full path on hover).
+  return '<span class="pathid" data-copy="'+esc(bid)+'" title="'+esc(bid)+' — click to copy"'
+    +' style="font-family:ui-monospace,Menlo,Consolas,monospace;cursor:copy;'
+    +'display:inline-block;max-width:26ch;overflow:hidden;text-overflow:ellipsis;'
+    +'white-space:nowrap;vertical-align:bottom">'+esc(bid)+'</span>';
+}
+function labelsCsv(){
+  const q2=(s)=>/[",\n]/.test(s)?'"'+String(s).replace(/"/g,'""')+'"':String(s);
+  const out=DATA.catalog.filter(r=>String(r.labels||'').trim()!=='')
+    .map(r=>({b:bidOf(r),l:String(r.labels).trim()}))
+    .sort((a,b)=>a.b.localeCompare(b.b));
+  return 'block_id,labels\n'+out.map(r=>q2(r.b)+','+q2(r.l)).join('\n')+'\n';
+}
+async function saveLabels(){
+  const csv=labelsCsv(), name='block_labels.csv';
+  let saved=false;
+  if(window.showSaveFilePicker){
+    try{
+      const h=await window.showSaveFilePicker({suggestedName:name, id:'blocklabels',
+        types:[{description:'CSV',accept:{'text/csv':['.csv']}}]});
+      const w=await h.createWritable(); await w.write(csv); await w.close(); saved=true;
+    }catch(e){ if(e&&e.name==='AbortError')return; }
+  }
+  if(!saved){
+    const a=document.createElement('a');
+    a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));
+    a.download=name; document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(()=>URL.revokeObjectURL(a.href),1500);
+  }
+  for(const k in edits) delete edits[k];   // exported -> clear the unsaved-edit marker
+  updateDirty(); renderBody();
+}
+function copyLabels(){try{navigator.clipboard.writeText(labelsCsv());}catch(e){}}
+function updateDirty(){
+  const d=document.getElementById('dirty'); if(!d)return;
+  const n=Object.keys(edits).length;
+  d.textContent=n?(n+' edited — export to save'):'';
+}
+
 const R={
   txt:(v)=>v===''?'<span class="muted">–</span>':esc(v),
   num:(v)=>v===''?'<span class="muted">–</span>':'<span class="mono">'+esc(v)+'</span>',
 };
 const VIEWS={
   catalog:{rows:DATA.catalog, cols:[
-    ['session_id','session',R.txt],['block','block',R.txt],['session_kind','kind',R.txt],
-    ['layout','layout',R.txt],['date_start','date',R.txt],['labels','labels',R.txt],
+    ['block_id','session/block',(v,r)=>pathCell(v,r)],['session_kind','kind',R.txt],
+    ['date_start','date',R.txt],['duration_median_sec','dur (h)',(v)=>durHours(v)],['labels','labels',(v,r)=>labelCell(v,r)],
     ['is_stim','stim',(v)=>boolCell(v)],['n_trials_observed','trials',R.num],
     ['n_colony_videos','vids',R.num],['has_sidecars','sidecars',(v)=>boolCell(v)],
     ['health_flag','health',(v)=>chip(v,HEALTH[v]||'muted')],
@@ -192,10 +257,14 @@ const VIEWS={
   ]},
 };
 const NUMKEYS=new Set(['n_trials_observed','n_colony_videos','n_slp','n_aruco_det','n_sleap_data',
-  'completeness_pct','cam_global','fps','frame_count','duration_sec','missed_frames','frame_drop',
+  'completeness_pct','duration_median_sec','cam_global','fps','frame_count','duration_sec','missed_frames','frame_drop',
   'trial','duty','dur_s','interval_s','cam_frame_start','cam_frame_end','gyro_rms_dps','acc_rms_g','temp_mean_C']);
 
-let view='catalog', sortKey='session_id', sortDir=1, q='', facet={};
+let view='catalog', sortKey='block_id', sortDir=1, q='', facet={};
+const TZ_OFF=9*3600*1000;   // JST (UTC+9, no DST): day/night uses recording-site local time
+const DAY_START_H=5.5, DAY_END_H=19.5;   // light period 05:30-19:30 JST (14L / 10D)
+const STIM_COL='#8b5cf6';   // stim-pulse stripe colour (violet, reads on both themes)
+let tlPxPerDay=120;         // timeline horizontal zoom (px per day)
 
 function kpis(){
   const c=DATA.catalog;
@@ -212,11 +281,12 @@ function kpis(){
     '<div class="kpi"><div class="v">'+t[1]+'</div><div class="l">'+t[0]+'</div></div>').join('');
 }
 function tabs(){
-  const names=[['catalog','catalog'],['videos','videos'],['trials','trials']];
-  document.getElementById('tabs').innerHTML=names.map(n=>
-    '<button class="tab'+(n[0]===view?' active':'')+'" data-v="'+n[0]+'">'+n[1]+' ('+VIEWS[n[0]].rows.length+')</button>').join('');
+  const names=[['catalog','catalog'],['videos','videos'],['trials','trials'],['timeline','timeline']];
+  document.getElementById('tabs').innerHTML=names.map(n=>{
+    const cnt=VIEWS[n[0]]?VIEWS[n[0]].rows.length:tlData().length;
+    return '<button class="tab'+(n[0]===view?' active':'')+'" data-v="'+n[0]+'">'+n[1]+' ('+cnt+')</button>';}).join('');
   document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{view=b.dataset.v;q='';facet={};
-    sortKey=VIEWS[view].cols[0][0];sortDir=1;render();});
+    if(VIEWS[view])sortKey=VIEWS[view].cols[0][0];sortDir=1;render();});
 }
 function toolbar(){
   let h='<input type="search" id="q" placeholder="filter…" value="'+esc(q)+'">';
@@ -224,11 +294,28 @@ function toolbar(){
     h+=facetSel('session_kind','kind')+facetSel('pipeline_status','pipeline')+facetSel('is_stim','stim');
     h+='<label><input type="checkbox" id="hz"'+(facet.__hz?' checked':'')+'> flagged only</label>';
   }else if(view==='videos'){h+=facetSel('video_health','health');}
-  h+='<span class="spacer"></span><span class="count" id="cnt"></span>';
+  if(view==='catalog'){
+    h+='<span class="spacer"></span><span class="count" id="dirty"></span>'
+      +'<button class="btn" id="savelabels" title="Save/download block_labels.csv into the _catalog/ folder">⬇ block_labels.csv</button>'
+      +'<button class="btn" id="copylabels" title="Copy block_labels.csv to clipboard">copy</button>'
+      +'<span class="count" id="cnt"></span>';
+  }else if(view==='timeline'){
+    h+='<span class="count">night shaded (19:30–05:30 JST · 14L/10D) · bar = recording · <b style="color:'+STIM_COL+'">▏</b> stim pulse</span>'
+      +'<span class="spacer"></span>'
+      +'<button class="btn" id="tlout">– zoom</button><button class="btn" id="tlin">zoom +</button>'
+      +'<span class="count" id="cnt"></span>';
+  }else{
+    h+='<span class="spacer"></span><span class="count" id="cnt"></span>';
+  }
   const tb=document.getElementById('toolbar');tb.innerHTML=h;
-  document.getElementById('q').oninput=(e)=>{q=e.target.value;renderBody();};
+  document.getElementById('q').oninput=(e)=>{q=e.target.value;view==='timeline'?renderTimeline():renderBody();};
   tb.querySelectorAll('select[data-k]').forEach(s=>s.onchange=()=>{facet[s.dataset.k]=s.value;renderBody();});
   const hz=document.getElementById('hz');if(hz)hz.onchange=()=>{facet.__hz=hz.checked;renderBody();};
+  const sv=document.getElementById('savelabels');if(sv)sv.onclick=saveLabels;
+  const cp=document.getElementById('copylabels');if(cp)cp.onclick=copyLabels;
+  const zi=document.getElementById('tlin');if(zi)zi.onclick=()=>{tlPxPerDay=Math.min(600,Math.round(tlPxPerDay*1.6));renderTimeline();};
+  const zo=document.getElementById('tlout');if(zo)zo.onclick=()=>{tlPxPerDay=Math.max(20,Math.round(tlPxPerDay/1.6));renderTimeline();};
+  updateDirty();
 }
 function facetSel(key,label){
   const vals=[...new Set(VIEWS[view].rows.map(r=>r[key]).filter(v=>v!==''&&v!=null))].sort();
@@ -263,10 +350,89 @@ function renderBody(){
   document.querySelector('#tbl tbody').innerHTML=body||'<tr><td>no matching rows</td></tr>';
   const cnt=document.getElementById('cnt');if(cnt)cnt.textContent=rows.length+' / '+VIEWS[view].rows.length+' rows';
 }
-function render(){tabs();toolbar();renderHead();renderBody();}
+function tlLocal(epoch){return new Date(epoch+TZ_OFF);}   // read fields via getUTC* -> JST
+function tlDate(epoch){const d=tlLocal(epoch),p=(n)=>String(n).padStart(2,'0');
+  return p(d.getUTCMonth()+1)+'/'+p(d.getUTCDate());}
+function tlDateTime(epoch){const d=tlLocal(epoch),p=(n)=>String(n).padStart(2,'0');
+  return d.getUTCFullYear()+'-'+p(d.getUTCMonth()+1)+'-'+p(d.getUTCDate())+' '+p(d.getUTCHours())+':'+p(d.getUTCMinutes());}
+function tlData(){
+  const startByBid={};
+  DATA.videos.forEach(v=>{const s=parseFloat(v.start_epoch_ms);
+    if(!isFinite(s))return;
+    const bid=v.session_id+'/'+(v.block||'-');
+    if(startByBid[bid]===undefined||s<startByBid[bid])startByBid[bid]=s;});
+  const out=[];
+  DATA.catalog.forEach(r=>{const bid=bidOf(r),s=startByBid[bid],dur=parseFloat(r.duration_median_sec);
+    if(s===undefined||!isFinite(dur))return;
+    out.push({bid:bid,start:s,end:s+dur*1000,health:r.health_flag||'',labels:r.labels||'',
+              fps:parseFloat(r.fps_mode)||24});});
+  out.sort((a,b)=>a.start-b.start);
+  return out;
+}
+function renderTimeline(scrollRight){
+  const labelsEl=document.getElementById('tlLabels'), chartEl=document.getElementById('tlChart');
+  let rows=tlData();
+  if(q){const s=q.toLowerCase();rows=rows.filter(r=>r.bid.toLowerCase().includes(s));}
+  const cnt=document.getElementById('cnt');if(cnt)cnt.textContent=rows.length+' blocks';
+  if(!rows.length){labelsEl.innerHTML='';
+    chartEl.innerHTML='<p class="muted" style="padding:16px">no blocks with recording timestamps</p>';return;}
+  const dayMs=86400000;
+  const floorDay=(t)=>{const d=tlLocal(t);d.setUTCHours(0,0,0,0);return d.getTime()-TZ_OFF;};
+  const minT=Math.min.apply(null,rows.map(r=>r.start)), maxT=Math.max.apply(null,rows.map(r=>r.end));
+  const t0=floorDay(minT), t1=floorDay(maxT)+dayMs, pxMs=tlPxPerDay/dayMs;
+  const rowH=24, top=26, W=Math.max(320,(t1-t0)*pxMs+8), H=top+rows.length*rowH+6;
+  const X=(t)=>(t-t0)*pxMs;
+  const night=getVar('--grid'), dayc=getVar('--surface'), bd=getVar('--border'), ink2=getVar('--ink2');
+  let s='<svg width="'+Math.round(W)+'" height="'+H+'" style="display:block">';
+  for(let d=t0; d<t1; d+=dayMs){
+    const x0=X(d), ds=X(d+DAY_START_H*3600000), de=X(d+DAY_END_H*3600000);
+    s+='<rect x="'+x0+'" y="'+top+'" width="'+(dayMs*pxMs)+'" height="'+(H-top)+'" style="fill:'+night+';opacity:.5"/>';
+    s+='<rect x="'+ds+'" y="'+top+'" width="'+(de-ds)+'" height="'+(H-top)+'" style="fill:'+dayc+'"/>';
+    s+='<line x1="'+x0+'" y1="'+top+'" x2="'+x0+'" y2="'+H+'" style="stroke:'+bd+'"/>';
+    s+='<text x="'+(x0+4)+'" y="16" style="font-size:11px;fill:'+ink2+'">'+tlDate(d)+'</text>';
+  }
+  rows.forEach((r,i)=>{
+    const y=top+i*rowH+3, bx=X(r.start), bw=Math.max(2,(r.end-r.start)*pxMs);
+    const col=C[HEALTH[r.health]||'muted']||C.muted, hrs=((r.end-r.start)/3600000).toFixed(1);
+    s+='<rect x="'+bx+'" y="'+y+'" width="'+bw+'" height="'+(rowH-6)+'" rx="3" '
+      +'style="fill:'+hexa(col,.55)+';stroke:'+col+'"><title>'+esc(r.bid)+'\nstart '+tlDateTime(r.start)
+      +' JST\nend   '+tlDateTime(r.end)+' JST\n'+hrs+' h'+(r.labels?'\nlabels: '+r.labels:'')+'</title></rect>';
+    if(r.labels)s+='<text x="'+(bx+5)+'" y="'+(y+(rowH-6)/2+3.5)+'" '
+      +'style="font-size:10.5px;fill:'+getVar('--ink')+';pointer-events:none">'+esc(r.labels.replace(/\|/g,' '))+'</text>';
+  });
+  // stim pulses: frame-anchored so they land on the bar regardless of clock/timezone
+  const idxByBid={};rows.forEach((r,i)=>{idxByBid[r.bid]=i;});
+  DATA.trials.forEach(t=>{
+    const bid=t.session_id+'/'+(t.block||'-'), i=idxByBid[bid];
+    if(i===undefined)return;
+    const fs=parseFloat(t.cam_frame_start); if(!isFinite(fs))return;
+    const fe=parseFloat(t.cam_frame_end), row=rows[i];
+    const pS=row.start+(fs/row.fps)*1000, pE=(isFinite(fe)&&fe>fs)?row.start+(fe/row.fps)*1000:pS+5000;
+    const yy=top+i*rowH+3, px=X(pS), pw=Math.max(1.5,(pE-pS)*pxMs);
+    s+='<rect x="'+px+'" y="'+yy+'" width="'+pw+'" height="'+(rowH-6)+'" style="fill:'+STIM_COL+';opacity:.85">'
+      +'<title>stim '+esc(String(t.trial||''))+'  '+esc(t.iso_time||'')+(t.duty?'  duty '+esc(String(t.duty)):'')+'</title></rect>';
+  });
+  s+='</svg>';
+  chartEl.innerHTML=s;
+  let lh='<div style="height:'+top+'px"></div>';
+  rows.forEach(r=>{lh+='<div class="pathid" data-copy="'+esc(r.bid)+'" title="'+esc(r.bid)+' — click to copy" '
+    +'style="height:'+rowH+'px;line-height:'+rowH+'px;padding:0 10px;font-family:ui-monospace,Menlo,Consolas,monospace;'
+    +'font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:210px;cursor:copy">'
+    +esc(r.bid)+'</div>';});
+  labelsEl.innerHTML=lh;
+  if(scrollRight){const w=document.getElementById('tlwrap');w.scrollLeft=w.scrollWidth;}  // newest first
+}
+function render(){
+  tabs();toolbar();
+  const isTL=view==='timeline';
+  document.getElementById('tblwrap').style.display=isTL?'none':'';
+  document.getElementById('tlwrap').style.display=isTL?'':'none';
+  if(isTL)renderTimeline(true); else {renderHead();renderBody();}
+}
 function applyTheme(t){document.documentElement.setAttribute('data-theme',t);
   Object.assign(C,{good:getVar('--good'),warn:getVar('--warn'),serious:getVar('--serious'),
-    crit:getVar('--crit'),info:getVar('--info'),muted:getVar('--muted')});renderBody();}
+    crit:getVar('--crit'),info:getVar('--info'),muted:getVar('--muted')});
+  view==='timeline'?renderTimeline():renderBody();}
 (function(){
   const dark=window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches;
   document.documentElement.setAttribute('data-theme',dark?'dark':'light');
@@ -276,6 +442,20 @@ function applyTheme(t){document.documentElement.setAttribute('data-theme',t);
   modal.addEventListener('click',e=>{if(e.target===modal||e.target.classList.contains('close'))modal.style.display='none';});
   document.addEventListener('keydown',e=>{if(e.key==='Escape')modal.style.display='none';});
   document.addEventListener('click',e=>{const b=e.target.closest&&e.target.closest('.recbtn');if(b){try{openRec(JSON.parse(b.dataset.rec));}catch(err){}}});
+  document.addEventListener('click',e=>{const p=e.target.closest&&e.target.closest('.pathid');
+    if(p&&p.dataset.copy){try{navigator.clipboard.writeText(p.dataset.copy);}catch(err){}
+      const t=p.textContent;p.textContent='copied ✓';setTimeout(()=>{p.textContent=t;},700);}});
+  DATA.catalog.forEach(r=>{catByBid[bidOf(r)]=r;});
+  document.addEventListener('input',e=>{
+    const el=e.target;
+    if(el&&el.classList&&el.classList.contains('labeledit')){
+      const bid=el.dataset.bid; edits[bid]=el.value;
+      const row=catByBid[bid]; if(row)row.labels=el.value;
+      el.classList.add('dirty'); updateDirty();
+    }
+  });
+  window.addEventListener('beforeunload',e=>{
+    if(Object.keys(edits).length){e.preventDefault();e.returnValue='';}});
   kpis();render();
 })();
 </script>
@@ -289,15 +469,16 @@ def _keep(rows, columns):
     return [{k: r.get(k, "") for k in columns} for r in rows]
 
 
-_CATALOG_KEYS = ["session_id", "block", "session_kind", "layout", "date_start", "labels",
+_CATALOG_KEYS = ["session_id", "block", "block_id", "session_kind", "date_start",
+                 "duration_median_sec", "fps_mode", "labels",
                  "is_stim", "n_trials_observed", "n_colony_videos", "has_sidecars",
                  "health_flag", "pipeline_status", "completeness_pct", "completeness_state",
                  "n_slp", "n_aruco_det", "n_sleap_data", "sleap_models", "saion_partition",
                  "stage_reached", "hazard_flags", "recover_type", "recover_missing",
                  "recover_cmd", "recover_steps"]
 _VIDEO_KEYS = ["session_id", "block", "vname", "cam_global", "ext", "has_sidecar", "fps",
-               "frame_count", "duration_sec", "missed_frames", "frame_drop", "video_health",
-               "assigned_pc", "assigned_drive"]
+               "frame_count", "duration_sec", "start_epoch_ms", "missed_frames", "frame_drop",
+               "video_health", "assigned_pc", "assigned_drive"]
 _TRIAL_KEYS = ["session_id", "block", "trial", "iso_time", "duty", "dur_s", "interval_s",
                "cam_frame_start", "cam_frame_end", "gyro_rms_dps", "acc_rms_g",
                "temp_mean_C", "imu_ok"]

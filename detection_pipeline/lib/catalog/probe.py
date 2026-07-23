@@ -54,7 +54,11 @@ def probe_video(vn, allow_ffprobe=False, ffprobe_timeout=120, max_probe_sec=180)
             info.fps = fps
             info.frame_count = frames
             info.status = str(ctx.get("status", ""))
-            info.clean_close = str(ctx.get("status", "")).lower() == "closed"
+            # Prefer the recorder's own cleanClose flag; fall back to status for
+            # older sidecars that predate the field.
+            cc = ctx.get("cleanClose")
+            info.clean_close = (cc if isinstance(cc, bool)
+                                else str(ctx.get("status", "")).lower() == "closed")
             info.start_epoch_ms = _num(ctx, "startEpochMs", int)
             info.frames_emitted = _num(cap, "framesEmitted", int)
             info.frames_encoded = _num(rec, "framesEncoded", int)
