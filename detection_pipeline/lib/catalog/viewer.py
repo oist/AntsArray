@@ -119,6 +119,7 @@ td.num{text-align:right;font-variant-numeric:tabular-nums}
 </div></div>
 <script>
 const DATA = {catalog: __CATALOG__, videos: __VIDEOS__, trials: __TRIALS__};
+const CAT_ROOT=__ROOTJSON__;   // scanned root, for building run commands
 const C = {good:getVar('--good'),warn:getVar('--warn'),serious:getVar('--serious'),
            crit:getVar('--crit'),info:getVar('--info'),muted:getVar('--muted')};
 function getVar(n){return getComputedStyle(document.documentElement).getPropertyValue(n).trim()||'#888';}
@@ -155,6 +156,46 @@ function pctCell(r){
 function boolCell(v){if(v==='true')return chip('yes','good');if(v==='false')return chip('no','muted');return '<span class="muted">–</span>';}
 function durHours(v){if(v===''||v==null)return '<span class="muted">–</span>';
   const h=parseFloat(v)/3600;return isNaN(h)?'<span class="muted">–</span>':'<span class="mono">'+h.toFixed(1)+' h</span>';}
+function runCmd(r){   // DETECTION: command to run/finish this block, or '' if nothing to run
+  const st=r.pipeline_status;
+  if(st==='complete'||st==='analysis_only'||!st)return '';
+  const rc=(r.recover_cmd||'').trim();
+  if(st==='partial'&&rc&&rc.charAt(0)!=='#')return rc;   // targeted recovery of missing chunks
+  const dir=CAT_ROOT+'/'+r.session_id+(r.block?'/'+r.block:'');   // full detection (+tracking) run
+  return 'bash detection_pipeline/pipeline.sh --dir '+dir
+    +' --sleap-model-centroid <CENTROID_DIR> --sleap-model-instance <INSTANCE_DIR> --run-tracking';
+}
+function statusCell(v,r){
+  const base=chip(v,STATUS[v]||'muted'), cmd=runCmd(r);
+  if(!cmd)return base;   // complete / analysis_only: plain chip, not clickable
+  return '<span class="runstat" data-cmd="'+esc(cmd)+'" title="'+esc(cmd)+'" style="cursor:copy">'+base+'</span>';
+}
+// TRACKING (colony) status, derived from which downstream dirs landed in the block.
+const TRK_STAGES=[['tracks',['tracks']],
+  ['stitched',['stitched','per_track','per_track_left','per_track_right']],
+  ['analysis',['xy_speed_sleep_pngs','predictions']],
+  ['interactions',['interactions']]];
+function trkCmd(r){   // colony tracking submitter (needs detection data/ present)
+  const blk=r.block||'block*';
+  return 'bash tracking/colony/submit_blocks_pipeline.sh --blocks_root '+CAT_ROOT+'/'+r.session_id+' --block_glob '+blk;
+}
+function trkInfo(r){
+  const have=new Set(String(r.downstream||'').toLowerCase().split('|').filter(Boolean));
+  let idx=-1;
+  TRK_STAGES.forEach((s,i)=>{if(s[1].some(d=>have.has(d)))idx=i;});
+  if(idx<0)return {status:'not_started',stage:''};
+  if(idx===TRK_STAGES.length-1)return {status:'complete',stage:'interactions'};
+  return {status:'partial',stage:TRK_STAGES[idx][0]};
+}
+function trackCell(v,r){
+  const info=trkInfo(r);
+  if(info.status==='complete')return chip('complete','good');
+  if(info.status==='partial'){const cmd=trkCmd(r);
+    return '<span class="runstat" data-cmd="'+esc(cmd)+'" title="'+esc(cmd)+'" style="cursor:copy">'+chip(info.stage,'warn')+'</span>';}
+  if(r.pipeline_status!=='complete')return '<span class="muted">–</span>';   // detection not done -> tracking N/A
+  const cmd=trkCmd(r);
+  return '<span class="runstat" data-cmd="'+esc(cmd)+'" title="'+esc(cmd)+'" style="cursor:copy">'+chip('not started','muted')+'</span>';
+}
 function recoverCell(r){
   if(!r.recover_type)return '<span class="muted">–</span>';
   const cheap=(r.recover_type==='slp2h5'||r.recover_type==='upload');
@@ -232,7 +273,7 @@ const VIEWS={
     ['is_stim','stim',(v)=>boolCell(v)],['n_trials_observed','trials',R.num],
     ['n_colony_videos','vids',R.num],['has_sidecars','sidecars',(v)=>boolCell(v)],
     ['health_flag','health',(v)=>chip(v,HEALTH[v]||'muted')],
-    ['pipeline_status','pipeline',(v)=>chip(v,STATUS[v]||'muted')],
+    ['pipeline_status','pipeline',(v,r)=>statusCell(v,r)],['downstream','tracking',(v,r)=>trackCell(v,r)],
     ['completeness_pct','complete %',(v,r)=>pctCell(r)],
     ['n_slp','slp',R.num],['n_aruco_det','aruco',R.num],['n_sleap_data','sleap_h5',R.num],
     ['sleap_models','models',R.txt],['saion_partition','partition',R.txt],
@@ -445,6 +486,10 @@ function applyTheme(t){document.documentElement.setAttribute('data-theme',t);
   document.addEventListener('click',e=>{const p=e.target.closest&&e.target.closest('.pathid');
     if(p&&p.dataset.copy){try{navigator.clipboard.writeText(p.dataset.copy);}catch(err){}
       const t=p.textContent;p.textContent='copied ✓';setTimeout(()=>{p.textContent=t;},700);}});
+  document.addEventListener('click',e=>{const el=e.target.closest&&e.target.closest('.runstat');
+    if(el&&el.dataset.cmd){try{navigator.clipboard.writeText(el.dataset.cmd);}catch(err){}
+      el.style.outline='2px solid '+C.good;el.style.borderRadius='999px';
+      setTimeout(()=>{el.style.outline='';},650);}});
   DATA.catalog.forEach(r=>{catByBid[bidOf(r)]=r;});
   document.addEventListener('input',e=>{
     const el=e.target;
@@ -474,7 +519,7 @@ _CATALOG_KEYS = ["session_id", "block", "block_id", "session_kind", "date_start"
                  "is_stim", "n_trials_observed", "n_colony_videos", "has_sidecars",
                  "health_flag", "pipeline_status", "completeness_pct", "completeness_state",
                  "n_slp", "n_aruco_det", "n_sleap_data", "sleap_models", "saion_partition",
-                 "stage_reached", "hazard_flags", "recover_type", "recover_missing",
+                 "stage_reached", "downstream", "hazard_flags", "recover_type", "recover_missing",
                  "recover_cmd", "recover_steps"]
 _VIDEO_KEYS = ["session_id", "block", "vname", "cam_global", "ext", "has_sidecar", "fps",
                "frame_count", "duration_sec", "start_epoch_ms", "missed_frames", "frame_drop",
@@ -492,6 +537,7 @@ def _embed(rows, columns):
 def write_html(path, catalog_rows, video_rows, trial_rows, scanned_at, root):
     """Write a self-contained catalog.html with the rows embedded."""
     html = _TEMPLATE
+    html = html.replace("__ROOTJSON__", json.dumps(root).replace("<", "\\u003c"))
     html = html.replace("__ROOT__", root)
     html = html.replace("__SCANNED_AT__", scanned_at)
     html = html.replace("__CATALOG__", _embed(catalog_rows, _CATALOG_KEYS))
