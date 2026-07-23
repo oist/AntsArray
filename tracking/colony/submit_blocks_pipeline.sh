@@ -242,6 +242,7 @@ analysis_cpus="$ANALYSIS_CPUS"
 analysis_mem="$ANALYSIS_MEM"
 analysis_time="$ANALYSIS_TIME"
 dry_run="$DRY_RUN"
+force_submit=0
 
 usage() {
   cat <<EOF
@@ -339,6 +340,9 @@ Optional:
   --analysis_mem MEM        Memory per per-track analysis job. Default: 16G
   --analysis_time TIME      Time per per-track analysis job. Default: 0-12:00:00
   --dry_run                 Write scripts but do not submit.
+  --force_submit            Submit even if live Slurm jobs already exist for the
+                            block. Default: refuse (prevents duplicate concurrent
+                            DAGs racing on the same tracks/stitched files).
   -h, --help
 EOF
 }
@@ -421,6 +425,7 @@ while [[ $# -gt 0 ]]; do
     --analysis_mem) analysis_mem="$2"; shift 2 ;;
     --analysis_time) analysis_time="$2"; shift 2 ;;
     --dry_run) dry_run=1; shift ;;
+    --force_submit) force_submit=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -486,6 +491,43 @@ for block_dir in "${blocks[@]}"; do
   fi
 
   block_name="$(basename "$block_dir")"
+  # Experiment-qualified tag (e.g. 20260716_block01) so the emitted Slurm job
+  # names -- and the duplicate-submission guard below -- cannot be confused with
+  # a same-named block from another date (job names alone are not date-scoped).
+  exp_tag="$(basename "$blocks_root")"
+  job_tag="${exp_tag}_${block_name}"
+
+  # --- Duplicate-submission guard -------------------------------------------
+  # SKIP_EXISTING makes a *sequential* re-run safe (it fills only the missing
+  # outputs), but nothing stops two *concurrent* DAGs from racing on the same
+  # tracks/stitched files -- e.g. a lingering track_trigger poller firing while
+  # another run is live, or a manual re-submit. Refuse if this exact dated block
+  # already has live Slurm jobs, unless --force_submit. The match is boundary-
+  # anchored on the experiment-qualified job_tag (the "_${job_tag}" substring must
+  # be followed by '_' or end-of-name), so block01 does NOT match block010 and
+  # 20260716 does NOT match 20260721. %.200j + whitespace trim make the match
+  # immune to squeue name truncation/padding. Fail-open if squeue is unavailable
+  # (the check is a safety net, not the sole protection).
+  if [[ "$dry_run" -eq 0 && "$force_submit" -eq 0 ]]; then
+    live_jobs="$(squeue -u "$RUN_USER" -h -o '%i|%.200j' 2>/dev/null \
+      | awk -F'|' -v t="_${job_tag}" '
+          { id=$1; name=$2
+            sub(/^[[:space:]]+/, "", id);   sub(/[[:space:]]+$/, "", id)
+            sub(/^[[:space:]]+/, "", name); sub(/[[:space:]]+$/, "", name)
+            p = index(name, t)
+            if (p > 0) {
+              c = substr(name, p + length(t), 1)
+              if (c == "" || c == "_") printf "%s(%s) ", name, id
+            } }' \
+      || true)"
+    if [[ -n "$live_jobs" ]]; then
+      echo "ERROR: live tracking jobs already exist for ${job_tag}: ${live_jobs}" >&2
+      echo "       Refusing to submit a duplicate concurrent DAG on the same block." >&2
+      echo "       Cancel those jobs first, or pass --force_submit to override." >&2
+      continue
+    fi
+  fi
+
   if [[ -n "$work_name" ]]; then
     work_dir="$output_root/$block_name/$work_name"
   else
@@ -584,7 +626,7 @@ for block_dir in "${blocks[@]}"; do
 
   cat > "$map_script" <<EOF
 #!/usr/bin/env bash
-#SBATCH -J map_${block_name}
+#SBATCH -J map_${job_tag}
 #SBATCH -p ${partition}
 #SBATCH -c ${map_cpus}
 #SBATCH --mem=${map_mem}
@@ -627,7 +669,7 @@ EOF
 
   cat > "$tracking_complete_script" <<EOF
 #!/usr/bin/env bash
-#SBATCH -J track_done_${block_name}
+#SBATCH -J track_done_${job_tag}
 #SBATCH -p ${partition}
 #SBATCH -c 1
 #SBATCH --mem=1G
@@ -643,7 +685,7 @@ EOF
 
   cat > "$stitch_script" <<EOF
 #!/usr/bin/env bash
-#SBATCH -J stitch_${block_name}
+#SBATCH -J stitch_${job_tag}
 #SBATCH -p ${partition}
 #SBATCH -c ${stitch_cpus}
 #SBATCH --mem=${stitch_mem}
@@ -675,7 +717,7 @@ EOF
 
   cat > "$track_submit_script" <<EOF
 #!/usr/bin/env bash
-#SBATCH -J submit_track_${block_name}
+#SBATCH -J submit_track_${job_tag}
 #SBATCH -p ${partition}
 #SBATCH -c ${track_submit_cpus}
 #SBATCH --mem=${track_submit_mem}
@@ -700,7 +742,7 @@ rm -f "${tracking_job_ids_file}" "${tracking_complete_done_file}" "${tracking_co
   --cpus "${track_cpus}" \\
   --mem "${track_mem}" \\
   --time "${track_time}" \\
-  --job_name "track_${block_name}" \\
+  --job_name "track_${job_tag}" \\
   --conda_env "${conda_env}" \\
   --conda_bin "${conda_bin}" \\
   --python_bin "${python_bin}" \\
@@ -746,7 +788,7 @@ EOF
 
   cat > "$per_track_analysis_submit_script" <<EOF
 #!/usr/bin/env bash
-#SBATCH -J submit_pta_${block_name}
+#SBATCH -J submit_pta_${job_tag}
 #SBATCH -p ${partition}
 #SBATCH -c ${per_track_analysis_submit_cpus}
 #SBATCH --mem=${per_track_analysis_submit_mem}
@@ -855,7 +897,7 @@ EOF
 
   cat > "$interaction_submit_script" <<EOF
 #!/usr/bin/env bash
-#SBATCH -J submit_inter_${block_name}
+#SBATCH -J submit_inter_${job_tag}
 #SBATCH -p ${partition}
 #SBATCH -c ${interaction_submit_cpus}
 #SBATCH --mem=${interaction_submit_mem}
@@ -880,7 +922,7 @@ rm -f "${interaction_job_ids_file}" "${interaction_complete_job_id_file}" "${int
   --cpus "${interaction_cpus}" \\
   --mem "${interaction_mem}" \\
   --time "${interaction_time}" \\
-  --job_name "inter_${block_name}" \\
+  --job_name "inter_${job_tag}" \\
   --conda_env "${conda_env}" \\
   --conda_bin "${conda_bin}" \\
   --python_bin "${python_bin}" \\
