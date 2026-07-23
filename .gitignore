@@ -1,5 +1,6 @@
 
 *.ai
 *.asv
+*.liene
 .venv/
 __pycache__/
