@@ -262,8 +262,9 @@ def build_steps(root, session_id, block, fp, vinfo, has_silent_partial, outdir,
         "%d chunks are missing their .slp (SLEAP predict never completed -" % n,
         "the scattered-across-cameras pattern is the array-wall timeout).",
         "",
-        "Option A - simple (re-chunks the whole block; skip-logic keeps it correct,",
-        "but recomputes all chunks, not just the %d):%s" % (n, mnote),
+        "Option A - simple (re-chunks the whole block, but the bucket-aware skip",
+        "runs SLEAP only on the %d missing/incomplete chunks; pass" % n,
+        "--sleap-force-recompute to redo all, e.g. to apply a new model):%s" % mnote,
         "  " + simple,
     ]
     if part:

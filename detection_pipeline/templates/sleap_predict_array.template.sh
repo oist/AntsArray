@@ -144,7 +144,12 @@ for (( row_idx=start_idx; row_idx<end_idx; row_idx++ )); do
 	(
 		out_h5="$REMOTE_OUTPUT/${vname}_${chunk}_sleap_data.h5"
 		echo "[$(date)] [bg] slp -> h5 ${vname}_${chunk}"
+		# Record the chunk's design frame count (worklist col 3) as the
+		# expected_frames h5 attr so a later --only-sleap re-run can verify this
+		# chunk was processed under the same chunking and skip it. Empty on the
+		# legacy 2-col worklist -> attr omitted (filter falls back to presence).
 		"$UV_TOOL_DIR/sleap-nn/bin/python" "$SCRIPTS_DIR/sleap2h5.py" "$out_slp" "$REMOTE_OUTPUT" \
+			${n_frames:+--expected-frames "$n_frames"} \
 			|| echo "[WARN] sleap2h5 failed for ${vname}_${chunk}; .slp will still upload" >&2
 
 		upload_files=( "$out_slp" )

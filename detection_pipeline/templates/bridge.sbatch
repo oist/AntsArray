@@ -90,6 +90,45 @@ WORKLIST="$JOBS_ROOT/aruco_worklist.txt"
 DEIGO_FLASH_SAION_PREFIX="/deigo_flash/ReiterU/$USER/$EXP_NAME"
 echo "[INFO] saion will self-fetch chunks from $DEIGO_FLASH_SAION_PREFIX (cross-mount; no rsync needed)"
 
+# --- Bucket-aware skip: drop chunks already complete on the bucket -----------
+# Default ON so a delayed --only-sleap re-run recomputes only the gaps. Runs on
+# deigo (compute reads /bucket -- see aruco_array's upload_one size check) and
+# writes a filtered worklist of just the chunks that still need SLEAP. The saion
+# array, sleap_datacp, and the verify-before-delete gate all read this filtered
+# list (uploaded as aruco_worklist.txt), so a skipped chunk is never re-run,
+# re-uploaded, or re-verified. --sleap-force-recompute (SLEAP_FORCE_RECOMPUTE=1)
+# recomputes everything -- required when re-running to apply a NEW model, whose
+# outputs the skip cannot distinguish from the old ones. h5py for expected_frames
+# verification comes from the opencv module (same env aruco uses to write h5); if
+# it is unavailable the filter degrades to a size-only presence check.
+SLEAP_STAGE="$JOBS_ROOT/saion_stage"
+mkdir -p "$SLEAP_STAGE"
+SLEAP_WORKLIST="$SLEAP_STAGE/aruco_worklist.txt"   # basename must match saion-side reader
+if [[ "${SLEAP_FORCE_RECOMPUTE:-0}" == "1" ]]; then
+	echo "[INFO] --sleap-force-recompute: bucket skip disabled; recomputing all chunks"
+	cp "$WORKLIST" "$SLEAP_WORKLIST"
+else
+	module load opencv/4.9.0 2>/dev/null || true   # provides h5py on deigo
+	if python3 "$SCRIPTS_DIR/filter_done_chunks.py" \
+			--worklist "$WORKLIST" --data-dir "$DATA_DIR" --out "$SLEAP_WORKLIST"; then
+		:
+	else
+		echo "[WARN] bucket-skip filter failed; recomputing all chunks (full worklist)" >&2
+		cp "$WORKLIST" "$SLEAP_WORKLIST"
+	fi
+fi
+WORKLIST="$SLEAP_WORKLIST"   # everything below (upload, array size, gate) uses the filtered list
+
+# Nothing left to do -> don't submit an empty array or a datacp/cleanup that
+# would wedge on zero producers; /flash reclamation still proceeds via the deigo
+# cleanup job that depends on this bridge.
+if (( $(wc -l < "$WORKLIST") == 0 )); then
+	echo "[INFO] bucket skip: all chunks already complete on bucket; no SLEAP tasks to submit"
+	: > "$JOBS_ROOT/jid_saion_sleap.txt"
+	echo "[INFO] bridge complete (nothing to do)"
+	exit 0
+fi
+
 # --- Render saion-side templates locally, then upload ------------------------
 RENDERED_PREDICT="$JOBS_ROOT/sleap_predict_array.rendered.sh"
 RENDERED_DATACP="$JOBS_ROOT/sleap_datacp_array.rendered.sh"

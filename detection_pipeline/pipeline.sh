@@ -60,6 +60,16 @@ Batching (minimize submitted job count):
                                     auto = ceil(total_chunks / --max-array-tasks))
   --max-array-tasks N               cap when auto-sizing batch (--batch-size ""). default: 500
 
+SLEAP bucket skip:
+  --sleap-force-recompute           Recompute every chunk's SLEAP output, even
+                                    ones already complete on the bucket. Default
+                                    is a bucket-aware skip: a re-run only redoes
+                                    chunks whose .slp/_sleap_data.h5 are missing
+                                    or were produced under a different chunking
+                                    (expected_frames verified). USE THIS when
+                                    re-running to apply a NEW model -- otherwise
+                                    the existing outputs are skipped and kept.
+
 Phase isolation (for testing):
   --only-chunk                      Stop after chunking
   --only-aruco                      Skip sleap branch
@@ -145,6 +155,7 @@ DATACP_CONCURRENCY=4
 BATCH_SIZE=1         # default: one chunk per array task (set "" to auto-size under MAX_ARRAY_TASKS)
 MAX_ARRAY_TASKS=500
 OUTPUT_GROUP=reiteruni   # group owner for shared bucket outputs (chgrp + setgid on created dirs)
+SLEAP_FORCE_RECOMPUTE=0   # default: bucket-aware skip in bridge; set 1 to redo every chunk
 ONLY_CHUNK=0
 ONLY_ARUCO=0
 ONLY_SLEAP=0
@@ -192,6 +203,7 @@ while [[ $# -gt 0 ]]; do
 		--batch-size) BATCH_SIZE="$2"; shift 2 ;;
 		--max-array-tasks) MAX_ARRAY_TASKS="$2"; shift 2 ;;
 		--group) OUTPUT_GROUP="$2"; shift 2 ;;
+		--sleap-force-recompute) SLEAP_FORCE_RECOMPUTE=1; shift ;;
 		--only-chunk) ONLY_CHUNK=1; shift ;;
 		--only-aruco) ONLY_ARUCO=1; shift ;;
 		--only-sleap) ONLY_SLEAP=1; shift ;;
@@ -411,6 +423,7 @@ export SLEAP_RUNTIME="$SLEAP_RUNTIME"
 export SKIP_TRT_EXPORT="$SKIP_TRT_EXPORT"
 export ONLY_ARUCO="$ONLY_ARUCO"
 export ONLY_SLEAP="$ONLY_SLEAP"
+export SLEAP_FORCE_RECOMPUTE="$SLEAP_FORCE_RECOMPUTE"
 export RUN_BACKUP="$RUN_BACKUP"
 export BACKUP_UNIT_ROOT="$BACKUP_UNIT_ROOT"
 export BACKUP_REL_DIR="$BACKUP_REL_DIR"

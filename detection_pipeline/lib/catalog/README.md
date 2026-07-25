@@ -91,7 +91,7 @@ Recovery types, cheapest first:
 - **upload** (`SILENT_PARTIAL`): outputs computed but not uploaded → rescue-copy from the saion login side.
 - **slp2h5** (`SLEAP_H5_MISSING`): `.slp` present, `_sleap_data.h5` missing → `slp2h5_array.sh` over the bucket `.slp` (CPU only, no re-chunk).
 - **aruco**: aruco behind → aruco array over the sub-worklist.
-- **sleap** (`.slp` missing, e.g. block03's 287 chunks): re-chunk those chunks → SLEAP → slp2h5 → upload. The command output gives both the simple `pipeline.sh --only-sleap` re-run and the minimal per-chunk resubmit.
+- **sleap** (`.slp` missing, e.g. block03's 287 chunks): re-chunk those chunks → SLEAP → slp2h5 → upload. The command output gives both the simple `pipeline.sh --only-sleap` re-run and the minimal per-chunk resubmit. The simple re-run is bucket-aware by default: it re-chunks the whole block but runs SLEAP only on the missing/incomplete chunks (a chunk is complete when its `.slp` + `_sleap_data.h5` are on the bucket and the h5's `expected_frames` attr matches the worklist). Pass `--sleap-force-recompute` to redo every chunk, e.g. when applying a new model.
 
 ### Consistency — models auto-filled per block
 
