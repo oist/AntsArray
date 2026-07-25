@@ -117,6 +117,15 @@ Tracking (optional auto-trigger after detection completes):
   --tracking-timeout N              Deadline (s) to wait for detection outputs.
                                     default: 172800 (48h)
 
+Notifications:
+  --notify-email ADDR               Email ADDR when detection completes (both
+                                    aruco+sleap on bucket; sent by the login-side
+                                    poller) and on any job failure (Slurm
+                                    --mail-type=FAIL on every submitted job;
+                                    arrays notify once per array). Forwarded to
+                                    the tracking submit script with --run-tracking.
+                                    default: $NOTIFY_EMAIL env, else off
+
 Other:
   -h, --help                        Show this help
 EOT
@@ -179,6 +188,9 @@ TRACKING_OUTPUT_ROOT=""
 TRACKING_EXTRA_ARGS=""
 TRACKING_POLL_SECS=300
 TRACKING_TIMEOUT=172800
+# Email notifications (empty = off): Slurm FAIL mail on every job + a
+# detection-complete email from the login-side poller (track_trigger.sh).
+NOTIFY_EMAIL="${NOTIFY_EMAIL:-}"
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
@@ -225,6 +237,7 @@ while [[ $# -gt 0 ]]; do
 		--tracking-args) TRACKING_EXTRA_ARGS="$2"; shift 2 ;;
 		--tracking-poll-secs) TRACKING_POLL_SECS="$2"; shift 2 ;;
 		--tracking-timeout) TRACKING_TIMEOUT="$2"; shift 2 ;;
+		--notify-email) NOTIFY_EMAIL="$2"; shift 2 ;;
 		-h|--help) usage ;;
 		*) echo "[ERR] unknown arg: $1" >&2; usage ;;
 	esac
@@ -441,8 +454,14 @@ export TRACKING_OUTPUT_ROOT="$TRACKING_OUTPUT_ROOT"
 export TRACKING_EXTRA_ARGS="$TRACKING_EXTRA_ARGS"
 export TRACKING_POLL_SECS="$TRACKING_POLL_SECS"
 export TRACKING_TIMEOUT="$TRACKING_TIMEOUT"
+export NOTIFY_EMAIL="$NOTIFY_EMAIL"
 EOF
 echo "[INFO] env file: $ENV_FILE"
+
+# Slurm-native failure mail on every job submitted here (chunk_finalize adds the
+# same args to the stages it fans out; arrays notify once per array, not per task).
+MAIL_ARGS=()
+[[ -n "$NOTIFY_EMAIL" ]] && MAIL_ARGS=(--mail-type=FAIL --mail-user="$NOTIFY_EMAIL")
 
 # Build manifest
 MANIFEST="$JOBS_ROOT/manifest.csv"
@@ -468,7 +487,7 @@ done
 # --only-backup: build manifest + submit ONLY the raw-video backup job.
 if (( ONLY_BACKUP )); then
 	(( RUN_BACKUP == 1 )) || { echo "[ERR] --only-backup conflicts with --no-backup" >&2; exit 2; }
-	JID_BACKUP=$(sbatch_retry backup --partition="$BACKUP_PARTITION" "$JOBS_ROOT/backup.sbatch")
+	JID_BACKUP=$(sbatch_retry backup --partition="$BACKUP_PARTITION" "${MAIL_ARGS[@]}" "$JOBS_ROOT/backup.sbatch")
 	echo "  backup        $JID_BACKUP"
 	echo "$JID_BACKUP" > "$JOBS_ROOT/jid_backup.txt"
 	echo "[INFO] --only-backup: submitted backup job only -> ${BACKUP_ARCHIVE_PATH:-(disabled)}"
@@ -478,7 +497,7 @@ fi
 # Submit chunk array
 CHUNK_UPPER=$(( N_VIDEOS - 1 ))
 echo "[INFO] sbatch chunk_array=0-${CHUNK_UPPER}"
-JID_CHUNK=$(sbatch_retry chunk --array=0-${CHUNK_UPPER} "$JOBS_ROOT/chunk.sbatch")
+JID_CHUNK=$(sbatch_retry chunk --array=0-${CHUNK_UPPER} "${MAIL_ARGS[@]}" "$JOBS_ROOT/chunk.sbatch")
 echo "  chunk         $JID_CHUNK"
 echo "$JID_CHUNK" > "$JOBS_ROOT/jid_chunk.txt"
 
@@ -488,19 +507,22 @@ if (( ONLY_CHUNK )); then
 fi
 
 # Submit chunk_finalize (builds worklist + submits aruco / bridge / cleanup)
-JID_CHUNK_FIN=$(sbatch_retry chunk_fin --dependency=afterok:$JID_CHUNK "$JOBS_ROOT/chunk_finalize.sbatch")
+JID_CHUNK_FIN=$(sbatch_retry chunk_fin --dependency=afterok:$JID_CHUNK "${MAIL_ARGS[@]}" "$JOBS_ROOT/chunk_finalize.sbatch")
 echo "  chunk_finalize $JID_CHUNK_FIN (dep: $JID_CHUNK)"
 echo "$JID_CHUNK_FIN" > "$JOBS_ROOT/jid_chunk_fin.txt"
 
 # Optional: launch the login-side tracking auto-trigger (nohup poller). It waits for
-# detection outputs to appear in the bucket, then submits colony tracking for this
-# block. Mirrors the tracking transfer watcher's login-nohup pattern; survives logout.
-if (( RUN_TRACKING == 1 )); then
+# detection outputs to appear in the bucket, then emails NOTIFY_EMAIL (detection
+# complete) and/or submits colony tracking for this block. Mirrors the tracking
+# transfer watcher's login-nohup pattern; survives logout. The notify-only launch
+# is restricted to full runs: an --only-* run never completes both modalities, so
+# the poller would just sit until its 48h deadline and mail a spurious timeout.
+if (( RUN_TRACKING == 1 )) || { [[ -n "$NOTIFY_EMAIL" ]] && (( ONLY_ARUCO == 0 && ONLY_SLEAP == 0 )); }; then
 	mkdir -p "$HPC_LOGS_DIR/pipeline"
 	sed "s#__JOBS_ROOT__#$JOBS_ROOT#g" "$TEMPLATES_DIR/track_trigger.sh" > "$JOBS_ROOT/track_trigger.sh"
 	chmod +x "$JOBS_ROOT/track_trigger.sh"
 	nohup "$JOBS_ROOT/track_trigger.sh" >> "$HPC_LOGS_DIR/pipeline/track_trigger.log" 2>&1 &
-	echo "  track_trigger  PID $! (nohup; log: $HPC_LOGS_DIR/pipeline/track_trigger.log)"
+	echo "  track_trigger  PID $! (nohup; tracking=$RUN_TRACKING notify=${NOTIFY_EMAIL:-off}; log: $HPC_LOGS_DIR/pipeline/track_trigger.log)"
 fi
 
 cat <<EOF

@@ -1,6 +1,8 @@
 #!/bin/bash -l
 # track_trigger.sh — login-side poller that launches colony tracking for THIS
-# block once detection outputs are all in the bucket.
+# block once detection outputs are all in the bucket, and/or emails
+# NOTIFY_EMAIL that detection is complete (this poller is the only place that
+# sees BOTH modalities land, so it is the authoritative "detection done" hook).
 #
 # Why a poller and not a SLURM dependency: SLEAP inference runs on SAION and
 # deigo cannot `afterok:` a saion job (no cross-cluster Slurm deps). The only
@@ -20,8 +22,15 @@ source "$JOBS_ROOT/pipeline.env"
 
 log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
 
-if [[ "${RUN_TRACKING:-0}" -ne 1 ]]; then
-	log "RUN_TRACKING != 1; nothing to do"
+if [[ -f "$LIB_DIR/notify.sh" ]]; then
+	source "$LIB_DIR/notify.sh"
+else
+	# Older deploy without lib/notify.sh: run without email notifications.
+	notify_send() { :; }
+fi
+
+if [[ "${RUN_TRACKING:-0}" -ne 1 && -z "${NOTIFY_EMAIL:-}" ]]; then
+	log "RUN_TRACKING != 1 and no NOTIFY_EMAIL; nothing to do"
 	exit 0
 fi
 
@@ -54,6 +63,9 @@ count_ext() {  # $1 = filename suffix, e.g. _sleap_data.h5
 while [[ ! -s "$worklist" ]]; do
 	if (( $(date +%s) >= deadline )); then
 		log "ERROR: deadline reached waiting for worklist $worklist; aborting"
+		notify_send "[AntsArray] detection watcher TIMEOUT: $EXP_NAME (no worklist)" \
+"track_trigger for $EXP_NAME gave up after ${timeout_secs}s: chunk_finalize never wrote
+$worklist -- the chunk stage likely failed. Check $HPC_LOGS_DIR and squeue on deigo."
 		exit 1
 	fi
 	log "waiting for worklist $worklist ..."
@@ -83,6 +95,10 @@ while true; do
 			fired_reason="timeout-partial"   # tracking processes the contiguous complete prefix
 		else
 			log "ERROR: deadline reached with aruco=$aruco_n sleap=$sleap_n; nothing complete, aborting"
+			notify_send "[AntsArray] detection FAILED: $EXP_NAME (nothing complete at deadline)" \
+"track_trigger for $EXP_NAME hit its ${timeout_secs}s deadline with aruco=$aruco_n
+sleap=$sleap_n of $expected expected outputs in $data_dir.
+At least one detection leg produced nothing; check $HPC_LOGS_DIR and the Slurm FAIL mails."
 			exit 1
 		fi
 		break
@@ -90,6 +106,24 @@ while true; do
 	sleep "$poll_secs"
 done
 log "firing tracking (reason=$fired_reason): aruco=$aruco_n sleap=$sleap_n expected=$expected"
+
+if [[ "$fired_reason" == "complete" ]]; then
+	notify_send "[AntsArray] detection complete: $EXP_NAME ($expected/$expected per modality)" \
+"Detection finished for $EXP_NAME: aruco=$aruco_n and sleap=$sleap_n of $expected
+expected outputs are on the bucket in $data_dir.
+RUN_TRACKING=${RUN_TRACKING:-0} (1 = colony tracking is being submitted now)."
+else
+	notify_send "[AntsArray] detection INCOMPLETE at deadline: $EXP_NAME (aruco=$aruco_n sleap=$sleap_n of $expected)" \
+"track_trigger for $EXP_NAME hit its ${timeout_secs}s deadline with partial outputs:
+aruco=$aruco_n sleap=$sleap_n of $expected expected in $data_dir.
+RUN_TRACKING=${RUN_TRACKING:-0}: if 1, tracking fires anyway on the contiguous complete prefix.
+Check the Slurm FAIL mails / $HPC_LOGS_DIR for the stalled leg."
+fi
+
+if [[ "${RUN_TRACKING:-0}" -ne 1 ]]; then
+	log "RUN_TRACKING != 1; detection notification sent, not submitting tracking"
+	exit 0
+fi
 
 # 3) Launch colony tracking for THIS one block. submit_blocks_pipeline.sh is a
 #    separate script in tracking/colony/; we only invoke it by path (no shared
@@ -102,6 +136,7 @@ submit_args=(
 )
 [[ -n "${TRACKING_OUTPUT_ROOT:-}" ]] && submit_args+=(--output_root "$TRACKING_OUTPUT_ROOT")
 [[ -n "${TRACKING_PYTHON_BIN:-}" ]] && submit_args+=(--python_bin "$TRACKING_PYTHON_BIN")
+[[ -n "${NOTIFY_EMAIL:-}" ]] && submit_args+=(--notify_email "$NOTIFY_EMAIL")
 if [[ -n "${TRACKING_EXTRA_ARGS:-}" ]]; then
 	# Space-separated simple tokens (no embedded quotes). Main override needs
 	# (--python_bin, --output_root) have dedicated flags above.
@@ -123,5 +158,9 @@ if bash "$TRACKING_SUBMIT" "${submit_args[@]}"; then
 else
 	rc=$?
 	log "ERROR: tracking submit failed (rc=$rc) for block=$block"
+	notify_send "[AntsArray] tracking submit FAILED: $EXP_NAME (rc=$rc)" \
+"submit_blocks_pipeline.sh exited rc=$rc for block=$block.
+See $HPC_LOGS_DIR/pipeline/track_trigger.log for its output; detection outputs are
+complete on the bucket, so tracking can be re-submitted manually."
 	exit "$rc"
 fi

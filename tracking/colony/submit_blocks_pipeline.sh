@@ -165,6 +165,15 @@ ANALYSIS_CPUS=4
 ANALYSIS_MEM="16G"
 ANALYSIS_TIME="0-12:00:00"
 
+# Email notifications (empty = off; or pass --notify_email). Sends:
+#   - Slurm FAIL mail from every orchestration job (map/submit/stitch/fan-outs)
+#   - ONE failure-digest email if any per-chunk tracking worker fails (an
+#     afterany sentinel; afterok leaves downstream jobs CANCELLED, which sends
+#     no Slurm FAIL mail, so worker failures would otherwise be silent)
+#   - a tracking-complete Slurm END mail (track_done marker job)
+#   - transfer-complete / stalled / failed emails from the login-side watcher
+NOTIFY_EMAIL="${NOTIFY_EMAIL:-}"
+
 # Set to 1 to write sbatch scripts without submitting jobs.
 DRY_RUN=0
 # -------------------------------------------------------------------------
@@ -241,6 +250,7 @@ run_analysis="$RUN_ANALYSIS"
 analysis_cpus="$ANALYSIS_CPUS"
 analysis_mem="$ANALYSIS_MEM"
 analysis_time="$ANALYSIS_TIME"
+notify_email="$NOTIFY_EMAIL"
 dry_run="$DRY_RUN"
 force_submit=0
 
@@ -339,6 +349,12 @@ Optional:
   --analysis_cpus N         CPUs per per-track analysis job. Default: 4
   --analysis_mem MEM        Memory per per-track analysis job. Default: 16G
   --analysis_time TIME      Time per per-track analysis job. Default: 0-12:00:00
+  --notify_email ADDR       Email ADDR when tracking completes (track_done END
+                            mail + a transfer-complete email once outputs are on
+                            the bucket) and on failures (Slurm FAIL mail on
+                            orchestration jobs, one digest email if any tracking
+                            worker fails, watcher stall/fail emails).
+                            Default: $NOTIFY_EMAIL env, else off.
   --dry_run                 Write scripts but do not submit.
   --force_submit            Submit even if live Slurm jobs already exist for the
                             block. Default: refuse (prevents duplicate concurrent
@@ -424,6 +440,7 @@ while [[ $# -gt 0 ]]; do
     --analysis_cpus) analysis_cpus="$2"; shift 2 ;;
     --analysis_mem) analysis_mem="$2"; shift 2 ;;
     --analysis_time) analysis_time="$2"; shift 2 ;;
+    --notify_email) notify_email="$2"; shift 2 ;;
     --dry_run) dry_run=1; shift ;;
     --force_submit) force_submit=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -471,6 +488,26 @@ fi
 if [[ "$dry_run" -eq 0 && "$transfer_to_bucket" -eq 1 ]] && ! command -v rsync >/dev/null 2>&1; then
   echo "ERROR: transfer watcher requires rsync, but rsync was not found." >&2
   exit 2
+fi
+
+# Email notification plumbing. The body-capable sender lives in the detection
+# tree (repo deploys as one unit); without it, fall back to header-only Slurm
+# mail and disable the digest/watcher emails rather than generating scripts
+# that would crash on a missing source.
+NOTIFY_LIB="$REPO_ROOT/detection_pipeline/lib/notify.sh"
+if [[ -n "$notify_email" && ! -f "$NOTIFY_LIB" ]]; then
+  echo "WARNING: notify helper not found: $NOTIFY_LIB; digest/watcher emails disabled (Slurm header mail stays on)" >&2
+fi
+# Rendered into the generated #SBATCH headers below. FAIL on orchestration
+# jobs; the tracking-complete marker also gets END -- that END mail IS the
+# per-block "tracking complete" notification (it runs afterok:<all workers>).
+mail_fail_directives=""
+mail_done_directives=""
+if [[ -n "$notify_email" ]]; then
+  mail_fail_directives="#SBATCH --mail-type=FAIL
+#SBATCH --mail-user=${notify_email}"
+  mail_done_directives="#SBATCH --mail-type=END,FAIL
+#SBATCH --mail-user=${notify_email}"
 fi
 
 shopt -s nullglob
@@ -552,6 +589,7 @@ for block_dir in "${blocks[@]}"; do
   interaction_logs_dir="$logs_dir/interaction_workers"
   tracking_job_ids_file="$state_dir/tracking_job_ids_${block_name}.txt"
   tracking_complete_script="$script_dir/tracking_complete_${block_name}.sbatch"
+  tracking_watch_script="$script_dir/tracking_watch_${block_name}.sbatch"
   tracking_complete_done_file="$state_dir/tracking_complete_${block_name}.ok"
   tracking_complete_job_id_file="$state_dir/tracking_complete_job_id_${block_name}.txt"
   stitch_script="$script_dir/stitch_${block_name}.sbatch"
@@ -633,6 +671,7 @@ for block_dir in "${blocks[@]}"; do
 #SBATCH -t ${map_time}
 #SBATCH -o ${submit_logs_dir}/map_${block_name}_%j.out
 #SBATCH -e ${submit_logs_dir}/map_${block_name}_%j.err
+${mail_fail_directives}
 
 set -euo pipefail
 umask 0002  # group-writable outputs (664/775); setgid parents keep group=reiteruni
@@ -676,12 +715,91 @@ EOF
 #SBATCH -t 0-00:10:00
 #SBATCH -o ${submit_logs_dir}/tracking_complete_${block_name}_%j.out
 #SBATCH -e ${submit_logs_dir}/tracking_complete_${block_name}_%j.err
+${mail_done_directives}
 
 set -euo pipefail
 umask 0002  # group-writable outputs (664/775); setgid parents keep group=reiteruni
 printf 'completed %s\n' "\$(date '+%Y-%m-%d %H:%M:%S')" > "${tracking_complete_done_file}"
 EOF
   chmod 755 "$tracking_complete_script"
+
+  # Failure digest for the per-chunk tracking workers. Submitted (only when
+  # --notify_email is set) with --dependency=afterany:<workers>, so unlike the
+  # afterok-gated track_done/stitch jobs it still runs when a worker fails
+  # (afterok leaves those CANCELLED, which sends no Slurm FAIL mail). Emails one
+  # digest listing every non-COMPLETED worker; silent when all succeeded
+  # (track_done's END mail is the success signal).
+  cat > "$tracking_watch_script" <<EOF
+#!/usr/bin/env bash
+#SBATCH -J track_watch_${job_tag}
+#SBATCH -p ${partition}
+#SBATCH -c 1
+#SBATCH --mem=1G
+#SBATCH -t 0-01:00:00
+#SBATCH -o ${submit_logs_dir}/tracking_watch_${block_name}_%j.out
+#SBATCH -e ${submit_logs_dir}/tracking_watch_${block_name}_%j.err
+${mail_fail_directives}
+
+set -uo pipefail   # no -e: a failing sacct probe must not kill the report
+
+NOTIFY_EMAIL="${notify_email}"
+if [[ -f "${NOTIFY_LIB}" ]]; then
+  source "${NOTIFY_LIB}"
+else
+  echo "WARNING: ${NOTIFY_LIB} missing; digest goes to this log only" >&2
+  notify_send() { :; }
+fi
+
+if [[ ! -s "${tracking_job_ids_file}" ]]; then
+  echo "ERROR: tracking job ids file missing/empty: ${tracking_job_ids_file}" >&2
+  notify_send "[AntsArray] tracking watch BROKEN: ${job_tag} (job-ids file missing)" \\
+"tracking_watch could not read ${tracking_job_ids_file}, so worker states were NOT checked.
+Inspect the tracking workers manually (sacct/squeue) for ${job_tag}."
+  exit 1   # header FAIL mail is the backstop if the notify helper is missing too
+fi
+
+# slurmdbd accounting can lag the afterany dependency release: an sacct row for
+# a just-finished worker may not exist yet. Settle first, then retry empty
+# lookups against a shared budget so a laggy DB cannot fake a failure digest.
+sleep 60
+sacct_state() {
+  sacct -j "\$1" -n -X -o State%40 2>/dev/null | head -1 | tr -d '[:space:]'
+}
+retry_budget=10
+total=0
+nfail=0
+failed_lines=""
+while IFS= read -r jid; do
+  [[ -n "\$jid" ]] || continue
+  total=\$(( total + 1 ))
+  state="\$(sacct_state "\$jid")"
+  while [[ -z "\$state" && \$retry_budget -gt 0 ]]; do
+    retry_budget=\$(( retry_budget - 1 ))
+    sleep 30
+    state="\$(sacct_state "\$jid")"
+  done
+  [[ -n "\$state" ]] || state="UNKNOWN"
+  if [[ "\$state" != "COMPLETED" ]]; then
+    nfail=\$(( nfail + 1 ))
+    failed_lines+="\$jid \$state"\$'\n'
+  fi
+done < "${tracking_job_ids_file}"
+
+echo "tracking workers: \$(( total - nfail ))/\$total COMPLETED"
+if (( nfail == 0 )); then
+  exit 0
+fi
+printf '%s' "\$failed_lines"
+notify_send "[AntsArray] tracking FAILED: ${job_tag} (\$nfail/\$total workers not COMPLETED)" \\
+"Non-COMPLETED per-chunk tracking workers for ${job_tag}:
+
+\$failed_lines
+Downstream afterok jobs (track_done_${job_tag}, stitch_${job_tag}, analysis, interactions)
+were cancelled by Slurm, so no further completion mail will arrive for this block.
+Worker logs: ${chunk_logs_dir}
+Re-run: re-invoke submit_blocks_pipeline.sh for this block (skip_existing fills only the gaps)."
+EOF
+  chmod 755 "$tracking_watch_script"
 
   cat > "$stitch_script" <<EOF
 #!/usr/bin/env bash
@@ -692,6 +810,7 @@ EOF
 #SBATCH -t ${stitch_time}
 #SBATCH -o ${submit_logs_dir}/stitch_${block_name}_%j.out
 #SBATCH -e ${submit_logs_dir}/stitch_${block_name}_%j.err
+${mail_fail_directives}
 
 set -euo pipefail
 umask 0002  # group-writable outputs (664/775); setgid parents keep group=reiteruni
@@ -724,6 +843,7 @@ EOF
 #SBATCH -t ${track_submit_time}
 #SBATCH -o ${submit_logs_dir}/submit_tracking_${block_name}_%j.out
 #SBATCH -e ${submit_logs_dir}/submit_tracking_${block_name}_%j.err
+${mail_fail_directives}
 
 set -euo pipefail
 umask 0002  # group-writable outputs (664/775); setgid parents keep group=reiteruni
@@ -771,6 +891,10 @@ fi
 tracking_complete_job_id="\$("${sbatch_bin}" --parsable "\${tracking_dependency_args[@]}" "${tracking_complete_script}")"
 echo "\${tracking_complete_job_id}" > "${tracking_complete_job_id_file}"
 echo "Submitted tracking completion marker: \${tracking_complete_job_id}"
+if [[ -n "${notify_email}" && "\${#tracking_dependency_args[@]}" -gt 0 ]]; then
+  tracking_watch_job_id="\$("${sbatch_bin}" --parsable --dependency=afterany:"\${tracking_dependency}" "${tracking_watch_script}")"
+  echo "Submitted tracking failure-digest watch: \${tracking_watch_job_id}"
+fi
 stitch_job_id="\$("${sbatch_bin}" --parsable "\${tracking_dependency_args[@]}" "${stitch_script}")"
 echo "\${stitch_job_id}" > "${stitch_job_id_file}"
 echo "Submitted stitch job: \${stitch_job_id}"
@@ -795,6 +919,7 @@ EOF
 #SBATCH -t ${per_track_analysis_submit_time}
 #SBATCH -o ${per_track_analysis_logs_dir}/submit_per_track_analysis_${block_name}_%j.out
 #SBATCH -e ${per_track_analysis_logs_dir}/submit_per_track_analysis_${block_name}_%j.err
+${mail_fail_directives}
 
 set -euo pipefail
 umask 0002  # group-writable outputs (664/775); setgid parents keep group=reiteruni
@@ -904,6 +1029,7 @@ EOF
 #SBATCH -t ${interaction_submit_time}
 #SBATCH -o ${submit_logs_dir}/submit_interactions_${block_name}_%j.out
 #SBATCH -e ${submit_logs_dir}/submit_interactions_${block_name}_%j.err
+${mail_fail_directives}
 
 set -euo pipefail
 umask 0002  # group-writable outputs (664/775); setgid parents keep group=reiteruni
@@ -955,6 +1081,16 @@ lock_dir="${transfer_lock_dir}"
 transfer_done_file="${transfer_done_file}"
 run_epoch="$(date +%s)"
 
+NOTIFY_EMAIL="${notify_email}"
+notify_lib="${NOTIFY_LIB}"
+if [[ -n "\${NOTIFY_EMAIL}" && -f "\${notify_lib}" ]]; then
+  source "\${notify_lib}"
+else
+  notify_send() { :; }
+fi
+stall_warn_secs=\$(( 48 * 3600 ))
+stall_warned=0
+
 log() {
   printf '[%s] %s\n' "\$(date '+%Y-%m-%d %H:%M:%S')" "\$*" | tee -a "\${transfer_log}"
 }
@@ -969,11 +1105,24 @@ fmt_elapsed() {
   printf '%dh%02dm' "\$(( s / 3600 ))" "\$(( (s % 3600) / 60 ))"
 }
 
+# EXIT trap: free the lock, and email on abnormal exit (rsync failure, missing
+# manifest, ...) -- this watcher runs under nohup where a silent death would
+# otherwise only show up as a forever-missing transfer marker.
+on_watcher_exit() {
+  local rc=\$?
+  rm -rf "\${lock_dir}"
+  if (( rc != 0 )); then
+    notify_send "[AntsArray] tracking transfer FAILED: ${job_tag} (rc=\${rc})" \\
+"Login-side transfer watcher for ${job_tag} exited rc=\${rc} before finishing.
+Log: \${transfer_log}"
+  fi
+}
+
 acquire_lock() {
   if mkdir "\${lock_dir}" 2>/dev/null; then
     printf '%s\n' "\$\$" > "\${lock_dir}/pid"
     hostname > "\${lock_dir}/host"
-    trap 'rm -rf "\${lock_dir}"' EXIT
+    trap on_watcher_exit EXIT
     return 0
   fi
   local old_pid=""
@@ -989,7 +1138,7 @@ acquire_lock() {
   mkdir "\${lock_dir}"
   printf '%s\n' "\$\$" > "\${lock_dir}/pid"
   hostname > "\${lock_dir}/host"
-  trap 'rm -rf "\${lock_dir}"' EXIT
+  trap on_watcher_exit EXIT
 }
 
 log "Transfer watcher start"
@@ -1028,7 +1177,17 @@ wait_for_fresh_file() {
       fi
       log "Ignoring stale \${label} marker: \${path} mtime=\${mtime}"
     fi
-    log "still waiting for \${label} (elapsed \$(fmt_elapsed \$(( \$(date +%s) - run_epoch )))); next check in \${poll_seconds}s"
+    elapsed=\$(( \$(date +%s) - run_epoch ))
+    if (( stall_warned == 0 && elapsed >= stall_warn_secs )); then
+      stall_warned=1
+      notify_send "[AntsArray] tracking STALLED: ${job_tag} waiting \$(fmt_elapsed \${elapsed}) for \${label}" \\
+"Transfer watcher for ${job_tag} has waited \$(fmt_elapsed \${elapsed}) for the \${label} marker:
+\${path}
+A marker that never appears usually means an upstream job failed or was cancelled
+(afterok cascade). The watcher keeps waiting; this warning is sent once.
+Log: \${transfer_log}"
+    fi
+    log "still waiting for \${label} (elapsed \$(fmt_elapsed \${elapsed})); next check in \${poll_seconds}s"
     sleep "\${poll_seconds}"
   done
 }
@@ -1065,6 +1224,10 @@ done < "\${manifest}"
 
 printf 'completed %s\n' "\$(date '+%Y-%m-%d %H:%M:%S')" > "\${transfer_done_file}"
 log "Transfer to bucket complete. marker=\${transfer_done_file}"
+notify_send "[AntsArray] tracking complete: ${job_tag} (all outputs on bucket)" \\
+"Tracking, analysis, and interaction outputs for ${job_tag} finished transferring to the bucket.
+Marker: \${transfer_done_file}
+Log: \${transfer_log}"
 EOF
   chmod 755 "$transfer_script"
 
@@ -1109,6 +1272,8 @@ EOF
     analysis_log="$logs_dir/analysis_after_stitch_${block_name}.log"
     if [[ -f "$analysis_after_stitch_script" ]]; then
       mkdir -p "$logs_dir"
+      analysis_notify_args=()
+      [[ -n "$notify_email" ]] && analysis_notify_args=(--notify_email "$notify_email")
       nohup bash "$analysis_after_stitch_script" \
         --stitch_ok "$stitch_done_file" \
         --per_track_dir "$stitched_dir/per_track" \
@@ -1121,6 +1286,7 @@ EOF
         --mem "$analysis_mem" \
         --time "$analysis_time" \
         --poll_seconds "$transfer_poll_seconds" \
+        "${analysis_notify_args[@]}" \
         >> "$analysis_log" 2>&1 &
       analysis_pid="$!"
       echo "Started analysis fan-out watcher for $block_name PID $analysis_pid; log: $analysis_log"

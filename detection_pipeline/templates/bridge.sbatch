@@ -13,6 +13,17 @@ JOBS_ROOT="__JOBS_ROOT__"
 source "$JOBS_ROOT/pipeline.env"
 source "$LIB_DIR/hosts.sh"
 
+# Slurm mail for the saion-side jobs, embedded as plain strings in the ssh'd
+# sbatch command lines (email addresses contain no whitespace; empty = off).
+# saion_cleanup gets END too: its exit 0 means the verify-before-delete gate
+# confirmed every .slp + _sleap_data.h5 on bucket, i.e. the SLEAP leg is done.
+MAIL_OPT=""
+CLEAN_MAIL_OPT=""
+if [[ -n "${NOTIFY_EMAIL:-}" ]]; then
+	MAIL_OPT="--mail-type=FAIL --mail-user=$NOTIFY_EMAIL"
+	CLEAN_MAIL_OPT="--mail-type=END,FAIL --mail-user=$NOTIFY_EMAIL"
+fi
+
 REMOTE_ROOT="$SAION_WORK_ROOT"
 REMOTE_INPUT="$REMOTE_ROOT/input"
 REMOTE_OUTPUT="$REMOTE_ROOT/output"
@@ -191,11 +202,11 @@ ARRAY_COUNT=$(( (N + BS - 1) / BS ))
 UPPER=$(( ARRAY_COUNT - 1 ))
 
 echo "[INFO] sbatch on saion: sleap_predict_array 0-$UPPER%$SLEAP_CONCURRENCY"
-JID_SLEAP=$(ssh_retry saion "sbatch --parsable --export=ALL,SLEAP_BATCH_SIZE=${SLEAP_BATCH_SIZE:-8} --array=0-${UPPER}%${SLEAP_CONCURRENCY} '$REMOTE_JOBS/sleap_predict_array.sh'")
+JID_SLEAP=$(ssh_retry saion "sbatch --parsable $MAIL_OPT --export=ALL,SLEAP_BATCH_SIZE=${SLEAP_BATCH_SIZE:-8} --array=0-${UPPER}%${SLEAP_CONCURRENCY} '$REMOTE_JOBS/sleap_predict_array.sh'")
 echo "  saion sleap         $JID_SLEAP"
 echo "$JID_SLEAP" > "$JOBS_ROOT/jid_saion_sleap.txt"
 
-JID_SLEAP_DC=$(ssh_retry saion "sbatch --parsable --dependency=afterok:$JID_SLEAP '$REMOTE_JOBS/sleap_datacp_array.sh'")
+JID_SLEAP_DC=$(ssh_retry saion "sbatch --parsable $MAIL_OPT --dependency=afterok:$JID_SLEAP '$REMOTE_JOBS/sleap_datacp_array.sh'")
 echo "  saion sleap_datacp  $JID_SLEAP_DC"
 echo "$JID_SLEAP_DC" > "$JOBS_ROOT/jid_saion_sleap_datacp.txt"
 
@@ -206,7 +217,7 @@ ssh_retry saion "cat > '$REMOTE_JOBS/saion_cleanup.sh'" <<CLEAN
 #SBATCH -c 1
 #SBATCH --partition=$SAION_DATACP_PARTITION
 #SBATCH --mem=4G
-#SBATCH -J sleap_clean
+#SBATCH -J sleap_done_$EXP_NAME
 #SBATCH -o $REMOTE_JOBS/saion_cleanup_%j.out
 #SBATCH -e $REMOTE_JOBS/saion_cleanup_%j.err
 set -eo pipefail
@@ -290,6 +301,6 @@ echo "[OK] all \$present / \$expected chunk outputs (.slp + _sleap_data.h5) pres
 echo "[INFO] removing $REMOTE_ROOT"
 rm -rf "$REMOTE_ROOT"
 CLEAN
-ssh_retry saion "chmod +x '$REMOTE_JOBS/saion_cleanup.sh' && sbatch --dependency=afterany:$JID_SLEAP_DC '$REMOTE_JOBS/saion_cleanup.sh'"
+ssh_retry saion "chmod +x '$REMOTE_JOBS/saion_cleanup.sh' && sbatch $CLEAN_MAIL_OPT --dependency=afterany:$JID_SLEAP_DC '$REMOTE_JOBS/saion_cleanup.sh'"
 
 echo "[INFO] bridge complete"

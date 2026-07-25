@@ -35,6 +35,7 @@ poll_seconds=120
 timeout_secs=172800   # 48h overall deadline
 run_sleep=0
 sleep_model=""
+notify_email=""
 
 usage() {
   cat <<EOF
@@ -58,6 +59,8 @@ Options:
   --timeout N             Overall wait deadline (s). Default: 172800 (48h)
   --run_sleep             Also fan out sleep predictions (needs --sleep_model).
   --sleep_model PATH      Trained sleep classifier for --run_sleep.
+  --notify_email ADDR     Email ADDR if this watcher aborts (stitch deadline,
+                          no per-track parquets). Default: off.
   -h, --help
 EOF
 }
@@ -78,6 +81,7 @@ while [[ $# -gt 0 ]]; do
     --timeout) timeout_secs="$2"; shift 2 ;;
     --run_sleep) run_sleep=1; shift ;;
     --sleep_model) sleep_model="$2"; run_sleep=1; shift 2 ;;
+    --notify_email) notify_email="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -90,6 +94,17 @@ fmt_elapsed() { local s="$1"; printf '%dh%02dm' "$(( s / 3600 ))" "$(( (s % 3600
 [[ -n "$bucket_stitched" ]] || { echo "ERROR: --bucket_stitched is required" >&2; exit 2; }
 fanout="$repo/scripts/per_track_slurm_fanout.sh"
 [[ -f "$fanout" ]] || { echo "ERROR: fan-out script not found: $fanout" >&2; exit 2; }
+
+# Best-effort email on abort (helper lives in the detection tree; repo deploys
+# as one unit). Missing helper degrades to log-only, never to a crash.
+NOTIFY_EMAIL="$notify_email"
+notify_lib="$repo/detection_pipeline/lib/notify.sh"
+if [[ -n "$NOTIFY_EMAIL" && -f "$notify_lib" ]]; then
+  source "$notify_lib"
+else
+  [[ -n "$NOTIFY_EMAIL" ]] && log "WARN: notify helper not found: $notify_lib; emails disabled"
+  notify_send() { :; }
+fi
 
 start_epoch="$(date +%s)"
 deadline=$(( start_epoch + timeout_secs ))
@@ -113,6 +128,11 @@ if [[ -n "$stitch_ok" ]]; then
     fi
     if (( $(date +%s) >= deadline )); then
       log "ERROR: deadline reached waiting for stitch marker; aborting analysis"
+      notify_send "[AntsArray] analysis watcher TIMEOUT waiting for stitch" \
+"analysis_after_stitch.sh gave up after ${timeout_secs}s waiting for a fresh stitch marker:
+$stitch_ok
+No per-track analysis jobs were submitted for $per_track_dir.
+The stitch job likely failed or was cancelled; check its Slurm FAIL mail / logs."
       exit 1
     fi
     log "still waiting for stitch (elapsed $(fmt_elapsed $(( $(date +%s) - start_epoch ))))"
@@ -124,6 +144,10 @@ fi
 n_tracks=$( { find "$per_track_dir" -maxdepth 1 -type f -name 'TrackID_*.parquet' 2>/dev/null || true; } | wc -l )
 if (( n_tracks == 0 )); then
   log "ERROR: no TrackID_*.parquet under $per_track_dir; nothing to analyze"
+  notify_send "[AntsArray] analysis watcher FAILED: no per-track parquets" \
+"analysis_after_stitch.sh found a fresh stitch marker but no TrackID_*.parquet under:
+$per_track_dir
+No analysis jobs were submitted; the stitch output looks empty or misplaced."
   exit 1
 fi
 log "found $n_tracks per-track parquet(s); fanning out analysis routines"

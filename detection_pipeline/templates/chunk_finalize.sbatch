@@ -12,6 +12,10 @@ JOBS_ROOT="__JOBS_ROOT__"
 source "$JOBS_ROOT/pipeline.env"
 source "$LIB_DIR/hosts.sh"   # sbatch_retry: a transient slurmctld timeout must not abort the DAG
 
+# Slurm-native failure mail on every fanned-out stage (arrays notify once per array).
+MAIL_ARGS=()
+[[ -n "${NOTIFY_EMAIL:-}" ]] && MAIL_ARGS=(--mail-type=FAIL --mail-user="$NOTIFY_EMAIL")
+
 WORKLIST="$JOBS_ROOT/aruco_worklist.txt"
 echo "[INFO] building worklist -> $WORKLIST"
 python3 "$LIB_DIR/worklist.py" \
@@ -52,6 +56,7 @@ if (( RUN_BACKUP == 1 )); then
 	echo "[INFO] sbatch backup (single job, stable archive: $BACKUP_ARCHIVE_PATH)"
 	JID_BACKUP=$(sbatch_retry backup \
 		--partition="$BACKUP_PARTITION" \
+		"${MAIL_ARGS[@]}" \
 		"$JOBS_ROOT/backup.sbatch")
 	echo "  backup        $JID_BACKUP"
 	echo "$JID_BACKUP" > "$JOBS_ROOT/jid_backup.txt"
@@ -62,6 +67,7 @@ if (( ONLY_SLEAP != 1 )); then
 	echo "[INFO] sbatch aruco_array=0-${UPPER}%${ARUCO_CONCURRENCY}"
 	JID_ARUCO=$(sbatch_retry aruco \
 		--array=0-${UPPER}%${ARUCO_CONCURRENCY} \
+		"${MAIL_ARGS[@]}" \
 		"$JOBS_ROOT/aruco_array.sbatch")
 	echo "  aruco         $JID_ARUCO"
 	echo "$JID_ARUCO" > "$JOBS_ROOT/jid_aruco.txt"
@@ -69,6 +75,7 @@ if (( ONLY_SLEAP != 1 )); then
 	echo "[INFO] sbatch aruco_datacp (single job, afterok:$JID_ARUCO)"
 	JID_ARUCO_DC=$(sbatch_retry aruco_dc \
 		--dependency=afterok:$JID_ARUCO \
+		"${MAIL_ARGS[@]}" \
 		"$JOBS_ROOT/aruco_datacp.sbatch")
 	echo "  aruco_datacp  $JID_ARUCO_DC"
 	echo "$JID_ARUCO_DC" > "$JOBS_ROOT/jid_aruco_datacp.txt"
@@ -77,7 +84,7 @@ fi
 # --- Bridge / SLEAP branch ---
 if (( ONLY_ARUCO != 1 )); then
 	echo "[INFO] sbatch bridge"
-	JID_BRIDGE=$(sbatch_retry bridge "$JOBS_ROOT/bridge.sbatch")
+	JID_BRIDGE=$(sbatch_retry bridge "${MAIL_ARGS[@]}" "$JOBS_ROOT/bridge.sbatch")
 	echo "  bridge        $JID_BRIDGE"
 	echo "$JID_BRIDGE" > "$JOBS_ROOT/jid_bridge.txt"
 fi
@@ -89,9 +96,9 @@ CLEANUP_DEP=""
 [[ -n "$JID_BRIDGE" ]] && CLEANUP_DEP="${CLEANUP_DEP:+$CLEANUP_DEP,}afterany:$JID_BRIDGE"
 
 if [[ -n "$CLEANUP_DEP" ]]; then
-	JID_CLEAN=$(sbatch_retry cleanup --dependency="$CLEANUP_DEP" "$JOBS_ROOT/cleanup.sbatch")
+	JID_CLEAN=$(sbatch_retry cleanup --dependency="$CLEANUP_DEP" "${MAIL_ARGS[@]}" "$JOBS_ROOT/cleanup.sbatch")
 else
-	JID_CLEAN=$(sbatch_retry cleanup "$JOBS_ROOT/cleanup.sbatch")
+	JID_CLEAN=$(sbatch_retry cleanup "${MAIL_ARGS[@]}" "$JOBS_ROOT/cleanup.sbatch")
 fi
 echo "  cleanup       $JID_CLEAN (dep: $CLEANUP_DEP)"
 echo "$JID_CLEAN" > "$JOBS_ROOT/jid_cleanup.txt"
