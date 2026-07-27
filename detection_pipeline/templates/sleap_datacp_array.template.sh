@@ -36,16 +36,42 @@ ssh_retry saion "mkdir -p '$DATA_DIR' && { chgrp $OUTPUT_GROUP '$DATA_DIR' 2>/de
 
 uploaded=0
 missing=0
+no_h5=0
 echo "[$(date)] starting sleap datacp -> saion:$DATA_DIR/"
 
+# Ship the .h5 alongside the .slp. This job is the end-of-run safety net, but it
+# used to copy only .slp -- and the tracking trigger counts _sleap_data.h5, so
+# the net could never clear the very stall it exists to prevent. On
+# 20260723/block02 it reported success while 3 chunks stayed absent from the
+# bucket and tracking waited indefinitely.
 while IFS=$'\t' read -r vname chunk _; do
 	src="$REMOTE_OUTPUT/${vname}_${chunk}.slp"
+	src_h5="$REMOTE_OUTPUT/${vname}_${chunk}_sleap_data.h5"
 	if [[ ! -s "$src" ]]; then
 		missing=$((missing+1))
 		continue
 	fi
-	rsync_retry -ah --chmod=Du=rwx,Dg=rwx,Fu=rw,Fg=rw --chown=:"$OUTPUT_GROUP" "$src" "saion:$DATA_DIR/"
+	send=( "$src" )
+	if [[ -s "$src_h5" ]]; then
+		send+=( "$src_h5" )
+	else
+		# slp->h5 conversion lives in the predict job (which has the sleap-nn
+		# venv); this partition may not. Flag it instead of reporting success.
+		echo "[GAP] ${vname}_${chunk}: .slp present but no _sleap_data.h5; tracking will stall on this chunk" >&2
+		no_h5=$((no_h5+1))
+	fi
+	rsync_retry -ah --chmod=Du=rwx,Dg=rwx,Fu=rw,Fg=rw --chown=:"$OUTPUT_GROUP" "${send[@]}" "saion:$DATA_DIR/"
 	uploaded=$((uploaded+1))
 done < "$WORKLIST"
 
-echo "[$(date)] done: uploaded=$uploaded missing=$missing total_worklist=$(wc -l < "$WORKLIST")"
+echo "[$(date)] done: uploaded=$uploaded missing=$missing no_h5=$no_h5 total_worklist=$(wc -l < "$WORKLIST")"
+
+# Exit non-zero so an incomplete run is visible in sacct and triggers the
+# failure mail. saion_cleanup is submitted --dependency=afterany on this job,
+# so log archival, the sacct post-mortem, and the verify-before-delete gate
+# still run; only the false "success" goes away.
+if (( no_h5 > 0 )); then
+	echo "[ERR] $no_h5 chunk(s) uploaded without _sleap_data.h5; tracking gates on that file and will not fire on completeness." >&2
+	echo "[ERR] grep '^\[GAP\]' in this log for the chunk list, then backfill with slp2h5_array.sh." >&2
+	exit 1
+fi
