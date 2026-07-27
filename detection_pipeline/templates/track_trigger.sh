@@ -92,7 +92,10 @@ while true; do
 	fi
 	if (( $(date +%s) >= deadline )); then
 		if (( aruco_n > 0 && sleap_n > 0 )); then
-			fired_reason="timeout-partial"   # tracking processes the contiguous complete prefix
+			# NOT a "contiguous complete prefix": map_combine groups whatever
+			# files exist per chunk and silently drops absent cameras, so a
+			# partial fire yields panoramas with holes, not a shorter run.
+			fired_reason="timeout-partial"
 		else
 			log "ERROR: deadline reached with aruco=$aruco_n sleap=$sleap_n; nothing complete, aborting"
 			notify_send "[AntsArray] detection FAILED: $EXP_NAME (nothing complete at deadline)" \
@@ -116,8 +119,24 @@ else
 	notify_send "[AntsArray] detection INCOMPLETE at deadline: $EXP_NAME (aruco=$aruco_n sleap=$sleap_n of $expected)" \
 "track_trigger for $EXP_NAME hit its ${timeout_secs}s deadline with partial outputs:
 aruco=$aruco_n sleap=$sleap_n of $expected expected in $data_dir.
-RUN_TRACKING=${RUN_TRACKING:-0}: if 1, tracking fires anyway on the contiguous complete prefix.
+Tracking is NOT being submitted: a chunk missing a camera still maps, producing a
+panorama with a hole and no error, so a partial run would look successful while
+quietly dropping every ant those cameras could see.
+Backfill the missing chunks and re-run the trigger, or set TRACKING_ALLOW_PARTIAL=1
+to accept the gaps (correct only when a camera is permanently dead).
 Check the Slurm FAIL mails / $HPC_LOGS_DIR for the stalled leg."
+fi
+
+# Refuse by default rather than firing on known-incomplete detection. The old
+# behaviour fired unconditionally on the (incorrect) assumption that tracking
+# would trim itself to a complete prefix; it does not, so this is where an
+# upstream shortfall must stop instead of becoming silently wrong tracks.
+if [[ "$fired_reason" == "timeout-partial" && "${TRACKING_ALLOW_PARTIAL:-0}" -ne 1 ]]; then
+	log "REFUSING to submit tracking: detection incomplete (aruco=$aruco_n sleap=$sleap_n of $expected)"
+	log "  map_combine drops absent cameras silently, so this would yield panoramas with holes."
+	log "  Backfill the missing chunks then re-run this trigger, or re-run with"
+	log "  TRACKING_ALLOW_PARTIAL=1 to accept the gaps (permanently dead camera)."
+	exit 1
 fi
 
 if [[ "${RUN_TRACKING:-0}" -ne 1 ]]; then

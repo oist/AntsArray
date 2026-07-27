@@ -408,6 +408,39 @@ def group_files_by_chunk(
     }
 
 
+def _warn_on_missing_cameras(
+    grouped: Dict[str, Dict[int, Path]],
+    root: Path,
+    expected_cams: int,
+    kind: str,
+) -> None:
+    """Flag chunks whose camera roster is short of the calibrated camera count.
+
+    A chunk missing a camera still maps without error -- it just yields a
+    panorama with a hole where that camera's field of view was. On
+    20260723/block02 three SLEAP chunks never reached the bucket, and because
+    two of them were chunk 000 the first half hour would have been built from
+    23 of 25 cameras with nothing raised. Detection incompleteness must not
+    reach the panorama as quietly missing ants.
+
+    The roster is the homography stack's camera count (one 3x3 per camera,
+    1-based ids to match `hmats[cam_idx - 1]`), NOT a union over the files
+    found: a camera absent from every chunk is the worst case and is exactly
+    what a union of what-we-found would fail to notice. Call this after any
+    `chunks` subset filter so a scoped re-run only reports chunks it handles.
+    """
+    expected = set(range(1, expected_cams + 1))
+    for ck, cams in grouped.items():
+        gap = sorted(expected - set(cams))
+        if gap:
+            logging.warning(
+                "%s chunk %s in %s has %d of %d cameras; missing cam(s) %s. "
+                "The panorama for this chunk will have gaps -- verify detection "
+                "completed for these cameras before trusting downstream tracks.",
+                kind, ck, root, len(cams), expected_cams, gap,
+            )
+
+
 def process_aruco_chunks(
     hmats: List[np.ndarray],
     aruco_dir: Path,
@@ -435,9 +468,10 @@ def process_aruco_chunks(
         re.VERBOSE,
     )
 
-    chunk_map: Dict[int, Dict[int, Path]] = group_files_by_chunk(aruco_dir, patt)
+    chunk_map: Dict[str, Dict[int, Path]] = group_files_by_chunk(aruco_dir, patt)
     if chunks is not None:
         chunk_map = {chunk: files for chunk, files in chunk_map.items() if chunk in chunks}
+    _warn_on_missing_cameras(chunk_map, aruco_dir, len(hmats), "ArUco")
 
     for chunk, cam_files in tqdm(chunk_map.items(), desc="ArUco chunks"):
         base = f"{exp}_chunk{chunk}_aruco_panorama"
@@ -563,9 +597,10 @@ def process_sleap_chunks(
         r"^cam(\d+)_cam\d+_\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}_(\d{3})(?:_sleap_data)?\.(?:h5|hdf5|csv)$"
     )
 
-    chunk_map = group_files_by_chunk(sleap_dir, patt)
+    chunk_map: Dict[str, Dict[int, Path]] = group_files_by_chunk(sleap_dir, patt)
     if chunks is not None:
         chunk_map = {chunk: files for chunk, files in chunk_map.items() if chunk in chunks}
+    _warn_on_missing_cameras(chunk_map, sleap_dir, len(hmats), "SLEAP")
 
     for chunk, cam_files in tqdm(chunk_map.items(), desc="SLEAP chunks"):
         base = f"{exp}_chunk{chunk}_sleap_panorama"
