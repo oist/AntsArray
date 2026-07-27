@@ -57,6 +57,66 @@ count_ext() {  # $1 = filename suffix, e.g. _sleap_data.h5
 	printf '%s' "${n//[[:space:]]/}"
 }
 
+# "Complete" has meant "the expected number of filenames exist", which counts a
+# truncated HDF5 as done. 20260723/block01 reached 175/175 with one 484 KB
+# unreadable _sleap_data.h5, fired tracking, and the deigo map job died three
+# minutes in -- an hour after the damage, on a cluster whose queue this poller
+# cannot even see. Open the files here, where the failure is still attributable
+# and the fix is a CPU-only re-convert from the surviving .slp.
+#
+# Prints one "name (ExceptionType)" line per unreadable file; rc 1 if any. Checks
+# both modalities because map_combine opens both. Readability only -- an
+# all-cameras-empty chunk is a legitimate (N,0,2) placeholder, not corruption.
+validate_h5_outputs() {  # stdout = bad files; diagnostics to stderr
+	local py="" cand
+	for cand in "${TRACKING_PYTHON_BIN:-}" /apps/unit/ReiterU/ant_tracking/venv/bin/python; do
+		[[ -n "$cand" && -x "$cand" ]] || continue
+		"$cand" -c 'import h5py' 2>/dev/null && { py="$cand"; break; }
+	done
+	# No validator is not a verdict: warn and let the run proceed rather than
+	# block good detection on a missing interpreter. The predict-side check is
+	# the primary defence; this is the net under it.
+	if [[ -z "$py" ]]; then
+		log "WARN: no python with h5py reachable; skipping detection integrity check" >&2
+		return 0
+	fi
+	log "verifying $((aruco_n + sleap_n)) detection h5 files are readable (python=$py)" >&2
+	"$py" - "$data_dir" <<'PY'
+import glob, os, sys, time
+import h5py
+
+
+def check(path):
+    try:
+        with h5py.File(path, "r") as h:
+            if not list(h.keys()):
+                return "no datasets"
+    except Exception as exc:
+        return type(exc).__name__
+    return None
+
+
+data_dir = sys.argv[1]
+paths = []
+for pattern in ("*_aruco_tracks.h5", "*_sleap_data.h5"):
+    paths.extend(sorted(glob.glob(os.path.join(data_dir, pattern))))
+
+bad = [(p, why) for p in paths for why in [check(p)] if why]
+
+# The poll loop declares completeness from filenames alone, so the last files may
+# have landed seconds ago. Give a suspect file one more chance before condemning
+# a whole successful detection run on what could be write-visibility lag -- a
+# false refusal costs a manual re-trigger on data that was never broken.
+if bad:
+    time.sleep(10)
+    bad = [(p, why) for p, _ in bad for why in [check(p)] if why]
+
+for path, why in bad:
+    print("%s (%s)" % (os.path.basename(path), why))
+sys.exit(1 if bad else 0)
+PY
+}
+
 # 1) Wait for chunk_finalize to build the worklist. It has one row per
 #    (camera, chunk), so its line count is the expected number of both
 #    _aruco_tracks.h5 and _sleap_data.h5 outputs.
@@ -108,6 +168,51 @@ At least one detection leg produced nothing; check $HPC_LOGS_DIR and the Slurm F
 	fi
 	sleep "$poll_secs"
 done
+# Counts are satisfied; integrity is a separate question. Ask it before firing.
+corrupt_files=""
+corrupt_rc=0
+corrupt_files="$(validate_h5_outputs)" || corrupt_rc=$?
+if (( corrupt_rc != 0 )); then
+	n_bad=$(printf '%s\n' "$corrupt_files" | grep -c . )
+	# Non-zero with nothing named means the validator itself died (interpreter
+	# fault, OOM, signal), not that the data is bad. Still refuse -- we have no
+	# evidence the outputs are sound -- but do not report "0 unreadable files".
+	if (( n_bad == 0 )); then
+		log "REFUSING to submit tracking: integrity validator failed (rc=$corrupt_rc) without reporting any file"
+		notify_send "[AntsArray] detection check FAILED: $EXP_NAME (validator error rc=$corrupt_rc)" \
+"track_trigger for $EXP_NAME could not verify detection outputs: the integrity
+validator exited $corrupt_rc without naming any file, so it crashed rather than
+finding corruption.
+
+Counts looked complete (aruco=$aruco_n sleap=$sleap_n of $expected in
+$data_dir). Tracking is NOT being submitted, because nothing has confirmed the
+outputs are readable. Re-run the trigger; if it repeats, check the python at
+${TRACKING_PYTHON_BIN:-/apps/unit/ReiterU/ant_tracking/venv/bin/python}."
+		exit 1
+	fi
+	log "REFUSING to submit tracking: $n_bad detection h5 file(s) are unreadable"
+	while IFS= read -r bad_file; do
+		[[ -n "$bad_file" ]] && log "  corrupt: $bad_file"
+	done <<< "$corrupt_files"
+	log "  regenerate each from its .slp (CPU only, no re-inference) then re-run this trigger:"
+	log "    <python> $SCRIPTS_DIR/sleap2h5.py $data_dir/<stem>.slp $data_dir --expected-frames <N>"
+	notify_send "[AntsArray] detection CORRUPT: $EXP_NAME ($n_bad unreadable h5)" \
+"track_trigger for $EXP_NAME found $n_bad unreadable HDF5 file(s) in
+$data_dir, even though the file counts look complete
+(aruco=$aruco_n sleap=$sleap_n of $expected expected):
+
+$corrupt_files
+
+Tracking is NOT being submitted. The map stage opens every one of these files and
+would die on the first bad one, after the queue wait and the panorama build.
+
+A truncated _sleap_data.h5 is almost always recoverable without re-inference: if
+the matching .slp still opens, re-run scripts/sleap2h5.py over it (CPU only,
+--expected-frames from worklist col 3), then re-run this trigger. Re-run SLEAP
+only for chunks whose .slp is also bad."
+	exit 1
+fi
+
 log "firing tracking (reason=$fired_reason): aruco=$aruco_n sleap=$sleap_n expected=$expected"
 
 if [[ "$fired_reason" == "complete" ]]; then

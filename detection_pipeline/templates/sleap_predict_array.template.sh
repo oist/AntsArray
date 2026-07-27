@@ -99,10 +99,58 @@ sys.exit(0 if ok else 1)
 	esac
 }
 
+# The h5 is what tracking actually reads, and it has the same killed-writer
+# failure mode as the .slp: a preempted sleap2h5 leaves a truncated file that is
+# still non-empty, so `-s` calls it done. 20260723/block01 cam13_005 shipped
+# 484 KB of unreadable HDF5 that way, and map_combine -- an hour later, on the far
+# side of a cluster boundary -- was the first thing to open it.
+#
+# Readability is the whole test: h5py.File() is exactly what map_combine does, so
+# a file that opens here opens there. Deliberately NOT checking row counts -- a
+# chunk with no detections yields a valid empty table, and rejecting that would
+# re-convert a good chunk on every requeue forever. Same non-destructive contract
+# as slp_is_complete: "cannot validate" is never a verdict of "bad".
+h5_is_readable() {
+	local f="$1" py="$UV_TOOL_DIR/sleap-nn/bin/python" rc=0
+	[[ -s "$f" ]] || return 1
+	if [[ ! -x "$py" ]]; then
+		echo "[WARN] no sleap-nn python at $py; cannot validate $f, assuming readable" >&2
+		return 0
+	fi
+	"$py" -c '
+import sys
+try:
+    import h5py
+except Exception:
+    sys.exit(3)               # validator unavailable, NOT a verdict on the file
+try:
+    with h5py.File(sys.argv[1], "r") as h:
+        ok = len(list(h.keys())) > 0
+except Exception:
+    ok = False                # unreadable/truncated HDF5 -> genuinely bad
+sys.exit(0 if ok else 1)
+' "$f" 2>/dev/null || rc=$?
+	case "$rc" in
+		0) return 0 ;;
+		1) return 1 ;;
+		*) echo "[WARN] cannot validate $f (h5py unavailable, rc=$rc); assuming readable" >&2
+		   return 0 ;;
+	esac
+}
+
 # Scratch is not the deliverable -- the bucket is. Tracking gates on
 # _sleap_data.h5, so a chunk is only "done" when BOTH artifacts landed.
 # Returns 0 present, 1 absent, 2 bucket unreachable. The remote test always
 # exits 0 so a legitimate absence does not burn ssh_retry's 5-attempt backoff.
+#
+# PRESENCE ONLY, deliberately: this runs `ssh saion` against the login node,
+# where h5py cannot import (GLIBC_2.28), and the bucket is not mounted on saion
+# compute -- so there is nowhere here to actually open the remote file. The
+# consequence is a real gap: a chunk whose bucket h5 was already corrupt before
+# this check existed takes the [SKIP] path below and is never repaired by this
+# stage. track_trigger.sh re-opens every bucket file before firing tracking and
+# refuses on any bad one, so such a chunk surfaces there (named, with the
+# CPU-only sleap2h5 recovery command) rather than reaching the map stage.
 bucket_has_outputs() {
 	local vname="$1" chunk="$2" out
 	out=$(ssh_retry saion "[[ -s '$DATA_DIR/${vname}_${chunk}.slp' && -s '$DATA_DIR/${vname}_${chunk}_sleap_data.h5' ]] && echo PRESENT || echo ABSENT" 2>/dev/null) || return 2
@@ -116,7 +164,21 @@ postprocess_and_upload() {
 	local out_slp="$REMOTE_OUTPUT/${vname}_${chunk}.slp"
 	local out_h5="$REMOTE_OUTPUT/${vname}_${chunk}_sleap_data.h5"
 
-	if [[ ! -s "$out_h5" ]]; then
+	# Convert when the h5 is absent OR unreadable. The old `! -s` test skipped
+	# conversion whenever a file existed, so a truncated leftover from a killed
+	# converter was passed straight through to the bucket as if it were finished.
+	if ! h5_is_readable "$out_h5"; then
+		if [[ -e "$out_h5" ]]; then
+			echo "[WARN] ${vname}_${chunk}: discarding unreadable _sleap_data.h5 ($(stat -c%s "$out_h5" 2>/dev/null || echo '?') bytes) and re-converting" >&2
+			# `|| true` is load-bearing: this function always runs backgrounded and
+			# is reaped by a bare `wait`, which reports 0 regardless. Under `set -e`
+			# a failing rm (stale NFS handle, quota, read-only scratch) would kill
+			# this subshell silently -- before the conversion, before the upload,
+			# before the [GAP] warning -- and the task would still exit COMPLETED
+			# with the chunk missing entirely. Losing the file is worse than
+			# failing to delete it; sleap2h5 overwrites in place either way.
+			rm -f "$out_h5" || echo "[WARN] could not remove $out_h5; re-converting over it" >&2
+		fi
 		echo "[$(date)] [bg] slp -> h5 ${vname}_${chunk}"
 		# Record the chunk's design frame count (worklist col 3) as the
 		# expected_frames h5 attr so a later --only-sleap re-run can verify this
@@ -127,11 +189,14 @@ postprocess_and_upload() {
 			|| echo "[WARN] sleap2h5 failed for ${vname}_${chunk}; .slp will still upload" >&2
 	fi
 
+	# Never ship an h5 we could not read. Leaving it off the bucket keeps the
+	# chunk visibly incomplete, which track_trigger reports as a stall against a
+	# named chunk -- far cheaper to act on than a map job dying on a silent hole.
 	local upload_files=( "$out_slp" )
-	if [[ -s "$out_h5" ]]; then
+	if h5_is_readable "$out_h5"; then
 		upload_files+=( "$out_h5" )
 	else
-		echo "[GAP] ${vname}_${chunk}: no _sleap_data.h5; tracking gates on it and will stall" >&2
+		echo "[GAP] ${vname}_${chunk}: no usable _sleap_data.h5 after conversion; tracking gates on it and will stall" >&2
 	fi
 	echo "[$(date)] [bg] uploading ${vname}_${chunk} (${#upload_files[@]} file(s)) -> bucket"
 	rsync_retry -ah --chmod=Du=rwx,Dg=rwx,Fu=rw,Fg=rw --chown=:"$OUTPUT_GROUP" \
