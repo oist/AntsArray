@@ -25,6 +25,56 @@ module load __SLEAP_MODULE__
 source "__HOSTS_LIB__"
 source "__SHIP_LIB__"
 
+# UV_TOOL_DIR is not a reliable handle on the sleap-nn interpreter: 0.2.0's
+# modulefile exports it, but 0.3.3's deliberately does not -- it only prepends
+# PATH, precisely so uv stops writing into the shared install tree. Resolving
+# through PATH covers both layouts: $apphome/bin/sleap-nn is a symlink into the
+# venv and its python sits beside the CLI.
+#
+# This is load-bearing, not cosmetic. Under 0.3.3 the old expression expanded to
+# "/sleap-nn/bin/python", which is not executable, so BOTH h5 validators took
+# their "cannot validate, assume good" path AND -- far worse -- the sleap2h5
+# conversion below failed outright. The chunk then shipped a .slp with no
+# _sleap_data.h5, which is the artifact tracking gates on.
+SLEAP_PY="${UV_TOOL_DIR:+$UV_TOOL_DIR/sleap-nn/bin/python}"
+if [[ ! -x "$SLEAP_PY" ]]; then
+	_cli="$(command -v sleap-nn 2>/dev/null || true)"
+	if [[ -n "$_cli" ]]; then
+		SLEAP_PY="$(dirname "$(readlink -f "$_cli")")/python"
+	fi
+fi
+if [[ -x "$SLEAP_PY" ]]; then
+	echo "[INFO] sleap-nn python: $SLEAP_PY"
+else
+	echo "[WARN] no sleap-nn python (UV_TOOL_DIR='${UV_TOOL_DIR:-}', no sleap-nn on PATH); h5 conversion will fail" >&2
+fi
+
+# sleap-nn rewrote the whole `predict` surface between 0.2.x and 0.3.x: both
+# positional arguments became required options, --batch-size gained an
+# underscore, and --n-frames was replaced by a --frames range. Only -o,
+# --runtime and --device survive unchanged, so no single spelling satisfies both
+# versions -- under 0.3.3 the old line dies in ~10 s on
+#   Error: No such option '--batch-size'
+# and takes the whole array plus its afterok datacp down with it.
+#
+# Decide from the module name rather than probing `--help`: the probe costs a
+# full import (tens of seconds on 0.2.0) and would pay it once per chunk, while
+# the module string is already exact. Anything that does not parse as a version
+# is treated as the new CLI, since that is where the project is going; the old
+# path stays reachable for the deployed 0.2.0 runs.
+SLEAP_MODULE_NAME="__SLEAP_MODULE__"
+_v="${SLEAP_MODULE_NAME##*/}"          # sleap-nn/0.3.3 -> 0.3.3
+_v="${_v%%-*}"                         # 0.2.0-cu128    -> 0.2.0
+_v_major="${_v%%.*}"
+_v_rest="${_v#*.}"
+_v_minor="${_v_rest%%.*}"
+if [[ "$_v_major" == "0" && "$_v_minor" =~ ^[0-9]+$ ]] && (( _v_minor < 3 )); then
+	SLEAP_CLI="legacy"
+else
+	SLEAP_CLI="v03"
+fi
+echo "[INFO] sleap-nn module '$SLEAP_MODULE_NAME' -> predict CLI: $SLEAP_CLI"
+
 REMOTE_JOBS="__REMOTE_JOBS__"
 REMOTE_INPUT="__REMOTE_INPUT__"
 REMOTE_OUTPUT="__REMOTE_OUTPUT__"
@@ -72,7 +122,7 @@ mkdir -p "$REMOTE_INPUT" "$REMOTE_OUTPUT"
 # probe exits 3 for "validator unavailable" and we then fall back to the old
 # presence-only behaviour -- degraded, but never destructive.
 slp_is_complete() {
-	local f="$1" py="$UV_TOOL_DIR/sleap-nn/bin/python" rc=0
+	local f="$1" py="$SLEAP_PY" rc=0
 	[[ -s "$f" ]] || return 1
 	if [[ ! -x "$py" ]]; then
 		echo "[WARN] no sleap-nn python at $py; cannot validate $f, assuming complete" >&2
@@ -111,7 +161,7 @@ sys.exit(0 if ok else 1)
 # re-convert a good chunk on every requeue forever. Same non-destructive contract
 # as slp_is_complete: "cannot validate" is never a verdict of "bad".
 h5_is_readable() {
-	local f="$1" py="$UV_TOOL_DIR/sleap-nn/bin/python" rc=0
+	local f="$1" py="$SLEAP_PY" rc=0
 	[[ -s "$f" ]] || return 1
 	if [[ ! -x "$py" ]]; then
 		echo "[WARN] no sleap-nn python at $py; cannot validate $f, assuming readable" >&2
@@ -184,7 +234,7 @@ postprocess_and_upload() {
 		# expected_frames h5 attr so a later --only-sleap re-run can verify this
 		# chunk was processed under the same chunking and skip it. Empty on the
 		# legacy 2-col worklist -> attr omitted (filter falls back to presence).
-		"$UV_TOOL_DIR/sleap-nn/bin/python" "$SCRIPTS_DIR/sleap2h5.py" "$out_slp" "$REMOTE_OUTPUT" \
+		"$SLEAP_PY" "$SCRIPTS_DIR/sleap2h5.py" "$out_slp" "$REMOTE_OUTPUT" \
 			${n_frames:+--expected-frames "$n_frames"} \
 			|| echo "[WARN] sleap2h5 failed for ${vname}_${chunk}; .slp will still upload" >&2
 	fi
@@ -264,12 +314,27 @@ for (( row_idx=start_idx; row_idx<end_idx; row_idx++ )); do
 	_t0=$SECONDS
 	if (( SKIP_TRT_EXPORT == 0 )) && [[ "$SLEAP_RUNTIME" != "pytorch" ]]; then
 		# Exported-model path: ONNX or TensorRT
-		sleap-nn predict "$EXPORT_DIR" "$input" \
-			-o "$out_slp" \
-			--runtime "$SLEAP_RUNTIME" \
-			--batch-size "$SLEAP_BATCH_SIZE" \
-			${n_frames:+--n-frames "$n_frames"} \
-			--device cuda
+		if [[ "$SLEAP_CLI" == "v03" ]]; then
+			# --frames is an inclusive range, so the worklist's frame COUNT
+			# becomes 0-(n-1). It serves the same purpose --n-frames did: _000
+			# chunks carry inflated container metadata, and without a bound the
+			# reader runs off the end of the real stream with an IndexError.
+			sleap-nn predict \
+				-m "$EXPORT_DIR" \
+				-i "$input" \
+				-o "$out_slp" \
+				--runtime "$SLEAP_RUNTIME" \
+				--batch_size "$SLEAP_BATCH_SIZE" \
+				${n_frames:+--frames "0-$(( n_frames - 1 ))"} \
+				--device cuda
+		else
+			sleap-nn predict "$EXPORT_DIR" "$input" \
+				-o "$out_slp" \
+				--runtime "$SLEAP_RUNTIME" \
+				--batch-size "$SLEAP_BATCH_SIZE" \
+				${n_frames:+--n-frames "$n_frames"} \
+				--device cuda
+		fi
 	else
 		# Fallback: legacy PyTorch path via raw model dirs.
 		# Note: sleap-nn track does not accept --n-frames; on _000 chunks with
@@ -301,8 +366,8 @@ for (( row_idx=start_idx; row_idx<end_idx; row_idx++ )); do
 	# BACKGROUND so the next chunk's GPU work overlaps with this chunk's CPU
 	# work + upload. With ~30 fps inference and ~few-min post-processing, at
 	# most ~1 background job is in flight at a time. The end-of-loop `wait`
-	# below ensures none are orphaned when the task exits. UV_TOOL_DIR is set
-	# by `module load sleap-nn/...`; pandas + h5py are in that venv.
+	# below ensures none are orphaned when the task exits. SLEAP_PY is resolved
+	# once at the top of this script; pandas + h5py live in that venv.
 	# sleap_datacp end-of-run remains the safety net for anything missed here.
 	postprocess_and_upload "$vname" "$chunk" "$n_frames" &
 done

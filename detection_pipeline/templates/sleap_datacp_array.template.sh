@@ -42,9 +42,16 @@ WORKLIST="$REMOTE_JOBS/aruco_worklist.txt"
 # h5py. "Cannot validate" must never become "file is bad" -- that would drop good
 # chunks on a host that merely lacks a library.
 h5_ok() {
-	local f="$1" py
+	local f="$1" py _cli _venv_py=""
 	[[ -s "$f" ]] || return 1
-	for py in "${UV_TOOL_DIR:-}/sleap-nn/bin/python" "$(command -v python3 2>/dev/null)"; do
+	# 0.3.3's modulefile does not export UV_TOOL_DIR (only PATH), so resolve the
+	# venv interpreter through the CLI symlink as well. System python3 stays last:
+	# it usually lacks h5py, and this probe must not report a good chunk as bad.
+	_cli="$(command -v sleap-nn 2>/dev/null || true)"
+	if [[ -n "$_cli" ]]; then
+		_venv_py="$(dirname "$(readlink -f "$_cli")")/python"
+	fi
+	for py in "${UV_TOOL_DIR:-}/sleap-nn/bin/python" "$_venv_py" "$(command -v python3 2>/dev/null)"; do
 		[[ -n "$py" && -x "$py" ]] || continue
 		"$py" -c 'import h5py' 2>/dev/null || continue
 		"$py" -c '
