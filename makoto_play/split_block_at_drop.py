@@ -91,7 +91,8 @@ def probe_gop(mkv, scan=3200):
            "-read_intervals", f"%+#{scan}",
            "-show_entries", "frame=key_frame", "-of", "csv=p=0", mkv]
     try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=180).stdout
+        out = subprocess.run(cmd, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, universal_newlines=True, timeout=180).stdout
     except (subprocess.SubprocessError, OSError):
         return None
     idx = [i for i, line in enumerate(out.splitlines()) if line.strip().startswith("1")]
@@ -121,7 +122,8 @@ def split_one(mkv, K, head_dir, tail_dir, staging_root, verify_decode=False):
            "-segment_list", seg_list, "-segment_list_type", "csv",
            seg_pat]
     t0 = dt.datetime.now()
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, universal_newlines=True)
     dur = (dt.datetime.now() - t0).total_seconds()
     if proc.returncode != 0:
         return {"name": name, "ok": False,
@@ -151,7 +153,8 @@ def _decode_count(mkv):
            "-count_frames", "-show_entries", "stream=nb_read_frames",
            "-of", "csv=p=0", mkv]
     try:
-        out = subprocess.run(cmd, capture_output=True, text=True).stdout.strip()
+        out = subprocess.run(cmd, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, universal_newlines=True).stdout.strip()
         return int(out)
     except (subprocess.SubprocessError, ValueError, OSError):
         return None
