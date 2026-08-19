@@ -48,6 +48,8 @@ class DetectorConfig:
     min_marker_perimeter_rate: float = 0.03
     max_marker_perimeter_rate: float = 4.0
     polygonal_approx_accuracy_rate: float = 0.03
+    max_erroneous_bits_in_border_rate: float = 0.35
+    min_otsu_std_dev: float = 5.0
 
 
 def _set_if_attr(obj: object, name: str, value: object) -> None:
@@ -109,6 +111,8 @@ def build_aruco_detector(
     _set_if_attr(params, "minMarkerPerimeterRate", float(config.min_marker_perimeter_rate))
     _set_if_attr(params, "maxMarkerPerimeterRate", float(config.max_marker_perimeter_rate))
     _set_if_attr(params, "polygonalApproxAccuracyRate", float(config.polygonal_approx_accuracy_rate))
+    _set_if_attr(params, "maxErroneousBitsInBorderRate", float(config.max_erroneous_bits_in_border_rate))
+    _set_if_attr(params, "minOtsuStdDev", float(config.min_otsu_std_dev))
 
     if aruco_dict is None:
         aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_1000)
