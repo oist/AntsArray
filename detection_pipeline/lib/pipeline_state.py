@@ -607,6 +607,20 @@ def cmd_complete_wave(args):
     return 2
 
 
+def cmd_declared_rows(args):
+    """Print the block's declared chunk total, for shell callers.
+
+    track_trigger.sh needs a BLOCK-wide denominator: it counts output files
+    across all of data/, so comparing that against one wave's worklist would
+    declare the block finished as soon as a later wave started.
+    """
+    state = load(args.data_dir)
+    if state is None:
+        return 1
+    print(int(state.get("chunking", {}).get("total_rows", 0)))
+    return 0
+
+
 def cmd_show(args):
     state = load(args.data_dir)
     if state is None:
@@ -683,6 +697,11 @@ def main(argv=None):
     p.add_argument("--data-dir", required=True)
     p.add_argument("--wave", required=True)
     p.set_defaults(func=cmd_complete_wave)
+
+    p = sub.add_parser("declared-rows",
+                       help="print the block's declared chunk total (exit 1 if no contract)")
+    p.add_argument("--data-dir", required=True)
+    p.set_defaults(func=cmd_declared_rows)
 
     p = sub.add_parser("show", help="print the contract and observed coverage")
     p.add_argument("--data-dir", required=True)

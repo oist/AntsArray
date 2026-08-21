@@ -441,14 +441,14 @@ if (( RUN_TRACKING == 1 )); then
 	: "${TRACKING_OUTPUT_ROOT:=/flash/ReiterU/$USER/colony_pipeline/$(basename "$(dirname "$DIR")")}"
 	echo "[INFO] tracking auto-trigger ON: submit=$TRACKING_SUBMIT hmats=$TRACKING_HMATS output_root=$TRACKING_OUTPUT_ROOT"
 	if [[ -n "$CHUNK_RANGE" ]]; then
-		# track_trigger.sh gates on the aruco_worklist.txt line count, which under
-		# --chunk-range is THIS WAVE's chunks, not the block's. So tracking fires
-		# as soon as this wave lands -- correct on the final wave, premature on
-		# any earlier one (it would map a fraction of the block and then be
-		# refused as a duplicate DAG when the real run comes).
-		echo "[WARN] --run-tracking with --chunk-range fires tracking when THIS WAVE"
-		echo "       ($CHUNK_RANGE) completes, not when the block does. Pass it only on"
-		echo "       the FINAL wave; on earlier waves drop it (--no-run-tracking)."
+		# The poller gates on the BLOCK's declared total, not this wave's worklist
+		# (track_trigger.sh), so it simply waits until every wave has landed --
+		# tracking cannot run on part of a block in any case, because map_combine
+		# drops absent cameras silently rather than shortening its output.
+		# Harmless on any single wave; the thing to avoid is one poller per wave.
+		echo "[INFO] --run-tracking waits for ALL $CHUNK_RANGE-style waves to finish"
+		echo "       (it gates on the block's declared chunk total, not this wave)."
+		echo "       Pass it on ONE wave only -- a second poller would submit tracking twice."
 	fi
 fi
 

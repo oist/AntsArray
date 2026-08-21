@@ -298,6 +298,32 @@ def test_wave_indices_clamp_to_each_videos_length():
         b.close()
 
 
+def test_declared_rows_is_block_wide_not_per_wave():
+    """track_trigger.sh's denominator.
+
+    It counts output files across all of data/, so gating on a wave's worklist
+    would call the block finished on wave 2's first poll -- wave 1's files
+    already outnumber wave 2's row count.
+    """
+    b = Block({VID_A: (10, 432000)})
+    try:
+        b.sync()
+        ps.main(["add-wave", "--data-dir", b.data_dir, "--range", "0-4", "--rows", "5"])
+        assert b.state()["chunking"]["total_rows"] == 10   # not the wave's 5
+        assert ps.main(["declared-rows", "--data-dir", b.data_dir]) == 0
+    finally:
+        b.close()
+
+
+def test_declared_rows_exits_nonzero_without_a_contract():
+    """Lets the shell caller fall back to the worklist count on old blocks."""
+    b = Block()
+    try:
+        assert ps.main(["declared-rows", "--data-dir", b.data_dir]) == 1
+    finally:
+        b.close()
+
+
 def test_complete_wave_stamps_only_that_wave():
     b = Block()
     try:

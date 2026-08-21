@@ -133,7 +133,25 @@ $worklist -- the chunk stage likely failed. Check $HPC_LOGS_DIR and squeue on de
 done
 expected=$(wc -l < "$worklist" 2>/dev/null | tr -d '[:space:]')
 [[ "$expected" =~ ^[0-9]+$ ]] || { log "ERROR: could not read expected count from $worklist"; exit 1; }
-log "expected per-modality outputs = $expected (from $(basename "$worklist"))"
+expected_src="$(basename "$worklist")"
+
+# Under --chunk-range the worklist covers only THIS WAVE, but count_ext globs all
+# of data/ and so counts every earlier wave's outputs too. Comparing the two
+# would declare the block finished on the first poll of wave 2, before it had
+# produced anything. Gate on the block's declared total instead -- which is the
+# right target with or without waves, because tracking needs the whole block:
+# map_combine groups whatever files exist per chunk and silently drops absent
+# cameras, so firing early yields panoramas with holes, not a shorter run.
+declared=$(python3 "$LIB_DIR/pipeline_state.py" declared-rows --data-dir "$data_dir" 2>/dev/null || true)
+if [[ "$declared" =~ ^[0-9]+$ ]] && (( declared > 0 )); then
+	if (( declared != expected )); then
+		log "worklist covers $expected chunk(s) of this block's $declared (wave run);"
+		log "  gating on the BLOCK total -- tracking cannot run on part of a block."
+	fi
+	expected="$declared"
+	expected_src="PIPELINE_STATE.json (block total)"
+fi
+log "expected per-modality outputs = $expected (from $expected_src)"
 
 # 2) Poll the bucket until BOTH modalities are complete, or the deadline passes.
 #    Gate on _sleap_data.h5 (NOT .slp): the tracking map stage reads _sleap_data.h5,

@@ -159,9 +159,18 @@ Notes:
 - **Gates on `_sleap_data.h5`, not `.slp`.** The map stage reads `_sleap_data.h5`; the inline
   `slp -> h5` conversion is best-effort, so a silent conversion failure (only `.slp` present)
   correctly counts as "not ready" instead of firing tracking on invisible SLEAP data.
-- **Deadline is generous** (`--tracking-timeout`, default 48h). On deadline with a partial set
-  it still fires — tracking processes the contiguous complete chunk prefix and skips the rest;
-  with zero SLEAP outputs it aborts instead of firing.
+- **Tracking needs the whole block, and refuses anything less.** `map_combine` groups whatever
+  files exist per chunk and silently drops absent cameras, so a partial fire produces panoramas
+  with holes rather than a shorter run — and produces them without an error. On deadline with a
+  partial set the poller therefore *refuses* to submit and mails instead; override with
+  `TRACKING_ALLOW_PARTIAL=1` only for a permanently dead camera.
+- **The gate is the block's declared chunk total**, read from `data/PIPELINE_STATE.json`, not the
+  worklist line count. Under `--chunk-range` the worklist is one wave, while the output counter
+  globs all of `data/`, so gating on the worklist would fire on wave 2's first poll. This also
+  means `--run-tracking` may be passed on any single wave: it waits for every wave. Pass it on
+  one wave only — a second poller submits tracking twice.
+- **Deadline is generous** (`--tracking-timeout`, default 48h). Raise it for multi-wave blocks:
+  detection on a 98-hour block takes ~3 days, well past the default.
 - **Cluster: deigo.** Tracking is CPU-only and reads `/bucket`; it runs on `compute` (the same
   login as detection). saion has no general CPU partition.
 - **Conda-free by default.** Tracking jobs run under the unit `ant_tracking` venv
