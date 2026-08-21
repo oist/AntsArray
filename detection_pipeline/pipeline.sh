@@ -614,7 +614,14 @@ echo "$JID_CHUNK_FIN" > "$JOBS_ROOT/jid_chunk_fin.txt"
 # transfer watcher's login-nohup pattern; survives logout. The notify-only launch
 # is restricted to full runs: an --only-* run never completes both modalities, so
 # the poller would just sit until its 48h deadline and mail a spurious timeout.
-if (( RUN_TRACKING == 1 )) || { [[ -n "$NOTIFY_EMAIL" ]] && (( ONLY_ARUCO == 0 && ONLY_SLEAP == 0 )); }; then
+# A --chunk-range wave is the same situation for the same reason -- the poller
+# gates on the block's DECLARED total, which one wave cannot reach -- so exclude
+# it too. Slurm's own --mail-type=FAIL is unaffected: that rides on each
+# submitted job via MAIL_ARGS, not on this poller, so failure mail still arrives.
+# With --run-tracking the poller IS wanted on a wave: waiting for the whole block
+# is precisely its job.
+if (( RUN_TRACKING == 1 )) || { [[ -n "$NOTIFY_EMAIL" ]] && [[ -z "$CHUNK_RANGE" ]] \
+		&& (( ONLY_ARUCO == 0 && ONLY_SLEAP == 0 )); }; then
 	mkdir -p "$HPC_LOGS_DIR/pipeline"
 	sed "s#__JOBS_ROOT__#$JOBS_ROOT#g" "$TEMPLATES_DIR/track_trigger.sh" > "$JOBS_ROOT/track_trigger.sh"
 	chmod +x "$JOBS_ROOT/track_trigger.sh"
