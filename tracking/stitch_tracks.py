@@ -101,6 +101,61 @@ def iter_key_sort_value(iter_key: str) -> Tuple[int, object]:
     return (2, iter_key)
 
 
+def chunk_frames_from_state(state_path: Path, fallback_fps: float) -> Tuple[int, float]:
+    """(frames_per_chunk, fps) from a block's PIPELINE_STATE.json.
+
+    The contract records chunk_sec and each video's fps, which is exactly what
+    detection used to cap a chunk -- so the product reproduces the chunk length
+    the parquet files were actually built at, rather than re-deriving it.
+    """
+    import json
+
+    with open(state_path, encoding="utf-8") as f:
+        state = json.load(f)
+    chunking = state.get("chunking", {})
+    chunk_sec = chunking.get("chunk_sec")
+    if not chunk_sec:
+        raise RuntimeError(f"{state_path} records no chunking.chunk_sec")
+    rates = {
+        float(meta["fps"])
+        for meta in chunking.get("videos", {}).values()
+        if meta.get("fps")
+    }
+    if len(rates) > 1:
+        print(
+            f"WARNING: {state_path} lists more than one fps {sorted(rates)}; "
+            f"using the highest for chunk length",
+            flush=True,
+        )
+    fps = max(rates) if rates else float(fallback_fps)
+    return int(round(fps * float(chunk_sec))), fps
+
+
+def _summarise_indices(idxs: List[int], limit: int = 6) -> str:
+    """'0,1,2,...,197 (198 chunks)' -- keeps a 198-chunk block out of the message."""
+    if len(idxs) <= limit:
+        return ",".join(str(i) for i in idxs)
+    head = ",".join(str(i) for i in idxs[:limit // 2])
+    tail = ",".join(str(i) for i in idxs[-(limit // 2):])
+    return f"{head},...,{tail} ({len(idxs)} chunks)"
+
+
+def parse_chunk_index(fp: Path) -> Optional[int]:
+    """The chunk index encoded in a per-chunk parquet name: ..._chunk005_... -> 5.
+
+    Detection numbers chunks from 0 per source video at a fixed length, so this
+    index alone fixes a file's position in the block -- independent of which other
+    files happen to be present. That is what makes a partial stitch safe.
+    """
+    m = CHUNK_TOKEN_IN_SUFFIX_RE.search(fp.stem)
+    if not m:
+        return None
+    try:
+        return int(m.group(1)[len("chunk"):])
+    except ValueError:
+        return None
+
+
 def parse_start_datetime_from_filename(fp: Path) -> Optional[datetime]:
     """
     Extract the first YYYYMMDD-HHMMSS occurrence from the filename stem and parse it.
@@ -399,6 +454,7 @@ def stitch_group(
     png_height: int = 900,
     skip_existing: bool = False,
     track_ids_filter: Optional[set[int]] = None,
+    chunk_frames: Optional[int] = None,
 ) -> None:
     if not files_sorted:
         return
@@ -448,9 +504,22 @@ def stitch_group(
             local_max = int(frame_df[frame_col].max())
             local_len = local_max + 1
 
-        # Determine time-faithful offset (if timestamp available); else fall back.
+        # Where does this file start, in block-global frames?
+        #
+        # Preferred: chunk_idx * chunk_frames. Detection produces fixed-length
+        # chunks numbered from 0 (only the final chunk is a short residual), so
+        # this is exact AND depends on nothing but the file's own name. Both
+        # fallbacks below are anchored to the set of files present -- ref_dt is
+        # min() over them and running_frame_offset accumulates over them -- so
+        # stitching a subset silently renumbers it from 0. Chunk 005 alone would
+        # claim frames 0..43199 instead of 216000..259199, and every downstream
+        # speed and sleep-bout figure would be computed against the wrong clock
+        # without anything looking wrong.
         dt = start_dt_by_fp.get(fp)
-        if (ref_dt is not None) and (dt is not None):
+        chunk_idx = parse_chunk_index(fp) if chunk_frames else None
+        if chunk_idx is not None:
+            frame_offset = chunk_idx * int(chunk_frames)
+        elif (ref_dt is not None) and (dt is not None):
             # Absolute frame index for the start of this file relative to the group's first timestamp.
             # Round for stability when fps is non-integer or time deltas are not exact multiples.
             frame_offset = int(round((dt - ref_dt).total_seconds() * float(fps)))
@@ -477,8 +546,8 @@ def stitch_group(
             }
         )
 
-        # Only advance running offset for timestamp-less mode.
-        if (ref_dt is None) or (dt is None):
+        # Only advance running offset when neither absolute anchor applied.
+        if chunk_idx is None and ((ref_dt is None) or (dt is None)):
             running_frame_offset += local_len
 
     if track_ids_filter is not None:
@@ -578,6 +647,7 @@ def main(
     skip_existing: bool = False,
     track_ids_filter: Optional[set[int]] = None,
     chunks_filter: Optional[set[str]] = None,
+    chunk_frames: Optional[int] = None,
 ) -> None:
     files = sorted(Path(input_dir).glob(f"*{string}"))
     if chunks_filter is not None:
@@ -590,6 +660,26 @@ def main(
         ]
     if not files:
         raise RuntimeError("No parquet files found")
+
+    # Without an absolute anchor, a file's position comes from the files present:
+    # the running offset just packs them end to end. That is right only when the
+    # selected chunks are the block's own 0,1,2,... -- the normal full-block case,
+    # which therefore keeps working untouched. Any other selection (a wave, or a
+    # set with a hole where a chunk was incomplete) gets silently translated onto
+    # the wrong part of the timeline, so stop instead of emitting it.
+    if not chunk_frames:
+        present = sorted({idx for idx in (parse_chunk_index(fp) for fp in files)
+                          if idx is not None})
+        if present and present != list(range(len(present))):
+            raise RuntimeError(
+                "refusing to stitch chunks %s without an absolute frame anchor: they "
+                "do not start at 0 and run contiguously, so offsets derived from the "
+                "files present would place them on the wrong part of the block's "
+                "timeline (chunk %d would claim frame 0). Pass --pipeline_state "
+                "<block>/data/PIPELINE_STATE.json, or --chunk_sec N if the block has "
+                "no contract."
+                % (_summarise_indices(present), present[0])
+            )
 
     # SINGLE output directory
     per_track_dir = Path(out_dir) / "per_track"
@@ -642,6 +732,7 @@ def main(
             png_height=png_height,
             skip_existing=skip_existing,
             track_ids_filter=track_ids_filter,
+            chunk_frames=chunk_frames,
         )
 
 
@@ -729,7 +820,24 @@ if __name__ == "__main__":
         "--chunk",
         action="append",
         default=None,
-        help="Only stitch this chunk number. May be passed more than once.",
+        help="Only stitch this chunk number. May be passed more than once. "
+             "Requires --pipeline_state or --chunk_sec so the subset keeps the "
+             "block's frame numbering.",
+    )
+    ap.add_argument(
+        "--pipeline_state",
+        type=Path,
+        default=None,
+        help="Block's data/PIPELINE_STATE.json. Supplies the authoritative "
+             "chunk_sec and fps, so global frames are anchored to each file's "
+             "chunk index instead of to whichever files are present.",
+    )
+    ap.add_argument(
+        "--chunk_sec",
+        type=float,
+        default=None,
+        help="Detection --chunk-sec, if there is no PIPELINE_STATE.json. "
+             "Frames per chunk = round(fps * chunk_sec).",
     )
     ap.add_argument(
         "--columns",
@@ -753,11 +861,29 @@ if __name__ == "__main__":
         )
         raise SystemExit(0)
 
+    # Resolve the absolute frame anchor. The contract wins over a hand-passed
+    # --chunk_sec, since it is what detection actually ran with.
+    stitch_fps = args.fps
+    chunk_frames = None
+    if args.pipeline_state is not None:
+        chunk_frames, stitch_fps = chunk_frames_from_state(args.pipeline_state, args.fps)
+        print(
+            f"Frame anchor from {args.pipeline_state}: {chunk_frames} frames/chunk "
+            f"(fps={stitch_fps:g})",
+            flush=True,
+        )
+    elif args.chunk_sec:
+        chunk_frames = int(round(float(args.fps) * float(args.chunk_sec)))
+        print(
+            f"Frame anchor from --chunk_sec {args.chunk_sec:g}: {chunk_frames} frames/chunk",
+            flush=True,
+        )
+
     main(
         args.input_dir,
         args.out_dir,
         args.columns,
-        fps=args.fps,
+        fps=stitch_fps,
         string=args.string,
         frame_col=args.frame_col,
         track_col=args.track_col,
@@ -770,4 +896,5 @@ if __name__ == "__main__":
         skip_existing=args.skip_existing,
         track_ids_filter=None if args.track_id is None else set(args.track_id),
         chunks_filter=None if args.chunk is None else {str(chunk).zfill(3) for chunk in args.chunk},
+        chunk_frames=chunk_frames,
     )

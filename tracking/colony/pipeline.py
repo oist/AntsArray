@@ -21,6 +21,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from tracking.colony.combine_batch import discover_jobs, filter_jobs_by_chunks, parse_sides, run_local, submit_slurm  # noqa: E402
 from tracking.colony.panorama_io import discover_complete_input_chunks  # noqa: E402
+from tracking.stitch_tracks import chunk_frames_from_state  # noqa: E402
 from tracking.stitch_tracks import main as stitch_tracks  # noqa: E402
 from tracking.stitch_tracks import write_pngs_from_existing  # noqa: E402
 
@@ -141,6 +142,7 @@ def run_stitching(
     skip_existing: bool,
     pngs_from_existing: bool,
     chunks: set[str] | None = None,
+    chunk_frames: int | None = None,
 ) -> None:
     stitched_dir.mkdir(parents=True, exist_ok=True)
     if pngs_from_existing:
@@ -175,6 +177,7 @@ def run_stitching(
         png_height=track_png_height,
         skip_existing=skip_existing,
         chunks_filter=chunks,
+        chunk_frames=chunk_frames,
     )
 
 
@@ -321,7 +324,26 @@ def main() -> None:
 
     if not args.skip_stitch:
         logging.info("Stage 3/3: stitching chunk tracks")
+        # Anchor global frames to each file's chunk index rather than to the set
+        # of files present. Derived from the block's own contract, so it needs no
+        # flag: detection wrote chunk_sec and fps there, and their product is the
+        # chunk length the parquet files were actually built at. Without it, a
+        # chunk set with a hole (an incomplete chunk excluded upstream) silently
+        # slides every later chunk into the gap.
+        state_fp = args.data_dir / "PIPELINE_STATE.json"
+        chunk_frames = None
+        if state_fp.is_file():
+            chunk_frames, _state_fps = chunk_frames_from_state(state_fp, args.fps)
+            logging.info("frame anchor: %d frames/chunk (from %s)",
+                         chunk_frames, state_fp)
+        else:
+            logging.warning(
+                "no %s; global frames fall back to accumulating over the files "
+                "present. Correct for a contiguous 0..N block, wrong for any "
+                "subset -- run `catalog.py state-init` to give this block a "
+                "contract.", state_fp)
         run_stitching(
+            chunk_frames=chunk_frames,
             tracks_dir=tracks_dir,
             stitched_dir=stitched_dir,
             fps=args.fps,
