@@ -64,6 +64,7 @@ detection_pipeline/
     manifest.py                    # video discovery + sidecar/ffprobe cross-check
     perms.sh                       # best-effort chgrp/setgid helpers for shared outputs
     worklist.py                    # chunk-ordered (chunk_idx ASC, vname ASC) TSV builder
+    pipeline_state.py              # data/PIPELINE_STATE.json: processing contract + wave ledger
   templates/
     backup.sbatch                  # update stable raw-video archive under /bucket/<unit>/Backup/<collection>
     chunk.sbatch                   # ffmpeg -c copy segment (no re-encode)
@@ -76,6 +77,8 @@ detection_pipeline/
     cleanup.sbatch                 # rm -rf /flash, afterany
   scripts/
     export_sleap_trt.sh            # one-time TRT/ONNX export on saion-largegpu
+    filter_done_aruco.py           # bucket-aware skip for the aruco leg
+    filter_done_chunks.py          # bucket-aware skip for the sleap leg
 ```
 
 ## Quick start
@@ -225,6 +228,106 @@ Re-running the same block updates the same archive with `zip -0 -FS`; it does
 not create timestamped duplicates. OIST's weekly Backup snapshots preserve older
 versions remotely. Pass `--no-backup` for test runs where no Backup archive
 should be updated.
+
+## Processing contract (`data/PIPELINE_STATE.json`)
+
+The first run of a block **declares** how it is processed; every later run must
+agree or is refused before anything is submitted.
+
+This exists because a chunk's filename encodes its *index*, not the settings that
+produced it. `cam01_..._042` means "the 43rd chunk under this `--chunk-sec`", so
+re-running a block at a different chunk length overwrites part of `data/` with
+content that no longer lines up with the part it did not overwrite — and nothing
+downstream can detect it afterwards, because every file stays individually valid
+and the names are unchanged. The same applies to a model swap: detection counts
+move ~4x between model generations, so a half-and-half block is quietly useless.
+
+```jsonc
+{
+  "chunking":  { "chunk_sec": 1800, "chunk_ext": "mkv", "total_rows": 4950,
+                 "videos": { "cam01_...": { "n_chunks": 198, "fps": 24.0, ... } } },
+  "detection": { "aruco_dict": "...", "sleap_model_centroid": "...", ... },
+  "waves":     [ { "wave": 1, "chunk_range": [0, 4], "rows": 125, ... } ]
+}
+```
+
+| field group | role | on mismatch |
+| ----------- | ---- | ----------- |
+| `chunking`, `aruco_dict`, `aruco_params`, `sleap_model_*` | changes the *content* of an identically-named output | **refused** (exit 2) |
+| `sleap_module`, `sleap_runtime`, `saion_partition` | changes how the work *ran* | warned, allowed |
+| `videos[].n_chunks` / `frame_count` | the source recording was replaced or repaired | **refused** |
+
+Keys the run does not exercise are not compared: an `--only-sleap` rerun supplies
+no ArUco settings, and absence means "not exercised", never "clear it". A key the
+contract never recorded is filled in rather than rejected.
+
+To deliberately re-process a block under new settings, pass
+`--new-processing-run`. It archives the contract to `PIPELINE_STATE.<utc>.json`;
+it does **not** delete the old outputs — move them aside yourself first.
+
+Blocks processed before contracts existed get one with:
+
+```bash
+python detection_pipeline/catalog.py state-init 20260716/block01 --chunk-sec 1800 --dry-run
+```
+
+`--chunk-sec` is required and cross-checked against the archived `manifest.csv`.
+It is not inferred: guessing it is the weakness the contract removes.
+
+## Wave processing (`--chunk-range`)
+
+A 98-hour block at `--chunk-sec 1800` is 4,950 chunks — over `compute`'s 2,016
+submit cap (Slurm counts each array task individually) and ~6 TiB held on
+`/flash` until the run ends. `--chunk-range A-B` processes one window of chunk
+indices instead of the whole block:
+
+```bash
+bash detection_pipeline/pipeline.sh --dir ... --chunk-sec 1800 --chunk-range 0-4    # wave 1
+bash detection_pipeline/pipeline.sh --dir ... --chunk-sec 1800 --chunk-range 5-6    # wave 2
+```
+
+Waves slice the **worklist**, never the source videos. Because a chunk's index is
+a pure function of `(video, --chunk-sec)`, a window names the same span of
+wall-clock in every run, re-running a window overwrites only its own outputs, and
+the block stays one contiguous experiment for tracking. Splitting the block
+directory instead would restart chunk numbering per piece and break track
+continuity at the seam.
+
+- Ranges are clamped per video, so a shorter camera contributes fewer rows.
+- `--chunk-sec` must be a whole number of GOPs. `chunk.sbatch` seeks with `-ss`
+  and then verifies the first chunk's packet count against the expected frame
+  cap, failing rather than emitting silently offset chunks.
+- `cleanup` frees only the wave's own chunks, so waves can overlap in time.
+- Every wave is appended to `waves[]`. Coverage is derived from what is actually
+  in `data/`, never from the ledger — a killed job cannot leave the ledger
+  claiming work that does not exist.
+- `--run-tracking` fires when *this wave* completes. Pass it on the final wave only.
+
+Inspect a block at any time:
+
+```bash
+python3 detection_pipeline/lib/pipeline_state.py show --data-dir <exp>/data
+```
+
+The catalog reports `expected_source`, `chunks_declared`, `waves_done` and
+`unclaimed_chunks`, and flags `WAVE_GAP` when a window between two submitted
+waves was never claimed. A trailing tail is normal progress and is not flagged.
+
+## Re-runs skip work already on the bucket
+
+Both legs consult `data/` before running, so a re-run only redoes the gaps:
+
+| leg | filter | verified by |
+| --- | ------ | ----------- |
+| SLEAP | `scripts/filter_done_chunks.py` (in `bridge.sbatch`) | h5 `expected_frames` attr |
+| ArUco | `scripts/filter_done_aruco.py` (in `chunk_finalize.sbatch`) | `aruco_tracks` dataset `shape[0]` |
+
+Before the ArUco filter existed, its only skip was flash-local — so once
+`cleanup` freed `/flash`, any later run recomputed the entire block's ArUco.
+
+Both keep a row on any uncertainty: an unreadable bucket dir, a corrupt h5 or a
+missing `h5py` all mean recompute. "Cannot verify" is never a verdict of "done".
+Force a full redo with `--sleap-force-recompute` / `--aruco-force-recompute`.
 
 ## Phase isolation (for testing)
 

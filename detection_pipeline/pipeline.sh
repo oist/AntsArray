@@ -33,6 +33,34 @@ Aruco:
 Chunking:
   --chunk-sec N                     Chunk duration in seconds. default: 7200 (2h)
   --chunk-ext {mkv|mp4|avi}         Output chunk container. default: mkv
+  --chunk-range A-B                 Process ONLY chunk indices A..B (inclusive) --
+                                    one "wave" of a long block instead of all of
+                                    it. Chunk indices are stable for a given
+                                    --chunk-sec, so a window always names the same
+                                    span of wall-clock; run waves back to back to
+                                    keep the array under the partition's submit
+                                    cap and to bound how much /flash is held at
+                                    once. Each wave is recorded in
+                                    <exp>/data/PIPELINE_STATE.json.
+                                    default: empty = the whole block.
+                                    NOTE: --chunk-sec must be a whole number of
+                                    GOPs for waves; chunk.sbatch verifies the
+                                    first chunk of every seeked wave and fails
+                                    rather than emit misaligned chunks.
+
+Processing contract:
+  --new-processing-run              Archive the block's existing
+                                    data/PIPELINE_STATE.json and start a fresh
+                                    contract. Needed only to deliberately
+                                    re-process a block under different settings
+                                    (new chunking, new models). Existing outputs
+                                    in data/ are NOT deleted -- move them aside
+                                    yourself first, or the two runs' outputs will
+                                    be interleaved under identical filenames.
+  --aruco-force-recompute           Recompute every ArUco chunk in the wave, even
+                                    ones already complete on the bucket. Mirrors
+                                    --sleap-force-recompute; use it when changing
+                                    detector parameters.
 
 SLEAP runtime:
   --sleap-runtime {tensorrt|onnx|pytorch}  default: tensorrt
@@ -138,6 +166,9 @@ ARUCO_DICT="A"
 ARUCO_EXTRA_ARGS=""
 CHUNK_SEC=7200
 CHUNK_EXT=mkv
+CHUNK_RANGE=""            # "A-B" inclusive; empty = the whole block (one wave)
+NEW_PROCESSING_RUN=0      # archive the block's contract and start a fresh one
+ARUCO_FORCE_RECOMPUTE=0   # redo every aruco chunk, ignoring bucket-complete ones
 SLEAP_MODEL_CENTROID=""
 SLEAP_MODEL_INSTANCE=""
 SLEAP_RUNTIME=tensorrt
@@ -198,6 +229,9 @@ while [[ $# -gt 0 ]]; do
 		--aruco-dict) ARUCO_DICT="$2"; shift 2 ;;
 		--aruco-params) ARUCO_EXTRA_ARGS="$2"; shift 2 ;;
 		--chunk-sec) CHUNK_SEC="$2"; shift 2 ;;
+		--chunk-range) CHUNK_RANGE="$2"; shift 2 ;;
+		--new-processing-run) NEW_PROCESSING_RUN=1; shift ;;
+		--aruco-force-recompute) ARUCO_FORCE_RECOMPUTE=1; shift ;;
 		--chunk-ext) CHUNK_EXT="$2"; shift 2 ;;
 		--sleap-model-centroid) SLEAP_MODEL_CENTROID="$2"; shift 2 ;;
 		--sleap-model-instance) SLEAP_MODEL_INSTANCE="$2"; shift 2 ;;
@@ -356,6 +390,14 @@ case "$CHUNK_EXT" in
 	mkv|mp4|avi) ;;
 	*) echo "[ERR] --chunk-ext must be mkv|mp4|avi" >&2; exit 2 ;;
 esac
+if [[ -n "$CHUNK_RANGE" ]]; then
+	[[ "$CHUNK_RANGE" =~ ^[0-9]+-[0-9]+$ ]] || {
+		echo "[ERR] --chunk-range must be 'A-B' with 0 <= A <= B, got '$CHUNK_RANGE'" >&2; exit 2; }
+	(( ${CHUNK_RANGE%%-*} <= ${CHUNK_RANGE##*-} )) || {
+		echo "[ERR] --chunk-range start is past its end: '$CHUNK_RANGE'" >&2; exit 2; }
+	echo "[INFO] wave run: chunk indices ${CHUNK_RANGE} only (chunk_sec=${CHUNK_SEC}s -> "\
+	     "$(( ${CHUNK_RANGE%%-*} * CHUNK_SEC ))s..$(( (${CHUNK_RANGE##*-} + 1) * CHUNK_SEC ))s into each video)"
+fi
 
 # Auto-select the SLEAP inference path from the model dir contents: sleap-nn
 # checkpoints (best.ckpt) can be TRT/ONNX-exported; legacy TF models
@@ -398,6 +440,16 @@ if (( RUN_TRACKING == 1 )); then
 	[[ -f "$TRACKING_SUBMIT" ]] || { echo "[ERR] tracking submit script not found: $TRACKING_SUBMIT" >&2; exit 2; }
 	: "${TRACKING_OUTPUT_ROOT:=/flash/ReiterU/$USER/colony_pipeline/$(basename "$(dirname "$DIR")")}"
 	echo "[INFO] tracking auto-trigger ON: submit=$TRACKING_SUBMIT hmats=$TRACKING_HMATS output_root=$TRACKING_OUTPUT_ROOT"
+	if [[ -n "$CHUNK_RANGE" ]]; then
+		# track_trigger.sh gates on the aruco_worklist.txt line count, which under
+		# --chunk-range is THIS WAVE's chunks, not the block's. So tracking fires
+		# as soon as this wave lands -- correct on the final wave, premature on
+		# any earlier one (it would map a fraction of the block and then be
+		# refused as a duplicate DAG when the real run comes).
+		echo "[WARN] --run-tracking with --chunk-range fires tracking when THIS WAVE"
+		echo "       ($CHUNK_RANGE) completes, not when the block does. Pass it only on"
+		echo "       the FINAL wave; on earlier waves drop it (--no-run-tracking)."
+	fi
 fi
 
 cat > "$ENV_FILE" <<EOF
@@ -416,6 +468,8 @@ export LIB_DIR="$LIB_DIR"
 export SCRIPTS_DIR="$SCRIPTS_DIR"
 export CHUNK_SEC="$CHUNK_SEC"
 export CHUNK_EXT="$CHUNK_EXT"
+export CHUNK_RANGE="$CHUNK_RANGE"
+export ARUCO_FORCE_RECOMPUTE="$ARUCO_FORCE_RECOMPUTE"
 export ARUCO_DICT_PATH="$ARUCO_DICT_PATH"
 export ARUCO_EXTRA_ARGS="$ARUCO_EXTRA_ARGS"
 export ARUCO_CONCURRENCY="$ARUCO_CONCURRENCY"
@@ -476,6 +530,49 @@ if (( N_VIDEOS <= 0 )); then
 	exit 2
 fi
 echo "[INFO] $N_VIDEOS grid videos discovered"
+
+# --- Processing contract ------------------------------------------------------
+# Declare (first run) or verify (every later run) how this block is processed.
+# A chunk's filename encodes its INDEX, not its settings, so re-running a block
+# under a different --chunk-sec or a different model silently overwrites part of
+# data/ with content that no longer lines up with the part it did not overwrite.
+# That is unrecoverable after the fact -- every file stays individually valid --
+# so a disagreement stops the run here rather than at the first output.
+# See lib/pipeline_state.py. Skipped for --only-backup, which produces no data/.
+if (( ONLY_BACKUP != 1 )); then
+	STATE_LEGS="aruco,sleap"
+	(( ONLY_ARUCO == 1 )) && STATE_LEGS="aruco"
+	(( ONLY_SLEAP == 1 )) && STATE_LEGS="sleap"
+
+	# Only pass keys this run actually exercises: an --only-sleap run supplies no
+	# aruco settings, and absence means "not exercised", never "clear it".
+	STATE_SET=(--set "chunk_sec=$CHUNK_SEC" --set "chunk_ext=$CHUNK_EXT")
+	if (( ONLY_SLEAP != 1 )); then
+		STATE_SET+=(--set "aruco_dict=$ARUCO_DICT_PATH"
+		            --set "aruco_params=$ARUCO_EXTRA_ARGS"
+		            --set "aruco_script=$(basename "${ARUCO_SCRIPT:-run_aruco_mp.py}")")
+	fi
+	if (( ONLY_ARUCO != 1 )); then
+		STATE_SET+=(--set "sleap_model_centroid=$SLEAP_MODEL_CENTROID"
+		            --set "sleap_model_instance=$SLEAP_MODEL_INSTANCE"
+		            --set "sleap_module=$SLEAP_MODULE"
+		            --set "sleap_runtime=$SLEAP_RUNTIME"
+		            --set "saion_partition=$SAION_PARTITION")
+	fi
+	NEW_RUN_ARG=()
+	(( NEW_PROCESSING_RUN == 1 )) && NEW_RUN_ARG=(--new-run)
+
+	if ! python3 "$LIB_DIR/pipeline_state.py" sync \
+			--data-dir "$DATA_DIR" \
+			--manifest "$MANIFEST" \
+			--block-dir "$DIR" \
+			--legs "$STATE_LEGS" \
+			"${STATE_SET[@]}" "${NEW_RUN_ARG[@]}"; then
+		echo "[ERR] refusing to submit: this run conflicts with the block's recorded" >&2
+		echo "      processing contract (see the diff above). Nothing was submitted." >&2
+		exit 2
+	fi
+fi
 
 # Render every template once (single placeholder: __JOBS_ROOT__)
 echo "[INFO] rendering templates -> $JOBS_ROOT/"

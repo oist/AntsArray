@@ -79,9 +79,33 @@ if (( expected > 0 )); then
 	echo "[OK] all $actual / $expected chunks present on saion; safe to free /flash"
 fi
 
+# Wave-scoped reclamation. A whole-block run still frees everything, but a wave
+# (CHUNK_RANGE set) must delete ONLY the chunks it was responsible for: another
+# wave's array may still be reading its own chunks out of the same FLASH_ROOT,
+# and a blanket rm -rf would pull them away mid-run.
+free_wave_chunks() {
+	local vname chunk n=0
+	while IFS=$'\t' read -r vname chunk _; do
+		[[ -n "$vname" && -n "$chunk" ]] || continue
+		rm -f "$FLASH_ROOT/$vname/${vname}_${chunk}.${CHUNK_EXT}"
+		rm -f "$FLASH_ROOT/aruco/$vname/${vname}_${chunk}"_aruco_* \
+		      "$FLASH_ROOT/aruco/$vname/${vname}_${chunk}.aruco.ok"
+		n=$((n+1))
+	done < "$WORKLIST"
+	echo "[INFO] freed $n chunks of wave $CHUNK_RANGE under $FLASH_ROOT"
+	# Prune only the directories this wave emptied; -delete skips non-empty ones,
+	# so a concurrent wave's files keep their parents alive.
+	find "$FLASH_ROOT" -mindepth 1 -type d -empty -delete 2>/dev/null || true
+	rmdir "$FLASH_ROOT" 2>/dev/null || true
+}
+
 if [[ -d "$FLASH_ROOT" ]]; then
-	echo "[INFO] freeing $FLASH_ROOT"
-	rm -rf "$FLASH_ROOT"
+	if [[ -n "${CHUNK_RANGE:-}" && -f "$WORKLIST" ]]; then
+		free_wave_chunks
+	else
+		echo "[INFO] freeing $FLASH_ROOT"
+		rm -rf "$FLASH_ROOT"
+	fi
 fi
 
 # Try to remove parent if empty (best-effort; harmless if not)

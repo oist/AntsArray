@@ -29,7 +29,7 @@ import sys
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib"))
-from catalog import build, const, recover  # noqa: E402
+from catalog import build, const, provenance, recover  # noqa: E402
 
 
 def _make_logger(logdir, stamp):
@@ -50,10 +50,21 @@ def _make_logger(logdir, stamp):
 def main(argv=None):
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("mode", nargs="?", choices=["scan", "build", "all", "recover"],
+    ap.add_argument("mode", nargs="?",
+                    choices=["scan", "build", "all", "recover", "state-init"],
                     default="all")
     ap.add_argument("target", nargs="?", default=None,
-                    help="for 'recover': the block id, e.g. 20260623/block03")
+                    help="for 'recover'/'state-init': the block id, "
+                         "e.g. 20260623/block03")
+    ap.add_argument("--chunk-sec", type=int, default=None,
+                    help="state-init: the --chunk-sec the ORIGINAL run used. "
+                         "Required, and cross-checked against the archived "
+                         "manifest -- guessing it is the weakness the contract "
+                         "exists to remove.")
+    ap.add_argument("--chunk-ext", default="mkv",
+                    help="state-init: chunk container of the original run")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="state-init: print what would be recorded, write nothing")
     ap.add_argument("--root", default="/bucket/ReiterU/Ants/basler",
                     help="basler root to scan (Windows: Z:/ReiterU/Ants/basler)")
     ap.add_argument("--outdir", default=None,
@@ -90,6 +101,29 @@ def main(argv=None):
                     "'recover 20260623/block03' or 'recover 20260623::block03'")
                 return
             recover.run_recover(args.root, outdir, args.target, log)
+            log("[catalog] done. log: %s" % logpath)
+            return
+        if args.mode == "state-init":
+            # Backfill a processing contract onto a block that predates them, so
+            # the catalog can report it against a declared denominator and a
+            # later run is held to the settings it was actually processed with.
+            if not args.target:
+                log("[catalog] state-init needs a block id, e.g. "
+                    "'state-init 20260716/block01 --chunk-sec 1800'")
+                return
+            if not args.chunk_sec:
+                log("[catalog] state-init needs --chunk-sec: the value the "
+                    "ORIGINAL run used. It is cross-checked against the archived "
+                    "manifest, and catalog.csv's chunk_sec column carries the "
+                    "inferred value if you need a starting point.")
+                return
+            session_id, block = recover.parse_block_id(args.target)
+            bd = recover.block_dir(args.root, session_id, block)
+            try:
+                provenance.backfill_state(bd, args.chunk_sec, args.chunk_ext,
+                                          dry_run=args.dry_run, log=log)
+            except ValueError as e:
+                log("[catalog] state-init failed: %s" % e)
             log("[catalog] done. log: %s" % logpath)
             return
         build.run(root=args.root, outdir=outdir, scanned_at=scanned_at,

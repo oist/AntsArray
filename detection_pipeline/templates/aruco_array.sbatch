@@ -32,7 +32,11 @@ module load opencv/4.9.0
 ARUCO_SCRIPT="${ARUCO_SCRIPT:-$SCRIPTS_DIR/run_aruco_mp.py}"
 [[ -f "$ARUCO_SCRIPT" ]] || { echo "[ERR] missing $ARUCO_SCRIPT" >&2; exit 2; }
 
-WORKLIST="$JOBS_ROOT/aruco_worklist.txt"
+# chunk_finalize writes a bucket-skip-filtered copy and exports its path; the
+# array must read THAT, not the wave's full worklist, or the task-id -> row
+# mapping would not match the array size it was submitted with. Falls back to
+# the full list so a deployment predating the filter still runs.
+WORKLIST="${ARUCO_RUN_WORKLIST:-$JOBS_ROOT/aruco_worklist.txt}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 aruco_extra_args=()
 if [[ -n "${ARUCO_EXTRA_ARGS:-}" ]]; then

@@ -34,13 +34,29 @@ def infer_chunk_sec(fps, frames, n):
 
 
 def _universe(fp, v):
-    """The 0..maxchunk set the deepest stage reached for video v."""
+    """Every chunk index video v is supposed to have.
+
+    When the block declares its chunking (PIPELINE_STATE.json) that count is the
+    answer. Otherwise fall back to 0..max(chunk_idx observed), which is the best
+    a bare data/ dir allows but is blind by construction: it derives the
+    denominator from the outputs it is judging, so a run that stopped part-way --
+    or a block processed in waves -- looks finished.
+    """
+    if getattr(fp, "expected_source", "observed") == "declared":
+        return set(range(int(fp.expected_per_video.get(v, 0))))
     mx = -1
     for d in fp.chunk_sets.values():
         s = d.get(v)
         if s:
             mx = max(mx, max(s))
     return set(range(mx + 1)) if mx >= 0 else set()
+
+
+def _chunk_sec(fp, fps, frames, n):
+    """Declared chunk_sec when the block has a contract, else the old guess."""
+    if getattr(fp, "chunk_sec", None):
+        return fp.chunk_sec
+    return infer_chunk_sec(fps, frames, n)
 
 
 def missing_sets(fp):
@@ -125,7 +141,7 @@ def chunk_worklist_rows(missing_map, fp, vinfo, prov=None):
         fps, frames = vinfo.get(v, (0, 0))
         uni = _universe(fp, v)
         n = (max(uni) + 1) if uni else 0
-        cs = infer_chunk_sec(fps, frames, n)
+        cs = _chunk_sec(fp, fps, frames, n)
         vwl = wl.get(v, {})
         for idx in idxs:
             exp = vwl.get(idx)
@@ -187,13 +203,14 @@ def build_steps(root, session_id, block, fp, vinfo, has_silent_partial, outdir,
     data_dir = bd + "/data"
     slug = _slug(session_id, block)
     rec_dir = os.path.join(outdir, "recover").replace(os.sep, "/").replace("\\", "/")
-    cs = None
-    for v in (fp.chunk_sets.get("det") or {}):
-        fps, frames = vinfo.get(v, (0, 0))
-        uni = _universe(fp, v)
-        cs = infer_chunk_sec(fps, frames, (max(uni) + 1) if uni else 0)
-        if cs:
-            break
+    cs = getattr(fp, "chunk_sec", None)
+    if not cs:
+        for v in (fp.chunk_sets.get("det") or {}):
+            fps, frames = vinfo.get(v, (0, 0))
+            uni = _universe(fp, v)
+            cs = infer_chunk_sec(fps, frames, (max(uni) + 1) if uni else 0)
+            if cs:
+                break
 
     gen = "python detection_pipeline/catalog.py recover %s::%s" % (session_id, block)
     if typ == "none":

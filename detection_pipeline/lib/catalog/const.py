@@ -119,6 +119,9 @@ HZ_CHUNK_INTERNAL_ONLY = "CHUNK_INTERNAL_ONLY"
 HZ_RAW_CHUNKED = "RAW_CHUNKED"
 HZ_CAM_COUNT_OFF = "CAM_COUNT_OFF"
 HZ_UNCLEAN_CLOSE = "UNCLEAN_CLOSE"   # recorder didn't finalize; counts agree -> remux/verify
+# Wave processing left part of the block unclaimed: no wave in PIPELINE_STATE.json
+# ever covered those chunk indices, so they are not "in progress", they are missed.
+HZ_WAVE_GAP = "WAVE_GAP"
 
 TOKEN_JOIN = "|"   # separator for multi-valued cells (Excel-scannable)
 
@@ -136,7 +139,8 @@ CATALOG_COLUMNS = [
     "fps_mode", "frames_median", "duration_median_sec", "health_flag",
     "pipeline_status", "stage_reached", "chunk_sec", "chunk_sec_source",
     "n_slp", "n_aruco_det", "n_aruco_tracks", "n_sleap_data",
-    "completeness_pct", "completeness_state", "downstream",
+    "completeness_pct", "completeness_state", "expected_source",
+    "chunks_declared", "waves_done", "unclaimed_chunks", "downstream",
     "sleap_models", "saion_partition", "hazard_flags", "recover_type",
     "recover_missing", "scan_error", "scanned_at",
 ]

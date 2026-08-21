@@ -106,7 +106,14 @@ def pipeline_status(unit, fp) -> str:
         return "not_started"
     if fp.pipeline_format == "h5_4tuple":
         counts = [fp.n_slp, fp.n_aruco_det, fp.n_aruco_tracks, fp.n_sleap_data]
-        if all(c > 0 for c in counts) and len(set(counts)) == 1:
+        # With a declared chunk count, "complete" means the block is whole. The
+        # agreement test below can only say the four stages kept pace with each
+        # other -- which a block that stopped a third of the way through also
+        # satisfies, and which a wave-processed block satisfies after wave 1.
+        if getattr(fp, "expected_source", "observed") == "declared":
+            if fp.expected_total > 0 and all(c == fp.expected_total for c in counts):
+                return "complete"
+        elif all(c > 0 for c in counts) and len(set(counts)) == 1:
             return "complete"
     return "partial"
 
@@ -126,10 +133,17 @@ def derive_hazards(unit, fp, video_infos) -> list:
             flags.append(const.HZ_STAGE_SKEW)
         if n_slp > 0 and n_det < n_slp:
             flags.append(const.HZ_ARUCO_MISSING)
+        # "declared" needs no caveat flag: the denominator is recorded, not
+        # derived from the outputs being judged.
         if fp.completeness_state == "internal":
             flags.append(const.HZ_CHUNK_INTERNAL_ONLY)
         elif fp.completeness_state == "unverifiable":
             flags.append(const.HZ_CHUNK_UNVERIFIABLE)
+        # A window between two submitted waves that no wave ever claimed. Not
+        # "still running" -- skipped, and invisible to every other check because
+        # the chunks on either side of it are complete and valid.
+        if getattr(fp, "wave_gaps", None):
+            flags.append(const.HZ_WAVE_GAP)
 
     if fp.truncated_files:
         flags.append(const.HZ_TRUNCATED_ARTIFACT)

@@ -60,6 +60,22 @@ def _missing_cam_ids(unit):
     return const.TOKEN_JOIN.join(str(i) for i in missing)
 
 
+def _unclaimed_cell(unclaimed):
+    """One CSV cell for the chunk indices no wave ever claimed.
+
+    Collapses to a single range when every video agrees (the usual case: all 25
+    cameras are the same length), and only names cameras when they diverge --
+    otherwise a 25-camera block would fill the cell with the same range 25 times.
+    """
+    if not unclaimed:
+        return ""
+    ranges = set(unclaimed.values())
+    if len(ranges) == 1:
+        return ranges.pop()
+    return const.TOKEN_JOIN.join(
+        "%s:%s" % (v, unclaimed[v]) for v in sorted(unclaimed))
+
+
 # --------------------------------------------------------------------------
 # row assembly
 # --------------------------------------------------------------------------
@@ -84,7 +100,10 @@ def _assemble(unit, fp, scanned_at, workers, allow_ffprobe, root, outdir, config
     health = qc.rollup_health(video_infos)
 
     vinfo = {vi.vname: (vi.fps or 0, vi.frame_count or 0) for vi in video_infos}
-    prov = provenance.read_provenance(unit.path) if fp.has_hpc_logs else {}
+    # Unconditional: a block can carry a PIPELINE_STATE.json contract without
+    # having hpc_logs (the contract is written at submit, logs archived only at
+    # cleanup). read_provenance returns empty fields when neither source exists.
+    prov = provenance.read_provenance(unit.path)
     rec = recover.recovery_summary(root, unit.session_id, unit.block, fp, vinfo,
                                    const.HZ_SILENT_PARTIAL in hazards, outdir,
                                    prov, config_default)
@@ -169,6 +188,11 @@ def _assemble(unit, fp, scanned_at, workers, allow_ffprobe, root, outdir, config
         "n_aruco_tracks": fp.n_aruco_tracks, "n_sleap_data": fp.n_sleap_data,
         "completeness_pct": _fmt(fp.completeness_pct),
         "completeness_state": fp.completeness_state,
+        "expected_source": fp.expected_source,
+        "chunks_declared": _fmt(fp.expected_total if fp.expected_source == "declared"
+                                else None),
+        "waves_done": _fmt(len(fp.waves) if fp.waves else None),
+        "unclaimed_chunks": _unclaimed_cell(fp.unclaimed),
         "downstream": const.TOKEN_JOIN.join(fp.downstream),
         "hazard_flags": const.TOKEN_JOIN.join(hazards),
         "sleap_models": provenance.model_label(prov),
