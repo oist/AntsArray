@@ -26,8 +26,18 @@ if [[ -z "$row" ]]; then
 fi
 vname=$(echo "$row" | awk -F, '{print $1}')
 source_path=$(echo "$row" | awk -F, '{print $2}')
-fps=$(echo "$row" | awk -F, '{print $4}')
-n_chunks=$(echo "$row" | awk -F, '{print $7}')
+# manifest.csv comes from csv.DictWriter, whose default lineterminator is CRLF,
+# so the LAST field arrives as "198\r". That made `(( lo < n_chunks - 1 ))` die
+# with "invalid arithmetic operator" -- which inside an if-condition is not fatal
+# under set -e: the test simply evaluated false, and verify_first_chunk never ran.
+# The alignment guard was silently inert for all of wave 2. Strip to digits
+# rather than trusting the field, and refuse the task if nothing usable is left.
+fps=$(echo "$row" | awk -F, '{print $4}' | tr -dc '0-9.')
+n_chunks=$(echo "$row" | awk -F, '{print $7}' | tr -dc '0-9')
+if [[ -z "$n_chunks" || -z "$fps" ]]; then
+	echo "[ERR] manifest row for task $SLURM_ARRAY_TASK_ID has no usable fps/n_chunks: $row" >&2
+	exit 1
+fi
 
 flash_dir="$FLASH_ROOT/$vname"
 mkdir -p "$flash_dir"
@@ -71,6 +81,38 @@ fi
 ss_args=()
 (( lo > 0 )) && ss_args=(-ss "$(( lo * CHUNK_SEC ))")
 
+# -t cannot be trusted to stop the segment muxer exactly at the window's end:
+# -reset_timestamps restarts the output clock for every segment, so the duration
+# limit never accumulates and ffmpeg opens ONE segment past hi before stopping.
+# Wave 5-6 left a 1,442-frame `_007.mkv` behind that way. That stub is the
+# dangerous kind of leftover -- a later wave covering chunk 7 would find it
+# non-empty, take the per-index idempotency skip, and hand a 1,442-frame chunk to
+# detection as if it were a full one. Record which out-of-window chunks existed
+# beforehand so the cleanup below removes only what THIS run produced, never a
+# complete chunk belonging to another wave.
+chunk_index_of() { local b="${1##*/}"; b="${b%.$OUT_EXT}"; echo "$(( 10#${b##*_} ))"; }
+pre_out_of_window=" "
+for f in "$flash_dir/${vname}"_[0-9][0-9][0-9]."$OUT_EXT"; do
+	[[ -e "$f" ]] || continue
+	i=$(chunk_index_of "$f")
+	(( i < lo || i > hi )) && pre_out_of_window+="$i "
+done
+
+prune_out_of_window() {
+	local f i n=0
+	for f in "$flash_dir/${vname}"_[0-9][0-9][0-9]."$OUT_EXT"; do
+		[[ -e "$f" ]] || continue
+		i=$(chunk_index_of "$f")
+		(( i < lo || i > hi )) || continue
+		[[ "$pre_out_of_window" == *" $i "* ]] && continue   # not ours; leave it
+		echo "[INFO] removing chunk $i: produced past the wave window $lo-$hi"
+		rm -f "$f"
+		n=$((n+1))
+	done
+	(( n )) && echo "[OK] pruned $n stray chunk(s) outside $lo-$hi"
+	return 0
+}
+
 echo "[$(date)] chunk $vname [$lo-$hi] -> $flash_dir/${vname}_%03d.${OUT_EXT} (segment_time=${CHUNK_SEC}s)"
 ffmpeg -hide_banner -nostdin -y "${ss_args[@]}" -i "$source_path" \
 	-t "$(( (hi - lo + 1) * CHUNK_SEC ))" -c copy -map 0 \
@@ -103,6 +145,8 @@ verify_first_chunk() {
 	fi
 	echo "[OK] chunk $lo alignment verified ($got frames)"
 }
+prune_out_of_window
+
 if (( lo > 0 && lo < n_chunks - 1 )); then
 	verify_first_chunk || exit 1
 fi
