@@ -306,11 +306,41 @@ continuity at the seam.
 - `--chunk-sec` must be a whole number of GOPs. `chunk.sbatch` seeks with `-ss`
   and then verifies the first chunk's packet count against the expected frame
   cap, failing rather than emitting silently offset chunks.
-- `cleanup` frees only the wave's own chunks, so waves can overlap in time.
 - Every wave is appended to `waves[]`. Coverage is derived from what is actually
   in `data/`, never from the ledger — a killed job cannot leave the ledger
   claiming work that does not exist.
 - `--run-tracking` fires when *this wave* completes. Pass it on the final wave only.
+
+### Overlapping waves
+
+Waves may overlap in time: wave *N+1* can be submitted while wave *N* is still on
+the GPUs, so the queue never drains. What makes that safe is that each wave owns
+its **control files** and shares only its **data files**:
+
+| path | scope | holds |
+| ---- | ----- | ----- |
+| `/flash/.../jobs/<exp>/wave_<A>-<B>/` | per wave | `pipeline.env`, `aruco_worklist.txt`, `jid_*.txt`, rendered templates |
+| `/work/.../<exp>/jobs/wave_<A>-<B>/` | per wave | uploaded worklist + rendered saion arrays |
+| `/flash/.../<exp>/` | per block | chunks — filenames carry the index, and `cleanup` frees only its own wave's |
+| `/work/.../<exp>/input`, `output` | per block | same; sharing `input/` is what lets `prefetch` skip an already-staged chunk |
+
+The worklist is the reason for the split: `prefetch`, `sleap_predict`,
+`sleap_datacp` and the verify gate all re-read it **at task start** and index it
+by row. A second wave overwriting it under a shared path would hand a running
+array a different wave's rows — every task would still report `COMPLETED`, with
+the wrong chunks processed. For the same reason `saion_cleanup` deletes only the
+chunks its own worklist names (mirroring `cleanup.sbatch` on `/flash`) instead of
+the whole `/work` root; the root disappears when the last wave leaves.
+
+Two runs that would land in the *same* jobs dir are refused before anything is
+written — the guard reads that dir's `jid_*.txt` and checks both clusters' queues.
+Override with `--force-submit`. A `--chunk-range` that overlaps a range already in
+`waves[]` only warns: recomputing a window for a new model, or to rescue
+half-landed chunks, has to stay possible.
+
+Practical limits when overlapping: the GPU cap and `GrpSubmit` (2,016 array tasks)
+are per user, so waves share them — divide `--sleap-concurrency` accordingly — and
+`/flash` holds every live wave's chunks at once.
 
 Inspect a block at any time:
 
@@ -483,14 +513,15 @@ needed. `cleanup.sbatch` polls bucket for final SLEAP outputs before deleting
 ## Run logs (`hpc_logs/`) — survive mid-run failures
 
 Job logs used to live only on scratch (`/work` on saion, `/flash` on deigo) and were
-destroyed by cleanup — saion's `rm -rf "$REMOTE_ROOT"` deletes the `jobs/` dir that
-holds the sleap `.out`/`.err`. So a walltime kill, node failure, mass `scancel`, or
-maintenance drain left nothing to diagnose. The pipeline now captures logs to bucket
-under `<exp>/hpc_logs/` in four layers (defense in depth):
+destroyed by cleanup — `saion_cleanup` removes the `jobs/` dir that holds the sleap
+`.out`/`.err`. So a walltime kill, node failure, mass `scancel`, or maintenance drain
+left nothing to diagnose. The pipeline now captures logs to bucket under
+`<exp>/hpc_logs/` in four layers (defense in depth):
 
 ```
 <exp>/hpc_logs/
-  sleap/     sleap_<A>_<a>.out|.err|.status, sacct_sleap_<jid>.tsv   (saion)
+  sleap/     sleap_<A>_<a>.out|.err|.status, prefetch_<A>_<a>.out|.err,
+             sacct_sleap_<jid>.tsv                                   (saion)
   aruco/     aruco_<A>_<a>.out|.err|.status, sacct_aruco_<jid>.tsv   (deigo)
   pipeline/  chunk_*, bridge_*, aruco_datacp_*, cleanup_*, manifest.csv, pipeline.env
 ```

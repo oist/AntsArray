@@ -607,6 +607,47 @@ def cmd_complete_wave(args):
     return 2
 
 
+def ranges_overlap(a, b):
+    """Do two inclusive (lo, hi) chunk ranges share an index?
+
+    ``None`` means "the whole block", which overlaps everything -- including
+    another whole-block run.
+    """
+    if a is None or b is None:
+        return True
+    return a[0] <= b[1] and b[0] <= a[1]
+
+
+def cmd_check_range(args):
+    """Print the recorded waves a proposed range collides with.
+
+    Advisory by contract: prints nothing and exits 0 when the range is free, so a
+    shell caller can just test for empty output. It never exits non-zero on an
+    overlap -- recomputing a claimed window is legitimate (a new model, a rescue
+    of half-landed chunks), and this must not be able to wedge such a run. An
+    absent contract, unreadable state and a malformed range all mean "nothing to
+    say" for the same reason.
+    """
+    state = load(args.data_dir)
+    if state is None:
+        return 0
+    try:
+        want = parse_range(args.range)
+    except ValueError:
+        return 0
+    for w in state.get("waves", []):
+        got = w.get("chunk_range")
+        got = tuple(got) if got else None
+        if not ranges_overlap(want, got):
+            continue
+        print("wave #%s  chunks %s  submitted %s  rows %s"
+              % (w.get("wave"),
+                 "%d-%d" % got if got else "all",
+                 w.get("submitted", "?"),
+                 w.get("rows", "?")))
+    return 0
+
+
 def cmd_declared_rows(args):
     """Print the block's declared chunk total, for shell callers.
 
@@ -697,6 +738,13 @@ def main(argv=None):
     p.add_argument("--data-dir", required=True)
     p.add_argument("--wave", required=True)
     p.set_defaults(func=cmd_complete_wave)
+
+    p = sub.add_parser("check-range",
+                       help="print the recorded waves a proposed --chunk-range overlaps "
+                            "(empty output = free; always exits 0)")
+    p.add_argument("--data-dir", required=True)
+    p.add_argument("--range", default="")
+    p.set_defaults(func=cmd_check_range)
 
     p = sub.add_parser("declared-rows",
                        help="print the block's declared chunk total (exit 1 if no contract)")

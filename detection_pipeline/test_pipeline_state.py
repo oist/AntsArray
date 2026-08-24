@@ -46,6 +46,23 @@ CONTRACT = {
 }
 
 
+def _capture(argv):
+    """Run the CLI and return (stdout, exit_code).
+
+    check-range's contract IS its stdout -- pipeline.sh's guard tests for empty
+    output -- so asserting on the exit code alone would not pin the behaviour
+    that matters.
+    """
+    import io
+    buf, real = io.StringIO(), sys.stdout
+    sys.stdout = buf
+    try:
+        rc = ps.main(argv)
+    finally:
+        sys.stdout = real
+    return buf.getvalue(), rc
+
+
 def write_manifest(path, videos):
     """videos: {vname: (n_chunks, frame_count)} -> a manifest.csv the module reads."""
     with open(path, "w") as f:
@@ -282,6 +299,58 @@ def test_add_wave_numbers_and_records_range():
         assert waves[0]["chunk_range"] == [0, 4]
         assert waves[1]["rows"] == 4
         assert waves[0]["completed"] is None
+    finally:
+        b.close()
+
+
+def test_ranges_overlap_treats_none_as_the_whole_block():
+    assert ps.ranges_overlap((0, 4), (5, 6)) is False
+    assert ps.ranges_overlap((0, 4), (4, 6)) is True     # touching at one index
+    assert ps.ranges_overlap((5, 6), (0, 4)) is False    # order must not matter
+    assert ps.ranges_overlap((2, 3), (0, 9)) is True     # fully contained
+    assert ps.ranges_overlap(None, (5, 6)) is True       # whole block vs a wave
+    assert ps.ranges_overlap((5, 6), None) is True
+    assert ps.ranges_overlap(None, None) is True
+
+
+def test_check_range_reports_only_real_collisions():
+    """A free range must print NOTHING (the guard tests for empty output), and an
+    overlap must still exit 0 -- recomputing a claimed window, for a new model or
+    to rescue half-landed chunks, has to stay possible."""
+    b = Block()
+    try:
+        b.sync()
+        ps.main(["add-wave", "--data-dir", b.data_dir, "--range", "0-4", "--rows", "10"])
+        ps.main(["add-wave", "--data-dir", b.data_dir, "--range", "5-6", "--rows", "4"])
+
+        assert _capture(["check-range", "--data-dir", b.data_dir,
+                         "--range", "7-8"]) == ("", 0)
+
+        out, rc = _capture(["check-range", "--data-dir", b.data_dir, "--range", "4-5"])
+        assert rc == 0
+        assert "wave #1" in out and "wave #2" in out, out
+
+        # No range at all means the whole block, which collides with every wave.
+        out, rc = _capture(["check-range", "--data-dir", b.data_dir, "--range", ""])
+        assert rc == 0
+        assert "wave #1" in out and "wave #2" in out, out
+    finally:
+        b.close()
+
+
+def test_check_range_is_silent_without_a_contract_or_on_a_bad_range():
+    """It runs before anything else is validated, so it must never be the thing
+    that stops a submission."""
+    b = Block()
+    try:
+        assert _capture(["check-range", "--data-dir", b.data_dir,
+                         "--range", "0-4"]) == ("", 0)
+        b.sync()
+        ps.main(["add-wave", "--data-dir", b.data_dir, "--range", "0-4", "--rows", "10"])
+        assert _capture(["check-range", "--data-dir", b.data_dir,
+                         "--range", "9-2"]) == ("", 0)
+        assert _capture(["check-range", "--data-dir", b.data_dir,
+                         "--range", "notarange"]) == ("", 0)
     finally:
         b.close()
 

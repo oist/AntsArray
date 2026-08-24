@@ -75,6 +75,36 @@ SLEAP runtime:
   --sleap-wall D-HH                 per-task walltime.   default: auto = partition wall
                                                          (largegpu 0-12, short-a100 0-2)
 
+Chunk prefetch (saion-side staging ahead of the GPU array):
+  --prefetch-partition NAME         saion partition that stages chunks from the
+                                    /deigo_flash cross-mount onto /work before
+                                    the SLEAP task needs them, so the ~1.3 GB
+                                    copy stops eating a scarce GPU allocation.
+                                    One prefetch task per SLEAP task, paired with
+                                    --dependency=aftercorr, so each chunk is
+                                    handed over as soon as IT is staged instead
+                                    of waiting for the whole staging array.
+                                    saion caps resources per partition and has no
+                                    submit-count limit, so this spends none of
+                                    largegpu's / short-a100's GPU quota.
+                                    'off' = every SLEAP task copies its own chunk
+                                    (the behaviour before this existed).
+                                    default: gpu
+  --prefetch-concurrency N          array %N cap for the prefetch. Keep it >= the
+                                    sleap concurrency so staging stays ahead.
+                                    default: 32
+  --prefetch-cpus N                 cpus per prefetch task. default: 2
+  --prefetch-mem SIZE               mem per prefetch task.  default: 4G
+  --prefetch-wall D-HH              walltime per prefetch task. default: 0-2
+
+Waves:
+  --force-submit                    Submit even when the concurrent-wave guard
+                                    objects. The guard refuses two live runs that
+                                    share a --jobs-root (they would race on the
+                                    same pipeline.env and worklist), and warns
+                                    when the requested --chunk-range overlaps a
+                                    range already claimed in PIPELINE_STATE.json.
+
 Concurrency:
   --aruco-concurrency N             default: 16
   --sleap-concurrency N             default: auto = partition GPU cap (largegpu 8, short-a100 32)
@@ -108,7 +138,14 @@ Phase isolation (for testing):
 
 Roots:
   --jobs-root PATH                  default: /flash/ReiterU/$USER/jobs/<exp>
+                                    ... plus /wave_<A>-<B> when --chunk-range is
+                                    given, so overlapping waves of one block never
+                                    share pipeline.env or a worklist. An explicit
+                                    path is used verbatim (no wave suffix).
   --flash-root PATH                 default: /flash/ReiterU/$USER/<exp>
+                                    Block-level on purpose: a chunk filename
+                                    carries its index, so waves cannot collide,
+                                    and cleanup frees only its own wave's chunks.
 
 Backup:
   --no-backup                       Do not submit the automatic raw-video backup
@@ -167,6 +204,8 @@ ARUCO_EXTRA_ARGS=""
 CHUNK_SEC=7200
 CHUNK_EXT=mkv
 CHUNK_RANGE=""            # "A-B" inclusive; empty = the whole block (one wave)
+WAVE_SLUG=""              # derived from CHUNK_RANGE; namespaces this wave's control dirs
+FORCE_SUBMIT=0            # override the concurrent-wave guard
 NEW_PROCESSING_RUN=0      # archive the block's contract and start a fresh one
 ARUCO_FORCE_RECOMPUTE=0   # redo every aruco chunk, ignoring bucket-complete ones
 SLEAP_MODEL_CENTROID=""
@@ -191,6 +230,13 @@ SLEAP_CONCURRENCY=""
 SLEAP_CPUS=""
 SLEAP_MEM=""
 SLEAP_WALL=""
+# Chunk staging ahead of the GPU array; "off" disables it and every sleap task
+# copies its own chunk, as before. See --prefetch-partition in the usage text.
+PREFETCH_PARTITION=gpu
+PREFETCH_CONCURRENCY=32
+PREFETCH_CPUS=2
+PREFETCH_MEM=4G
+PREFETCH_WALL=0-2
 DATACP_CONCURRENCY=4
 BATCH_SIZE=1         # default: one chunk per array task (set "" to auto-size under MAX_ARRAY_TASKS)
 MAX_ARRAY_TASKS=500
@@ -230,6 +276,7 @@ while [[ $# -gt 0 ]]; do
 		--aruco-params) ARUCO_EXTRA_ARGS="$2"; shift 2 ;;
 		--chunk-sec) CHUNK_SEC="$2"; shift 2 ;;
 		--chunk-range) CHUNK_RANGE="$2"; shift 2 ;;
+		--force-submit) FORCE_SUBMIT=1; shift ;;
 		--new-processing-run) NEW_PROCESSING_RUN=1; shift ;;
 		--aruco-force-recompute) ARUCO_FORCE_RECOMPUTE=1; shift ;;
 		--chunk-ext) CHUNK_EXT="$2"; shift 2 ;;
@@ -245,6 +292,11 @@ while [[ $# -gt 0 ]]; do
 		--sleap-cpus) SLEAP_CPUS="$2"; shift 2 ;;
 		--sleap-mem) SLEAP_MEM="$2"; shift 2 ;;
 		--sleap-wall) SLEAP_WALL="$2"; shift 2 ;;
+		--prefetch-partition) PREFETCH_PARTITION="$2"; shift 2 ;;
+		--prefetch-concurrency) PREFETCH_CONCURRENCY="$2"; shift 2 ;;
+		--prefetch-cpus) PREFETCH_CPUS="$2"; shift 2 ;;
+		--prefetch-mem) PREFETCH_MEM="$2"; shift 2 ;;
+		--prefetch-wall) PREFETCH_WALL="$2"; shift 2 ;;
 		--datacp-concurrency) DATACP_CONCURRENCY="$2"; shift 2 ;;
 		--batch-size) BATCH_SIZE="$2"; shift 2 ;;
 		--max-array-tasks) MAX_ARRAY_TASKS="$2"; shift 2 ;;
@@ -397,6 +449,17 @@ if [[ -n "$CHUNK_RANGE" ]]; then
 		echo "[ERR] --chunk-range start is past its end: '$CHUNK_RANGE'" >&2; exit 2; }
 	echo "[INFO] wave run: chunk indices ${CHUNK_RANGE} only (chunk_sec=${CHUNK_SEC}s -> "\
 	     "$(( ${CHUNK_RANGE%%-*} * CHUNK_SEC ))s..$(( (${CHUNK_RANGE##*-} + 1) * CHUNK_SEC ))s into each video)"
+	# Namespaces every MUTABLE control file this wave owns, on both clusters:
+	# /flash jobs dir (pipeline.env, worklist, jid_*.txt, rendered templates) and
+	# saion's $SAION_WORK_ROOT/jobs (worklist + rendered arrays). Those files are
+	# re-read AT RUN TIME by jobs that are already queued -- prefetch, predict,
+	# datacp and the verify gate all index the worklist by row -- so a second wave
+	# writing them under the block name would hand a running array a different
+	# wave's rows. Every task would still report COMPLETED; the chunks would just
+	# be the wrong ones. The chunk/output files themselves stay block-level: their
+	# names carry the chunk index, so waves cannot collide there, and sharing them
+	# is what lets prefetch skip an already-staged chunk.
+	WAVE_SLUG="wave_${CHUNK_RANGE}"
 fi
 
 # Auto-select the SLEAP inference path from the model dir contents: sleap-nn
@@ -413,8 +476,10 @@ if (( SKIP_TRT_EXPORT == 0 )) && [[ "$SLEAP_RUNTIME" != "pytorch" ]]; then
 	fi
 fi
 
-# Roots
-JOBS_ROOT="${JOBS_ROOT:-/flash/ReiterU/$USER/jobs/$EXP_NAME}"
+# Roots. Only the jobs dir is wave-scoped -- see the WAVE_SLUG comment above.
+# An explicit --jobs-root is honoured verbatim: the caller has already chosen the
+# namespace, and silently appending to it would surprise a rescue run.
+JOBS_ROOT="${JOBS_ROOT:-/flash/ReiterU/$USER/jobs/$EXP_NAME${WAVE_SLUG:+/$WAVE_SLUG}}"
 FLASH_ROOT="${FLASH_ROOT:-/flash/ReiterU/$USER/$EXP_NAME}"
 SAION_WORK_ROOT="/work/ReiterU/$USER/$EXP_NAME"
 DATA_DIR="$DIR/data"
@@ -428,6 +493,91 @@ ensure_group_perms "$JOBS_ROOT" "$FLASH_ROOT" "$DATA_DIR" "$HPC_LOGS_DIR"
 # Preflight: warn (don't fail) if the experiment dir isn't group-shared. It may
 # hold other users' files we can't chgrp, so this is advisory only.
 check_group_perms "$DIR" || true
+
+# --- Concurrent-wave guard ----------------------------------------------------
+# Wave scoping (WAVE_SLUG) makes DIFFERENT ranges safe to overlap. What it cannot
+# make safe is two live runs that land in the SAME jobs dir: the second would
+# rewrite pipeline.env and aruco_worklist.txt under the first one's running array,
+# which reads them by row at task start. So refuse that outright, and warn on a
+# range some earlier wave already claimed (usually a typo, occasionally a
+# deliberate recompute). Both are overridable with --force-submit.
+#
+# Jobs are identified by the jid_*.txt files the previous run left in that dir,
+# not by job name: every deigo template uses a generic -J (bridge, cleanup,
+# chunk_fin), so squeue alone cannot tell this block's jobs from another's. Each
+# cluster's queue is fetched once -- a per-jid `squeue -j` on a finished id exits
+# non-zero and would spend ssh_retry's whole backoff ladder on every file.
+guard_concurrent_wave() {
+	local live_deigo live_saion q_deigo q_saion f base jid
+	[[ -d "$JOBS_ROOT" ]] || return 0
+	shopt -s nullglob
+	local jid_files=( "$JOBS_ROOT"/jid_*.txt )
+	shopt -u nullglob
+	(( ${#jid_files[@]} )) || return 0
+
+	q_deigo=$(squeue -h -u "$USER" -o '%i' 2>/dev/null || true)
+	# Best-effort: no saion login (or a network blip) must not block a submission,
+	# but say so, because the saion half of the check then did not happen.
+	q_saion=$(ssh -x -oBatchMode=yes -oStrictHostKeyChecking=no \
+		-oConnectTimeout=15 saion "squeue -h -u \$USER -o '%i'" 2>/dev/null) || {
+		echo "[WARN] could not reach saion to check for a live sleap array; guard covers deigo only" >&2
+		q_saion=""
+	}
+
+	live_deigo=""; live_saion=""
+	for f in "${jid_files[@]}"; do
+		base=$(basename "$f")
+		jid=$(tr -d '[:space:]' < "$f")
+		[[ -n "$jid" ]] || continue
+		# Array tasks show as <jid>_<task>, so anchor on the id plus a boundary.
+		local pat='^'"$jid"'(_|$)'
+		if [[ "$base" == jid_saion_* ]]; then
+			if grep -qE "$pat" <<<"$q_saion"; then live_saion+=" $base=$jid"; fi
+		else
+			if grep -qE "$pat" <<<"$q_deigo"; then live_deigo+=" $base=$jid"; fi
+		fi
+	done
+
+	if [[ -n "$live_deigo$live_saion" ]]; then
+		echo "[ERR] a run is still live in this jobs dir: $JOBS_ROOT" >&2
+		[[ -n "$live_deigo" ]] && echo "        deigo:$live_deigo" >&2
+		[[ -n "$live_saion" ]] && echo "        saion:$live_saion" >&2
+		echo "      Submitting now would rewrite its pipeline.env and worklist while its" >&2
+		echo "      array is still reading them, silently pairing tasks to the wrong chunks." >&2
+		if [[ -z "$CHUNK_RANGE" ]]; then
+			echo "      Give this run its own --chunk-range (waves get their own jobs dir)," >&2
+			echo "      or its own --jobs-root, or wait for the run above to finish." >&2
+		else
+			echo "      This is the same wave ($WAVE_SLUG) as the live run. Pick a different" >&2
+			echo "      --chunk-range, or wait for it to finish." >&2
+		fi
+		return 1
+	fi
+	return 0
+}
+
+if ! guard_concurrent_wave; then
+	if (( FORCE_SUBMIT == 1 )); then
+		echo "[WARN] --force-submit: proceeding into a live jobs dir anyway" >&2
+	else
+		echo "[ERR] refusing to submit; pass --force-submit to override" >&2
+		exit 2
+	fi
+fi
+
+# Overlap against the block ledger. Advisory only: a deliberate recompute of an
+# already-processed window is legitimate (that is what --sleap-force-recompute
+# and --new-processing-run are for), and the ledger records intent rather than
+# completion, so this must not be able to block a rescue run.
+if [[ -d "$DATA_DIR" ]]; then
+	_overlap=$(python3 "$LIB_DIR/pipeline_state.py" check-range \
+		--data-dir "$DATA_DIR" --range "$CHUNK_RANGE" 2>&1) || true
+	if [[ -n "$_overlap" ]]; then
+		echo "[WARN] this range overlaps a wave already recorded in PIPELINE_STATE.json:" >&2
+		echo "$_overlap" | sed 's/^/       /' >&2
+		echo "       Re-running it recomputes those chunks and overwrites their outputs." >&2
+	fi
+fi
 
 # --- Tracking auto-trigger: validate + derive defaults ------------------------
 if (( RUN_TRACKING == 1 )); then
@@ -469,6 +619,7 @@ export SCRIPTS_DIR="$SCRIPTS_DIR"
 export CHUNK_SEC="$CHUNK_SEC"
 export CHUNK_EXT="$CHUNK_EXT"
 export CHUNK_RANGE="$CHUNK_RANGE"
+export WAVE_SLUG="$WAVE_SLUG"
 export ARUCO_FORCE_RECOMPUTE="$ARUCO_FORCE_RECOMPUTE"
 export ARUCO_DICT_PATH="$ARUCO_DICT_PATH"
 export ARUCO_EXTRA_ARGS="$ARUCO_EXTRA_ARGS"
@@ -477,6 +628,11 @@ export SLEAP_CONCURRENCY="$SLEAP_CONCURRENCY"
 export SLEAP_CPUS="$SLEAP_CPUS"
 export SLEAP_MEM="$SLEAP_MEM"
 export SLEAP_WALL="$SLEAP_WALL"
+export PREFETCH_PARTITION="$PREFETCH_PARTITION"
+export PREFETCH_CONCURRENCY="$PREFETCH_CONCURRENCY"
+export PREFETCH_CPUS="$PREFETCH_CPUS"
+export PREFETCH_MEM="$PREFETCH_MEM"
+export PREFETCH_WALL="$PREFETCH_WALL"
 export DATACP_CONCURRENCY="$DATACP_CONCURRENCY"
 export BATCH_SIZE="$BATCH_SIZE"
 export MAX_ARRAY_TASKS="$MAX_ARRAY_TASKS"

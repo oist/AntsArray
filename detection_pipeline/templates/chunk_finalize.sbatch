@@ -47,7 +47,14 @@ if [[ -z "${BATCH_SIZE:-}" ]]; then
 fi
 (( BATCH_SIZE >= 1 )) || BATCH_SIZE=1
 
-# Persist resolved batch size so array tasks see the same value.
+# Persist resolved batch size so array tasks see the same value. Drop any earlier
+# BATCH_SIZE line first: this used to append blindly, so re-running the same wave
+# left two definitions and the file grew a line each time. Harmless while the last
+# one written happens to be the right one, but it turns the env file into a log
+# rather than a record, and hand-editing the wrong line then silently does
+# nothing. Safe to rewrite here because every consumer sources this file at task
+# start and none has been submitted yet -- the sbatch calls are all below.
+sed -i '/^export BATCH_SIZE=/d' "$JOBS_ROOT/pipeline.env"
 echo "export BATCH_SIZE=$BATCH_SIZE" >> "$JOBS_ROOT/pipeline.env"
 
 # --- ArUco leg: skip chunks already complete on the bucket --------------------

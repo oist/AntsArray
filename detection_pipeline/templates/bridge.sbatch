@@ -27,7 +27,15 @@ fi
 REMOTE_ROOT="$SAION_WORK_ROOT"
 REMOTE_INPUT="$REMOTE_ROOT/input"
 REMOTE_OUTPUT="$REMOTE_ROOT/output"
-REMOTE_JOBS="$REMOTE_ROOT/jobs"
+# Wave-scoped control dir; block-level input/output. The worklist and the
+# rendered arrays under here are re-read AT RUN TIME -- prefetch, predict, datacp
+# and the verify gate all index the worklist by row -- so a second wave writing
+# them under a shared path would hand a running array a different wave's rows,
+# with every task still reporting COMPLETED. input/ and output/ stay shared on
+# purpose: chunk filenames carry their index, so waves cannot collide there, and
+# sharing input/ is what lets prefetch skip an already-staged chunk.
+# WAVE_SLUG is empty for a whole-block run, which restores the old flat layout.
+REMOTE_JOBS="$REMOTE_ROOT/jobs${WAVE_SLUG:+/$WAVE_SLUG}"
 EXPORT_ROOT="/work/ReiterU/$USER/sleap_export"
 
 # Identify model set + GPU partition so engines for different GPU types coexist.
@@ -143,9 +151,20 @@ fi
 # --- Render saion-side templates locally, then upload ------------------------
 RENDERED_PREDICT="$JOBS_ROOT/sleap_predict_array.rendered.sh"
 RENDERED_DATACP="$JOBS_ROOT/sleap_datacp_array.rendered.sh"
+RENDERED_PREFETCH="$JOBS_ROOT/prefetch_array.rendered.sh"
 
 SLEAP_MODULE="${SLEAP_MODULE:-sleap-nn/0.2.0}"
 SAION_DATACP_PARTITION="${SAION_DATACP_PARTITION:-test-gpu}"
+# Chunk staging ahead of the GPU array. "off" restores the old behaviour, where
+# every SLEAP task copies its own chunk from /deigo_flash inside its own GPU
+# allocation. saion caps resources per partition (GrpTRES) and has no submit
+# count limit, so a prefetch on `gpu`/`intel` spends none of largegpu's or
+# short-a100's GPU quota.
+PREFETCH_PARTITION="${PREFETCH_PARTITION:-gpu}"
+PREFETCH_CONCURRENCY="${PREFETCH_CONCURRENCY:-32}"
+PREFETCH_CPUS="${PREFETCH_CPUS:-2}"
+PREFETCH_MEM="${PREFETCH_MEM:-4G}"
+PREFETCH_WALL="${PREFETCH_WALL:-0-2}"
 # Per-task sleap resources (default = proven largegpu profile so old env files render).
 SLEAP_WALL="${SLEAP_WALL:-0-12}"
 SLEAP_CPUS="${SLEAP_CPUS:-16}"
@@ -183,15 +202,31 @@ sed -e "s#__REMOTE_JOBS__#$REMOTE_JOBS#g" \
     -e "s#__BATCH_SIZE__#${BATCH_SIZE:-1}#g" \
     "$TEMPLATES_DIR/sleap_datacp_array.template.sh" > "$RENDERED_DATACP"
 
+UPLOAD_SET=("$WORKLIST" "$RENDERED_PREDICT" "$RENDERED_DATACP")
+if [[ "$PREFETCH_PARTITION" != "off" ]]; then
+	sed -e "s#__REMOTE_JOBS__#$REMOTE_JOBS#g" \
+	    -e "s#__REMOTE_INPUT__#$REMOTE_INPUT#g" \
+	    -e "s#__DEIGO_FLASH_SAION_PREFIX__#$DEIGO_FLASH_SAION_PREFIX#g" \
+	    -e "s#__CHUNK_EXT__#$CHUNK_EXT#g" \
+	    -e "s#__BATCH_SIZE__#${BATCH_SIZE:-1}#g" \
+	    -e "s#__PREFETCH_PARTITION__#$PREFETCH_PARTITION#g" \
+	    -e "s#__PREFETCH_CPUS__#$PREFETCH_CPUS#g" \
+	    -e "s#__PREFETCH_MEM__#$PREFETCH_MEM#g" \
+	    -e "s#__PREFETCH_WALL__#$PREFETCH_WALL#g" \
+	    "$TEMPLATES_DIR/prefetch_array.template.sh" > "$RENDERED_PREFETCH"
+	UPLOAD_SET+=("$RENDERED_PREFETCH")
+fi
+
 echo "[INFO] uploading worklist and rendered saion scripts"
 rsync_retry -ah --chmod=Du=rwx,Dg=rwx,Fu=rwx,Fg=rwx \
-	"$WORKLIST" "$RENDERED_PREDICT" "$RENDERED_DATACP" \
+	"${UPLOAD_SET[@]}" \
 	"saion:$REMOTE_JOBS/"
 
 ssh_retry saion "
 	cd '$REMOTE_JOBS' &&
 	mv -f sleap_predict_array.rendered.sh sleap_predict_array.sh &&
 	mv -f sleap_datacp_array.rendered.sh sleap_datacp_array.sh &&
+	{ [[ -f prefetch_array.rendered.sh ]] && mv -f prefetch_array.rendered.sh prefetch_array.sh && chmod +x prefetch_array.sh || true; } &&
 	chmod +x sleap_predict_array.sh sleap_datacp_array.sh
 "
 
@@ -201,12 +236,36 @@ BS="${BATCH_SIZE:-1}"
 ARRAY_COUNT=$(( (N + BS - 1) / BS ))
 UPPER=$(( ARRAY_COUNT - 1 ))
 
-echo "[INFO] sbatch on saion: sleap_predict_array 0-$UPPER%$SLEAP_CONCURRENCY"
-JID_SLEAP=$(ssh_retry saion "sbatch --parsable $MAIL_OPT --export=ALL,SLEAP_BATCH_SIZE=${SLEAP_BATCH_SIZE:-8} --array=0-${UPPER}%${SLEAP_CONCURRENCY} '$REMOTE_JOBS/sleap_predict_array.sh'")
+# --- Optional chunk prefetch --------------------------------------------------
+# One task per SLEAP task, same worklist, same BATCH_SIZE, so task IDs pair 1:1
+# and `aftercorr` can start SLEAP task N the moment prefetch task N is done --
+# per-chunk handoff rather than waiting for the whole staging array.
+SLEAP_DEP=""
+if [[ "$PREFETCH_PARTITION" != "off" ]]; then
+	echo "[INFO] sbatch on saion: prefetch_array 0-$UPPER%$PREFETCH_CONCURRENCY (partition=$PREFETCH_PARTITION)"
+	JID_PREFETCH=$(ssh_retry saion "sbatch --parsable $MAIL_OPT --array=0-${UPPER}%${PREFETCH_CONCURRENCY} '$REMOTE_JOBS/prefetch_array.sh'")
+	echo "  saion prefetch      $JID_PREFETCH"
+	echo "$JID_PREFETCH" > "$JOBS_ROOT/jid_saion_prefetch.txt"
+	# aftercorr is a per-task afterok. prefetch_array always exits 0 precisely so
+	# a failed copy cannot cancel its SLEAP task -- the task then self-fetches, as
+	# it did before prefetch existed.
+	SLEAP_DEP="--dependency=aftercorr:$JID_PREFETCH"
+fi
+
+echo "[INFO] sbatch on saion: sleap_predict_array 0-$UPPER%$SLEAP_CONCURRENCY${SLEAP_DEP:+ (aftercorr on prefetch)}"
+JID_SLEAP=$(ssh_retry saion "sbatch --parsable $MAIL_OPT $SLEAP_DEP --export=ALL,SLEAP_BATCH_SIZE=${SLEAP_BATCH_SIZE:-8} --array=0-${UPPER}%${SLEAP_CONCURRENCY} '$REMOTE_JOBS/sleap_predict_array.sh'")
 echo "  saion sleap         $JID_SLEAP"
 echo "$JID_SLEAP" > "$JOBS_ROOT/jid_saion_sleap.txt"
 
-JID_SLEAP_DC=$(ssh_retry saion "sbatch --parsable $MAIL_OPT --dependency=afterok:$JID_SLEAP '$REMOTE_JOBS/sleap_datacp_array.sh'")
+# afterany, NOT afterok. This job is the safety net that uploads whatever the
+# inline per-chunk uploads missed, so gating it on every task succeeding inverts
+# its purpose: the run that most needs rescuing is the one where something
+# failed. It also stops being submitted at all when Slurm decides an afterok can
+# never be satisfied -- which is what happened in the 20260810 wave-2 run, where
+# all 50 tasks COMPLETED yet the datacp was cancelled with Reason=Dependency and
+# took saion_cleanup (afterany on it) down with it, stranding 73 GB on /work.
+# The verify-before-delete gate below is what actually protects the outputs.
+JID_SLEAP_DC=$(ssh_retry saion "sbatch --parsable $MAIL_OPT --dependency=afterany:$JID_SLEAP '$REMOTE_JOBS/sleap_datacp_array.sh'")
 echo "  saion sleap_datacp  $JID_SLEAP_DC"
 echo "$JID_SLEAP_DC" > "$JOBS_ROOT/jid_saion_sleap_datacp.txt"
 
@@ -235,7 +294,11 @@ sacct -j $JID_SLEAP \
 # Layer 3: archive every sleap task log to bucket BEFORE deleting the scratch tree.
 # Compute can't write /bucket, so rsync via the saion login alias (has bucket write).
 ssh_retry saion "mkdir -p '$HPC_LOGS_DIR/sleap' && { chgrp $OUTPUT_GROUP '$HPC_LOGS_DIR/sleap' 2>/dev/null; chmod 2775 '$HPC_LOGS_DIR/sleap' 2>/dev/null; true; }" || true
-logs=( $REMOTE_JOBS/sleap_*.out $REMOTE_JOBS/sleap_*.err $REMOTE_JOBS/sleap_*.status $REMOTE_JOBS/sacct_sleap_*.tsv $REMOTE_JOBS/saion_cleanup_*.out )
+# prefetch_* belongs here: it is the only record of what the staging array did,
+# and the reclamation below deletes this dir. The wave-3 run of 20260810/block02
+# archived 683 files and not one of them was a prefetch log, because the glob
+# listed sleap_* only -- so the very feature under test left no evidence.
+logs=( $REMOTE_JOBS/sleap_*.out $REMOTE_JOBS/sleap_*.err $REMOTE_JOBS/sleap_*.status $REMOTE_JOBS/sacct_sleap_*.tsv $REMOTE_JOBS/prefetch_*.out $REMOTE_JOBS/prefetch_*.err $REMOTE_JOBS/saion_cleanup_*.out )
 if (( \${#logs[@]} )); then
 	rsync_retry -ah --chmod=Du=rwx,Dg=rwx,Fu=rw,Fg=rw --chown=:$OUTPUT_GROUP \
 		"\${logs[@]}" "saion:$HPC_LOGS_DIR/sleap/" || echo "[WARN] log archive failed; streamed copies remain on bucket"
@@ -254,12 +317,18 @@ fi
 WORKLIST="$REMOTE_JOBS/aruco_worklist.txt"
 if [[ ! -r "\$WORKLIST" ]]; then
 	echo "[WARN] no readable worklist at $REMOTE_JOBS/aruco_worklist.txt; KEEPING $REMOTE_ROOT (cannot verify uploads)."
-	echo "       To force-delete after manual verification: rm -rf $REMOTE_ROOT"
+	echo "       To force-delete after manual verification: rm -rf $REMOTE_JOBS plus this"
+	echo "       wave's chunks under $REMOTE_INPUT and $REMOTE_OUTPUT."
+	echo "       Do NOT rm -rf $REMOTE_ROOT unless no other wave of this block is running:"
+	echo "       input/ and output/ are shared by every wave."
 	exit 1
 fi
 if [[ ! -d "$DATA_DIR" ]]; then
 	echo "[WARN] bucket data dir $DATA_DIR absent/unreadable; KEEPING $REMOTE_ROOT (cannot verify uploads)."
-	echo "       To force-delete after manual verification: rm -rf $REMOTE_ROOT"
+	echo "       To force-delete after manual verification: rm -rf $REMOTE_JOBS plus this"
+	echo "       wave's chunks under $REMOTE_INPUT and $REMOTE_OUTPUT."
+	echo "       Do NOT rm -rf $REMOTE_ROOT unless no other wave of this block is running:"
+	echo "       input/ and output/ are shared by every wave."
 	exit 1
 fi
 
@@ -285,7 +354,10 @@ done < "\$WORKLIST"
 
 if (( expected == 0 )); then
 	echo "[WARN] no sleap outputs found in $REMOTE_OUTPUT; KEEPING $REMOTE_ROOT (nothing verified as uploaded)."
-	echo "       To force-delete after manual verification: rm -rf $REMOTE_ROOT"
+	echo "       To force-delete after manual verification: rm -rf $REMOTE_JOBS plus this"
+	echo "       wave's chunks under $REMOTE_INPUT and $REMOTE_OUTPUT."
+	echo "       Do NOT rm -rf $REMOTE_ROOT unless no other wave of this block is running:"
+	echo "       input/ and output/ are shared by every wave."
 	exit 1
 fi
 
@@ -293,13 +365,46 @@ if (( missing > 0 )); then
 	echo "[WARN] upload verification FAILED: \$present / \$expected chunk outputs confirmed on bucket ($DATA_DIR)"
 	echo "       \$missing chunk(s) not fully uploaded (missing .slp: \$miss_slp, missing _sleap_data.h5: \$miss_h5)."
 	echo "       KEEPING $REMOTE_ROOT so it stays the only copy (gpu25 broken-DNS strand or sleap2h5 KeyError)."
-	echo "       Re-run sleap_datacp / slp2h5 to backfill bucket, then force-delete: rm -rf $REMOTE_ROOT"
+	echo "       Re-run sleap_datacp / slp2h5 to backfill bucket, then re-run this job."
+	echo "       To force-delete instead: rm -rf $REMOTE_JOBS plus this wave's chunks under"
+	echo "       $REMOTE_INPUT and $REMOTE_OUTPUT (never rm -rf $REMOTE_ROOT while another"
+	echo "       wave of this block is running -- input/ and output/ are shared)."
 	exit 1
 fi
 
-echo "[OK] all \$present / \$expected chunk outputs (.slp + _sleap_data.h5) present on bucket; safe to free $REMOTE_ROOT"
-echo "[INFO] removing $REMOTE_ROOT"
-rm -rf "$REMOTE_ROOT"
+echo "[OK] all \$present / \$expected chunk outputs (.slp + _sleap_data.h5) present on bucket; safe to free this wave's scratch"
+
+# --- Wave-scoped reclamation --------------------------------------------------
+# Deliberately NOT \`rm -rf $REMOTE_ROOT\`. input/ and output/ are block-level and
+# shared by every wave, so a blanket delete pulls a concurrent wave's staged
+# chunks and in-flight outputs away mid-run -- and that wave's arrays are already
+# queued, so nothing downstream would even report an error. Delete only what THIS
+# wave's worklist names, exactly as cleanup.sbatch's free_wave_chunks does on the
+# /flash side, then let the empty-dir prune remove the root once the last wave is
+# out.
+freed=0
+while IFS=\$'\t' read -r vname chunk _ || [[ -n "\$vname" ]]; do
+	[[ -n "\$vname" && -n "\$chunk" ]] || continue
+	rm -f "$REMOTE_INPUT/\${vname}_\${chunk}.$CHUNK_EXT" \
+	      "$REMOTE_OUTPUT/\${vname}_\${chunk}.slp" \
+	      "$REMOTE_OUTPUT/\${vname}_\${chunk}_sleap_data.h5"
+	freed=\$((freed+1))
+done < "\$WORKLIST"
+echo "[INFO] freed \$freed chunks of ${WAVE_SLUG:-the whole block} under $REMOTE_ROOT"
+
+# This wave's own control dir, last: the archive above already shipped its logs to
+# bucket. Our own stdout dies with it -- the same trade the blanket rm always made,
+# and it only applies on the success path, since every failure exits 1 above and
+# keeps the whole tree for inspection.
+echo "[INFO] removing $REMOTE_JOBS"
+rm -rf "$REMOTE_JOBS"
+
+# Best-effort: each rmdir succeeds only when that dir is empty, so the root
+# disappears when the last wave leaves and survives untouched while any other
+# wave still has chunks staged.
+rmdir "$REMOTE_INPUT" "$REMOTE_OUTPUT" 2>/dev/null || true
+rmdir "$REMOTE_ROOT/jobs" 2>/dev/null || true
+rmdir "$REMOTE_ROOT" 2>/dev/null && echo "[INFO] last wave out; removed $REMOTE_ROOT" || true
 CLEAN
 ssh_retry saion "chmod +x '$REMOTE_JOBS/saion_cleanup.sh' && sbatch $CLEAN_MAIL_OPT --dependency=afterany:$JID_SLEAP_DC '$REMOTE_JOBS/saion_cleanup.sh'"
 
