@@ -352,6 +352,77 @@ The catalog reports `expected_source`, `chunks_declared`, `waves_done` and
 `unclaimed_chunks`, and flags `WAVE_GAP` when a window between two submitted
 waves was never claimed. A trailing tail is normal progress and is not flagged.
 
+## Multi-user wave processing (`pipeline_multi.sh`)
+
+Every limit that throttles a block — `GrpSubmit` 2016, `compute`'s 2000 cpu,
+`largegpu`'s 8 GPUs — is **per user**, and every mutable control path is
+already namespaced by `$USER`. So 2–3 unit members can process one block in
+parallel by taking disjoint waves: on `largegpu` that is 8 → 16/24 A100s.
+(`short-a100`'s 32-GPU cap is already the whole partition, so extra users add
+nothing there.)
+
+The shared policy lives in one plan file, next to the contract:
+
+```jsonc
+// <exp>/data/MULTIUSER_PLAN.json
+{
+  "settings": { "chunk_sec": 1800, "aruco_dict": "A",
+                "sleap_model_centroid": "...", "sleap_model_instance": "...",
+                "saion_partition": "largegpu" },      // pipeline.sh flags, _ for -
+  "slots": {
+    "makoto-hiroi": { "waves": ["0-1649"], "backup": true, "tracking": true },
+    "user2":        { "waves": ["1650-3299"] },
+    "user3":        { "waves": ["3300-4949"] }
+  }
+}
+```
+
+Each user (from a deigo login, needs `reiteruni` + a working `saion` SSH alias):
+
+```bash
+pipeline_multi.sh submit --plan <exp>/data/MULTIUSER_PLAN.json  # my next wave
+pipeline_multi.sh auto   --plan ...   # nohup poller: my waves back to back
+pipeline_multi.sh status --plan ...   # every slot: wave coverage + both queues
+```
+
+The wrapper derives every `pipeline.sh` flag from the plan (no per-user typo
+drift; the processing contract would refuse drift anyway) and enforces the two
+things that must stay unique: **one backup writer** (backup rides only the
+backup slot's first wave — concurrent `zip -FS` updates can corrupt the
+archive) and **one tracking poller** (launched from the tracking slot's last
+wave; it gates on the block's declared total, so it waits for everyone).
+`load_plan` refuses overlapping waves across slots, duplicate backup/tracking
+slots, and policy keys smuggled into `settings`.
+
+`auto` mirrors `track_trigger.sh`'s login-side nohup pattern: it polls
+`data/`, submits the slot's next wave when the previous one's outputs are
+complete (`--max-live 2` overlaps waves), retries a half-landed wave at most
+3× (the bucket-aware skip redoes only gaps), and exits when the slot is done.
+Progress log: `<exp>/hpc_logs/pipeline/multi_auto_<user>.log`.
+
+For fully central operation, a secondary user may grant a **forced-command
+key** — this key can only drive the wrapper, it never gets a shell:
+
+```text
+command=".../current/detection_pipeline/pipeline_multi.sh agent",no-pty,no-port-forwarding,no-agent-forwarding,no-X11-forwarding ssh-ed25519 AAAA... pipeline-key
+```
+
+### Shared deploy (`scripts/deploy_release.sh`)
+
+Multi-user runs need one checkout every user's jobs can read at run time
+(pipeline.env bakes `LIB_DIR`/`SCRIPTS_DIR`/`TEMPLATES_DIR` paths). Deploy to
+`/apps/unit/ReiterU/AntsArray` as immutable `releases/<date>_<sha>/` dirs with
+a `current` symlink:
+
+```bash
+scripts/deploy_release.sh --repo-url git@github.com:<org>/AntsArray.git   # first time
+scripts/deploy_release.sh                                                 # update
+```
+
+`pipeline.sh` resolves itself with `pwd -P`, so a submitted wave pins its
+release dir and a later deploy (symlink flip) never changes code under a
+running block. Releases are group-readable, never group-writable.
+
 ## Re-runs skip work already on the bucket
 
 Both legs consult `data/` before running, so a re-run only redoes the gaps:

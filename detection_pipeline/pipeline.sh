@@ -10,7 +10,10 @@
 #        --sleap-model-centroid <dir> --sleap-model-instance <dir> [options]
 set -eo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# pwd -P: under a releases/<sha> + current-symlink deploy (scripts/deploy_release.sh)
+# the run must pin its release dir — jobs re-read LIB_DIR/SCRIPTS_DIR/TEMPLATES_DIR
+# from pipeline.env at run time, and a later deploy repoints the symlink.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 LIB_DIR="$SCRIPT_DIR/lib"
 TEMPLATES_DIR="$SCRIPT_DIR/templates"
 SCRIPTS_DIR="$SCRIPT_DIR/scripts"
@@ -585,7 +588,7 @@ if (( RUN_TRACKING == 1 )); then
 		echo "[ERR] --run-tracking needs a full aruco+sleap run; drop the --only-* flag(s)" >&2
 		exit 2
 	fi
-	: "${TRACKING_SUBMIT:=$(cd "$SCRIPT_DIR/.." && pwd)/tracking/colony/submit_blocks_pipeline.sh}"
+	: "${TRACKING_SUBMIT:=$(cd "$SCRIPT_DIR/.." && pwd -P)/tracking/colony/submit_blocks_pipeline.sh}"
 	[[ -f "$TRACKING_HMATS" ]] || { echo "[ERR] --run-tracking requires --tracking-hmats <existing .npz>" >&2; exit 2; }
 	[[ -f "$TRACKING_SUBMIT" ]] || { echo "[ERR] tracking submit script not found: $TRACKING_SUBMIT" >&2; exit 2; }
 	: "${TRACKING_OUTPUT_ROOT:=/flash/ReiterU/$USER/colony_pipeline/$(basename "$(dirname "$DIR")")}"
