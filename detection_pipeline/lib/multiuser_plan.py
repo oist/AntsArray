@@ -321,7 +321,9 @@ def cmd_status(args):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    sub = ap.add_subparsers(dest="cmd", required=True)
+    # No required=True: that kwarg is 3.7+, and deigo/saion logins run the
+    # system python 3.6. Enforced manually after parsing instead.
+    sub = ap.add_subparsers(dest="cmd")
 
     def add(name, fn, **extra_args):
         p = sub.add_parser(name)
@@ -338,6 +340,8 @@ def main(argv=None):
     add("flags", cmd_flags, user={"required": True}, wave={"required": True})
 
     args = ap.parse_args(argv)
+    if not getattr(args, "fn", None):
+        ap.error("a subcommand is required (validate|status|waves|slot-status|flags)")
     try:
         return args.fn(args)
     except (ValueError, OSError) as e:
