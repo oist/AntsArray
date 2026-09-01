@@ -34,10 +34,13 @@ Used by pipeline_multi.sh; the CLI prints machine-readable output (one token
 or one TSV row per line) so the shell side never parses JSON.
 """
 import argparse
+import datetime
 import json
 import os
 import re
+import subprocess
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pipeline_state as ps  # noqa: E402
@@ -248,6 +251,208 @@ def wave_status(plan, user, data_dir):
 
 
 # ---------------------------------------------------------------------------
+# plan generation (`pipeline_multi.sh plan`)
+# ---------------------------------------------------------------------------
+# What people get wrong in a hand-written plan is never the syntax, it is the
+# values: settings that disagree with the block's recorded contract (refused at
+# submit), a total chunk count nobody looked up, and wave widths that overrun
+# the per-user submit cap. So the generator takes settings FROM the contract
+# when one exists, counts chunks itself, and sizes waves from the cap.
+DEFAULTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "..", "templates", "multiuser_defaults.json")
+
+# deigo compute GrpSubmit is 2016 jobs per user. A wave costs about
+# rows/batch_size aruco tasks plus ~30 fixed jobs; the same user's OTHER work
+# (tracking DAGs, sleep prediction) shares the cap, so leave real headroom.
+DEFAULT_WAVE_ROWS = 1500
+
+# Contract keys that are not pipeline.sh flags.
+_CONTRACT_ONLY = ("aruco_script",)
+
+
+def load_defaults(path):
+    with open(path) as f:
+        d = json.load(f)
+    if not isinstance(d, dict):
+        raise ValueError("%s: defaults must be an object" % path)
+    return dict((k, v) for k, v in d.items() if not k.startswith("_"))
+
+
+def parse_override(item):
+    """--set key=value -> (key, typed value). true/false -> bool, digits -> int."""
+    if "=" not in item:
+        raise ValueError("--set expects key=value, got %r" % item)
+    k, _, v = item.partition("=")
+    k = k.strip()
+    if v in ("true", "false"):
+        return k, v == "true"
+    if v.isdigit():
+        return k, int(v)
+    return k, v
+
+
+def resolve_settings(defaults, state, overrides):
+    """defaults < recorded contract < --set overrides; empty strings dropped.
+
+    The contract wins over defaults because pipeline.sh will refuse anything
+    else; an override that contradicts a HARD contract key is reported so the
+    author learns it before the submit does.
+    """
+    settings = dict(defaults)
+    if state is not None:
+        ch = state.get("chunking", {})
+        settings["chunk_sec"] = int(ch.get("chunk_sec"))
+        settings["chunk_ext"] = ch.get("chunk_ext")
+        for k, v in state.get("detection", {}).items():
+            if k in _CONTRACT_ONLY:
+                continue
+            settings[k] = v
+    conflicts = []
+    for k, v in overrides.items():
+        if state is not None and k in ps.HARD_KEYS and k in settings \
+                and str(settings[k]) != str(v):
+            conflicts.append((k, settings[k], v))
+        settings[k] = v
+    settings = dict((k, v) for k, v in settings.items() if v not in ("", None))
+    return settings, conflicts
+
+
+def split_waves(total, users, n_videos, wave_rows=DEFAULT_WAVE_ROWS, max_live=1):
+    """Contiguous, near-equal split of chunk indices 0..total-1 across users,
+    each share cut into equal-width waves no wider than the submit cap allows.
+
+    Width is derived from ROWS (chunk x camera), the unit the cap actually
+    counts, so a 19-camera and a 25-camera block size themselves correctly.
+    Returns ({user: [range_str, ...]}, width).
+    """
+    if total <= 0:
+        raise ValueError("block declares no chunks")
+    if n_videos <= 0:
+        raise ValueError("block declares no videos")
+    if len(users) > total:
+        raise ValueError("%d users but only %d chunk indices" % (len(users), total))
+    width = max(1, wave_rows // (n_videos * max(1, max_live)))
+    base, rem = divmod(total, len(users))
+    slots, lo = {}, 0
+    for i, user in enumerate(users):
+        share = base + (1 if i < rem else 0)
+        n_waves = -(-share // width)
+        wb, wr = divmod(share, n_waves)
+        waves, cur = [], lo
+        for j in range(n_waves):
+            w = wb + (1 if j < wr else 0)
+            waves.append("%d-%d" % (cur, cur + w - 1))
+            cur += w
+        slots[user] = waves
+        lo += share
+    return slots, width
+
+
+def _videos_via_manifest(exp_dir, chunk_sec):
+    """No contract yet: probe the block the way pipeline.sh does."""
+    manifest_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "manifest.py")
+    fd, tmp = tempfile.mkstemp(prefix="muplan_manifest_", suffix=".csv")
+    os.close(fd)
+    try:
+        subprocess.check_call([sys.executable, manifest_py, "--dir", exp_dir,
+                               "--out", tmp, "--chunk-sec", str(chunk_sec)])
+        return ps.read_manifest(tmp)
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+def build_plan(exp_dir, users, defaults, overrides, wave_rows, max_live,
+               backup_user=None, tracking_user=None, videos=None):
+    data_dir = os.path.join(exp_dir, "data")
+    state = ps.load(data_dir) if os.path.isfile(ps.state_path(data_dir)) else None
+    settings, conflicts = resolve_settings(defaults, state, overrides)
+
+    if not settings.get("only_aruco"):
+        for k in ("sleap_model_centroid", "sleap_model_instance"):
+            if k not in settings:
+                raise ValueError(
+                    "settings lack %s: pass --set %s=<dir> (or run after a first "
+                    "contract exists, or --set only_aruco=true)" % (k, k))
+
+    if videos is None:
+        videos = (state["chunking"]["videos"] if state is not None
+                  else _videos_via_manifest(exp_dir, settings["chunk_sec"]))
+    total = max(int(v.get("n_chunks", 0)) for v in videos.values())
+    slots, width = split_waves(total, users, len(videos), wave_rows, max_live)
+
+    backup_user = backup_user or users[0]
+    tracking_user = tracking_user or users[0]
+    for role, u in (("backup", backup_user), ("tracking", tracking_user)):
+        if u not in slots:
+            raise ValueError("--%s-user %r is not one of the users" % (role, u))
+    full_slots = {}
+    for u, w in slots.items():
+        slot = {"waves": w}
+        if u == backup_user:
+            slot["backup"] = True
+        if u == tracking_user:
+            slot["tracking"] = True
+        full_slots[u] = slot
+
+    plan = {
+        "meta": {
+            "generated": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "settings_source": "contract" if state is not None else "defaults",
+            "total_chunk_indices": total,
+            "n_videos": len(videos),
+            "wave_rows": wave_rows,
+            "max_live": max_live,
+            "wave_width": width,
+        },
+        "settings": settings,
+        "slots": full_slots,
+    }
+    return plan, conflicts
+
+
+def cmd_init(args):
+    exp_dir = os.path.abspath(args.dir)
+    if not os.path.isdir(exp_dir):
+        raise ValueError("--dir not found: %s" % exp_dir)
+    users = [u for u in args.users.split(",") if u]
+    if not users:
+        raise ValueError("--users needs at least one username")
+    out = args.out or os.path.join(exp_dir, "data", PLAN_BASENAME)
+    if os.path.exists(out) and not args.force:
+        raise ValueError("%s exists; pass --force to overwrite" % out)
+
+    overrides = dict(parse_override(x) for x in (args.set or ()))
+    plan, conflicts = build_plan(
+        exp_dir, users, load_defaults(args.defaults or DEFAULTS_PATH), overrides,
+        args.wave_rows, args.max_live, args.backup_user, args.tracking_user)
+    for k, have, want in conflicts:
+        sys.stderr.write("[WARN] --set %s=%r contradicts the recorded contract (%r); "
+                         "pipeline.sh will refuse this plan\n" % (k, want, have))
+
+    if not os.path.isdir(os.path.dirname(out)):
+        os.makedirs(os.path.dirname(out))
+    with open(out, "w") as f:
+        json.dump(plan, f, indent=2)
+        f.write("\n")
+    try:
+        os.chmod(out, 0o664)  # group-editable: the plan is the team's, not the author's
+    except OSError:
+        pass
+    load_plan(out)  # the generator must never emit a plan it would refuse
+    m = plan["meta"]
+    sys.stderr.write("[OK] wrote %s (settings from %s; %d indices x %d videos; "
+                     "wave width %d = %d rows / %d videos / max_live %d)\n"
+                     % (out, m["settings_source"], m["total_chunk_indices"],
+                        m["n_videos"], m["wave_width"], m["wave_rows"],
+                        m["n_videos"], m["max_live"]))
+    args.plan = out
+    return cmd_validate(args)
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 def _exp_dir_of(plan_path):
@@ -335,13 +540,25 @@ def main(argv=None):
 
     add("validate", cmd_validate)
     add("status", cmd_status)
+    p_init = sub.add_parser("init")
+    p_init.add_argument("--dir", required=True)
+    p_init.add_argument("--users", required=True, help="comma-separated usernames")
+    p_init.add_argument("--wave-rows", type=int, default=DEFAULT_WAVE_ROWS)
+    p_init.add_argument("--max-live", type=int, default=1)
+    p_init.add_argument("--backup-user")
+    p_init.add_argument("--tracking-user")
+    p_init.add_argument("--defaults")
+    p_init.add_argument("--set", action="append")
+    p_init.add_argument("--out")
+    p_init.add_argument("--force", action="store_true")
+    p_init.set_defaults(fn=cmd_init)
     add("waves", cmd_waves, user={"required": True})
     add("slot-status", cmd_slot_status, user={"required": True})
     add("flags", cmd_flags, user={"required": True}, wave={"required": True})
 
     args = ap.parse_args(argv)
     if not getattr(args, "fn", None):
-        ap.error("a subcommand is required (validate|status|waves|slot-status|flags)")
+        ap.error("a subcommand is required (init|validate|status|waves|slot-status|flags)")
     try:
         return args.fn(args)
     except (ValueError, OSError) as e:

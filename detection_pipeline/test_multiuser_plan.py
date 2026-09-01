@@ -299,6 +299,94 @@ def test_cli_slot_status_tsv_and_flags_tokens():
 
 
 # ---------------------------------------------------------------------------
+# plan generation
+# ---------------------------------------------------------------------------
+def test_split_waves_is_contiguous_disjoint_and_cap_sized():
+    # 196 indices (98 h at 1800 s), 25 cameras, 3 users, 1500 rows/wave:
+    # width = 1500 // 25 = 60; shares 66/65/65 -> 2 waves each, equal widths.
+    slots, width = mp.split_waves(196, ["a", "b", "c"], 25, wave_rows=1500)
+    assert width == 60
+    assert slots["a"] == ["0-32", "33-65"]
+    assert slots["b"] == ["66-98", "99-130"]
+    assert slots["c"] == ["131-163", "164-195"]
+    # Every index exactly once, no wave wider than the cap.
+    seen = []
+    for waves in slots.values():
+        for w in waves:
+            lo, hi = ps.parse_range(w)
+            assert hi - lo + 1 <= width
+            seen.extend(range(lo, hi + 1))
+    assert sorted(seen) == list(range(196))
+
+
+def test_split_waves_halves_width_for_overlapping_waves_and_scales_by_cameras():
+    _, w1 = mp.split_waves(196, ["a"], 25, wave_rows=1500, max_live=1)
+    _, w2 = mp.split_waves(196, ["a"], 25, wave_rows=1500, max_live=2)
+    _, w19 = mp.split_waves(196, ["a"], 19, wave_rows=1500)
+    assert (w1, w2, w19) == (60, 30, 78)
+    raises_value_error(lambda: mp.split_waves(2, ["a", "b", "c"], 25), "users")
+
+
+def test_resolve_settings_contract_beats_defaults_and_flags_conflicts():
+    defaults = {"chunk_sec": 7200, "aruco_dict": "A", "saion_partition": "largegpu"}
+    state = ps.new_state("/blk", 1800, "mkv",
+                         {VID_A: {"n_chunks": 5, "fps": 24.0, "frame_count": 216000}},
+                         {"aruco_dict": "/dicts/custom_4x4_A100.npz", "aruco_params": "",
+                          "aruco_script": "run_aruco_mp.py",
+                          "sleap_model_centroid": "/models/x.centroid",
+                          "sleap_model_instance": "/models/x.centered_instance",
+                          "sleap_module": "sleap-nn/0.3.3", "sleap_runtime": "tensorrt",
+                          "saion_partition": "short-a100"})
+    settings, conflicts = mp.resolve_settings(defaults, state, {"saion_partition": "largegpu"})
+    assert settings["chunk_sec"] == 1800                      # contract, not default
+    assert settings["aruco_dict"] == "/dicts/custom_4x4_A100.npz"
+    assert "aruco_script" not in settings                     # contract-only key
+    assert "aruco_params" not in settings                     # empty dropped
+    assert settings["saion_partition"] == "largegpu"          # soft override, no conflict
+    assert conflicts == []
+    _, conflicts = mp.resolve_settings(defaults, state, {"sleap_model_centroid": "/models/other"})
+    assert conflicts and conflicts[0][0] == "sleap_model_centroid"
+
+
+def _defaults_file(block):
+    p = os.path.join(block.root, "defaults.json")
+    with open(p, "w") as f:
+        json.dump({"_comment": "x", "chunk_sec": 7200, "aruco_dict": "A",
+                   "saion_partition": "largegpu"}, f)
+    return p
+
+
+def test_init_writes_a_plan_the_loader_accepts():
+    videos = {VID_A: {"n_chunks": 10, "fps": 24.0, "frame_count": 432000},
+              VID_B: {"n_chunks": 10, "fps": 24.0, "frame_count": 432000}}
+    b = Block(make_plan({"usera": {"waves": ["0-4"]}}), videos=videos)
+    try:
+        os.remove(b.plan_path)  # init must create it, not find it
+        # Contract lacks sleap models: init must demand them.
+        rc = mp.main(["init", "--dir", b.root, "--users", "usera,userb",
+                      "--defaults", _defaults_file(b)])
+        assert rc == 2
+        rc = mp.main(["init", "--dir", b.root, "--users", "usera,userb",
+                      "--defaults", _defaults_file(b),
+                      "--set", "sleap_model_centroid=/models/x.centroid",
+                      "--set", "sleap_model_instance=/models/x.centered_instance",
+                      "--wave-rows", "6"])
+        assert rc == 0
+        plan = mp.load_plan(b.plan_path)
+        assert plan["settings"]["chunk_sec"] == 1800          # from the contract
+        assert plan["meta"]["settings_source"] == "contract"
+        assert plan["meta"]["wave_width"] == 3                # 6 rows / 2 videos
+        assert plan["slots"]["usera"] == {"waves": ["0-2", "3-4"], "backup": True, "tracking": True}
+        assert plan["slots"]["userb"] == {"waves": ["5-7", "8-9"]}
+        # Refuses to clobber without --force.
+        rc = mp.main(["init", "--dir", b.root, "--users", "usera",
+                      "--defaults", _defaults_file(b)])
+        assert rc == 2
+    finally:
+        b.close()
+
+
+# ---------------------------------------------------------------------------
 # runner
 # ---------------------------------------------------------------------------
 def _run_all():

@@ -9,6 +9,13 @@
 # drift between people (the processing contract would refuse a drift anyway —
 # this stops it before a refused submission, not after).
 #
+#   pipeline_multi.sh plan      --dir <exp> --users a,b,c [--wave-rows 1500]
+#                               [--set key=value ...] [--force]
+#                                                # generate <exp>/data/MULTIUSER_PLAN.json:
+#                                                # settings from the block's contract (or
+#                                                # templates/multiuser_defaults.json), chunk
+#                                                # count from the block, waves sized to the
+#                                                # per-user submit cap
 #   pipeline_multi.sh validate  --plan <plan>    # check the plan, show slots
 #   pipeline_multi.sh submit    --plan <plan>    # submit MY next pending wave
 #   pipeline_multi.sh auto      --plan <plan>    # nohup poller: submit my waves
@@ -30,7 +37,7 @@ PIPELINE="$SCRIPT_DIR/pipeline.sh"
 log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
 die() { echo "[ERR] $*" >&2; exit 2; }
 
-usage() { sed -n '2,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 1; }
+usage() { sed -n '2,29p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 1; }
 
 # --- args --------------------------------------------------------------------
 CMD="${1:-}"; shift || true
@@ -38,12 +45,20 @@ PLAN=""
 POLL_SECS=600
 MAX_LIVE=1
 DRY_RUN=0
+PLAN_DIR=""
+PLAN_USERS=""
+PLAN_ARGS=()   # pass-through for `plan`
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 		--plan) PLAN="$2"; shift 2 ;;
 		--poll-secs) POLL_SECS="$2"; shift 2 ;;
 		--max-live) MAX_LIVE="$2"; shift 2 ;;
 		--dry-run) DRY_RUN=1; shift ;;
+		--dir) PLAN_DIR="$2"; shift 2 ;;
+		--users) PLAN_USERS="$2"; shift 2 ;;
+		--wave-rows|--backup-user|--tracking-user|--set|--defaults|--out)
+			PLAN_ARGS+=("$1" "$2"); shift 2 ;;
+		--force) PLAN_ARGS+=(--force); shift ;;
 		-h|--help) usage ;;
 		*) die "unknown arg: $1" ;;
 	esac
@@ -51,6 +66,7 @@ done
 
 case "$CMD" in
 	validate|submit|auto|status|stop-auto) [[ -n "$PLAN" ]] || die "--plan is required" ;;
+	plan) [[ -n "$PLAN_DIR" && -n "$PLAN_USERS" ]] || die "plan needs --dir <exp> and --users a,b,c" ;;
 	agent) ;;
 	*) usage ;;
 esac
@@ -325,6 +341,13 @@ for u in sorted(multiuser_plan.load_plan(sys.argv[1])["slots"]): print(u)' \
 	fi
 }
 
+# --- plan (generate the plan file) -------------------------------------------
+cmd_plan() {
+	[[ -d "$PLAN_DIR" ]] || die "--dir not found: $PLAN_DIR"
+	python3 "$MP" init --dir "$PLAN_DIR" --users "$PLAN_USERS" \
+		--max-live "$MAX_LIVE" "${PLAN_ARGS[@]}"
+}
+
 # --- agent (forced-command SSH entry) ----------------------------------------
 # For a restricted authorized_keys line:
 #   command=".../pipeline_multi.sh agent",no-port-forwarding,no-pty,... key...
@@ -359,6 +382,7 @@ cmd_agent() {
 }
 
 case "$CMD" in
+	plan)      cmd_plan ;;
 	validate)  python3 "$MP" validate --plan "$PLAN" ;;
 	submit)    cmd_submit ;;
 	auto)      cmd_auto ;;

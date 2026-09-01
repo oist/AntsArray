@@ -377,6 +377,28 @@ The shared policy lives in one plan file, next to the contract:
 }
 ```
 
+Do not write the plan by hand -- generate it, so the values that actually
+bite (settings that must match the block's recorded contract, the block's
+chunk count, wave widths under the per-user submit cap) are looked up rather
+than typed:
+
+```bash
+pipeline_multi.sh plan --dir /bucket/.../20260xxx/block01 --users makoto-hiroi,user2,user3 \
+    --set sleap_model_centroid=/bucket/.../x.centroid \
+    --set sleap_model_instance=/bucket/.../x.centered_instance
+```
+
+Settings resolve as `templates/multiuser_defaults.json` < the block's
+`PIPELINE_STATE.json` (if a first run already declared a contract, its values
+win -- pipeline.sh would refuse anything else) < `--set key=value`. Chunk
+indices are split contiguously and near-equally across `--users`; each share
+is cut into equal waves no wider than `--wave-rows` (default 1500) / cameras /
+`--max-live`, because deigo's 2016-job GrpSubmit counts rows (chunk x camera)
+and the same user's tracking/sleep jobs share that cap. For a 98 h block at
+1800 s chunks (196 indices, 25 cameras, 3 users) that is 2 waves of ~33 per
+user, ~1 TB of /flash per live wave per user. `backup`/`tracking` go to the
+first user unless `--backup-user`/`--tracking-user` say otherwise.
+
 Each user (from a deigo login, needs `reiteruni` + a working `saion` SSH alias):
 
 ```bash
