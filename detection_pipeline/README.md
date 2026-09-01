@@ -411,17 +411,27 @@ command=".../current/detection_pipeline/pipeline_multi.sh agent",no-pty,no-port-
 
 Multi-user runs need one checkout every user's jobs can read at run time
 (pipeline.env bakes `LIB_DIR`/`SCRIPTS_DIR`/`TEMPLATES_DIR` paths). Deploy to
-`/apps/unit/ReiterU/AntsArray` as immutable `releases/<date>_<sha>/` dirs with
-a `current` symlink:
+`/apps/unit/ReiterU/AntsArray` as immutable `releases/<commit-date>_<sha>/`
+dirs with a `current` symlink. **`/apps/unit` is a different filesystem on
+deigo and on saion** (unlike `$HOME`), and saion's SLEAP tasks source `lib/`
+and run `scripts/sleap2h5.py` from the exact path deigo baked into
+pipeline.env — so every deploy must land on both clusters under one name.
+`--mirror saion` does that in the same command (the release name comes from
+the commit date, never the wall clock, so both sides agree across midnight):
 
 ```bash
-scripts/deploy_release.sh --repo-url git@github.com:<org>/AntsArray.git   # first time
-scripts/deploy_release.sh                                                 # update
+# first time, from a deigo login (the deploy key in the shared $HOME works on both sides)
+scripts/deploy_release.sh --repo-url git@github.com-antsarray:oist/AntsArray.git --mirror saion
+# updates
+/apps/unit/ReiterU/AntsArray/current/detection_pipeline/scripts/deploy_release.sh --mirror saion
 ```
 
 `pipeline.sh` resolves itself with `pwd -P`, so a submitted wave pins its
 release dir and a later deploy (symlink flip) never changes code under a
-running block. Releases are group-readable, never group-writable.
+running block. It also refuses to submit a SLEAP run whose checkout saion
+cannot see (`ssh saion test -f $SCRIPTS_DIR/sleap2h5.py`), so a one-sided
+deploy fails at submission instead of hours later in every chunk's h5
+conversion. Releases are group-readable, never group-writable.
 
 ## Re-runs skip work already on the bucket
 

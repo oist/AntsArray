@@ -582,6 +582,29 @@ if [[ -d "$DATA_DIR" ]]; then
 	fi
 fi
 
+# --- Cross-cluster checkout preflight ----------------------------------------
+# saion's SLEAP tasks source $LIB_DIR/{hosts,ship_logs}.sh and run
+# $SCRIPTS_DIR/sleap2h5.py from the SAME absolute path baked into pipeline.env,
+# and saion login runs scripts/export_sleap_trt.sh from it. $HOME is shared
+# between the clusters but /apps/unit is not, so a checkout deployed on deigo
+# only would fail hours from now, silently, in every chunk's h5 conversion
+# (20260623 had zero _sleap_data.h5 for exactly this reason). Refuse up front.
+# Connection failure (rc 255) is a warning, like the concurrent-wave guard:
+# a saion blip must not block a submission the bridge will retry anyway.
+if (( ONLY_CHUNK != 1 && ONLY_ARUCO != 1 && ONLY_BACKUP != 1 )); then
+	_saion_rc=0
+	ssh -x -oBatchMode=yes -oStrictHostKeyChecking=no -oConnectTimeout=15 saion 		"test -f '$SCRIPTS_DIR/sleap2h5.py' && test -f '$LIB_DIR/ship_logs.sh' && test -f '$LIB_DIR/hosts.sh'" 		2>/dev/null || _saion_rc=$?
+	if (( _saion_rc == 255 )); then
+		echo "[WARN] could not reach saion to verify this checkout is visible there; SLEAP tasks need $SCRIPTS_DIR on saion" >&2
+	elif (( _saion_rc != 0 )); then
+		echo "[ERR] this checkout is not visible on saion: $SCRIPT_DIR" >&2
+		echo "      saion's SLEAP tasks read lib/ and scripts/sleap2h5.py from that exact path." >&2
+		echo "      /apps/unit is per-cluster: deploy it there too, e.g." >&2
+		echo "        bash $SCRIPTS_DIR/deploy_release.sh --ref <ref> --mirror saion" >&2
+		exit 2
+	fi
+fi
+
 # --- Tracking auto-trigger: validate + derive defaults ------------------------
 if (( RUN_TRACKING == 1 )); then
 	if (( ONLY_CHUNK == 1 || ONLY_ARUCO == 1 || ONLY_SLEAP == 1 || ONLY_BACKUP == 1 )); then
