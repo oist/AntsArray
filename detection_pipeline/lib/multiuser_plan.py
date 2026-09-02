@@ -54,6 +54,12 @@ FORBIDDEN_SETTINGS = (
     "dir", "chunk_range", "backup", "no_backup", "only_backup",
     "run_tracking", "no_run_tracking", "force_submit",
     "jobs_root", "flash_root", "new_processing_run",
+    # A plan is group-writable data, and these two name a script and an
+    # interpreter that track_trigger.sh EXECUTES as the submitting user. Left
+    # settable, they would turn the forced-command SSH key (which can only run
+    # this wrapper) into an arbitrary-execution primitive for anyone able to
+    # write a plan file. Override them on the pipeline.sh command line instead.
+    "tracking_submit", "tracking_python_bin",
 )
 
 # Slot keys become `squeue -u`/ssh arguments in pipeline_multi.sh, and the

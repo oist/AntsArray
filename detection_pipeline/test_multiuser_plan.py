@@ -104,7 +104,8 @@ def test_two_backup_or_tracking_slots_are_refused():
 def test_policy_keys_in_settings_are_refused():
     # chunk_range / no_backup / run_tracking in settings would bypass the very
     # policy the plan centralizes.
-    for bad in ("chunk_range", "no_backup", "run_tracking", "dir"):
+    for bad in ("chunk_range", "no_backup", "run_tracking", "dir",
+                "tracking_submit", "tracking_python_bin"):
         settings = dict(SETTINGS)
         settings[bad] = "x"
         b = Block(make_plan({"usera": {"waves": ["0-4"]}}, settings))
