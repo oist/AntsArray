@@ -31,9 +31,15 @@
 #                     [--mirror saion]
 set -euo pipefail
 
+# Resolve our own real path FIRST: this script is normally invoked through
+# the current symlink and then flips that very symlink; reading "$0" after
+# the flip resolved into the NEW release (20260902: which did not contain
+# this script at all) and the mirror step died mid-deploy.
+SELF="$(readlink -f "$0")"
+
 ROOT=/apps/unit/ReiterU/AntsArray
 REPO_URL=""
-REF=main
+REF=""
 GROUP=reiteruni
 MIRROR=""
 
@@ -44,10 +50,21 @@ while [[ $# -gt 0 ]]; do
 		--ref) REF="$2"; shift 2 ;;
 		--group) GROUP="$2"; shift 2 ;;
 		--mirror) MIRROR="$2"; shift 2 ;;
-		-h|--help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+		-h|--help) sed -n '2,30p' "$SELF" | sed 's/^# \{0,1\}//'; exit 0 ;;
 		*) echo "[ERR] unknown arg: $1" >&2; exit 2 ;;
 	esac
 done
+
+if [[ -z "$REF" ]]; then
+	REF=$(sed -n 's/^ref=//p' "$ROOT/current/DEPLOY_INFO" 2>/dev/null || true)
+	if [[ -z "$REF" || "$REF" =~ ^[0-9a-f]{40}$ ]]; then
+		# No current yet, or it was pinned to a bare SHA (a mirror target):
+		# there is no line of work to follow, so demand an explicit choice.
+		[[ -n "$REF" ]] && echo "[ERR] current is pinned to SHA $REF; pass --ref <branch>" >&2 \n			|| echo "[ERR] no current deploy to take a ref from; pass --ref <branch>" >&2
+		exit 2
+	fi
+	echo "[INFO] no --ref given; following current's ref: $REF"
+fi
 
 CACHE="$ROOT/.git-cache"
 mkdir -p "$ROOT/releases"
@@ -97,7 +114,7 @@ echo "[INFO] $(hostname): current -> $REL ($SHA)"
 if [[ -n "$MIRROR" ]]; then
 	echo "[INFO] mirroring to $MIRROR ..."
 	ssh -x -oBatchMode=yes -oStrictHostKeyChecking=no "$MIRROR" \
-		bash -s -- --root "$ROOT" --repo-url "$REPO_URL" --ref "$SHA" --group "$GROUP" < "$0"
+		bash -s -- --root "$ROOT" --repo-url "$REPO_URL" --ref "$SHA" --group "$GROUP" < "$SELF"
 	# Verify the mirror landed under the identical path: this is the path
 	# saion's SLEAP tasks will source lib/ and scripts/ from.
 	ssh -x -oBatchMode=yes -oStrictHostKeyChecking=no "$MIRROR" \
