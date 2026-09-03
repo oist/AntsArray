@@ -426,8 +426,31 @@ For fully central operation, a secondary user may grant a **forced-command
 key** — this key can only drive the wrapper, it never gets a shell:
 
 ```text
-command=".../current/detection_pipeline/pipeline_multi.sh agent",no-pty,no-port-forwarding,no-agent-forwarding,no-X11-forwarding ssh-ed25519 AAAA... pipeline-key
+restrict,command="/apps/unit/ReiterU/AntsArray/current/detection_pipeline/pipeline_multi.sh agent" ssh-ed25519 AAAA... pipeline-key
 ```
+
+Verified 2026-09-04 against the live wrapper: `validate` / `status` / `submit`
+run, while a bare shell command, a non-allowlisted subcommand (`plan`), a `..`
+traversal out of `/bucket`, a shell metacharacter, and an empty command are all
+refused. Two operational constraints, both found the hard way:
+
+- **Pin the login node** (`deigo-login2`). On `deigo-login1`, `/apps/unit` is a
+  symlink to `/hpcshare/appsunit` but `/hpcshare` is not mounted, so the wrapper
+  is invisible there and the forced command dies with "No such file or
+  directory". Pinning is needed regardless: `auto` records host+pid in its lock,
+  and only `stop-auto` on that same host can stop it.
+- **Self-testing the key needs the other auth methods disabled.** On your own
+  account GSSAPI/host-based auth succeeds before publickey, so the forced
+  command never applies and the subcommand runs as a plain shell command
+  (`bash: validate: command not found`):
+
+  ```bash
+  ssh -i ~/.ssh/antsarray_agent -o IdentitiesOnly=yes       -o PreferredAuthentications=publickey -o GSSAPIAuthentication=no       -o HostbasedAuthentication=no $USER@deigo-login2.oist.jp "status --plan <plan>"
+  ```
+
+  Connecting to someone *else's* account needs none of that: you hold neither
+  their Kerberos ticket nor host-based trust, so the agent key is the only one
+  that can authenticate.
 
 ### Shared deploy (`scripts/deploy_release.sh`)
 
