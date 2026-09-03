@@ -448,9 +448,12 @@ scripts/deploy_release.sh --repo-url git@github.com-antsarray:oist/AntsArray.git
 /apps/unit/ReiterU/AntsArray/current/detection_pipeline/scripts/deploy_release.sh --mirror saion
 ```
 
-`pipeline.sh` resolves itself with `pwd -P`, so a submitted wave pins its
-release dir and a later deploy (symlink flip) never changes code under a
-running block. It also refuses to submit a SLEAP run whose checkout saion
+`pipeline.sh` pins its release by rewriting only the `current` component of
+its own path, so a later deploy (symlink flip) never changes code under a
+running block. It deliberately does NOT use `pwd -P`: `/apps/unit` is
+itself a symlink to a per-cluster real path (deigo resolves it to
+`/hpcshare/appsunit`), and that string is what saion's SLEAP tasks read
+`lib/` and `scripts/sleap2h5.py` from. It also refuses to submit a SLEAP run whose checkout saion
 cannot see (`ssh saion test -f $SCRIPTS_DIR/sleap2h5.py`), so a one-sided
 deploy fails at submission instead of hours later in every chunk's h5
 conversion. Releases are group-readable, never group-writable.

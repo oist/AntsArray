@@ -10,10 +10,29 @@
 #        --sleap-model-centroid <dir> --sleap-model-instance <dir> [options]
 set -eo pipefail
 
-# pwd -P: under a releases/<sha> + current-symlink deploy (scripts/deploy_release.sh)
-# the run must pin its release dir — jobs re-read LIB_DIR/SCRIPTS_DIR/TEMPLATES_DIR
-# from pipeline.env at run time, and a later deploy repoints the symlink.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# Pin the release WITHOUT resolving cluster-local mount symlinks. `pwd -P` is
+# wrong here: /apps/unit is itself a symlink to a per-cluster real path (deigo:
+# /hpcshare/appsunit), and this directory is baked into pipeline.env as
+# LIB_DIR/SCRIPTS_DIR/TEMPLATES_DIR, which saion's SLEAP tasks then read from
+# that exact string -- a deigo-resolved path does not exist there. So keep the
+# logical /apps/unit prefix and replace only a `current` component with the
+# release it points at, so a later deploy flipping that symlink cannot change
+# code under a block that is already running.
+pin_release_dir() {
+	local d="$1" root tail rel
+	case "$d" in
+		*/current|*/current/*) ;;
+		*) printf '%s' "$d"; return ;;
+	esac
+	root="${d%%/current*}"
+	tail="${d#*/current}"
+	rel=$(readlink "$root/current" 2>/dev/null) || { printf '%s' "$d"; return; }
+	case "$rel" in
+		/*) printf '%s%s' "$rel" "$tail" ;;
+		*)  printf '%s/%s%s' "$root" "$rel" "$tail" ;;
+	esac
+}
+SCRIPT_DIR="$(pin_release_dir "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)")"
 LIB_DIR="$SCRIPT_DIR/lib"
 TEMPLATES_DIR="$SCRIPT_DIR/templates"
 SCRIPTS_DIR="$SCRIPT_DIR/scripts"
