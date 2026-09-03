@@ -387,6 +387,42 @@ def test_init_writes_a_plan_the_loader_accepts():
         b.close()
 
 
+def test_split_waves_can_start_partway_into_a_block():
+    slots, _ = mp.split_waves(12, ["a"], 25, wave_rows=1500, first=0)
+    assert slots["a"] == ["0-11"]
+    # A slice keeps absolute indices, so a later plan for the rest lines up.
+    slots, _ = mp.split_waves(20, ["a", "b"], 25, wave_rows=1500, first=10)
+    assert slots["a"] == ["10-14"]
+    assert slots["b"] == ["15-19"]
+    raises_value_error(lambda: mp.split_waves(5, ["a"], 25, first=5), "declares only")
+
+
+def test_init_chunks_slice_with_backup_and_tracking_off():
+    videos = {VID_A: {"n_chunks": 100, "fps": 24.0, "frame_count": 4320000}}
+    b = Block(make_plan({"usera": {"waves": ["0-4"]}}), videos=videos)
+    try:
+        os.remove(b.plan_path)
+        rc = mp.main(["init", "--dir", b.root, "--users", "usera",
+                      "--defaults", _defaults_file(b),
+                      "--set", "sleap_model_centroid=/models/x.centroid",
+                      "--set", "sleap_model_instance=/models/x.centered_instance",
+                      "--chunks", "0-11", "--no-backup", "--no-tracking"])
+        assert rc == 0
+        plan = mp.load_plan(b.plan_path)
+        assert plan["slots"]["usera"] == {"waves": ["0-11"]}   # no backup/tracking
+        assert plan["meta"]["planned_indices"] == "0-11"
+        assert plan["meta"]["total_chunk_indices"] == 100
+        # A slice must never be silently widened past the block.
+        rc = mp.main(["init", "--dir", b.root, "--users", "usera", "--force",
+                      "--defaults", _defaults_file(b),
+                      "--set", "sleap_model_centroid=/models/x.centroid",
+                      "--set", "sleap_model_instance=/models/x.centered_instance",
+                      "--chunks", "90-120"])
+        assert rc == 2
+    finally:
+        b.close()
+
+
 # ---------------------------------------------------------------------------
 # runner
 # ---------------------------------------------------------------------------

@@ -10,6 +10,7 @@
 # this stops it before a refused submission, not after).
 #
 #   pipeline_multi.sh plan      --dir <exp> --users a,b,c [--wave-rows 1500]
+#                               [--chunks A-B] [--no-backup] [--no-tracking]
 #                               [--set key=value ...] [--force]
 #                                                # generate <exp>/data/MULTIUSER_PLAN.json:
 #                                                # settings from the block's contract (or
@@ -56,9 +57,9 @@ while [[ $# -gt 0 ]]; do
 		--dry-run) DRY_RUN=1; shift ;;
 		--dir) PLAN_DIR="$2"; shift 2 ;;
 		--users) PLAN_USERS="$2"; shift 2 ;;
-		--wave-rows|--backup-user|--tracking-user|--set|--defaults|--out)
+		--wave-rows|--chunks|--backup-user|--tracking-user|--set|--defaults|--out)
 			PLAN_ARGS+=("$1" "$2"); shift 2 ;;
-		--force) PLAN_ARGS+=(--force); shift ;;
+		--force|--no-backup|--no-tracking) PLAN_ARGS+=("$1"); shift ;;
 		-h|--help) usage ;;
 		*) die "unknown arg: $1" ;;
 	esac

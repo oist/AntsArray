@@ -323,8 +323,9 @@ def resolve_settings(defaults, state, overrides):
     return settings, conflicts
 
 
-def split_waves(total, users, n_videos, wave_rows=DEFAULT_WAVE_ROWS, max_live=1):
-    """Contiguous, near-equal split of chunk indices 0..total-1 across users,
+def split_waves(total, users, n_videos, wave_rows=DEFAULT_WAVE_ROWS, max_live=1,
+                first=0):
+    """Contiguous, near-equal split of chunk indices first..total-1 across users,
     each share cut into equal-width waves no wider than the submit cap allows.
 
     Width is derived from ROWS (chunk x camera), the unit the cap actually
@@ -335,11 +336,15 @@ def split_waves(total, users, n_videos, wave_rows=DEFAULT_WAVE_ROWS, max_live=1)
         raise ValueError("block declares no chunks")
     if n_videos <= 0:
         raise ValueError("block declares no videos")
-    if len(users) > total:
-        raise ValueError("%d users but only %d chunk indices" % (len(users), total))
+    count = total - first
+    if count <= 0:
+        raise ValueError("chunk range starts at %d but the block declares only %d"
+                         % (first, total))
+    if len(users) > count:
+        raise ValueError("%d users but only %d chunk indices" % (len(users), count))
     width = max(1, wave_rows // (n_videos * max(1, max_live)))
-    base, rem = divmod(total, len(users))
-    slots, lo = {}, 0
+    base, rem = divmod(count, len(users))
+    slots, lo = {}, first
     for i, user in enumerate(users):
         share = base + (1 if i < rem else 0)
         n_waves = -(-share // width)
@@ -371,7 +376,8 @@ def _videos_via_manifest(exp_dir, chunk_sec):
 
 
 def build_plan(exp_dir, users, defaults, overrides, wave_rows, max_live,
-               backup_user=None, tracking_user=None, videos=None):
+               backup_user=None, tracking_user=None, videos=None, chunks=None,
+               want_backup=True, want_tracking=True):
     data_dir = os.path.join(exp_dir, "data")
     state = ps.load(data_dir) if os.path.isfile(ps.state_path(data_dir)) else None
     settings, conflicts = resolve_settings(defaults, state, overrides)
@@ -387,12 +393,26 @@ def build_plan(exp_dir, users, defaults, overrides, wave_rows, max_live,
         videos = (state["chunking"]["videos"] if state is not None
                   else _videos_via_manifest(exp_dir, settings["chunk_sec"]))
     total = max(int(v.get("n_chunks", 0)) for v in videos.values())
-    slots, width = split_waves(total, users, len(videos), wave_rows, max_live)
+    # A plan may cover a SLICE of the block (a short trial run, or finishing a
+    # block someone started by hand). Indices keep their absolute value, so a
+    # later plan for the rest of the block lines up with the same outputs.
+    first, last = 0, total - 1
+    if chunks:
+        first, last = ps.parse_range(str(chunks))
+        if last >= total:
+            raise ValueError("--chunks %s runs past the block's last index %d"
+                             % (chunks, total - 1))
+    slots, width = split_waves(last + 1, users, len(videos), wave_rows, max_live,
+                               first=first)
 
-    backup_user = backup_user or users[0]
-    tracking_user = tracking_user or users[0]
+    # None = nobody does it. Both are per-block singletons, so a plan covering
+    # only part of a block usually wants neither: the backup archives raw
+    # videos (already done for a reprocessed block) and the tracking poller
+    # gates on the block total, which a slice can never reach.
+    backup_user = (backup_user or users[0]) if want_backup else None
+    tracking_user = (tracking_user or users[0]) if want_tracking else None
     for role, u in (("backup", backup_user), ("tracking", tracking_user)):
-        if u not in slots:
+        if u is not None and u not in slots:
             raise ValueError("--%s-user %r is not one of the users" % (role, u))
     full_slots = {}
     for u, w in slots.items():
@@ -408,6 +428,7 @@ def build_plan(exp_dir, users, defaults, overrides, wave_rows, max_live,
             "generated": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "settings_source": "contract" if state is not None else "defaults",
             "total_chunk_indices": total,
+            "planned_indices": "%d-%d" % (first, last),
             "n_videos": len(videos),
             "wave_rows": wave_rows,
             "max_live": max_live,
@@ -433,7 +454,17 @@ def cmd_init(args):
     overrides = dict(parse_override(x) for x in (args.set or ()))
     plan, conflicts = build_plan(
         exp_dir, users, load_defaults(args.defaults or DEFAULTS_PATH), overrides,
-        args.wave_rows, args.max_live, args.backup_user, args.tracking_user)
+        args.wave_rows, args.max_live, args.backup_user, args.tracking_user,
+        chunks=args.chunks, want_backup=not args.no_backup,
+        want_tracking=not args.no_tracking)
+    # pipeline.sh refuses --run-tracking without --tracking-hmats, and that
+    # flag rides the tracking slot's LAST wave -- so without this warning the
+    # plan looks fine and then fails days later, on the final submission.
+    if not args.no_tracking and "tracking_hmats" not in plan["settings"]:
+        sys.stderr.write(
+            "[WARN] a slot has tracking=true but settings lack tracking_hmats; "
+            "pipeline.sh will refuse that slot's LAST wave. Add "
+            "--set tracking_hmats=<npz>, or --no-tracking.\n")
     for k, have, want in conflicts:
         sys.stderr.write("[WARN] --set %s=%r contradicts the recorded contract (%r); "
                          "pipeline.sh will refuse this plan\n" % (k, want, have))
@@ -449,11 +480,11 @@ def cmd_init(args):
         pass
     load_plan(out)  # the generator must never emit a plan it would refuse
     m = plan["meta"]
-    sys.stderr.write("[OK] wrote %s (settings from %s; %d indices x %d videos; "
-                     "wave width %d = %d rows / %d videos / max_live %d)\n"
-                     % (out, m["settings_source"], m["total_chunk_indices"],
-                        m["n_videos"], m["wave_width"], m["wave_rows"],
-                        m["n_videos"], m["max_live"]))
+    sys.stderr.write("[OK] wrote %s (settings from %s; indices %s of %d x %d "
+                     "videos; wave width %d = %d rows / %d videos / max_live %d)\n"
+                     % (out, m["settings_source"], m["planned_indices"],
+                        m["total_chunk_indices"], m["n_videos"], m["wave_width"],
+                        m["wave_rows"], m["n_videos"], m["max_live"]))
     args.plan = out
     return cmd_validate(args)
 
@@ -551,6 +582,9 @@ def main(argv=None):
     p_init.add_argument("--users", required=True, help="comma-separated usernames")
     p_init.add_argument("--wave-rows", type=int, default=DEFAULT_WAVE_ROWS)
     p_init.add_argument("--max-live", type=int, default=1)
+    p_init.add_argument("--chunks", help="only this A-B slice of the block")
+    p_init.add_argument("--no-backup", action="store_true")
+    p_init.add_argument("--no-tracking", action="store_true")
     p_init.add_argument("--backup-user")
     p_init.add_argument("--tracking-user")
     p_init.add_argument("--defaults")
