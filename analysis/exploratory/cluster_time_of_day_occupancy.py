@@ -1,5 +1,5 @@
 # %%
-# Local time-of-day occupancy analysis for occupancy clusters.
+# Exploratory local time-of-day occupancy analysis for occupancy clusters.
 try:
     get_ipython().run_line_magic("matplotlib", "qt")  # type: ignore[name-defined]
 except Exception:

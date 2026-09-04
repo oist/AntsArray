@@ -1,4 +1,5 @@
-#%%
+# %%
+# Exploratory/legacy workflow; not part of the canonical ant-job analysis.
 
 import re
 from pathlib import Path
@@ -15,7 +16,7 @@ def _enable_qt_matplotlib() -> None:
         pass
 
 
-sys.path.append(str(Path(__file__).resolve().parents[1]))
+sys.path.append(str(Path(__file__).resolve().parents[2]))
 from analysis.sleep_analysis_utils import classify_sleep_wake_from_sleap
 
 # --------------------

@@ -1,5 +1,5 @@
 # %%
-# VS Code/Jupyter interactive script:
+# Exploratory VS Code/Jupyter script:
 # spatiotemporal activity clusters, predicted sleep timing, and
 # within-cluster work/sleep shifts.
 try:

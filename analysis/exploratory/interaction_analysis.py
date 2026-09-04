@@ -1,5 +1,5 @@
 # %%
-# VS Code/Jupyter interactive script for directed interaction analysis.
+# Exploratory VS Code/Jupyter script for directed interaction analysis.
 try:
     get_ipython().run_line_magic("matplotlib", "qt")  # type: ignore[name-defined]
 except Exception:
@@ -35,7 +35,7 @@ importlib.reload(ia)
 
 # %%
 # Edit these settings first. Defaults intentionally load one chunk/side for quick testing.
-DATASET_ROOT = Path("/home/sam-reiter/bucket/ReiterU/Ants/basler/20260515/block02")
+DATASET_ROOT = Path("/home/sam-reiter/bucket/ReiterU/Ants/basler/20260723/block02")
 INTERACTION_ROOT = DATASET_ROOT / "interactions"
 TRACKS_ROOT = DATASET_ROOT / "tracks"
 GRID_ROOT = DATASET_ROOT / "stitched" / "grid_occupancy_histograms"

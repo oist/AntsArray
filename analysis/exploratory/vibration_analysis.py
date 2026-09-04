@@ -1,4 +1,5 @@
-#%%
+# %%
+# Exploratory/legacy workflow; not part of the canonical ant-job analysis.
 def _enable_qt_matplotlib() -> None:
     try:
         get_ipython().run_line_magic("matplotlib", "qt")  # type: ignore[name-defined]
@@ -12,7 +13,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from pathlib import Path
 import sys
-sys.path.append(str(Path(__file__).resolve().parents[1]))
+sys.path.append(str(Path(__file__).resolve().parents[2]))
 from analysis.sleep_analysis_utils import classify_sleep_wake_from_sleap
 
 #%% Testing parquet files. I have converted the tracking pkl
@@ -27,7 +28,7 @@ from pathlib import Path
 from tqdm import tqdm
 import sys
 
-sys.path.append(str(Path(__file__).resolve().parents[1]))
+sys.path.append(str(Path(__file__).resolve().parents[2]))
 from analysis.sleep_analysis_utils import classify_sleep_wake_from_sleap, get_event_trig_avg
 
 # -----------------------

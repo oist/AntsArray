@@ -1,5 +1,5 @@
 # %%
-# Test for subclusters inside grid-occupancy clusters.
+# Exploratory test for subclusters inside grid-occupancy clusters.
 #
 # This script uses the cluster assignments from grid_occupancy.py and asks whether
 # tracks inside each coarse cluster still separate by:
@@ -41,7 +41,7 @@ import analysis.grid_occupancy_utils as go
 # %%
 # Edit these settings first.
 GRID_ROOT = Path(
-    "/home/sam-reiter/bucket/ReiterU/Ants/basler/20260515/block02/stitched/grid_occupancy_histograms"
+    "/home/sam-reiter/bucket/ReiterU/Ants/basler/20260723/block02/stitched/grid_occupancy_histograms"
 )
 SPEED_ROOT = go.infer_speed_root(GRID_ROOT)
 CLUSTER_TABLE_PATH = GRID_ROOT / "track_cluster_ids.csv"
