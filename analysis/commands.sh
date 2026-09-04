@@ -13,6 +13,9 @@ SLEEP_SPEED_ROOT="${SLEEP_SPEED_ROOT:-$(dirname "${PER_TRACK_DIR}")/speed_vector
 SLEEP_CONDA_ENV="${SLEEP_CONDA_ENV:-${CONDA_ENV}}"
 RUN_SLEEP_PREDICTIONS="${RUN_SLEEP_PREDICTIONS:-0}"
 SLEEP_SKIP_EXISTING="${SLEEP_SKIP_EXISTING:-auto}"
+GRID_OCCUPANCY_GRID_SIZE_MM="${GRID_OCCUPANCY_GRID_SIZE_MM:-1.0}"
+GRID_OCCUPANCY_OUTPUT_NAME="${GRID_OCCUPANCY_OUTPUT_NAME:-grid_occupancy_histograms}"
+GRID_OCCUPANCY_BOUNDS_JSON="${GRID_OCCUPANCY_BOUNDS_JSON:-}"
 
 # Full command: colony presence vectors.
 bash scripts/per_track_slurm_fanout.sh \
@@ -36,12 +39,20 @@ bash scripts/per_track_slurm_fanout.sh \
   --conda_env "${CONDA_ENV}" \
   --bucket_data_root "${BUCKET_DATA_ROOT}"
 
-# Full command: 10 mm grid occupancy histograms.
+grid_occupancy_operation_args=(--grid_size_mm "${GRID_OCCUPANCY_GRID_SIZE_MM}")
+if [[ -n "${GRID_OCCUPANCY_BOUNDS_JSON}" ]]; then
+  grid_occupancy_operation_args+=(--bounds_json "${GRID_OCCUPANCY_BOUNDS_JSON}")
+fi
+grid_occupancy_operation_args_text="$(printf ' %q' "${grid_occupancy_operation_args[@]}")"
+grid_occupancy_operation_args_text="${grid_occupancy_operation_args_text# }"
+
+# Full command: grid occupancy histograms.
 bash scripts/per_track_slurm_fanout.sh \
   --per_track_dir "${PER_TRACK_DIR}" \
   --operation_script analysis/compute_track_grid_occupancy.py \
   --operation_name grid_occupancy \
-  --output_name grid_occupancy_histograms \
+  --output_name "${GRID_OCCUPANCY_OUTPUT_NAME}" \
+  --operation_args "${grid_occupancy_operation_args_text}" \
   --run_workdir "${REPO_DIR}" \
   --conda_bin "${CONDA_BIN}" \
   --conda_env "${CONDA_ENV}" \

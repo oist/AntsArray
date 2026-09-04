@@ -1,5 +1,5 @@
 # %%
-# Lightweight ant-ant interaction test for one chunk.
+# Exploratory ant-ant interaction test for one chunk.
 #
 # This uses the stitched track coordinate space directly:
 # - candidate ant pairs are selected by TrackX/TrackY distance

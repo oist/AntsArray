@@ -1,5 +1,5 @@
 # %%
-# VS Code/Jupyter interactive script for colony speed vectors.
+# Exploratory VS Code/Jupyter script for colony speed vectors.
 try:
     get_ipython().run_line_magic("matplotlib", "qt")  # type: ignore[name-defined]
 except Exception:
@@ -32,9 +32,8 @@ importlib.reload(cs)
 
 # %%
 # Edit these settings first.
-SPEED_ROOT = Path(
-    "/home/sam-reiter/bucket/ReiterU/Ants/basler/20260713/block01/stitched/speed_vectors"
-)
+SPEED_ROOT = Path("/home/sam-reiter/bucket/ReiterU/Ants/basler/20260723/block02/stitched/speed_vectors")
+
 PRESENCE_ROOT = cs.infer_presence_root(SPEED_ROOT)
 SLEEP_ROOT = cs.infer_sleep_prediction_root(SPEED_ROOT)
 CONDUCTOR_PATH = cs.infer_conductor_path(SPEED_ROOT)
@@ -47,7 +46,7 @@ IMAGE_SMOOTH_SECONDS = 0
 
 PRE_PULSE_SECONDS = 120.0
 POST_PULSE_SECONDS = 800.0
-PULSE_RESPONSE_SIDE = "left"  # "left", "right", or "both"
+PULSE_RESPONSE_SIDE = "both"  # "left", "right", or "both"
 PULSE_RESPONSE_SMOOTH_SECONDS = 0.0
 PULSE_RESPONSE_YLIM = None
 PULSE_RESPONSE_VMIN = 0.0
@@ -58,7 +57,7 @@ PULSE_RESPONSE_SORT_BY_STIMULUS_STRENGTH = True
 PULSE_RESPONSE_STIMULUS_STRENGTH_COL = "auto"  # "auto" prefers duty, duty_pct, then sensor magnitudes.
 PULSE_RESPONSE_STIMULUS_SORT_ASCENDING = True
 
-SLEEP_PERCENT_SIDE = "left"  # "left", "right", or "both"
+SLEEP_PERCENT_SIDE = "both"  # "left", "right", or "both"
 SLEEP_PERCENT_BIN_SECONDS = 20.0
 SLEEP_PERCENT_SMOOTH_SECONDS = 5.0
 SLEEP_PERCENT_SLEEP_THRESHOLD = 0.5

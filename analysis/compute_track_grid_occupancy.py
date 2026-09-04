@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -21,6 +22,9 @@ DEFAULT_Y_MIN_PX = -5280.0
 DEFAULT_Y_MAX_PX = 8097.0
 DEFAULT_GRID_SIZE_MM = 1.0
 DEFAULT_GRID_PAD_MM = 10.0
+DEFAULT_BOUNDS_QUANTILE = 0.001
+DEFAULT_BOUNDS_SAMPLE_STRIDE = 240
+DEFAULT_BOUNDS_MAX_POINTS_PER_TRACK = 50000
 
 
 def parquet_columns(path: Path) -> list[str]:
@@ -103,6 +107,218 @@ def infer_side(path: Path, position: pd.DataFrame, x_split_px: float) -> str:
 
     median_x = float(np.nanmedian(position["X"].to_numpy(np.float64)))
     return "left" if median_x < float(x_split_px) else "right"
+
+
+def _record_batch_column(batch: Any, name: str) -> np.ndarray:
+    index = batch.schema.names.index(name)
+    return batch.column(index).to_numpy(zero_copy_only=False)
+
+
+def sample_track_xy(
+    path: Path,
+    *,
+    x_col: str,
+    y_col: str,
+    bodypoint: int,
+    sample_stride: int,
+    max_points: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    cols = set(parquet_columns(path))
+    missing = {x_col, y_col}.difference(cols)
+    if missing:
+        raise ValueError(f"{path.name} is missing required columns: {sorted(missing)}")
+
+    sample_stride = max(1, int(sample_stride))
+    max_points = max(1, int(max_points))
+    xs: list[np.ndarray] = []
+    ys: list[np.ndarray] = []
+    offset = 0
+
+    if "Bodypoint" in cols:
+        try:
+            import pyarrow.compute as pc
+            import pyarrow.dataset as ds
+
+            scanner = ds.dataset(path, format="parquet").scanner(
+                columns=["Bodypoint", x_col, y_col],
+                filter=pc.field("Bodypoint") == int(bodypoint),
+            )
+            for batch in scanner.to_batches():
+                n_rows = batch.num_rows
+                if n_rows == 0:
+                    continue
+                start = (-offset) % sample_stride
+                take = np.arange(start, n_rows, sample_stride, dtype=np.int64)
+                offset += n_rows
+                if len(take) == 0:
+                    continue
+                x = np.asarray(_record_batch_column(batch, x_col), dtype=np.float64)[take]
+                y = np.asarray(_record_batch_column(batch, y_col), dtype=np.float64)[take]
+                finite = np.isfinite(x) & np.isfinite(y)
+                if finite.any():
+                    xs.append(x[finite])
+                    ys.append(y[finite])
+        except Exception:
+            df = pd.read_parquet(path, columns=["Bodypoint", x_col, y_col])
+            df = df[pd.to_numeric(df["Bodypoint"], errors="coerce") == int(bodypoint)]
+            x = pd.to_numeric(df[x_col], errors="coerce").to_numpy(np.float64)
+            y = pd.to_numeric(df[y_col], errors="coerce").to_numpy(np.float64)
+            x = x[::sample_stride]
+            y = y[::sample_stride]
+            finite = np.isfinite(x) & np.isfinite(y)
+            if finite.any():
+                xs.append(x[finite])
+                ys.append(y[finite])
+    else:
+        df = pd.read_parquet(path, columns=[x_col, y_col])
+        x = pd.to_numeric(df[x_col], errors="coerce").to_numpy(np.float64)[::sample_stride]
+        y = pd.to_numeric(df[y_col], errors="coerce").to_numpy(np.float64)[::sample_stride]
+        finite = np.isfinite(x) & np.isfinite(y)
+        if finite.any():
+            xs.append(x[finite])
+            ys.append(y[finite])
+
+    if not xs:
+        return np.empty(0, dtype=np.float64), np.empty(0, dtype=np.float64)
+
+    x_all = np.concatenate(xs)
+    y_all = np.concatenate(ys)
+    if len(x_all) > max_points:
+        take = np.linspace(0, len(x_all) - 1, max_points, dtype=np.int64)
+        x_all = x_all[take]
+        y_all = y_all[take]
+    return x_all, y_all
+
+
+def infer_grid_bounds_from_tracks(
+    per_track_dir: Path,
+    *,
+    track_glob: str,
+    x_col: str,
+    y_col: str,
+    bodypoint: int,
+    mm_per_px: float,
+    quantile: float,
+    sample_stride: int,
+    max_points_per_track: int,
+) -> dict[str, Any]:
+    per_track_dir = Path(per_track_dir)
+    if not per_track_dir.exists():
+        raise FileNotFoundError(f"per-track directory does not exist: {per_track_dir}")
+    q = float(quantile)
+    if not 0.0 <= q < 0.5:
+        raise ValueError(f"bounds quantile must be in [0, 0.5), got {quantile}")
+
+    side_samples: dict[str, dict[str, list[np.ndarray]]] = {
+        "left": {"x": [], "y": []},
+        "right": {"x": [], "y": []},
+    }
+    side_track_counts = {"left": 0, "right": 0}
+    skipped_tracks: list[str] = []
+
+    for track_path in sorted(per_track_dir.glob(track_glob)):
+        if not track_path.is_file():
+            continue
+        side = side_from_name(track_path)
+        if side not in {"left", "right"}:
+            skipped_tracks.append(str(track_path))
+            continue
+        x, y = sample_track_xy(
+            track_path,
+            x_col=x_col,
+            y_col=y_col,
+            bodypoint=bodypoint,
+            sample_stride=sample_stride,
+            max_points=max_points_per_track,
+        )
+        if len(x) == 0:
+            skipped_tracks.append(str(track_path))
+            continue
+        side_samples[side]["x"].append(x)
+        side_samples[side]["y"].append(y)
+        side_track_counts[side] += 1
+
+    missing_sides = [side for side in ("left", "right") if not side_samples[side]["x"]]
+    if missing_sides:
+        raise ValueError(f"No finite sampled {x_col}/{y_col} points for side(s): {missing_sides}")
+
+    side_stats: dict[str, dict[str, float | int]] = {}
+    for side in ("left", "right"):
+        x = np.concatenate(side_samples[side]["x"])
+        y = np.concatenate(side_samples[side]["y"])
+        side_stats[side] = {
+            "n_tracks": int(side_track_counts[side]),
+            "n_sampled_points": int(len(x)),
+            "x_min_quantile_px": float(np.quantile(x, q)),
+            "x_max_quantile_px": float(np.quantile(x, 1.0 - q)),
+            "y_min_quantile_px": float(np.quantile(y, q)),
+            "y_max_quantile_px": float(np.quantile(y, 1.0 - q)),
+            "x_min_sample_px": float(np.min(x)),
+            "x_max_sample_px": float(np.max(x)),
+            "y_min_sample_px": float(np.min(y)),
+            "y_max_sample_px": float(np.max(y)),
+        }
+
+    left = side_stats["left"]
+    right = side_stats["right"]
+    left_x0 = float(left["x_min_quantile_px"])
+    left_x1 = float(left["x_max_quantile_px"])
+    right_x0 = float(right["x_min_quantile_px"])
+    right_x1 = float(right["x_max_quantile_px"])
+    x_split_px = 0.5 * (left_x1 + right_x0)
+    x_min_px = left_x0
+    x_max_px = right_x1
+    if not x_min_px < x_split_px < x_max_px:
+        all_x = np.concatenate([np.concatenate(side_samples["left"]["x"]), np.concatenate(side_samples["right"]["x"])])
+        x_min_px = float(np.quantile(all_x, q))
+        x_max_px = float(np.quantile(all_x, 1.0 - q))
+        x_split_px = float(np.median(all_x))
+        if not x_min_px < x_split_px < x_max_px:
+            raise ValueError(
+                "Could not infer ordered x bounds from track data. "
+                f"Got x_min={x_min_px}, x_split={x_split_px}, x_max={x_max_px}."
+            )
+
+    y_min_px = min(float(left["y_min_quantile_px"]), float(right["y_min_quantile_px"]))
+    y_max_px = max(float(left["y_max_quantile_px"]), float(right["y_max_quantile_px"]))
+    if not y_min_px < y_max_px:
+        raise ValueError(f"Could not infer ordered y bounds: y_min={y_min_px}, y_max={y_max_px}")
+
+    return {
+        "bounds_source": "track_data_quantiles",
+        "per_track_dir": str(per_track_dir),
+        "track_glob": str(track_glob),
+        "x_col": str(x_col),
+        "y_col": str(y_col),
+        "bodypoint": int(bodypoint),
+        "mm_per_px": float(mm_per_px),
+        "quantile": float(q),
+        "sample_stride": int(sample_stride),
+        "max_points_per_track": int(max_points_per_track),
+        "x_min_px": float(x_min_px),
+        "x_split_px": float(x_split_px),
+        "x_max_px": float(x_max_px),
+        "y_min_px": float(y_min_px),
+        "y_max_px": float(y_max_px),
+        "side_stats": side_stats,
+        "n_skipped_tracks": int(len(skipped_tracks)),
+        "skipped_tracks": skipped_tracks[:50],
+    }
+
+
+def write_inferred_bounds(path: Path, bounds: dict[str, Any]) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(bounds, indent=2) + "\n")
+
+
+def read_bounds_json(path: Path) -> dict[str, float]:
+    data = json.loads(Path(path).read_text())
+    required = ["x_min_px", "x_split_px", "x_max_px", "y_min_px", "y_max_px"]
+    missing = [key for key in required if key not in data]
+    if missing:
+        raise ValueError(f"{path} is missing grid bound keys: {missing}")
+    return {key: float(data[key]) for key in required}
 
 
 def fixed_width_edges(max_value: float, bin_size: float) -> np.ndarray:
@@ -248,6 +464,13 @@ def main() -> None:
     parser.add_argument("--x_max_px", type=float, default=DEFAULT_X_MAX_PX)
     parser.add_argument("--y_min_px", type=float, default=DEFAULT_Y_MIN_PX)
     parser.add_argument("--y_max_px", type=float, default=DEFAULT_Y_MAX_PX)
+    parser.add_argument("--bounds_json", type=Path, default=None, help="JSON file with x/y pixel bounds from --infer_bounds_out.")
+    parser.add_argument("--per_track_dir", type=Path, default=None, help="Per-track folder used with --infer_bounds_out.")
+    parser.add_argument("--track_glob", default="TrackID_*.parquet", help="Track glob used with --infer_bounds_out.")
+    parser.add_argument("--infer_bounds_out", type=Path, default=None, help="Infer block grid bounds from --per_track_dir and write this JSON, then exit.")
+    parser.add_argument("--bounds_quantile", type=float, default=DEFAULT_BOUNDS_QUANTILE)
+    parser.add_argument("--bounds_sample_stride", type=int, default=DEFAULT_BOUNDS_SAMPLE_STRIDE)
+    parser.add_argument("--bounds_max_points_per_track", type=int, default=DEFAULT_BOUNDS_MAX_POINTS_PER_TRACK)
     parser.add_argument(
         "--same_shape_sides",
         dest="same_shape_sides",
@@ -274,6 +497,30 @@ def main() -> None:
     parser.add_argument("--fail_if_no_in_grid", action="store_true")
     args = parser.parse_args()
 
+    if args.infer_bounds_out is not None:
+        per_track_dir = args.per_track_dir
+        if per_track_dir is None:
+            env_per_track_dir = os.environ.get("PER_TRACK_DIR", "").strip()
+            if env_per_track_dir:
+                per_track_dir = Path(env_per_track_dir)
+        if per_track_dir is None:
+            raise ValueError("--infer_bounds_out requires --per_track_dir or $PER_TRACK_DIR")
+        bounds = infer_grid_bounds_from_tracks(
+            per_track_dir,
+            track_glob=args.track_glob,
+            x_col=args.x_col,
+            y_col=args.y_col,
+            bodypoint=int(args.bodypoint),
+            mm_per_px=float(args.mm_per_px),
+            quantile=float(args.bounds_quantile),
+            sample_stride=int(args.bounds_sample_stride),
+            max_points_per_track=int(args.bounds_max_points_per_track),
+        )
+        write_inferred_bounds(args.infer_bounds_out, bounds)
+        print(f"Wrote inferred grid bounds: {args.infer_bounds_out}")
+        print(json.dumps({key: bounds[key] for key in ["x_min_px", "x_split_px", "x_max_px", "y_min_px", "y_max_px"]}, indent=2))
+        return
+
     track = args.track or Path(os.environ["TRACK_PATH"])
     out_dir = args.out or Path(os.environ["TASK_OUTPUT_DIR"])
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -286,10 +533,23 @@ def main() -> None:
         bodypoint=int(args.bodypoint),
     )
     side = infer_side(track, xy, float(args.x_split_px)) if args.side == "auto" else args.side
-    x_min_px = float(args.x_min_px)
-    x_max_px = float(args.x_max_px)
-    y_min_px = float(args.y_min_px)
-    y_max_px = float(args.y_max_px)
+    bounds_json_data = read_bounds_json(args.bounds_json) if args.bounds_json is not None else None
+    if bounds_json_data is not None:
+        x_min_px = bounds_json_data["x_min_px"]
+        x_split_px = bounds_json_data["x_split_px"]
+        x_max_px = bounds_json_data["x_max_px"]
+        y_min_px = bounds_json_data["y_min_px"]
+        y_max_px = bounds_json_data["y_max_px"]
+        if args.side == "auto":
+            side = infer_side(track, xy, x_split_px)
+        bounds_source = "bounds_json"
+    else:
+        x_min_px = float(args.x_min_px)
+        x_split_px = float(args.x_split_px)
+        x_max_px = float(args.x_max_px)
+        y_min_px = float(args.y_min_px)
+        y_max_px = float(args.y_max_px)
+        bounds_source = "explicit_args"
 
     occupancy, x_edges_mm, y_edges_mm, stats = compute_grid_occupancy(
         xy,
@@ -297,7 +557,7 @@ def main() -> None:
         mm_per_px=float(args.mm_per_px),
         grid_size_mm=float(args.grid_size_mm),
         x_min_px=x_min_px,
-        x_split_px=float(args.x_split_px),
+        x_split_px=x_split_px,
         x_max_px=x_max_px,
         y_min_px=y_min_px,
         y_max_px=y_max_px,
@@ -339,8 +599,9 @@ def main() -> None:
         "mm_per_px": float(args.mm_per_px),
         "grid_size_mm": float(args.grid_size_mm),
         "grid_pad_mm": float(args.grid_pad_mm),
-        "bounds_source": "explicit_args",
-        "x_split_px": float(args.x_split_px),
+        "bounds_source": bounds_source,
+        "bounds_json": str(args.bounds_json) if args.bounds_json is not None else None,
+        "x_split_px": float(x_split_px),
         "x_min_px": float(x_min_px),
         "x_max_px": float(x_max_px),
         "y_min_px": float(y_min_px),
