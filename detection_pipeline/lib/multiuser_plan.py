@@ -275,6 +275,14 @@ DEFAULT_WAVE_ROWS = 1500
 # Contract keys that are not pipeline.sh flags.
 _CONTRACT_ONLY = ("aruco_script",)
 
+# Contract keys that ARE pipeline.sh flags but must NOT be inherited: they
+# record WHERE the work ran, not WHAT it computed. short-a100 may have been
+# the right partition the day a block was first submitted; months later it is
+# often the saturated one and largegpu has the free slots. pipeline.sh already
+# classes this as a SOFT key (a change only warns), so the plan should follow
+# today's default rather than pin every later wave to a stale choice.
+_NOT_INHERITED = ("saion_partition",)
+
 
 def load_defaults(path):
     with open(path) as f:
@@ -310,7 +318,7 @@ def resolve_settings(defaults, state, overrides):
         settings["chunk_sec"] = int(ch.get("chunk_sec"))
         settings["chunk_ext"] = ch.get("chunk_ext")
         for k, v in state.get("detection", {}).items():
-            if k in _CONTRACT_ONLY:
+            if k in _CONTRACT_ONLY or k in _NOT_INHERITED:
                 continue
             settings[k] = v
     conflicts = []

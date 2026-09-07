@@ -349,6 +349,23 @@ def test_resolve_settings_contract_beats_defaults_and_flags_conflicts():
     assert conflicts and conflicts[0][0] == "sleap_model_centroid"
 
 
+def test_saion_partition_is_not_inherited_from_the_contract():
+    # Placement is not content: a block first run on short-a100 must not pin
+    # every later wave there once largegpu is the partition with free slots.
+    defaults = {"chunk_sec": 7200, "saion_partition": "largegpu"}
+    state = ps.new_state("/blk", 1800, "mkv",
+                         {VID_A: {"n_chunks": 5, "fps": 24.0, "frame_count": 216000}},
+                         {"saion_partition": "short-a100",
+                          "sleap_module": "sleap-nn/0.3.3"})
+    settings, conflicts = mp.resolve_settings(defaults, state, {})
+    assert settings["saion_partition"] == "largegpu"       # default wins
+    assert settings["sleap_module"] == "sleap-nn/0.3.3"    # this one IS inherited
+    assert conflicts == []
+    # An explicit override still wins over the default.
+    settings, _ = mp.resolve_settings(defaults, state, {"saion_partition": "short-a100"})
+    assert settings["saion_partition"] == "short-a100"
+
+
 def _defaults_file(block):
     p = os.path.join(block.root, "defaults.json")
     with open(p, "w") as f:
