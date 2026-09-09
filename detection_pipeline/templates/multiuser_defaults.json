@@ -1,0 +1,8 @@
+{
+  "_comment": "Lab-standard settings merged UNDER a block's recorded contract by `pipeline_multi.sh plan`. Keys are pipeline.sh long options with underscores; keys starting with _ are ignored. SLEAP model dirs are deliberately absent: pass them with --set sleap_model_centroid=... --set sleap_model_instance=... (or let an existing PIPELINE_STATE.json supply them).",
+  "chunk_sec": 1800,
+  "chunk_ext": "mkv",
+  "aruco_dict": "A",
+  "saion_partition": "largegpu",
+  "sleap_runtime": "tensorrt"
+}

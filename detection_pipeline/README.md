@@ -352,6 +352,135 @@ The catalog reports `expected_source`, `chunks_declared`, `waves_done` and
 `unclaimed_chunks`, and flags `WAVE_GAP` when a window between two submitted
 waves was never claimed. A trailing tail is normal progress and is not flagged.
 
+## Multi-user wave processing (`pipeline_multi.sh`)
+
+Every limit that throttles a block — `GrpSubmit` 2016, `compute`'s 2000 cpu,
+`largegpu`'s 8 GPUs — is **per user**, and every mutable control path is
+already namespaced by `$USER`. So 2–3 unit members can process one block in
+parallel by taking disjoint waves: on `largegpu` that is 8 → 16/24 A100s.
+(`short-a100`'s 32-GPU cap is already the whole partition, so extra users add
+nothing there.)
+
+The shared policy lives in one plan file, next to the contract:
+
+```jsonc
+// <exp>/data/MULTIUSER_PLAN.json
+{
+  "settings": { "chunk_sec": 1800, "aruco_dict": "A",
+                "sleap_model_centroid": "...", "sleap_model_instance": "...",
+                "saion_partition": "largegpu" },      // pipeline.sh flags, _ for -
+  "slots": {
+    "makoto-hiroi": { "waves": ["0-1649"], "backup": true, "tracking": true },
+    "user2":        { "waves": ["1650-3299"] },
+    "user3":        { "waves": ["3300-4949"] }
+  }
+}
+```
+
+Do not write the plan by hand -- generate it, so the values that actually
+bite (settings that must match the block's recorded contract, the block's
+chunk count, wave widths under the per-user submit cap) are looked up rather
+than typed:
+
+```bash
+pipeline_multi.sh plan --dir /bucket/.../20260xxx/block01 --users makoto-hiroi,user2,user3 \
+    --set sleap_model_centroid=/bucket/.../x.centroid \
+    --set sleap_model_instance=/bucket/.../x.centered_instance
+```
+
+Settings resolve as `templates/multiuser_defaults.json` < the block's
+`PIPELINE_STATE.json` (if a first run already declared a contract, its values
+win -- pipeline.sh would refuse anything else) < `--set key=value`. Chunk
+indices are split contiguously and near-equally across `--users`; each share
+is cut into equal waves no wider than `--wave-rows` (default 1500) / cameras /
+`--max-live`, because deigo's 2016-job GrpSubmit counts rows (chunk x camera)
+and the same user's tracking/sleep jobs share that cap. For a 98 h block at
+1800 s chunks (196 indices, 25 cameras, 3 users) that is 2 waves of ~33 per
+user, ~1 TB of /flash per live wave per user. `backup`/`tracking` go to the
+first user unless `--backup-user`/`--tracking-user` say otherwise.
+
+Each user (from a deigo login, needs `reiteruni` + a working `saion` SSH alias):
+
+```bash
+pipeline_multi.sh submit --plan <exp>/data/MULTIUSER_PLAN.json  # my next wave
+pipeline_multi.sh auto   --plan ...   # nohup poller: my waves back to back
+pipeline_multi.sh status --plan ...   # every slot: wave coverage + both queues
+```
+
+The wrapper derives every `pipeline.sh` flag from the plan (no per-user typo
+drift; the processing contract would refuse drift anyway) and enforces the two
+things that must stay unique: **one backup writer** (backup rides only the
+backup slot's first wave — concurrent `zip -FS` updates can corrupt the
+archive) and **one tracking poller** (launched from the tracking slot's last
+wave; it gates on the block's declared total, so it waits for everyone).
+`load_plan` refuses overlapping waves across slots, duplicate backup/tracking
+slots, and policy keys smuggled into `settings`.
+
+`auto` mirrors `track_trigger.sh`'s login-side nohup pattern: it polls
+`data/`, submits the slot's next wave when the previous one's outputs are
+complete (`--max-live 2` overlaps waves), retries a half-landed wave at most
+3× (the bucket-aware skip redoes only gaps), and exits when the slot is done.
+Progress log: `<exp>/hpc_logs/pipeline/multi_auto_<user>.log`.
+
+For fully central operation, a secondary user may grant a **forced-command
+key** — this key can only drive the wrapper, it never gets a shell:
+
+```text
+restrict,command="/apps/unit/ReiterU/AntsArray/current/detection_pipeline/pipeline_multi.sh agent" ssh-ed25519 AAAA... pipeline-key
+```
+
+Verified 2026-09-04 against the live wrapper: `validate` / `status` / `submit`
+run, while a bare shell command, a non-allowlisted subcommand (`plan`), a `..`
+traversal out of `/bucket`, a shell metacharacter, and an empty command are all
+refused. Two operational constraints, both found the hard way:
+
+- **Pin the login node** (`deigo-login2`). On `deigo-login1`, `/apps/unit` is a
+  symlink to `/hpcshare/appsunit` but `/hpcshare` is not mounted, so the wrapper
+  is invisible there and the forced command dies with "No such file or
+  directory". Pinning is needed regardless: `auto` records host+pid in its lock,
+  and only `stop-auto` on that same host can stop it.
+- **Self-testing the key needs the other auth methods disabled.** On your own
+  account GSSAPI/host-based auth succeeds before publickey, so the forced
+  command never applies and the subcommand runs as a plain shell command
+  (`bash: validate: command not found`):
+
+  ```bash
+  ssh -i ~/.ssh/antsarray_agent -o IdentitiesOnly=yes       -o PreferredAuthentications=publickey -o GSSAPIAuthentication=no       -o HostbasedAuthentication=no $USER@deigo-login2.oist.jp "status --plan <plan>"
+  ```
+
+  Connecting to someone *else's* account needs none of that: you hold neither
+  their Kerberos ticket nor host-based trust, so the agent key is the only one
+  that can authenticate.
+
+### Shared deploy (`scripts/deploy_release.sh`)
+
+Multi-user runs need one checkout every user's jobs can read at run time
+(pipeline.env bakes `LIB_DIR`/`SCRIPTS_DIR`/`TEMPLATES_DIR` paths). Deploy to
+`/apps/unit/ReiterU/AntsArray` as immutable `releases/<commit-date>_<sha>/`
+dirs with a `current` symlink. **`/apps/unit` is a different filesystem on
+deigo and on saion** (unlike `$HOME`), and saion's SLEAP tasks source `lib/`
+and run `scripts/sleap2h5.py` from the exact path deigo baked into
+pipeline.env — so every deploy must land on both clusters under one name.
+`--mirror saion` does that in the same command (the release name comes from
+the commit date, never the wall clock, so both sides agree across midnight):
+
+```bash
+# first time, from a deigo login (the deploy key in the shared $HOME works on both sides)
+scripts/deploy_release.sh --repo-url git@github.com-antsarray:oist/AntsArray.git --mirror saion
+# updates
+/apps/unit/ReiterU/AntsArray/current/detection_pipeline/scripts/deploy_release.sh --mirror saion
+```
+
+`pipeline.sh` pins its release by rewriting only the `current` component of
+its own path, so a later deploy (symlink flip) never changes code under a
+running block. It deliberately does NOT use `pwd -P`: `/apps/unit` is
+itself a symlink to a per-cluster real path (deigo resolves it to
+`/hpcshare/appsunit`), and that string is what saion's SLEAP tasks read
+`lib/` and `scripts/sleap2h5.py` from. It also refuses to submit a SLEAP run whose checkout saion
+cannot see (`ssh saion test -f $SCRIPTS_DIR/sleap2h5.py`), so a one-sided
+deploy fails at submission instead of hours later in every chunk's h5
+conversion. Releases are group-readable, never group-writable.
+
 ## Re-runs skip work already on the bucket
 
 Both legs consult `data/` before running, so a re-run only redoes the gaps:

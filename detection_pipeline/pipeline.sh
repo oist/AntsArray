@@ -10,7 +10,29 @@
 #        --sleap-model-centroid <dir> --sleap-model-instance <dir> [options]
 set -eo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Pin the release WITHOUT resolving cluster-local mount symlinks. `pwd -P` is
+# wrong here: /apps/unit is itself a symlink to a per-cluster real path (deigo:
+# /hpcshare/appsunit), and this directory is baked into pipeline.env as
+# LIB_DIR/SCRIPTS_DIR/TEMPLATES_DIR, which saion's SLEAP tasks then read from
+# that exact string -- a deigo-resolved path does not exist there. So keep the
+# logical /apps/unit prefix and replace only a `current` component with the
+# release it points at, so a later deploy flipping that symlink cannot change
+# code under a block that is already running.
+pin_release_dir() {
+	local d="$1" root tail rel
+	case "$d" in
+		*/current|*/current/*) ;;
+		*) printf '%s' "$d"; return ;;
+	esac
+	root="${d%%/current*}"
+	tail="${d#*/current}"
+	rel=$(readlink "$root/current" 2>/dev/null) || { printf '%s' "$d"; return; }
+	case "$rel" in
+		/*) printf '%s%s' "$rel" "$tail" ;;
+		*)  printf '%s/%s%s' "$root" "$rel" "$tail" ;;
+	esac
+}
+SCRIPT_DIR="$(pin_release_dir "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)")"
 LIB_DIR="$SCRIPT_DIR/lib"
 TEMPLATES_DIR="$SCRIPT_DIR/templates"
 SCRIPTS_DIR="$SCRIPT_DIR/scripts"
@@ -579,13 +601,36 @@ if [[ -d "$DATA_DIR" ]]; then
 	fi
 fi
 
+# --- Cross-cluster checkout preflight ----------------------------------------
+# saion's SLEAP tasks source $LIB_DIR/{hosts,ship_logs}.sh and run
+# $SCRIPTS_DIR/sleap2h5.py from the SAME absolute path baked into pipeline.env,
+# and saion login runs scripts/export_sleap_trt.sh from it. $HOME is shared
+# between the clusters but /apps/unit is not, so a checkout deployed on deigo
+# only would fail hours from now, silently, in every chunk's h5 conversion
+# (20260623 had zero _sleap_data.h5 for exactly this reason). Refuse up front.
+# Connection failure (rc 255) is a warning, like the concurrent-wave guard:
+# a saion blip must not block a submission the bridge will retry anyway.
+if (( ONLY_CHUNK != 1 && ONLY_ARUCO != 1 && ONLY_BACKUP != 1 )); then
+	_saion_rc=0
+	ssh -x -oBatchMode=yes -oStrictHostKeyChecking=no -oConnectTimeout=15 saion 		"test -f '$SCRIPTS_DIR/sleap2h5.py' && test -f '$LIB_DIR/ship_logs.sh' && test -f '$LIB_DIR/hosts.sh'" 		2>/dev/null || _saion_rc=$?
+	if (( _saion_rc == 255 )); then
+		echo "[WARN] could not reach saion to verify this checkout is visible there; SLEAP tasks need $SCRIPTS_DIR on saion" >&2
+	elif (( _saion_rc != 0 )); then
+		echo "[ERR] this checkout is not visible on saion: $SCRIPT_DIR" >&2
+		echo "      saion's SLEAP tasks read lib/ and scripts/sleap2h5.py from that exact path." >&2
+		echo "      /apps/unit is per-cluster: deploy it there too, e.g." >&2
+		echo "        bash $SCRIPTS_DIR/deploy_release.sh --ref <ref> --mirror saion" >&2
+		exit 2
+	fi
+fi
+
 # --- Tracking auto-trigger: validate + derive defaults ------------------------
 if (( RUN_TRACKING == 1 )); then
 	if (( ONLY_CHUNK == 1 || ONLY_ARUCO == 1 || ONLY_SLEAP == 1 || ONLY_BACKUP == 1 )); then
 		echo "[ERR] --run-tracking needs a full aruco+sleap run; drop the --only-* flag(s)" >&2
 		exit 2
 	fi
-	: "${TRACKING_SUBMIT:=$(cd "$SCRIPT_DIR/.." && pwd)/tracking/colony/submit_blocks_pipeline.sh}"
+	: "${TRACKING_SUBMIT:=$(cd "$SCRIPT_DIR/.." && pwd -P)/tracking/colony/submit_blocks_pipeline.sh}"
 	[[ -f "$TRACKING_HMATS" ]] || { echo "[ERR] --run-tracking requires --tracking-hmats <existing .npz>" >&2; exit 2; }
 	[[ -f "$TRACKING_SUBMIT" ]] || { echo "[ERR] tracking submit script not found: $TRACKING_SUBMIT" >&2; exit 2; }
 	: "${TRACKING_OUTPUT_ROOT:=/flash/ReiterU/$USER/colony_pipeline/$(basename "$(dirname "$DIR")")}"
