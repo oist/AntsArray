@@ -60,6 +60,10 @@ BARE_TS_RE = re.compile(r"^(\d{8})-(\d{6})$")                   # 20251118-12151
 DATE_ORD_RE = re.compile(r"^(\d{8})(?:_(\d+))?(?:_(.*))?$")     # 20250321_2_test / 20260420
 FUZZY_DATE_RE = re.compile(r"^(\d{4})_([A-Za-z]{3,})(?:_(.*))?$")  # 2025_Sep_no_pertubation
 
+# Deliberately NOT matching window views (block02-w149-197, made by
+# tracking/colony/make_window_block.py): they are tracking-side symlink views
+# of a real block's data/, not detection units, and listing them would let
+# `recover` propose re-running detection on a read-only slice.
 BLOCK_DIR_RE = re.compile(r"^block\d+$", re.IGNORECASE)
 
 # Tokens (lowercased) in a session name that hint at stim/vibration.

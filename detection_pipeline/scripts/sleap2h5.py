@@ -61,13 +61,20 @@ def slp2h5(
             h5.attrs["expected_frames"] = int(expected_frames)
         h5.attrs["instance_count"] = int(dset["nAnimals"])
         h5.attrs["node_count"] = int(dset["nNodes"])
-        h5.create_dataset(
-            "sleap_data",
-            data=records,
-            compression="gzip",
-            shuffle=True,
-            chunks=True,
-        )
+        if len(records) == 0:
+            # A zero-row chunk (no detections) cannot be chunked/compressed:
+            # h5py guesses a chunk shape larger than the (0,) data and refuses.
+            # A contiguous empty dataset still carries the column names, so
+            # readers see the schema and completeness checks count the chunk.
+            h5.create_dataset("sleap_data", data=records)
+        else:
+            h5.create_dataset(
+                "sleap_data",
+                data=records,
+                compression="gzip",
+                shuffle=True,
+                chunks=True,
+            )
 
     print(f" saved: {h5_path}", file=sys.stderr)
     return h5_path
