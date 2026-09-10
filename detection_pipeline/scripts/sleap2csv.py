@@ -119,6 +119,17 @@ def import_slp(slp_path: pathlib.Path) -> Dict[str, Any]:
     return dset
 
 
+FLAT_COLUMNS = (
+    ("Frame", np.int32), ("Instance", np.int32), ("Bodypoint", np.int32),
+    ("X", np.float32), ("Y", np.float32), ("Score_node", np.float32),
+)
+
+
+def _empty_flat() -> pd.DataFrame:
+    """Zero-row frame with exactly the columns/dtypes flatten_data produces."""
+    return pd.DataFrame({name: np.empty(0, dtype=dt) for name, dt in FLAT_COLUMNS})
+
+
 def flatten_data(dset: Dict[str, Any]) -> pd.DataFrame:
     tracks = dset["tracks"]
 
@@ -128,6 +139,15 @@ def flatten_data(dset: Dict[str, Any]) -> pd.DataFrame:
 
     n_instances = len(instances["frame_id"])
     num_rows = len(pred["x"])
+
+    # A chunk with no detections at all is a legitimate result: a camera can
+    # see no ant for a whole chunk, and the few-minute stub at the end of a
+    # block often does. It must still become a valid, EMPTY h5 -- otherwise the
+    # chunk looks "never converted" to every completeness check and the
+    # tracking preflight refuses the whole window. Before this guard the
+    # division below raised ZeroDivisionError (cam12 chunk 197, 20260810/block02).
+    if n_instances == 0 or num_rows == 0:
+        return _empty_flat()
 
     n_nodes = dset["nNodes"] if dset["nNodes"] > 0 else num_rows // n_instances
 

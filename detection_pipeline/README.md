@@ -481,6 +481,54 @@ cannot see (`ssh saion test -f $SCRIPTS_DIR/sleap2h5.py`), so a one-sided
 deploy fails at submission instead of hours later in every chunk's h5
 conversion. Releases are group-readable, never group-writable.
 
+## Partial blocks: window views for tracking
+
+Tracking, the analysis scripts and the curation GUI are block-scoped and read
+`<block>/data/` from chunk 000. A block whose detection finished in disjoint
+spans (20260810/block02: chunks 0–31 and 149–197 of 198) cannot be tracked as
+one block — the spans would share the same state files and overwrite each
+other's stitched track IDs — so each finished span becomes a sibling **view**
+block that every consumer treats as an ordinary block:
+
+```text
+20260810/block02-w149-197/
+  cam*.mkv, *.json, sess_*.txt   -> ../block02/...          (GUI playback, sidecars, conductor log)
+  data/<chunk 149..197 files>    -> ../../block02/data/...  (original names)
+  data/PIPELINE_STATE.json       copy of the contract + a "window" key
+  WINDOW.json                    provenance
+  tracks/ stitched/ ...          written by the tracking pipeline as usual
+```
+
+Nothing is renamed or re-indexed: chunk indices and the timestamps in file
+names stay absolute, so stitching anchors global frames at
+`chunk_idx × frames_per_chunk` and analysis derives the true wall-clock time.
+`discover_complete_input_chunks` now starts at the lowest chunk present (it
+used to insist on chunk 000) — but tracking still **refuses** a non-000 start
+unless the directory proves it is a view (the `"window"` key / `WINDOW.json`
+that only `materialize` writes): for an ordinary block a missing chunk 000 is
+the upload-loss pattern, not a window. The detection catalog deliberately
+ignores views; they are not detection units.
+
+Declare the windows once (`data/WINDOWS.json`), then materialize each as its
+detection completes:
+
+```bash
+W=tracking/colony/make_window_block.py
+python3 $W init        --block <exp> --ranges 0-31,32-70,71-109,110-148,149-197
+python3 $W status      --block <exp>                 # per-window trk/sdat completeness
+python3 $W materialize --block <exp> --window w149-197
+bash tracking/colony/submit_blocks_pipeline.sh --blocks_root <date> --block_glob 'block02-w*' --hmats ...
+```
+
+`materialize` refuses an incomplete window (tracking would stop at its first
+hole) unless `--force`. Views of one block run concurrently: their job tags,
+state dirs and bucket copy-back dirs are all keyed by the view's name.
+
+Related fix: a chunk with **zero detections** now converts to a valid, empty
+`_sleap_data.h5` (`scripts/sleap2h5.py`). Before, `sleap2csv.flatten_data`
+divided by the instance count and the chunk was stranded — counted as missing
+by every completeness check, and a hole for the tracking preflight.
+
 ## Re-runs skip work already on the bucket
 
 Both legs consult `data/` before running, so a re-run only redoes the gaps:

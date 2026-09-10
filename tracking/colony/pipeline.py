@@ -20,7 +20,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
 from tracking.colony.combine_batch import discover_jobs, filter_jobs_by_chunks, parse_sides, run_local, submit_slurm  # noqa: E402
-from tracking.colony.panorama_io import discover_complete_input_chunks  # noqa: E402
+from tracking.colony.panorama_io import discover_complete_input_chunks, require_contiguous_from_start  # noqa: E402
 from tracking.stitch_tracks import chunk_frames_from_state  # noqa: E402
 from tracking.stitch_tracks import main as stitch_tracks  # noqa: E402
 from tracking.stitch_tracks import write_pngs_from_existing  # noqa: E402
@@ -281,6 +281,14 @@ def main() -> None:
         int(chunk_summary.get("reference_camera_count", 0)),
         chunk_summary.get("first_incomplete"),
     )
+    # A non-000 start is legitimate only for a window view (make_window_block.py);
+    # for an ordinary block it is the upload-loss pattern, and this raises.
+    if require_contiguous_from_start(complete_chunks, args.data_dir) != "000":
+        logging.warning(
+            "window view starting at chunk%s (%s); global frames remain anchored "
+            "to the absolute chunk index",
+            complete_chunks[0], args.data_dir,
+        )
 
     if not args.skip_map:
         logging.info("Stage 1/3: mapping detections into panorama PKLs")
