@@ -120,7 +120,7 @@ fetch_queues() {
 	Q_SAION_OK=1
 	Q_DEIGO=$(squeue -h -u "$USER" -o '%i' 2>/dev/null || true)
 	Q_SAION=$(ssh -x -oBatchMode=yes -oStrictHostKeyChecking=no \
-		-oConnectTimeout=15 saion "squeue -h -u \$USER -o '%i'" 2>/dev/null) || {
+		-oConnectTimeout=15 saion "bash -lc 'squeue -h -u \"\$USER\" -o %i'" 2>/dev/null) || {
 		Q_SAION=""; Q_SAION_OK=0
 	}
 }

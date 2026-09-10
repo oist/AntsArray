@@ -51,6 +51,11 @@ rsync -ah --chmod=Du=rwx,Dg=rwx,Fu=rw,Fg=rw \
 - All cross-cluster SSH (TRT export trigger, saion sbatch, inline uploads) uses
   `ssh_retry` with 5 attempts + 10·n backoff — the lesson from block01's
   `kex_exchange_identification` reset wedging the whole pipeline.
+- Remote Slurm queue checks and submissions initialize `bash -lc`, so the
+  cluster's `/etc/profile.d/` setup provides `squeue` and `sbatch` even when
+  the user's `.bashrc` does not. `ssh_login_retry` preserves the existing SSH
+  retries; file transfers and other SSH commands are unchanged. No persistent
+  user `PATH` edit is needed.
 
 ## Layout
 
@@ -100,7 +105,7 @@ Monitor:
 ```bash
 squeue -u $USER
 ls /flash/ReiterU/$USER/jobs/<exp>/         # rendered sbatches + jid_*.txt + manifest.csv + worklist
-ssh saion squeue -u $USER                   # saion side
+ssh saion 'bash -lc "squeue -u $USER"'      # saion side
 ```
 
 Outputs land in `<exp>/data/`, per grid camera per chunk:
