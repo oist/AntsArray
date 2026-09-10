@@ -70,3 +70,31 @@ def test_all_remote_sbatch_submissions_use_login_wrapper():
     assert len(calls) == 4  # prefetch, SLEAP, upload safety net, and cleanup
     assert all("ssh_login_retry saion" in line for line in calls)
     assert 'ssh_retry saion "mkdir' in source  # File operations stay on ordinary SSH.
+    assert 'ssh_login_retry saion "SLEAP_MODULE=' in source  # Export invokes srun.
+
+
+def test_chunk_initializes_unit_module_path_before_loading_ffmpeg():
+    prefix = (ROOT / "templates/chunk.sbatch").read_text().split('JOBS_ROOT=', 1)[0]
+    script = """
+module() {
+    case "$*" in
+        'use /apps/unit/ReiterU/.modulefiles') unit_modules_ready=1 ;;
+        'load ffmpeg/7.1') [[ "${unit_modules_ready:-}" == 1 ]] ;;
+        *) return 92 ;;
+    esac
+}
+""" + prefix
+    result = run_bash(script)
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("filename", ["aruco_array.sbatch", "bridge.sbatch"])
+def test_opencv_load_adds_unit_modules(filename):
+    source = (ROOT / "templates" / filename).read_text()
+    assert re.search(r"module use /apps/unit/ReiterU/\.modulefiles\s+module load opencv/4\.9\.0", source)
+
+
+@pytest.mark.parametrize("filename", ["templates/sleap_predict_array.template.sh", "scripts/export_sleap_trt.sh"])
+def test_sleap_load_adds_unit_modules(filename):
+    source = (ROOT / filename).read_text()
+    assert re.search(r"module use /apps/unit/ReiterU/\.modulefiles\s+module load .*SLEAP_MODULE", source)

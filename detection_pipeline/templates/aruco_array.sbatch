@@ -27,6 +27,7 @@ log_stream_start "deigo" "$HPC_LOGS_DIR/aruco" \
 	"$JOBS_ROOT/aruco_${_LA}_${_la}.err"
 install_log_traps
 
+module use /apps/unit/ReiterU/.modulefiles
 module load opencv/4.9.0
 
 ARUCO_SCRIPT="${ARUCO_SCRIPT:-$SCRIPTS_DIR/run_aruco_mp.py}"

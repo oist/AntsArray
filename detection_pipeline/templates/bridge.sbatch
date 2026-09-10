@@ -90,7 +90,7 @@ if (( SKIP_TRT_EXPORT == 0 )) && [[ "$SLEAP_RUNTIME" != "pytorch" ]]; then
 		else
 			echo "[INFO] no sibling engine; building on $SAION_PARTITION via $SCRIPTS_DIR/export_sleap_trt.sh"
 			# export_sleap_trt.sh srun's itself onto $SAION_PARTITION and blocks until done
-			ssh_retry saion "bash '$SCRIPTS_DIR/export_sleap_trt.sh' \
+			ssh_login_retry saion "SLEAP_MODULE='${SLEAP_MODULE:-sleap-nn/0.2.0}' bash '$SCRIPTS_DIR/export_sleap_trt.sh' \
 				--centroid '$SLEAP_MODEL_CENTROID' \
 				--instance '$SLEAP_MODEL_INSTANCE' \
 				--out '$EXPORT_DIR' \
@@ -127,6 +127,7 @@ if [[ "${SLEAP_FORCE_RECOMPUTE:-0}" == "1" ]]; then
 	echo "[INFO] --sleap-force-recompute: bucket skip disabled; recomputing all chunks"
 	cp "$WORKLIST" "$SLEAP_WORKLIST"
 else
+	module use /apps/unit/ReiterU/.modulefiles
 	module load opencv/4.9.0 2>/dev/null || true   # provides h5py on deigo
 	if python3 "$SCRIPTS_DIR/filter_done_chunks.py" \
 			--worklist "$WORKLIST" --data-dir "$DATA_DIR" --out "$SLEAP_WORKLIST"; then

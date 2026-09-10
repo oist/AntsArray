@@ -56,6 +56,8 @@ rsync -ah --chmod=Du=rwx,Dg=rwx,Fu=rw,Fg=rw \
   the user's `.bashrc` does not. `ssh_login_retry` preserves the existing SSH
   retries; file transfers and other SSH commands are unchanged. No persistent
   user `PATH` edit is needed.
+- Jobs explicitly add `/apps/unit/ReiterU/.modulefiles` before loading
+  FFmpeg/OpenCV/SLEAP, so they do not depend on a user's personal module setup.
 
 ## Layout
 

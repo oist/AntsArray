@@ -9,6 +9,8 @@
 set -eo pipefail
 shopt -s nullglob
 
+# Unit tools are not in every user's default MODULEPATH.
+module use /apps/unit/ReiterU/.modulefiles
 module load ffmpeg/7.1
 
 JOBS_ROOT="__JOBS_ROOT__"
