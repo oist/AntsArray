@@ -118,6 +118,22 @@ def pipeline_status(unit, fp) -> str:
     return "partial"
 
 
+def tracking_hazards(fp, trk) -> list:
+    """Flags about the tracking record (see lib/tracking_state.py).
+
+    TRACKING_STATE_CORRUPT: a record exists but could not be read -- look at
+    the file; do not backfill over it.
+    TRACKING_UNRECORDED: tracks/ landed but nothing says which homography made
+    them. Only the record can tell a block tracked with the right calibration
+    from one tracked with a stale one, so this doubles as the backfill queue.
+    """
+    if trk.get("tracking_error"):
+        return [const.HZ_TRACKING_STATE_CORRUPT]
+    if "tracks" in (fp.downstream or []) and not trk.get("tracking_hmats"):
+        return [const.HZ_TRACKING_UNRECORDED]
+    return []
+
+
 def derive_hazards(unit, fp, video_infos) -> list:
     """Return the ordered, de-duplicated hazard flag list for one unit."""
     flags = list(unit.extra_hazards)  # from discovery (dead symlink, legacy naming, ...)

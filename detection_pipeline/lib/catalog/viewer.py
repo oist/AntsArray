@@ -131,7 +131,7 @@ function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','
 const STATUS={complete:'good',partial:'warn',not_started:'muted',analysis_only:'info'};
 const HEALTH={ok:'good',warn:'warn',bad:'crit',unknown:'muted','n/a':'muted'};
 const HAZ_CRIT=new Set(['SLEAP_H5_MISSING','ARUCO_MISSING','STAGE_SKEW','SILENT_PARTIAL','DEAD_SYMLINK','TRUNCATED_ARTIFACT']);
-const HAZ_WARN=new Set(['NAME_DATE_MISMATCH','CAM_COUNT_OFF','NO_SESS_FILE','CHUNK_UNVERIFIABLE']);
+const HAZ_WARN=new Set(['NAME_DATE_MISMATCH','CAM_COUNT_OFF','NO_SESS_FILE','CHUNK_UNVERIFIABLE','TRACKING_UNRECORDED','TRACKING_STATE_CORRUPT']);
 
 function chip(label,colorKey){
   if(label==='')return '<span class="muted">–</span>';
@@ -186,6 +186,17 @@ function trkInfo(r){
   if(idx<0)return {status:'not_started',stage:''};
   if(idx===TRK_STAGES.length-1)return {status:'complete',stage:'interactions'};
   return {status:'partial',stage:TRK_STAGES[idx][0]};
+}
+// Which homography (calibration) made this block's tracks: tracks/TRACKING_STATE.json.
+function hmatCell(v,r){
+  if(!v){const have=String(r.downstream||'').toLowerCase().split('|').includes('tracks');
+    return have?chip('unrecorded','warn'):'<span class="muted">–</span>';}
+  const tip=['hmats: '+(r.tracking_hmats_path||''),
+    r.tracking_x_threshold?'x_threshold: '+r.tracking_x_threshold:'',
+    r.tracked_at?'tracked: '+r.tracked_at:'',
+    r.tracking_source?'source: '+r.tracking_source:''].filter(Boolean).join('\n');
+  return '<span class="mono" title="'+esc(tip)+'">'+esc(v)
+    +(r.tracking_source==='backfill'?' <span class="muted">(backfill)</span>':'')+'</span>';
 }
 function trackCell(v,r){
   const info=trkInfo(r);
@@ -274,6 +285,7 @@ const VIEWS={
     ['n_colony_videos','vids',R.num],['has_sidecars','sidecars',(v)=>boolCell(v)],
     ['health_flag','health',(v)=>chip(v,HEALTH[v]||'muted')],
     ['pipeline_status','pipeline',(v,r)=>statusCell(v,r)],['downstream','tracking',(v,r)=>trackCell(v,r)],
+    ['tracking_hmats','hmat used',(v,r)=>hmatCell(v,r)],
     ['completeness_pct','complete %',(v,r)=>pctCell(r)],
     ['n_slp','slp',R.num],['n_aruco_det','aruco',R.num],['n_sleap_data','sleap_h5',R.num],
     ['sleap_models','models',R.txt],['saion_partition','partition',R.txt],
@@ -519,7 +531,9 @@ _CATALOG_KEYS = ["session_id", "block", "block_id", "session_kind", "date_start"
                  "is_stim", "n_trials_observed", "n_colony_videos", "has_sidecars",
                  "health_flag", "pipeline_status", "completeness_pct", "completeness_state",
                  "n_slp", "n_aruco_det", "n_sleap_data", "sleap_models", "saion_partition",
-                 "stage_reached", "downstream", "hazard_flags", "recover_type", "recover_missing",
+                 "stage_reached", "downstream", "tracking_hmats", "tracking_hmats_path",
+                 "tracking_x_threshold", "tracked_at", "tracking_source",
+                 "hazard_flags", "recover_type", "recover_missing",
                  "recover_cmd", "recover_steps"]
 _VIDEO_KEYS = ["session_id", "block", "vname", "cam_global", "ext", "has_sidecar", "fps",
                "frame_count", "duration_sec", "start_epoch_ms", "missed_frames", "frame_drop",

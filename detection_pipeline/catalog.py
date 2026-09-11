@@ -30,6 +30,7 @@ from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib"))
 from catalog import build, const, provenance, recover  # noqa: E402
+import tracking_state  # noqa: E402
 
 
 def _make_logger(logdir, stamp):
@@ -51,11 +52,28 @@ def main(argv=None):
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("mode", nargs="?",
-                    choices=["scan", "build", "all", "recover", "state-init"],
+                    choices=["scan", "build", "all", "recover", "state-init", "track-init"],
                     default="all")
     ap.add_argument("target", nargs="?", default=None,
-                    help="for 'recover'/'state-init': the block id, "
+                    help="for 'recover'/'state-init'/'track-init': the block id, "
                          "e.g. 20260623/block03")
+    ap.add_argument("--hmats", default=None,
+                    help="track-init: the homography .npz the block was tracked "
+                         "with (as passed to submit_blocks_pipeline.sh --hmats)")
+    ap.add_argument("--x-threshold", type=float, default=None,
+                    help="track-init: the panorama split used (--x_threshold)")
+    ap.add_argument("--tracked-at", default=None,
+                    help="track-init: when the tracking ran, ISO date/time "
+                         "(the backfill's own timestamp is recorded separately)")
+    ap.add_argument("--note", default=None,
+                    help="track-init: where the hmats value came from, e.g. "
+                         "'rendered sbatch on /flash, 2026-09-11'")
+    ap.add_argument("--overwrite", action="store_true",
+                    help="track-init: replace a record the pipeline wrote itself "
+                         "(the displaced record is kept in history)")
+    ap.add_argument("--allow-missing-tracks", action="store_true",
+                    help="track-init: record even though the block has no tracks/ "
+                         "directory (creates it)")
     ap.add_argument("--chunk-sec", type=int, default=None,
                     help="state-init: the --chunk-sec the ORIGINAL run used. "
                          "Required, and cross-checked against the archived "
@@ -64,7 +82,8 @@ def main(argv=None):
     ap.add_argument("--chunk-ext", default="mkv",
                     help="state-init: chunk container of the original run")
     ap.add_argument("--dry-run", action="store_true",
-                    help="state-init: print what would be recorded, write nothing")
+                    help="state-init/track-init: print what would be recorded, "
+                         "write nothing")
     ap.add_argument("--root", default="/bucket/ReiterU/Ants/basler",
                     help="basler root to scan (Windows: Z:/ReiterU/Ants/basler)")
     ap.add_argument("--outdir", default=None,
@@ -101,6 +120,46 @@ def main(argv=None):
                     "'recover 20260623/block03' or 'recover 20260623::block03'")
                 return
             recover.run_recover(args.root, outdir, args.target, log)
+            log("[catalog] done. log: %s" % logpath)
+            return
+        if args.mode == "track-init":
+            # Backfill tracks/TRACKING_STATE.json for a block tracked before the
+            # mapper recorded its homography. Evidence comes from the operator
+            # (a rendered sbatch, a lab note); a record the pipeline wrote itself
+            # is never replaced without --overwrite. (--force keeps its scan
+            # meaning and does nothing here.)
+            if not args.target or not args.hmats:
+                log("[catalog] track-init needs a block id and --hmats, e.g. "
+                    "'track-init 20260716/block01 --hmats /bucket/.../aruco_H_mats.npz "
+                    "--x-threshold 2475'")
+                return
+            session_id, block = recover.parse_block_id(args.target)
+            tracks_dir = os.path.join(recover.block_dir(args.root, session_id, block),
+                                      "tracks")
+            if not os.path.isdir(tracks_dir) and not args.allow_missing_tracks:
+                log("[catalog] %s has no tracks/: nothing was tracked here "
+                    "(--allow-missing-tracks records anyway)" % os.path.dirname(tracks_dir))
+                return
+            if args.overwrite:
+                log("[catalog] --overwrite: a record written by the pipeline itself "
+                    "will be replaced (kept in history)")
+            try:
+                state = tracking_state.backfill(
+                    tracks_dir, args.hmats, x_threshold=args.x_threshold,
+                    tracked_at=args.tracked_at, note=args.note,
+                    force=args.overwrite, dry_run=args.dry_run)
+            except ValueError as e:
+                log("[catalog] track-init failed: %s" % e)
+                return
+            m = state["map"]
+            log("[catalog] %s %s: hmats=%s sha256=%s x_threshold=%s tracked_at=%s"
+                % ("would record" if args.dry_run else "recorded",
+                   tracking_state.state_path(tracks_dir), m["hmats_calib_id"],
+                   (m.get("hmats_sha256") or "file-not-readable")[:12],
+                   m.get("x_threshold"), m.get("tracked_at") or "-"))
+            if not m.get("hmats_sha256"):
+                log("[catalog] note: %s is not readable from here, so the record "
+                    "carries the path only, not a content hash" % args.hmats)
             log("[catalog] done. log: %s" % logpath)
             return
         if args.mode == "state-init":

@@ -121,6 +121,41 @@ Caveat: `sleap`/`aruco` recovery reads chunk videos from `/flash`, which is
 cleaned after a run — for an old block those chunks must be re-chunked first
 (the emitted steps say so).
 
+## Tracking provenance (`tracks/TRACKING_STATE.json`)
+
+Which homography stack (`--hmats`, i.e. which camera calibration) and which
+panorama split (`--x_threshold`) made a block's tracks. Detection always
+recorded its settings (`pipeline.env`, `PIPELINE_STATE.json`); tracking did
+not, and a block tracked against a stale calibration is indistinguishable on
+disk from one tracked against the right one.
+
+`tracking/colony/pipeline.py` now writes the record before mapping (and adds
+the stitch settings before stitching). It lives in `tracks/` because that
+directory already travels to the bucket with the tracking transfer manifest,
+and every window view has its own `tracks/`. Re-mapping with a different hmats
+or split moves the displaced record into `history`, so retracks stay visible.
+
+Catalog columns: `tracking_hmats` (the calibration directory name, e.g.
+`20260623_calib_elevated_by_2mm_from_arenafloor`), `tracking_hmats_path`,
+`tracking_x_threshold`, `tracked_at`, `tracking_source` (`pipeline` |
+`backfill`). The viewer shows `hmat used` next to `tracking`; hover for the
+full path, split and time.
+
+Blocks tracked before the record existed show `TRACKING_UNRECORDED`. Backfill
+them from evidence (the rendered sbatch under `/flash`, a lab note):
+
+```bash
+python detection_pipeline/catalog.py track-init 20260716/block01 \
+    --hmats /bucket/ReiterU/Ants/basler/cameraArray_calib/20260623_calib_elevated_by_2mm_from_arenafloor/frame0/aruco_stitch/aruco_H_mats.npz \
+    --x-threshold 2475 --tracked-at 2026-07-20 --note "rendered sbatch on /flash"
+```
+
+`--dry-run` prints without writing. A record the pipeline wrote itself is never
+replaced by a backfill unless `--overwrite` (the displaced record stays in
+`history`); a block without a `tracks/` directory is refused unless
+`--allow-missing-tracks`. The hmats file is hashed when readable, so two records
+are comparable even after a calibration is recomputed in place.
+
 ## Completeness (honest by design)
 
 Newer colony blocks carry no chunk-count ground truth on disk (the pipeline's
@@ -141,7 +176,11 @@ opens `.h5`/`.slp` files — it counts filenames only.
 (`.npy`/`.csv`/trailing-`_` outputs; h5 flags suppressed) ·
 `NAME_DATE_MISMATCH` · `NO_SESS_FILE` · `NO_SIDECAR` · `CAM_COUNT_OFF`
 (≠25 colony cams) · `CHUNK_INTERNAL_ONLY` / `CHUNK_UNVERIFIABLE` ·
-`TRUNCATED_ARTIFACT` (needs `--check-sizes`) · `RAW_CHUNKED`.
+`TRUNCATED_ARTIFACT` (needs `--check-sizes`) · `RAW_CHUNKED` ·
+`TRACKING_UNRECORDED` (`tracks/` landed but no `tracks/TRACKING_STATE.json`
+says which homography made them — the `track-init` backfill queue) ·
+`TRACKING_STATE_CORRUPT` (the record exists but cannot be read — inspect it,
+do not backfill over it).
 
 ## Example questions
 

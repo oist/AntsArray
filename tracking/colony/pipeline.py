@@ -24,6 +24,7 @@ from tracking.colony.panorama_io import discover_complete_input_chunks, require_
 from tracking.stitch_tracks import chunk_frames_from_state  # noqa: E402
 from tracking.stitch_tracks import main as stitch_tracks  # noqa: E402
 from tracking.stitch_tracks import write_pngs_from_existing  # noqa: E402
+from detection_pipeline.lib import tracking_state  # noqa: E402
 
 
 def run_mapping(
@@ -292,6 +293,25 @@ def main() -> None:
 
     if not args.skip_map:
         logging.info("Stage 1/3: mapping detections into panorama PKLs")
+        # Record which homography and split are about to make these tracks.
+        # Written before mapping so a run that dies half-way still leaves the
+        # settings its partial outputs were made with. tracks/ travels to the
+        # bucket with the transfer manifest, so the catalog can read it there.
+        tracks_dir.mkdir(parents=True, exist_ok=True)
+        rec = tracking_state.record_map(
+            tracks_dir,
+            hmats=args.hmats,
+            x_threshold=args.x_threshold,
+            map_mode=args.map_mode,
+            min_instance_frame_frac=args.min_instance_frame_frac,
+            data_dir=args.data_dir,
+            chunks=complete_chunks,
+            code_dir=REPO_ROOT,
+            argv=sys.argv,
+        )
+        logging.info("tracking record: %s (hmats %s, x_threshold %s)",
+                     tracking_state.state_path(tracks_dir),
+                     rec["map"]["hmats_calib_id"], args.x_threshold)
         run_mapping(
             hmats_path=args.hmats,
             data_dir=args.data_dir,
@@ -350,6 +370,8 @@ def main() -> None:
                 "present. Correct for a contiguous 0..N block, wrong for any "
                 "subset -- run `catalog.py state-init` to give this block a "
                 "contract.", state_fp)
+        tracking_state.record_stitch(tracks_dir, fps=args.fps, chunk_frames=chunk_frames,
+                                     side=args.side, code_dir=REPO_ROOT)
         run_stitching(
             chunk_frames=chunk_frames,
             tracks_dir=tracks_dir,

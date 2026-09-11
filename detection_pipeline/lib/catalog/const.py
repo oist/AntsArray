@@ -101,7 +101,7 @@ DEFAULT_EXPECTED_CAMS = 25
 DEFAULT_WORKERS = 8
 TRUNCATED_H5_BYTES = 2048        # below this a data .h5 is almost certainly truncated
 NAME_DATE_TOL_DAYS = 2           # folder-name date vs earliest video date tolerance
-SCAN_VERSION = 7                 # bump to invalidate cache on logic change
+SCAN_VERSION = 8                 # bump to invalidate cache on logic change
 
 # ---------------------------------------------------------------------------
 # Hazard flag names (kept as constants to avoid typos across modules)
@@ -126,6 +126,13 @@ HZ_UNCLEAN_CLOSE = "UNCLEAN_CLOSE"   # recorder didn't finalize; counts agree ->
 # Wave processing left part of the block unclaimed: no wave in PIPELINE_STATE.json
 # ever covered those chunk indices, so they are not "in progress", they are missed.
 HZ_WAVE_GAP = "WAVE_GAP"
+# tracks/ landed but no tracks/TRACKING_STATE.json says which homography made
+# them. A block tracked with a stale calibration is otherwise indistinguishable,
+# so this is the backfill queue for `catalog.py track-init`.
+HZ_TRACKING_UNRECORDED = "TRACKING_UNRECORDED"
+# tracks/TRACKING_STATE.json exists but cannot be read: distinct from "never
+# recorded", because the fix is to inspect the file, not to backfill over it.
+HZ_TRACKING_STATE_CORRUPT = "TRACKING_STATE_CORRUPT"
 
 TOKEN_JOIN = "|"   # separator for multi-valued cells (Excel-scannable)
 
@@ -145,6 +152,8 @@ CATALOG_COLUMNS = [
     "n_slp", "n_aruco_det", "n_aruco_tracks", "n_sleap_data",
     "completeness_pct", "completeness_state", "expected_source",
     "chunks_declared", "waves_done", "unclaimed_chunks", "downstream",
+    "tracking_hmats", "tracking_hmats_path", "tracking_x_threshold", "tracked_at",
+    "tracking_source",
     "sleap_models", "saion_partition", "hazard_flags", "recover_type",
     "recover_missing", "scan_error", "scanned_at",
 ]

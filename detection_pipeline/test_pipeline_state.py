@@ -722,6 +722,245 @@ def test_missing_pipeline_env_leaves_provenance_empty():
 
 
 # ---------------------------------------------------------------------------
+# tracking provenance: tracks/TRACKING_STATE.json (lib/tracking_state.py)
+# ---------------------------------------------------------------------------
+import tracking_state as ts  # noqa: E402
+from catalog import const, tracking as trk_mod  # noqa: E402
+
+CALIB_A = "cameraArray_calib/20260623_calib_elevated_by_2mm_from_arenafloor/frame0/aruco_stitch/aruco_H_mats.npz"
+CALIB_B = "cameraArray_calib/20260810_calib_elevated_by_2mm/frame0/aruco_stitch/aruco_H_mats.npz"
+
+
+class TrackedBlock(object):
+    """A throwaway block dir with tracks/ and fake calibration files."""
+
+    def __init__(self):
+        self.root = tempfile.mkdtemp(prefix="trktest_")
+        self.tracks = os.path.join(self.root, "tracks")
+        os.makedirs(self.tracks)
+        self.bucket = os.path.join(self.root, "bucket")
+
+    def hmats(self, rel, content=b"H-stack-A"):
+        p = os.path.join(self.bucket, *rel.split("/"))
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "wb") as f:
+            f.write(content)
+        return p
+
+    def close(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+
+class _FP(object):
+    def __init__(self, downstream):
+        self.downstream = downstream
+
+
+def test_record_map_captures_hmats_identity_and_settings():
+    b = TrackedBlock()
+    try:
+        h = b.hmats(CALIB_A)
+        state = ts.record_map(b.tracks, hmats=h, x_threshold=2475.0, map_mode="both",
+                              min_instance_frame_frac=0.25, data_dir=os.path.join(b.root, "data"),
+                              chunks=["003", "000", "001"], code_dir="/apps/x/releases/20260911_abc/tracking",
+                              argv=["pipeline.py", "--hmats", h])
+        m = ts.load(b.tracks)["map"]
+        assert m["source"] == "pipeline"
+        assert m["hmats"] == h
+        assert m["hmats_calib_id"] == "20260623_calib_elevated_by_2mm_from_arenafloor"
+        assert m["hmats_sha256"] == ts.file_fingerprint(h)["sha256"]
+        assert m["x_threshold"] == 2475.0
+        assert m["chunks"] == {"first": "000", "last": "003", "count": 3}
+        assert m["release"] == "20260911_abc"
+        assert m["user"] and m["host"] and m["recorded_at"].endswith("Z")
+        assert state["stitch"] is None and state["history"] == []
+        s = ts.summary(state)
+        assert s["tracking_hmats"] == "20260623_calib_elevated_by_2mm_from_arenafloor"
+        assert s["tracking_x_threshold"] == "2475"
+        assert s["tracked_at"] == m["recorded_at"]
+    finally:
+        b.close()
+
+
+def test_remapping_with_other_hmats_keeps_the_displaced_record_in_history():
+    b = TrackedBlock()
+    try:
+        ha, hb = b.hmats(CALIB_A), b.hmats(CALIB_B, b"H-stack-B")
+        ts.record_map(b.tracks, hmats=ha, x_threshold=2475.0)
+        ts.record_map(b.tracks, hmats=ha, x_threshold=2475.0)       # same run again
+        assert ts.load(b.tracks)["history"] == []
+        ts.record_map(b.tracks, hmats=hb, x_threshold=2475.0)       # recalibrated
+        state = ts.load(b.tracks)
+        assert state["map"]["hmats_calib_id"] == "20260810_calib_elevated_by_2mm"
+        assert [h["hmats_calib_id"] for h in state["history"]] == \
+            ["20260623_calib_elevated_by_2mm_from_arenafloor"]
+        ts.record_map(b.tracks, hmats=hb, x_threshold=2500.0)       # split changed
+        assert len(ts.load(b.tracks)["history"]) == 2
+    finally:
+        b.close()
+
+
+def test_record_stitch_leaves_the_map_record_alone():
+    b = TrackedBlock()
+    try:
+        ts.record_stitch(b.tracks, fps=24.0, chunk_frames=43200, side="both")  # no map yet
+        state = ts.load(b.tracks)
+        assert state["map"] is None and state["stitch"]["chunk_frames"] == 43200
+        h = b.hmats(CALIB_A)
+        ts.record_map(b.tracks, hmats=h, x_threshold=2475.0)
+        ts.record_stitch(b.tracks, fps=24.0, chunk_frames=43200, side="left")
+        state = ts.load(b.tracks)
+        assert state["map"]["hmats_calib_id"].startswith("20260623")
+        assert state["stitch"]["side"] == "left"
+    finally:
+        b.close()
+
+
+def test_backfill_refuses_to_overwrite_a_pipeline_record_unless_forced():
+    b = TrackedBlock()
+    try:
+        h = b.hmats(CALIB_A)
+        ts.record_map(b.tracks, hmats=h, x_threshold=2475.0)
+        hb = b.hmats(CALIB_B, b"H-stack-B")
+        try:
+            ts.backfill(b.tracks, hb, x_threshold=2475.0)
+            assert False, "backfill over a pipeline record must be refused"
+        except ValueError as e:
+            assert "--force" in str(e)
+        assert ts.load(b.tracks)["map"]["source"] == "pipeline"
+        ts.backfill(b.tracks, hb, x_threshold=2475.0, force=True,
+                    tracked_at="2026-08-21", note="rendered sbatch")
+        state = ts.load(b.tracks)
+        assert state["map"]["source"] == "backfill"
+        assert state["map"]["tracked_at"] == "2026-08-21"
+        assert state["history"][0]["source"] == "pipeline"
+        assert ts.summary(state)["tracked_at"] == "2026-08-21"   # tracked, not backfilled
+    finally:
+        b.close()
+
+
+def test_backfill_dry_run_writes_nothing_and_path_only_hmats_still_labels():
+    b = TrackedBlock()
+    try:
+        missing = "/bucket/ReiterU/Ants/basler/" + CALIB_A       # not readable here
+        state = ts.backfill(b.tracks, missing, x_threshold=2475.0, dry_run=True)
+        assert state["map"]["hmats_calib_id"] == "20260623_calib_elevated_by_2mm_from_arenafloor"
+        assert "hmats_sha256" not in state["map"]
+        assert ts.load(b.tracks) is None
+    finally:
+        b.close()
+
+
+def test_corrupt_record_is_set_aside_by_the_pipeline_but_fatal_for_backfill():
+    b = TrackedBlock()
+    try:
+        with open(ts.state_path(b.tracks), "w") as f:
+            f.write("{not json")
+        try:
+            ts.backfill(b.tracks, b.hmats(CALIB_A))
+            assert False, "backfill must not paper over a corrupt record"
+        except ValueError:
+            pass
+        ts.record_map(b.tracks, hmats=b.hmats(CALIB_A), x_threshold=2475.0)
+        assert ts.load(b.tracks)["map"]["source"] == "pipeline"
+        kept = [n for n in os.listdir(b.tracks) if ".corrupt." in n]
+        assert len(kept) == 1
+    finally:
+        b.close()
+
+
+def test_calib_id_falls_back_to_the_parent_directory():
+    assert ts.calib_id_from_hmats("C:\\data\\cameraArray_calib\\20260414_calibration_dataset\\x\\initial_H_mats.npz") \
+        == "20260414_calibration_dataset"
+    assert ts.calib_id_from_hmats("/home/sam/hmats/refined/refined_H_mats.npz") == "refined"
+
+
+def test_catalog_reads_the_record_and_flags_unrecorded_tracks():
+    b = TrackedBlock()
+    try:
+        trk = trk_mod.read_tracking(b.root)
+        assert trk["tracking_hmats"] == "" and trk["tracking_error"] == ""
+        assert qc.tracking_hazards(_FP(["tracks"]), trk) == [const.HZ_TRACKING_UNRECORDED]
+        assert qc.tracking_hazards(_FP([]), trk) == []          # never tracked: no flag
+        ts.record_map(b.tracks, hmats=b.hmats(CALIB_A), x_threshold=2475.0)
+        trk = trk_mod.read_tracking(b.root)
+        assert trk["tracking_hmats"] == "20260623_calib_elevated_by_2mm_from_arenafloor"
+        assert trk["tracking_x_threshold"] == "2475"
+        assert qc.tracking_hazards(_FP(["tracks"]), trk) == []
+        with open(ts.state_path(b.tracks), "w") as f:
+            f.write("{not json")
+        trk = trk_mod.read_tracking(b.root)
+        assert trk["tracking_hmats"] == "" and "not valid JSON" in trk["tracking_error"]
+        # corrupt is told apart from never-recorded: the fix differs
+        assert qc.tracking_hazards(_FP(["tracks"]), trk) == [const.HZ_TRACKING_STATE_CORRUPT]
+    finally:
+        b.close()
+
+
+def _catalog_cli(argv, cwd):
+    """Run detection_pipeline/catalog.py as a subprocess; returns its stderr log."""
+    import subprocess
+    here = os.path.dirname(os.path.abspath(__file__))
+    r = subprocess.run([sys.executable, os.path.join(here, "catalog.py")] + argv,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                       universal_newlines=True, cwd=cwd)
+    return r.returncode, r.stderr
+
+
+def test_track_init_cli_backfills_and_refuses_what_it_should():
+    root = tempfile.mkdtemp(prefix="trkcli_")
+    try:
+        blk = os.path.join(root, "20260716", "block01")
+        os.makedirs(os.path.join(blk, "tracks"))
+        os.makedirs(os.path.join(root, "20260726", "block01"))       # never tracked
+        hm = os.path.join(root, "cameraArray_calib", "20260623_calib_x", "aruco_H_mats.npz")
+        os.makedirs(os.path.dirname(hm))
+        with open(hm, "wb") as f:
+            f.write(b"H")
+        outdir = os.path.join(root, "_catalog")
+        base = ["--root", root, "--outdir", outdir]
+
+        rc, err = _catalog_cli(["track-init", "20260716/block01", "--hmats", hm,
+                                "--x-threshold", "2475", "--dry-run"] + base, root)
+        assert rc == 0 and "would record" in err
+        assert ts.load(os.path.join(blk, "tracks")) is None
+
+        rc, err = _catalog_cli(["track-init", "20260716/block01", "--hmats", hm,
+                                "--x-threshold", "2475", "--tracked-at", "2026-07-20",
+                                "--note", "test"] + base, root)
+        assert rc == 0 and "recorded" in err
+        state = ts.load(os.path.join(blk, "tracks"))
+        assert state["map"]["source"] == "backfill"
+        assert state["map"]["hmats_calib_id"] == "20260623_calib_x"
+        assert state["map"]["x_threshold"] == 2475.0
+        assert state["map"]["tracked_at"] == "2026-07-20"
+
+        # a block that was never tracked is refused without --allow-missing-tracks
+        rc, err = _catalog_cli(["track-init", "20260726/block01", "--hmats", hm] + base, root)
+        assert rc == 0 and "no tracks/" in err
+        assert not os.path.isdir(os.path.join(root, "20260726", "block01", "tracks"))
+        rc, err = _catalog_cli(["track-init", "20260726/block01", "--hmats", hm,
+                                "--allow-missing-tracks"] + base, root)
+        assert rc == 0 and "recorded" in err
+        assert ts.load(os.path.join(root, "20260726", "block01", "tracks"))["map"]["source"] == "backfill"
+
+        # a pipeline-written record needs --overwrite, and --force is NOT it
+        ts.record_map(os.path.join(blk, "tracks"), hmats=hm, x_threshold=2475.0)
+        rc, err = _catalog_cli(["track-init", "20260716/block01", "--hmats", hm,
+                                "--force"] + base, root)
+        assert rc == 0 and "track-init failed" in err and "--force" in err
+        assert ts.load(os.path.join(blk, "tracks"))["map"]["source"] == "pipeline"
+        rc, err = _catalog_cli(["track-init", "20260716/block01", "--hmats", hm,
+                                "--overwrite"] + base, root)
+        assert rc == 0 and "recorded" in err
+        state = ts.load(os.path.join(blk, "tracks"))
+        assert state["map"]["source"] == "backfill"
+        assert state["history"][-1]["source"] == "pipeline"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
 # runner
 # ---------------------------------------------------------------------------
 def _run_all():

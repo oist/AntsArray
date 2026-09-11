@@ -10,7 +10,7 @@ import os
 import statistics
 
 from . import (cache as cache_mod, const, discover, footprint as fp_mod,
-               labels as labels_mod, probe as probe_mod, provenance, qc,
+               labels as labels_mod, probe as probe_mod, provenance, qc, tracking as tracking_mod,
                recover, sess_parse, viewer)
 from .classify import name_hints_stim
 
@@ -96,6 +96,8 @@ def _assemble(unit, fp, scanned_at, workers, allow_ffprobe, root, outdir, config
     cam_map = sess.cam_pc_map if sess else {}
 
     hazards = qc.derive_hazards(unit, fp, video_infos)
+    trk = tracking_mod.read_tracking(unit.path)
+    hazards += qc.tracking_hazards(fp, trk)
     status = qc.pipeline_status(unit, fp)
     health = qc.rollup_health(video_infos)
 
@@ -194,6 +196,10 @@ def _assemble(unit, fp, scanned_at, workers, allow_ffprobe, root, outdir, config
         "waves_done": _fmt(len(fp.waves) if fp.waves else None),
         "unclaimed_chunks": _unclaimed_cell(fp.unclaimed),
         "downstream": const.TOKEN_JOIN.join(fp.downstream),
+        "tracking_hmats": trk["tracking_hmats"],
+        "tracking_hmats_path": trk["tracking_hmats_path"],
+        "tracking_x_threshold": trk["tracking_x_threshold"],
+        "tracked_at": trk["tracked_at"], "tracking_source": trk["tracking_source"],
         "hazard_flags": const.TOKEN_JOIN.join(hazards),
         "sleap_models": provenance.model_label(prov),
         "sleap_model_centroid": prov.get("sleap_model_centroid", ""),
