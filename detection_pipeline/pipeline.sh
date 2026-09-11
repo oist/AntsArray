@@ -541,7 +541,7 @@ guard_concurrent_wave() {
 	# Best-effort: no saion login (or a network blip) must not block a submission,
 	# but say so, because the saion half of the check then did not happen.
 	q_saion=$(ssh -x -oBatchMode=yes -oStrictHostKeyChecking=no \
-		-oConnectTimeout=15 saion "squeue -h -u \$USER -o '%i'" 2>/dev/null) || {
+		-oConnectTimeout=15 saion "bash -lc 'squeue -h -u \"\$USER\" -o %i'" 2>/dev/null) || {
 		echo "[WARN] could not reach saion to check for a live sleap array; guard covers deigo only" >&2
 		q_saion=""
 	}

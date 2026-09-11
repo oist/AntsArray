@@ -19,6 +19,7 @@
 set -eo pipefail
 
 source ~/.bashrc
+module use /apps/unit/ReiterU/.modulefiles
 module load __SLEAP_MODULE__
 
 # Home is shared deigo<->saion, so the rendered deigo repo path also works on saion.

@@ -66,6 +66,7 @@ if [[ -z "${SLURM_JOB_ID:-}" ]]; then
 fi
 
 source ~/.bashrc
+module use /apps/unit/ReiterU/.modulefiles
 module load "$SLEAP_MODULE"
 
 echo "[INFO] sleap-nn export"

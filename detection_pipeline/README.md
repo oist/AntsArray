@@ -51,6 +51,13 @@ rsync -ah --chmod=Du=rwx,Dg=rwx,Fu=rw,Fg=rw \
 - All cross-cluster SSH (TRT export trigger, saion sbatch, inline uploads) uses
   `ssh_retry` with 5 attempts + 10·n backoff — the lesson from block01's
   `kex_exchange_identification` reset wedging the whole pipeline.
+- Remote Slurm queue checks and submissions initialize `bash -lc`, so the
+  cluster's `/etc/profile.d/` setup provides `squeue` and `sbatch` even when
+  the user's `.bashrc` does not. `ssh_login_retry` preserves the existing SSH
+  retries; file transfers and other SSH commands are unchanged. No persistent
+  user `PATH` edit is needed.
+- Jobs explicitly add `/apps/unit/ReiterU/.modulefiles` before loading
+  FFmpeg/OpenCV/SLEAP, so they do not depend on a user's personal module setup.
 
 ## Layout
 
@@ -100,18 +107,25 @@ Monitor:
 ```bash
 squeue -u $USER
 ls /flash/ReiterU/$USER/jobs/<exp>/         # rendered sbatches + jid_*.txt + manifest.csv + worklist
-ssh saion squeue -u $USER                   # saion side
+ssh saion 'bash -lc "squeue -u $USER"'      # saion side
 ```
 
 Outputs land in `<exp>/data/`, per grid camera per chunk:
 
-- `<vname>_NNN_aruco_tracks.h5`     dense `(frames, instances, 2)` arrays (deigo aruco array)
-- `<vname>_NNN_aruco_detections.h5` DataFrame `(Frame, Instance, X, Y, Confidence)` (deigo aruco array)
+- `<vname>_NNN_aruco_tracks.h5`     lossless `aruco_detections` records plus legacy dense summaries
+- `<vname>_NNN_aruco_detections.h5` lossless DataFrame `(Frame, Instance, X, Y, Confidence)`
 - `<vname>_NNN.slp`                 SLEAP predictions (saion sleap predict)
 - `<vname>_NNN_sleap_data.h5`       SLEAP DataFrame via `sleap2h5.py` (saion, inline post-process)
 
 The colony tracking map stage consumes the `.h5` files (`_aruco_tracks.h5` / `_aruco_detections.h5`
 and `_sleap_data.h5`); it does **not** read `.slp` directly.
+
+ArUco `Instance` means tag ID, not a unique row key. Multiple detections of the
+same ID in one camera/frame are preserved, mapped and split by colony before
+the tracker chooses among candidates. The mapper prefers the native lossless
+records; direct readers of the old dense arrays still see a lossy summary.
+See [ArUco output format and compatibility](aruco_output_format.md) for the
+schema, regression tests and requirements for recomputing old outputs.
 
 ## CLI
 

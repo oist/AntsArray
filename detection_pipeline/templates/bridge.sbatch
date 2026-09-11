@@ -90,7 +90,7 @@ if (( SKIP_TRT_EXPORT == 0 )) && [[ "$SLEAP_RUNTIME" != "pytorch" ]]; then
 		else
 			echo "[INFO] no sibling engine; building on $SAION_PARTITION via $SCRIPTS_DIR/export_sleap_trt.sh"
 			# export_sleap_trt.sh srun's itself onto $SAION_PARTITION and blocks until done
-			ssh_retry saion "bash '$SCRIPTS_DIR/export_sleap_trt.sh' \
+			ssh_login_retry saion "SLEAP_MODULE='${SLEAP_MODULE:-sleap-nn/0.2.0}' bash '$SCRIPTS_DIR/export_sleap_trt.sh' \
 				--centroid '$SLEAP_MODEL_CENTROID' \
 				--instance '$SLEAP_MODEL_INSTANCE' \
 				--out '$EXPORT_DIR' \
@@ -127,6 +127,7 @@ if [[ "${SLEAP_FORCE_RECOMPUTE:-0}" == "1" ]]; then
 	echo "[INFO] --sleap-force-recompute: bucket skip disabled; recomputing all chunks"
 	cp "$WORKLIST" "$SLEAP_WORKLIST"
 else
+	module use /apps/unit/ReiterU/.modulefiles
 	module load opencv/4.9.0 2>/dev/null || true   # provides h5py on deigo
 	if python3 "$SCRIPTS_DIR/filter_done_chunks.py" \
 			--worklist "$WORKLIST" --data-dir "$DATA_DIR" --out "$SLEAP_WORKLIST"; then
@@ -243,7 +244,7 @@ UPPER=$(( ARRAY_COUNT - 1 ))
 SLEAP_DEP=""
 if [[ "$PREFETCH_PARTITION" != "off" ]]; then
 	echo "[INFO] sbatch on saion: prefetch_array 0-$UPPER%$PREFETCH_CONCURRENCY (partition=$PREFETCH_PARTITION)"
-	JID_PREFETCH=$(ssh_retry saion "sbatch --parsable $MAIL_OPT --array=0-${UPPER}%${PREFETCH_CONCURRENCY} '$REMOTE_JOBS/prefetch_array.sh'")
+	JID_PREFETCH=$(ssh_login_retry saion "sbatch --parsable $MAIL_OPT --array=0-${UPPER}%${PREFETCH_CONCURRENCY} '$REMOTE_JOBS/prefetch_array.sh'")
 	echo "  saion prefetch      $JID_PREFETCH"
 	echo "$JID_PREFETCH" > "$JOBS_ROOT/jid_saion_prefetch.txt"
 	# aftercorr is a per-task afterok. prefetch_array always exits 0 precisely so
@@ -253,7 +254,7 @@ if [[ "$PREFETCH_PARTITION" != "off" ]]; then
 fi
 
 echo "[INFO] sbatch on saion: sleap_predict_array 0-$UPPER%$SLEAP_CONCURRENCY${SLEAP_DEP:+ (aftercorr on prefetch)}"
-JID_SLEAP=$(ssh_retry saion "sbatch --parsable $MAIL_OPT $SLEAP_DEP --export=ALL,SLEAP_BATCH_SIZE=${SLEAP_BATCH_SIZE:-8} --array=0-${UPPER}%${SLEAP_CONCURRENCY} '$REMOTE_JOBS/sleap_predict_array.sh'")
+JID_SLEAP=$(ssh_login_retry saion "sbatch --parsable $MAIL_OPT $SLEAP_DEP --export=ALL,SLEAP_BATCH_SIZE=${SLEAP_BATCH_SIZE:-8} --array=0-${UPPER}%${SLEAP_CONCURRENCY} '$REMOTE_JOBS/sleap_predict_array.sh'")
 echo "  saion sleap         $JID_SLEAP"
 echo "$JID_SLEAP" > "$JOBS_ROOT/jid_saion_sleap.txt"
 
@@ -265,7 +266,7 @@ echo "$JID_SLEAP" > "$JOBS_ROOT/jid_saion_sleap.txt"
 # all 50 tasks COMPLETED yet the datacp was cancelled with Reason=Dependency and
 # took saion_cleanup (afterany on it) down with it, stranding 73 GB on /work.
 # The verify-before-delete gate below is what actually protects the outputs.
-JID_SLEAP_DC=$(ssh_retry saion "sbatch --parsable $MAIL_OPT --dependency=afterany:$JID_SLEAP '$REMOTE_JOBS/sleap_datacp_array.sh'")
+JID_SLEAP_DC=$(ssh_login_retry saion "sbatch --parsable $MAIL_OPT --dependency=afterany:$JID_SLEAP '$REMOTE_JOBS/sleap_datacp_array.sh'")
 echo "  saion sleap_datacp  $JID_SLEAP_DC"
 echo "$JID_SLEAP_DC" > "$JOBS_ROOT/jid_saion_sleap_datacp.txt"
 
@@ -406,6 +407,6 @@ rmdir "$REMOTE_INPUT" "$REMOTE_OUTPUT" 2>/dev/null || true
 rmdir "$REMOTE_ROOT/jobs" 2>/dev/null || true
 rmdir "$REMOTE_ROOT" 2>/dev/null && echo "[INFO] last wave out; removed $REMOTE_ROOT" || true
 CLEAN
-ssh_retry saion "chmod +x '$REMOTE_JOBS/saion_cleanup.sh' && sbatch $CLEAN_MAIL_OPT --dependency=afterany:$JID_SLEAP_DC '$REMOTE_JOBS/saion_cleanup.sh'"
+ssh_login_retry saion "chmod +x '$REMOTE_JOBS/saion_cleanup.sh' && sbatch $CLEAN_MAIL_OPT --dependency=afterany:$JID_SLEAP_DC '$REMOTE_JOBS/saion_cleanup.sh'"
 
 echo "[INFO] bridge complete"

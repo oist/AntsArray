@@ -6,7 +6,8 @@ Map ArUco & SLEAP detections from many camera chunks into a common panorama per 
 Simplifications
 ---------------
 - ArUco inputs are ALWAYS H5/HDF5 (no CSV support).
-- num_frames is ALWAYS read from H5 dataset "aruco_tracks" (shape[0]) and is never None.
+- Prefer lossless raw ArUco records; legacy dense inputs remain readable with a warning.
+- Frame count comes from the raw H5 span or explicit detection-table metadata.
 - Outputs are written into ONE FLAT output directory (no chunk subfolders).
 
 Updated policy (as requested)
@@ -227,6 +228,21 @@ def aruco_h5_to_long_df_full(
     ds_name: str = "aruco_tracks",
     frame_offset: int = 0,
 ) -> pd.DataFrame:
+    """Read all candidates; repeated Frame/Instance/Cam combinations are valid."""
+    if "aruco_detections" in f:
+        records = f["aruco_detections"]
+        required = {"Frame", "Instance", "X", "Y"}
+        if not isinstance(records, h5py.Dataset) or records.ndim != 1 or not required.issubset(records.dtype.names or ()):
+            raise ValueError(f"Malformed lossless aruco_detections in {f.filename}")
+        df = pd.DataFrame.from_records(records[...])
+        df["Frame"] = df["Frame"].astype(np.int64) + frame_offset
+        return df
+    if int(f.attrs.get("aruco_detection_schema_version", 1)) >= 2:
+        raise ValueError(f"Missing lossless aruco_detections in {f.filename}; refusing lossy fallback")
+    logging.warning(
+        "Legacy dense ArUco input %s has at most one position per frame/ID; "
+        "same-camera duplicates cannot be recovered.", f.filename,
+    )
     arr = f[ds_name][...]
     if arr.ndim != 3 or arr.shape[2] != 2:
         raise ValueError(f"Expected (frames, instances, 2); got {arr.shape}")
@@ -281,6 +297,22 @@ def _filter_instances_by_frame_fraction(
     return df[df["Instance"].isin(keep_instances)].copy()
 
 
+def _aruco_num_frames(f: h5py.File, ds_name: str = "aruco_tracks") -> int:
+    """Use explicit v2 frame span, checking any compatibility array agrees."""
+    declared = f.attrs.get("num_frames")
+    dense_count = int(f[ds_name].shape[0]) if ds_name in f else None
+    if declared is not None:
+        count = int(declared)
+        if count < 0 or count != declared:
+            raise ValueError(f"Invalid num_frames={declared!r} in {f.filename}")
+        if dense_count is not None and count != dense_count:
+            raise ValueError(f"Frame-count metadata disagrees with {ds_name} in {f.filename}")
+        return count
+    if dense_count is None:
+        raise ValueError(f"Missing explicit frame span and {ds_name} in {f.filename}")
+    return dense_count
+
+
 def _load_aruco_h5_to_df_and_num_frames(
     file: Path,
     *,
@@ -289,14 +321,14 @@ def _load_aruco_h5_to_df_and_num_frames(
 ) -> Tuple[pd.DataFrame, int]:
     """
     ArUco inputs are ALWAYS H5/HDF5.
-    Returns (df, num_frames) where num_frames is f[ds_name].shape[0].
+    Returns all detection rows and the explicit/legacy H5 frame span.
     """
     suf = file.suffix.lower()
     if suf not in {".h5", ".hdf5"}:
         raise ValueError(f"Expected .h5/.hdf5 ArUco input, got {file}")
 
     with h5py.File(file, "r") as f:
-        num_frames = int(f[ds_name].shape[0])
+        num_frames = _aruco_num_frames(f, ds_name)
         df = aruco_h5_to_long_df_full(f, ds_name=ds_name, frame_offset=frame_offset)
 
     return df, num_frames
@@ -322,24 +354,41 @@ def _load_aruco_detections_h5_to_df_and_num_frames(
     *,
     ds_name: str = "aruco_tracks",
 ) -> Tuple[pd.DataFrame, int]:
-    # The detections H5 is a pandas HDFStore (key="detections"). Files written by an
-    # older pandas/PyTables (e.g. legacy pre-v2 blocks) can be unreadable by a newer
-    # pandas even when the group exists on disk. Fall back to the sibling dense
-    # _aruco_tracks.h5 (plain h5py, version-stable, identical X/Y detections) so a
-    # detector/tracking pandas-version drift never breaks the map stage.
+    # New raw H5 files carry version-stable, lossless records. Prefer these even
+    # if discovery selected the pandas export, which may be stale or unreadable.
+    tracks_file = _matching_aruco_tracks_file(file)
+    if tracks_file is not None:
+        with h5py.File(tracks_file, "r") as f:
+            use_raw = "aruco_detections" in f or int(f.attrs.get("aruco_detection_schema_version", 1)) >= 2
+        if use_raw:
+            return _load_aruco_h5_to_df_and_num_frames(tracks_file, ds_name=ds_name)
+
+    table_num_frames = None
+    table_schema = 1
     try:
-        df = pd.read_hdf(file, key="detections")
-    except Exception as exc:  # noqa: BLE001 - any HDFStore read failure -> use dense arrays
-        tracks_file = _matching_aruco_tracks_file(file)
+        with pd.HDFStore(file, mode="r") as store:
+            df = store["detections"]
+            attrs = store.get_storer("detections").attrs
+            table_num_frames = getattr(attrs, "num_frames", None)
+            table_schema = int(getattr(attrs, "aruco_detection_schema_version", 1))
+    except Exception as exc:  # noqa: BLE001 - handle legacy pandas-version drift
+        # A v2 table must never fall back to legacy dense data. Read its marker
+        # using h5py if pandas itself could not open it.
+        with h5py.File(file, "r") as f:
+            group = f.get("detections")
+            if group is not None and int(group.attrs.get("aruco_detection_schema_version", 1)) >= 2:
+                raise ValueError(f"Cannot read lossless detections in {file}; refusing lossy fallback") from exc
         if tracks_file is not None and tracks_file != file:
             logging.warning(
-                "Could not read %s as a pandas HDFStore (%s); falling back to dense %s.",
+                "Could not read %s as a pandas HDFStore (%s); falling back to legacy dense %s.",
                 file.name,
                 exc,
                 tracks_file.name,
             )
             return _load_aruco_h5_to_df_and_num_frames(tracks_file, ds_name=ds_name)
         raise
+    if table_schema < 2:
+        logging.warning("Legacy ArUco table %s may already have lost same-camera duplicate IDs.", file)
     required = ["Frame", "Instance", "X", "Y"]
     missing = [col for col in required if col not in df.columns]
     if missing:
@@ -351,8 +400,9 @@ def _load_aruco_detections_h5_to_df_and_num_frames(
     df = df.dropna(subset=required)
     df[["Frame", "Instance"]] = df[["Frame", "Instance"]].astype(int)
 
-    tracks_file = _matching_aruco_tracks_file(file)
-    if tracks_file is None:
+    if table_num_frames is not None:
+        num_frames = int(table_num_frames)
+    elif tracks_file is None:
         num_frames = int(df["Frame"].max() + 1) if not df.empty else 0
         logging.warning(
             "No matching dense ArUco tracks file for %s; using max(Frame)+1=%d for num_frames.",
@@ -361,7 +411,7 @@ def _load_aruco_detections_h5_to_df_and_num_frames(
         )
     else:
         with h5py.File(tracks_file, "r") as f:
-            num_frames = int(f[ds_name].shape[0])
+            num_frames = _aruco_num_frames(f, ds_name)
 
     return df, num_frames
 

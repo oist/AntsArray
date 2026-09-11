@@ -770,8 +770,8 @@ def get_complete_tracks(
                             )
                         )
 
-            # ArUco identity is primary. When the same tag is detected in
-            # overlapping cameras, choose the duplicate closest to the previous
+            # ArUco identity is primary. Multiple candidates may come from one
+            # camera (lossless export) or overlapping cameras. Choose closest to the previous
             # tracked ArUco position first, then attach the best compatible
             # SLEAP instance to that selected tag. At camera overlaps, "best"
             # prefers the fuller skeleton over the closest cut-off skeleton.
