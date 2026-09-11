@@ -101,7 +101,7 @@ DEFAULT_EXPECTED_CAMS = 25
 DEFAULT_WORKERS = 8
 TRUNCATED_H5_BYTES = 2048        # below this a data .h5 is almost certainly truncated
 NAME_DATE_TOL_DAYS = 2           # folder-name date vs earliest video date tolerance
-SCAN_VERSION = 6                 # bump to invalidate cache on logic change
+SCAN_VERSION = 7                 # bump to invalidate cache on logic change
 
 # ---------------------------------------------------------------------------
 # Hazard flag names (kept as constants to avoid typos across modules)

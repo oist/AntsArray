@@ -96,13 +96,18 @@ Recovery types, cheapest first:
 ### Consistency — models auto-filled per block
 
 `pipeline.sh --only-sleap` also needs the SLEAP model paths. The catalog reads
-them from the block's **own** `hpc_logs/pipeline/bridge_*.out` (the pipeline
-echoes `centroid:` / `instance:`), so the recovery command reuses the *exact*
-models that block was processed with — different blocks legitimately used
-different models, so this is per-block, not a global guess. The model set also
-shows in the `sleap_models` catalog column for at-a-glance consistency checks.
-The real `aruco_worklist.txt` (also under `hpc_logs`) supplies the authoritative
-per-chunk `expected_frames`, so the sub-worklist is exact, not inferred.
+them from the block's **own** records, in priority order: `data/PIPELINE_STATE.json`
+(the processing contract, blocks from 20260722 on), then `hpc_logs/pipeline/bridge_*.out`
+(the pipeline echoes `centroid:` / `instance:`), then `hpc_logs/pipeline/pipeline.env`
+(the `export SLEAP_MODEL_*` configuration every run was submitted with — the only
+source for blocks whose bridge jobs predate the echo). So the recovery command
+reuses the *exact* models that block was processed with — different blocks
+legitimately used different models, so this is per-block, not a global guess. The
+model set also shows in the `sleap_models` catalog column for at-a-glance
+consistency checks. `pipeline.env` likewise supplies the saion partition when
+nothing better recorded it. The real `aruco_worklist.txt` (also under `hpc_logs`)
+supplies the authoritative per-chunk `expected_frames`, so the sub-worklist is
+exact, not inferred.
 
 If a block has no logs, models fall back to an optional
 `_catalog/recover.config.json`:

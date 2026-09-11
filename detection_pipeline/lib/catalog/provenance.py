@@ -1,6 +1,6 @@
 """Recover per-block processing provenance.
 
-Two sources, in priority order.
+Two source trees, in priority order.
 
 1. ``data/PIPELINE_STATE.json`` -- the block's declared processing contract,
    written by pipeline.sh (see lib/pipeline_state.py). Authoritative: chunking,
@@ -13,6 +13,16 @@ Two sources, in priority order.
    both can be scraped back out. This is genuinely a scrape: model paths come
    from a regex over log text, and ``--chunk-sec`` cannot be read at all, only
    guessed from frame counts (see recover.infer_chunk_sec).
+
+   ``hpc_logs/pipeline/pipeline.env`` sits alongside: pipeline.sh has always
+   written its full configuration there as ``export KEY="value"`` lines, and it
+   is archived with the logs. Bridge jobs only started echoing their models in
+   summer 2026, so for most contract-less blocks this file is the *only* record
+   of the model set (and of the saion partition). It is read after the bridge
+   logs and fills only what they left blank. It also records ``CHUNK_SEC``, but
+   that is deliberately not consumed here: footprint/recover derive chunk_sec
+   from the contract or from frame counts, and switching them to an archived
+   value needs the manifest cross-check that ``state-init`` performs.
 
 If a block has neither, model paths fall back to an optional
 `_catalog/recover.config.json` default so the recovery command is still complete.
@@ -37,6 +47,8 @@ _INSTANCE_RE = re.compile(r"instance:\s*(\S+)")
 _RUNTIME_RE = re.compile(r"runtime:\s*(\S+)")
 # saion sleap partition, taken from the TRT engine dir suffix ..__<partition>/model
 _ENGINE_PART_RE = re.compile(r"__([a-z0-9-]+)/model")
+# one pipeline.env assignment: `export KEY="value"`, `KEY='value'` or bare `KEY=value`
+_ENV_LINE_RE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
 
 # saion partition -> (sleap GPU concurrency cap, per-task walltime label).
 # Must match saion_caps() in pipeline.sh; short-a100's wall is 2h, not 1h.
@@ -58,6 +70,55 @@ def _hpc_logs_dir(blockdir):
         if os.path.isdir(p):
             return p
     return None
+
+
+def _read_pipeline_env(pdir):
+    """{KEY: value} from <pdir>/pipeline.env, or {} when absent or unreadable.
+
+    Only flat assignments are parsed (one per line, optional ``export``, one
+    layer of matching quotes stripped). Anything else -- comments, blank lines,
+    shell constructs -- is skipped rather than interpreted: this is a record to
+    read back, not a script to run.
+    """
+    path = os.path.join(pdir, "pipeline.env")
+    if not os.path.isfile(path):
+        return {}
+    env = {}
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                m = _ENV_LINE_RE.match(line.rstrip("\n"))
+                if not m:
+                    continue
+                val = m.group(2).strip()
+                if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+                    val = val[1:-1]
+                env[m.group(1)] = val
+    except OSError:
+        return {}
+    return env
+
+
+def _fill_from_env(prov, env):
+    """Fill the model/partition gaps pipeline.env can answer; never override.
+
+    Models are all-or-nothing: a centroid without an instance is not a usable
+    model set, and a recovery command built from half of one would be worse than
+    an empty cell. ``source`` names where the *models* came from, exactly as the
+    bridge-log branch sets it. Returns the (mutated) prov for convenience.
+    """
+    if not prov["sleap_model_centroid"]:
+        c = env.get("SLEAP_MODEL_CENTROID", "")
+        i = env.get("SLEAP_MODEL_INSTANCE", "")
+        if c and i:
+            prov["sleap_model_centroid"] = c
+            prov["sleap_model_instance"] = i
+            prov["sleap_runtime"] = env.get("SLEAP_RUNTIME", "")
+            prov["source"] = "hpc_logs"
+    if not prov["saion_partition"] and env.get("SAION_PARTITION"):
+        prov["saion_partition"] = env["SAION_PARTITION"]
+        prov["partitions"] = [env["SAION_PARTITION"]]
+    return prov
 
 
 def read_state(blockdir):
@@ -159,6 +220,12 @@ def read_provenance(blockdir):
     if part_counts and not prov["saion_partition"]:
         prov["saion_partition"] = max(part_counts, key=lambda k: (part_counts[k], k))
         prov["partitions"] = sorted(part_counts)
+
+    # pipeline.env: the configuration the run was submitted with. Bridge jobs
+    # before the `centroid:` echo left nothing else to read the models from.
+    env = _read_pipeline_env(pdir)
+    if env:
+        _fill_from_env(prov, env)
 
     # Worklist (vname -> {chunk_idx -> expected_frames}) from the archived copy.
     # Only when the contract did not already supply one: on a wave-processed
