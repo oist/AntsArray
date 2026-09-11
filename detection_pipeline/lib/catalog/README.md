@@ -179,7 +179,16 @@ different calibration, the row gets `HMAT_MISMATCH` and the viewer shows an
 amber *mismatch* chip in the `calib` column: that block was tracked with a
 stale or wrong homography and should be re-tracked. The `calibrations` tab lists
 the registry with per-calibration counts of blocks expecting it and blocks
-tracked with it.
+tracked with it, and the KPI row counts `hmat mismatch` blocks.
+
+On the **timeline**, each enabled calibration is a dashed vertical marker at its
+`valid_from` (labelled `calib MM/DD`, hover for the id, filming date and counts),
+in a colour that is reused everywhere: each block bar carries a bottom strip in
+the colour of its *expected* calibration and a top strip in the colour it was
+*tracked with* (grey when tracked but unrecorded); a mismatch also outlines the
+bar in dashed red. Markers more than 45 days outside the shown blocks are
+omitted so an old calibration cannot stretch the axis. The legend in the
+timeline toolbar maps colours to calibration dates.
 
 The registry is applied after the scan cache, like the label overlay. So after a
 new calibration: put its `*_H_mats.npz` under `cameraArray_calib/<date>_…/`,

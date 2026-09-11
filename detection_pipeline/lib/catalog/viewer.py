@@ -295,10 +295,11 @@ const VIEWS={
     ['n_colony_videos','vids',R.num],['has_sidecars','sidecars',(v)=>boolCell(v)],
     ['health_flag','health',(v)=>chip(v,HEALTH[v]||'muted')],
     ['pipeline_status','pipeline',(v,r)=>statusCell(v,r)],['downstream','tracking',(v,r)=>trackCell(v,r)],
-    ['tracking_hmats','hmat used',(v,r)=>hmatCell(v,r)],['calib_expected','calib',(v,r)=>calibCell(v,r)],
     ['completeness_pct','complete %',(v,r)=>pctCell(r)],
     ['n_slp','slp',R.num],['n_aruco_det','aruco',R.num],['n_sleap_data','sleap_h5',R.num],
-    ['sleap_models','models',R.txt],['saion_partition','partition',R.txt],
+    ['sleap_models','models',R.txt],
+    ['tracking_hmats','hmat used',(v,r)=>hmatCell(v,r)],['calib_expected','calib',(v,r)=>calibCell(v,r)],
+    ['saion_partition','partition',R.txt],
     ['stage_reached','stage',R.txt],['hazard_flags','hazards',(v)=>hazCell(v)],
     ['recover_type','recover',(v,r)=>recoverCell(r)],
   ]},
@@ -335,6 +336,19 @@ const TZ_OFF=9*3600*1000;   // JST (UTC+9, no DST): day/night uses recording-sit
 const DAY_START_H=5.5, DAY_END_H=19.5;   // light period 05:30-19:30 JST (14L / 10D)
 const STIM_COL='#8b5cf6';   // stim-pulse stripe colour (violet, reads on both themes)
 let tlPxPerDay=120;         // timeline horizontal zoom (px per day)
+// Calibrations (calibrations.csv): one hue per enabled calibration, oldest valid_from
+// first, so the same calibration has the same colour on the axis markers, the bar
+// strips and the legend. Hues chosen to read on both themes.
+const CALIB_PALETTE=['#2563eb','#16a34a','#ea580c','#9333ea','#0d9488','#db2777','#b45309'];
+function calibAll(){   // every calibration once, oldest first -- colours index into THIS list,
+  const seen={},out=[];  // so retiring one does not recolour the others
+  DATA.calibs.slice().sort((a,b)=>String(a.calib_date||a.valid_from||'').localeCompare(String(b.calib_date||b.valid_from||'')))
+    .forEach(c=>{if(seen[c.calib_id])return;seen[c.calib_id]=1;out.push(c);});
+  return out;
+}
+function calibList(){return calibAll().filter(c=>String(c.enabled)!=='false');}   // what applies to blocks
+function calibColor(id){const i=calibAll().findIndex(c=>c.calib_id===id);return i<0?C.muted:CALIB_PALETTE[i%CALIB_PALETTE.length];}
+function calibShort(id){const m=/^(\d{4})(\d{2})(\d{2})/.exec(id||'');return m?m[2]+'/'+m[3]:String(id||'').slice(0,10);}
 
 function kpis(){
   const c=DATA.catalog;
@@ -346,6 +360,7 @@ function kpis(){
     ['not started',cnt(r=>r.pipeline_status==='not_started')],
     ['stim',cnt(r=>r.is_stim==='true')],
     ['flagged',cnt(r=>r.hazard_flags!=='')],
+    ['hmat mismatch',cnt(r=>String(r.hazard_flags||'').split('|').includes('HMAT_MISMATCH'))],
   ];
   document.getElementById('kpis').innerHTML=tiles.map(t=>
     '<div class="kpi"><div class="v">'+t[1]+'</div><div class="l">'+t[0]+'</div></div>').join('');
@@ -370,7 +385,9 @@ function toolbar(){
       +'<button class="btn" id="copylabels" title="Copy block_labels.csv to clipboard">copy</button>'
       +'<span class="count" id="cnt"></span>';
   }else if(view==='timeline'){
-    h+='<span class="count">night shaded (19:30–05:30 JST · 14L/10D) · bar = recording · <b style="color:'+STIM_COL+'">▏</b> stim pulse</span>'
+    const leg=calibList().map(c=>'<b style="color:'+calibColor(c.calib_id)+'" title="'+esc(c.calib_id)+'">▮</b> '+esc(c.calib_date||c.calib_id)).join('  ');
+    h+='<span class="count">night shaded (19:30–05:30 JST · 14L/10D) · bar = recording · <b style="color:'+STIM_COL+'">▏</b> stim pulse'
+      +(leg?' · calibrations: '+leg+' — bar strip top = tracked with, bottom = expected; dashed red outline = mismatch':'')+'</span>'
       +'<span class="spacer"></span>'
       +'<button class="btn" id="tlout">– zoom</button><button class="btn" id="tlin">zoom +</button>'
       +'<span class="count" id="cnt"></span>';
@@ -435,7 +452,9 @@ function tlData(){
   DATA.catalog.forEach(r=>{const bid=bidOf(r),s=startByBid[bid],dur=parseFloat(r.duration_median_sec);
     if(s===undefined||!isFinite(dur))return;
     out.push({bid:bid,start:s,end:s+dur*1000,health:r.health_flag||'',labels:r.labels||'',
-              fps:parseFloat(r.fps_mode)||24});});
+              fps:parseFloat(r.fps_mode)||24,
+              expected:r.calib_expected||'',used:r.tracking_hmats||'',
+              tracked:String(r.downstream||'').toLowerCase().split('|').includes('tracks')});});
   out.sort((a,b)=>a.start-b.start);
   return out;
 }
@@ -449,8 +468,15 @@ function renderTimeline(scrollRight){
   const dayMs=86400000;
   const floorDay=(t)=>{const d=tlLocal(t);d.setUTCHours(0,0,0,0);return d.getTime()-TZ_OFF;};
   const minT=Math.min.apply(null,rows.map(r=>r.start)), maxT=Math.max.apply(null,rows.map(r=>r.end));
-  const t0=floorDay(minT), t1=floorDay(maxT)+dayMs, pxMs=tlPxPerDay/dayMs;
-  const rowH=24, top=26, W=Math.max(320,(t1-t0)*pxMs+8), H=top+rows.length*rowH+6;
+  // Calibration markers sit at valid_from (JST midnight). Those within 45 days of
+  // the shown blocks are drawn and may widen the axis; farther ones are left out so
+  // a lone old calibration cannot stretch the timeline by months.
+  const dayT=(iso)=>{const m=/^(\d{4})-(\d{2})-(\d{2})$/.exec(String(iso||''));return m?Date.UTC(+m[1],+m[2]-1,+m[3])-TZ_OFF:NaN;};
+  const marks=calibList().map(c=>({c:c,t:dayT(c.valid_from||c.calib_date)}))
+    .filter(m=>isFinite(m.t)&&m.t>=minT-45*dayMs&&m.t<=maxT+45*dayMs);
+  const lo=Math.min.apply(null,[minT].concat(marks.map(m=>m.t))), hi=Math.max.apply(null,[maxT].concat(marks.map(m=>m.t)));
+  const t0=floorDay(lo), t1=floorDay(hi)+dayMs, pxMs=tlPxPerDay/dayMs;
+  const rowH=24, top=marks.length?42:26, W=Math.max(320,(t1-t0)*pxMs+8), H=top+rows.length*rowH+6;
   const X=(t)=>(t-t0)*pxMs;
   const night=getVar('--grid'), dayc=getVar('--surface'), bd=getVar('--border'), ink2=getVar('--ink2');
   let s='<svg width="'+Math.round(W)+'" height="'+H+'" style="display:block">';
@@ -462,12 +488,27 @@ function renderTimeline(scrollRight){
     s+='<text x="'+(x0+4)+'" y="16" style="font-size:11px;fill:'+ink2+'">'+tlDate(d)+'</text>';
   }
   rows.forEach((r,i)=>{
-    const y=top+i*rowH+3, bx=X(r.start), bw=Math.max(2,(r.end-r.start)*pxMs);
+    const y=top+i*rowH+3, bx=X(r.start), bw=Math.max(2,(r.end-r.start)*pxMs), bh=rowH-6;
     const col=C[HEALTH[r.health]||'muted']||C.muted, hrs=((r.end-r.start)/3600000).toFixed(1);
-    s+='<rect x="'+bx+'" y="'+y+'" width="'+bw+'" height="'+(rowH-6)+'" rx="3" '
-      +'style="fill:'+hexa(col,.55)+';stroke:'+col+'"><title>'+esc(r.bid)+'\nstart '+tlDateTime(r.start)
-      +' JST\nend   '+tlDateTime(r.end)+' JST\n'+hrs+' h'+(r.labels?'\nlabels: '+r.labels:'')+'</title></rect>';
-    if(r.labels)s+='<text x="'+(bx+5)+'" y="'+(y+(rowH-6)/2+3.5)+'" '
+    const mism=!!(r.used&&r.expected&&r.used!==r.expected);
+    const tip=r.bid+'\nstart '+tlDateTime(r.start)+' JST\nend   '+tlDateTime(r.end)+' JST\n'+hrs+' h'
+      +(r.labels?'\nlabels: '+r.labels:'')
+      +(r.expected?'\ncalib expected: '+r.expected:'')
+      +(r.used?'\ntracked with:   '+r.used+(mism?'   << MISMATCH: retrack':''):(r.tracked?'\ntracked with:   (unrecorded)':''));
+    s+='<rect x="'+bx+'" y="'+y+'" width="'+bw+'" height="'+bh+'" rx="3" '
+      +'style="fill:'+hexa(col,.55)+';stroke:'+col+'">'
+      +'<title>'+esc(tip)+'</title></rect>';
+    // calibration strips: bottom = expected for the block's date, top = tracked with
+    if(r.expected)s+='<rect x="'+bx+'" y="'+(y+bh-4)+'" width="'+bw+'" height="4" style="fill:'+calibColor(r.expected)+'">'
+      +'<title>expected calibration: '+esc(r.expected)+'</title></rect>';
+    if(r.used)s+='<rect x="'+bx+'" y="'+y+'" width="'+bw+'" height="4" style="fill:'+calibColor(r.used)+'">'
+      +'<title>tracked with: '+esc(r.used)+(mism?' (MISMATCH)':'')+'</title></rect>';
+    else if(r.tracked)s+='<rect x="'+bx+'" y="'+y+'" width="'+bw+'" height="4" style="fill:'+C.muted+';opacity:.6">'
+      +'<title>tracked, calibration unrecorded (TRACKING_UNRECORDED)</title></rect>';
+    // mismatch outline drawn last so the strips cannot cover it
+    if(mism)s+='<rect x="'+bx+'" y="'+y+'" width="'+bw+'" height="'+bh+'" rx="3" '
+      +'style="fill:none;stroke:'+C.crit+';stroke-width:2;stroke-dasharray:4 2;pointer-events:none"/>';
+    if(r.labels)s+='<text x="'+(bx+5)+'" y="'+(y+bh/2+3.5)+'" '
       +'style="font-size:10.5px;fill:'+getVar('--ink')+';pointer-events:none">'+esc(r.labels.replace(/\|/g,' '))+'</text>';
   });
   // stim pulses: frame-anchored so they land on the bar regardless of clock/timezone
@@ -479,8 +520,17 @@ function renderTimeline(scrollRight){
     const fe=parseFloat(t.cam_frame_end), row=rows[i];
     const pS=row.start+(fs/row.fps)*1000, pE=(isFinite(fe)&&fe>fs)?row.start+(fe/row.fps)*1000:pS+5000;
     const yy=top+i*rowH+3, px=X(pS), pw=Math.max(1.5,(pE-pS)*pxMs);
-    s+='<rect x="'+px+'" y="'+yy+'" width="'+pw+'" height="'+(rowH-6)+'" style="fill:'+STIM_COL+';opacity:.85">'
+    s+='<rect x="'+px+'" y="'+(yy+4)+'" width="'+pw+'" height="'+(rowH-14)+'" style="fill:'+STIM_COL+';opacity:.85">'
       +'<title>stim '+esc(String(t.trial||''))+'  '+esc(t.iso_time||'')+(t.duty?'  duty '+esc(String(t.duty)):'')+'</title></rect>';
+  });
+  // calibration markers: dashed line at valid_from, label in the header band, hover for detail
+  marks.forEach(m=>{
+    const x=X(m.t), colr=calibColor(m.c.calib_id), c=m.c;
+    s+='<line x1="'+x+'" y1="'+(top-14)+'" x2="'+x+'" y2="'+H+'" style="stroke:'+colr+';stroke-width:1.5;stroke-dasharray:5 3"/>';
+    s+='<text x="'+(x+4)+'" y="'+(top-4)+'" style="font-size:10.5px;font-weight:600;fill:'+colr+'">calib '+esc(calibShort(c.calib_id))+'</text>';
+    s+='<rect x="'+(x-4)+'" y="'+(top-16)+'" width="8" height="'+(H-top+16)+'" style="fill:transparent;pointer-events:all">'
+      +'<title>'+esc(c.calib_id)+'\nfilmed '+esc(c.calib_date||'?')+'\nvalid from '+esc(c.valid_from||'?')
+      +'\nexpected by '+esc(String(c.blocks_expected||0))+' blocks · tracked with by '+esc(String(c.blocks_tracked||0))+'</title></rect>';
   });
   s+='</svg>';
   chartEl.innerHTML=s;

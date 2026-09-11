@@ -155,9 +155,10 @@ CATALOG_COLUMNS = [
     "n_slp", "n_aruco_det", "n_aruco_tracks", "n_sleap_data",
     "completeness_pct", "completeness_state", "expected_source",
     "chunks_declared", "waves_done", "unclaimed_chunks", "downstream",
+    "sleap_models",
     "tracking_hmats", "tracking_hmats_path", "tracking_x_threshold", "tracked_at",
     "tracking_source", "calib_expected", "calib_expected_from",
-    "sleap_models", "saion_partition", "hazard_flags", "recover_type",
+    "saion_partition", "hazard_flags", "recover_type",
     "recover_missing", "scan_error", "scanned_at",
 ]
 
