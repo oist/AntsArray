@@ -118,7 +118,7 @@ td.num{text-align:right;font-variant-numeric:tabular-nums}
   <div class="row"><button class="btn copy">copy command</button><button class="btn close">close</button></div>
 </div></div>
 <script>
-const DATA = {catalog: __CATALOG__, videos: __VIDEOS__, trials: __TRIALS__};
+const DATA = {catalog: __CATALOG__, videos: __VIDEOS__, trials: __TRIALS__, calibs: __CALIBS__};
 const CAT_ROOT=__ROOTJSON__;   // scanned root, for building run commands
 const C = {good:getVar('--good'),warn:getVar('--warn'),serious:getVar('--serious'),
            crit:getVar('--crit'),info:getVar('--info'),muted:getVar('--muted')};
@@ -131,7 +131,7 @@ function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','
 const STATUS={complete:'good',partial:'warn',not_started:'muted',analysis_only:'info'};
 const HEALTH={ok:'good',warn:'warn',bad:'crit',unknown:'muted','n/a':'muted'};
 const HAZ_CRIT=new Set(['SLEAP_H5_MISSING','ARUCO_MISSING','STAGE_SKEW','SILENT_PARTIAL','DEAD_SYMLINK','TRUNCATED_ARTIFACT']);
-const HAZ_WARN=new Set(['NAME_DATE_MISMATCH','CAM_COUNT_OFF','NO_SESS_FILE','CHUNK_UNVERIFIABLE','TRACKING_UNRECORDED','TRACKING_STATE_CORRUPT']);
+const HAZ_WARN=new Set(['NAME_DATE_MISMATCH','CAM_COUNT_OFF','NO_SESS_FILE','CHUNK_UNVERIFIABLE','TRACKING_UNRECORDED','TRACKING_STATE_CORRUPT','HMAT_MISMATCH']);
 
 function chip(label,colorKey){
   if(label==='')return '<span class="muted">–</span>';
@@ -186,6 +186,16 @@ function trkInfo(r){
   if(idx<0)return {status:'not_started',stage:''};
   if(idx===TRK_STAGES.length-1)return {status:'complete',stage:'interactions'};
   return {status:'partial',stage:TRK_STAGES[idx][0]};
+}
+// Calibration the registry expects for the block's date (calibrations.csv); amber
+// 'mismatch' when the tracking record names a different one -> retrack candidate.
+function calibCell(v,r){
+  if(!v)return '<span class="muted">–</span>';
+  const tip='expected: '+v+(r.calib_expected_from?'\nvalid from: '+r.calib_expected_from:'')
+    +(r.tracking_hmats?'\ntracked with: '+r.tracking_hmats:'');
+  let s='<span class="mono" title="'+esc(tip)+'">'+esc(v)+'</span>';
+  if(r.tracking_hmats&&r.tracking_hmats!==v)s+=' '+chip('mismatch','warn');
+  return s;
 }
 // Which homography (calibration) made this block's tracks: tracks/TRACKING_STATE.json.
 function hmatCell(v,r){
@@ -285,7 +295,7 @@ const VIEWS={
     ['n_colony_videos','vids',R.num],['has_sidecars','sidecars',(v)=>boolCell(v)],
     ['health_flag','health',(v)=>chip(v,HEALTH[v]||'muted')],
     ['pipeline_status','pipeline',(v,r)=>statusCell(v,r)],['downstream','tracking',(v,r)=>trackCell(v,r)],
-    ['tracking_hmats','hmat used',(v,r)=>hmatCell(v,r)],
+    ['tracking_hmats','hmat used',(v,r)=>hmatCell(v,r)],['calib_expected','calib',(v,r)=>calibCell(v,r)],
     ['completeness_pct','complete %',(v,r)=>pctCell(r)],
     ['n_slp','slp',R.num],['n_aruco_det','aruco',R.num],['n_sleap_data','sleap_h5',R.num],
     ['sleap_models','models',R.txt],['saion_partition','partition',R.txt],
@@ -307,6 +317,13 @@ const VIEWS={
     ['cam_frame_end','frame end',R.num],['gyro_rms_dps','gyro rms',R.num],
     ['acc_rms_g','acc rms',R.num],['temp_mean_C','temp C',R.num],
     ['imu_ok','imu',(v)=>boolCell(v)],
+  ]},
+  calibrations:{rows:DATA.calibs, cols:[
+    ['calib_id','calibration',R.txt],['calib_date','filmed',R.txt],['valid_from','valid from',R.txt],
+    ['enabled','enabled',(v)=>boolCell(v)],['variant','stack',R.txt],['n_cams','cams',R.num],
+    ['blocks_expected','blocks expected',R.num],['blocks_tracked','blocks tracked',R.num],
+    ['computed_at','computed',R.txt],['sha256','sha256',(v)=>v?'<span class="mono" title="'+esc(v)+'">'+esc(v.slice(0,12))+'</span>':'<span class="muted">–</span>'],
+    ['hmats_rel','file',R.txt],['note','note',R.txt],
   ]},
 };
 const NUMKEYS=new Set(['n_trials_observed','n_colony_videos','n_slp','n_aruco_det','n_sleap_data',
@@ -334,7 +351,7 @@ function kpis(){
     '<div class="kpi"><div class="v">'+t[1]+'</div><div class="l">'+t[0]+'</div></div>').join('');
 }
 function tabs(){
-  const names=[['catalog','catalog'],['videos','videos'],['trials','trials'],['timeline','timeline']];
+  const names=[['catalog','catalog'],['videos','videos'],['trials','trials'],['calibrations','calibrations'],['timeline','timeline']];
   document.getElementById('tabs').innerHTML=names.map(n=>{
     const cnt=VIEWS[n[0]]?VIEWS[n[0]].rows.length:tlData().length;
     return '<button class="tab'+(n[0]===view?' active':'')+'" data-v="'+n[0]+'">'+n[1]+' ('+cnt+')</button>';}).join('');
@@ -533,6 +550,7 @@ _CATALOG_KEYS = ["session_id", "block", "block_id", "session_kind", "date_start"
                  "n_slp", "n_aruco_det", "n_sleap_data", "sleap_models", "saion_partition",
                  "stage_reached", "downstream", "tracking_hmats", "tracking_hmats_path",
                  "tracking_x_threshold", "tracked_at", "tracking_source",
+                 "calib_expected", "calib_expected_from",
                  "hazard_flags", "recover_type", "recover_missing",
                  "recover_cmd", "recover_steps"]
 _VIDEO_KEYS = ["session_id", "block", "vname", "cam_global", "ext", "has_sidecar", "fps",
@@ -541,6 +559,9 @@ _VIDEO_KEYS = ["session_id", "block", "vname", "cam_global", "ext", "has_sidecar
 _TRIAL_KEYS = ["session_id", "block", "trial", "iso_time", "duty", "dur_s", "interval_s",
                "cam_frame_start", "cam_frame_end", "gyro_rms_dps", "acc_rms_g",
                "temp_mean_C", "imu_ok"]
+_CALIB_KEYS = ["calib_id", "calib_date", "valid_from", "enabled", "variant", "n_cams",
+               "blocks_expected", "blocks_tracked", "computed_at", "sha256", "hmats_rel",
+               "note"]
 
 
 def _embed(rows, columns):
@@ -548,7 +569,8 @@ def _embed(rows, columns):
     return json.dumps(_keep(rows, columns)).replace("<", "\\u003c")
 
 
-def write_html(path, catalog_rows, video_rows, trial_rows, scanned_at, root):
+def write_html(path, catalog_rows, video_rows, trial_rows, scanned_at, root,
+               calib_rows=None):
     """Write a self-contained catalog.html with the rows embedded."""
     html = _TEMPLATE
     html = html.replace("__ROOTJSON__", json.dumps(root).replace("<", "\\u003c"))
@@ -557,5 +579,6 @@ def write_html(path, catalog_rows, video_rows, trial_rows, scanned_at, root):
     html = html.replace("__CATALOG__", _embed(catalog_rows, _CATALOG_KEYS))
     html = html.replace("__VIDEOS__", _embed(video_rows, _VIDEO_KEYS))
     html = html.replace("__TRIALS__", _embed(trial_rows, _TRIAL_KEYS))
+    html = html.replace("__CALIBS__", _embed(calib_rows or [], _CALIB_KEYS))
     with open(path, "w", encoding="utf-8") as f:
         f.write(html)

@@ -11,6 +11,7 @@ import statistics
 
 from . import (cache as cache_mod, const, discover, footprint as fp_mod,
                labels as labels_mod, probe as probe_mod, provenance, qc, tracking as tracking_mod,
+               calib as calib_mod,
                recover, sess_parse, viewer)
 from .classify import name_hints_stim
 
@@ -315,6 +316,19 @@ def run(root, outdir, scanned_at, workers=8, only=None, force=False,
         log("[labels] merged per-block labels into %d/%d rows from %s"
             % (touched, len(catalog_rows), labels_path))
 
+    # Calibration registry: also post-cache, so a new *_H_mats.npz under
+    # cameraArray_calib (or an edited calibration_overrides.csv) re-derives every
+    # block's expected calibration -- and HMAT_MISMATCH against the tracking
+    # record -- on the next run, with no rescan.
+    calib_rows = calib_mod.discover(root, log=log)
+    overrides = calib_mod.load_overrides(
+        os.path.join(outdir, calib_mod.OVERRIDES_FILENAME), log=log)
+    calib_rows = calib_mod.apply_overrides(calib_rows, overrides, log=log)
+    n_exp, n_mis = calib_mod.apply_to_rows(catalog_rows, calib_rows)
+    log("[calib] %d homography stacks in %d calibrations; expected calibration set "
+        "on %d rows; %d HMAT_MISMATCH"
+        % (len(calib_rows), len(set(r["calib_id"] for r in calib_rows)), n_exp, n_mis))
+
     catalog_rows.sort(key=lambda r: (r["session_id"], r["block"]))
     video_rows.sort(key=lambda r: (r["session_id"], r["block"], r["vname"]))
 
@@ -322,10 +336,13 @@ def run(root, outdir, scanned_at, workers=8, only=None, force=False,
         _write_csv(os.path.join(outdir, "catalog.csv"), const.CATALOG_COLUMNS, catalog_rows)
         _write_csv(os.path.join(outdir, "videos.csv"), const.VIDEO_COLUMNS, video_rows)
         _write_csv(os.path.join(outdir, "trials.csv"), const.TRIAL_COLUMNS, trial_rows)
+        _write_csv(os.path.join(outdir, calib_mod.OUTPUT_FILENAME), const.CALIB_COLUMNS,
+                   calib_rows)
         _write_run_json(os.path.join(outdir, "catalog_run.json"),
                         scanned_at, root, catalog_rows, ignored)
         viewer.write_html(os.path.join(outdir, "catalog.html"),
-                          catalog_rows, video_rows, trial_rows, scanned_at, root)
+                          catalog_rows, video_rows, trial_rows, scanned_at, root,
+                          calib_rows=calib_rows)
         if parquet:
             _write_parquet(outdir, catalog_rows, video_rows, trial_rows, log)
         log(f"[write] catalog.csv={len(catalog_rows)} videos.csv={len(video_rows)} "

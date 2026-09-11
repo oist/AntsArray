@@ -133,6 +133,9 @@ HZ_TRACKING_UNRECORDED = "TRACKING_UNRECORDED"
 # tracks/TRACKING_STATE.json exists but cannot be read: distinct from "never
 # recorded", because the fix is to inspect the file, not to backfill over it.
 HZ_TRACKING_STATE_CORRUPT = "TRACKING_STATE_CORRUPT"
+# The tracking record names a different calibration than the registry expects
+# for the block's date: tracked with a stale (or wrong) homography -> retrack.
+HZ_HMAT_MISMATCH = "HMAT_MISMATCH"
 
 TOKEN_JOIN = "|"   # separator for multi-valued cells (Excel-scannable)
 
@@ -153,7 +156,7 @@ CATALOG_COLUMNS = [
     "completeness_pct", "completeness_state", "expected_source",
     "chunks_declared", "waves_done", "unclaimed_chunks", "downstream",
     "tracking_hmats", "tracking_hmats_path", "tracking_x_threshold", "tracked_at",
-    "tracking_source",
+    "tracking_source", "calib_expected", "calib_expected_from",
     "sleap_models", "saion_partition", "hazard_flags", "recover_type",
     "recover_missing", "scan_error", "scanned_at",
 ]
@@ -171,4 +174,11 @@ TRIAL_COLUMNS = [
     "session_id", "block", "trial", "iso_time", "duty", "dur_s", "interval_s",
     "cam_frame_start", "cam_frame_end", "fs_hz", "samples",
     "gyro_rms_dps", "gyro_peak_dps", "acc_rms_g", "acc_peak_g", "temp_mean_C", "imu_ok",
+]
+
+# calibrations.csv: one row per homography stack under cameraArray_calib/
+CALIB_COLUMNS = [
+    "calib_id", "calib_date", "valid_from", "enabled", "variant", "n_cams",
+    "blocks_expected", "blocks_tracked", "hmats_path", "hmats_rel", "sha256", "size",
+    "computed_at", "note",
 ]

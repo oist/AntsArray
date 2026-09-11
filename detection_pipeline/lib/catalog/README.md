@@ -35,6 +35,7 @@ pass the `Z:` mount. Runs auto-log to `<outdir>/logs/catalog_<UTC>.log`.
 | `catalog.csv` | one row per **block** (a flat session = one implicit block) | the "one-go" sheet: identity, stim summary, camera counts, recording health, pipeline status + completeness |
 | `videos.csv` | one row per grid video | per-camera health: fps, frames, missed frames, clean-close, PC/drive |
 | `trials.csv` | one row per vibration pulse | each `CSV_PULSE` with camera frame range + IMU + temperature |
+| `calibrations.csv` | one row per homography stack under `cameraArray_calib/` | the calibration registry: date, `valid_from`, file, sha256, how many blocks expect / were tracked with it |
 | `catalog.html` | — | self-contained browser viewer (data embedded; see below) |
 | `catalog_run.json` | — | run summary + ignored/unknown entries |
 | `.scan_cache.jsonl` | — | incremental cache (do not edit) |
@@ -156,6 +157,36 @@ replaced by a backfill unless `--overwrite` (the displaced record stays in
 `--allow-missing-tracks`. The hmats file is hashed when readable, so two records
 are comparable even after a calibration is recomputed in place.
 
+## Calibration registry (`calibrations.csv`)
+
+Which camera-array calibration (homography stack) applies to which block. Every
+`aruco_H_mats.npz` / `initial_H_mats.npz` / `refined_H_mats.npz` /
+`aruco_board_H_mats.npz` under `cameraArray_calib/<calib_id>/…` becomes a row,
+keyed by the calibration directory name and dated from it (the npz stores no
+date; its mtime is the *computation* date, which for the 20260414 set is two
+months later). `n_cams` is read from the npy header without numpy.
+
+A block's **expected** calibration (`calib_expected`, `calib_expected_from`) is
+the enabled row with the latest `valid_from` on or before the block's
+`date_start`. `valid_from` defaults to the calibration date; adjust it, retire a
+calibration, or annotate it in `<outdir>/calibration_overrides.csv`
+(`calib_id,valid_from,enabled,note`; see `calibration_overrides.example.csv`).
+Blocks with a fuzzy date, and the calibration filmings themselves, get no
+expectation.
+
+Where a block has a tracking record (`tracks/TRACKING_STATE.json`) naming a
+different calibration, the row gets `HMAT_MISMATCH` and the viewer shows an
+amber *mismatch* chip in the `calib` column: that block was tracked with a
+stale or wrong homography and should be re-tracked. The `calibrations` tab lists
+the registry with per-calibration counts of blocks expecting it and blocks
+tracked with it.
+
+The registry is applied after the scan cache, like the label overlay. So after a
+new calibration: put its `*_H_mats.npz` under `cameraArray_calib/<date>_…/`,
+optionally add an override row, and run `catalog.py all` (or `build`) — every
+block from that date on switches its expectation, and anything already tracked
+with the older stack is flagged. No rescan, no code change.
+
 ## Completeness (honest by design)
 
 Newer colony blocks carry no chunk-count ground truth on disk (the pipeline's
@@ -180,7 +211,8 @@ opens `.h5`/`.slp` files — it counts filenames only.
 `TRACKING_UNRECORDED` (`tracks/` landed but no `tracks/TRACKING_STATE.json`
 says which homography made them — the `track-init` backfill queue) ·
 `TRACKING_STATE_CORRUPT` (the record exists but cannot be read — inspect it,
-do not backfill over it).
+do not backfill over it) · `HMAT_MISMATCH` (tracked with a different
+calibration than the registry expects for the block's date — retrack candidate).
 
 ## Example questions
 

@@ -961,6 +961,178 @@ def test_track_init_cli_backfills_and_refuses_what_it_should():
 
 
 # ---------------------------------------------------------------------------
+# calibration registry (catalog/calib.py)
+# ---------------------------------------------------------------------------
+from catalog import calib as calib_mod  # noqa: E402
+
+
+def _write_npz_with_H(path, shape=(25, 3, 3), version=1):
+    """A real .npz holding array 'H' of the given shape, built without numpy.
+
+    version 1 uses the 2-byte header length, version 2 the 4-byte one -- both
+    formats exist in the wild (numpy picks 2 only for very long headers).
+    """
+    import zipfile
+    n = 1
+    for s in shape:
+        n *= s
+    header = "{'descr': '<f8', 'fortran_order': False, 'shape': %s, }" % (tuple(shape),)
+    prefix = 10 if version == 1 else 12
+    pad = 64 - ((prefix + len(header) + 1) % 64)
+    header = header + " " * pad + "\n"
+    if version == 1:
+        npy = b"\x93NUMPY\x01\x00" + len(header).to_bytes(2, "little")
+    else:
+        npy = b"\x93NUMPY\x02\x00" + len(header).to_bytes(4, "little")
+    npy += header.encode("latin1") + b"\x00" * (8 * n)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("H.npy", npy)
+
+
+class CalibTree(object):
+    """A throwaway basler root with a cameraArray_calib/ tree."""
+
+    def __init__(self):
+        self.root = tempfile.mkdtemp(prefix="calibtest_")
+        base = os.path.join(self.root, "cameraArray_calib")
+        # two stacks from one filming, one from another, one legacy pkl, one junk dir
+        _write_npz_with_H(os.path.join(base, "20260414_calibration_dataset", "set0",
+                                       "frame0", "initial_H_mats.npz"))
+        _write_npz_with_H(os.path.join(base, "20260414_calibration_dataset", "set0",
+                                       "frame0", "aruco_stitch", "aruco_H_mats.npz"))
+        _write_npz_with_H(os.path.join(base, "20260623_calib_x", "frame0", "aruco_stitch",
+                                       "aruco_H_mats.npz"))
+        legacy = os.path.join(base, "2023-12-26-22-42_AruCo_glass")
+        os.makedirs(legacy)
+        with open(os.path.join(legacy, "cam_homographies.pkl"), "wb") as f:
+            f.write(b"pkl")
+        os.makedirs(os.path.join(base, "lens_FOV_calculation"))
+        self.outdir = os.path.join(self.root, "_catalog")
+        os.makedirs(self.outdir)
+
+    def close(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+
+def test_registry_discovers_stacks_dated_from_the_directory_name():
+    t = CalibTree()
+    try:
+        rows = calib_mod.discover(t.root)
+        assert [(r["calib_id"], r["variant"]) for r in rows] == [
+            ("20260414_calibration_dataset", "aruco_stitch"),
+            ("20260414_calibration_dataset", "initial"),
+            ("20260623_calib_x", "aruco_stitch")]
+        assert rows[0]["calib_date"] == "2026-04-14" and rows[0]["valid_from"] == "2026-04-14"
+        assert rows[2]["calib_date"] == "2026-06-23"
+        assert all(r["n_cams"] == 25 for r in rows)
+        assert all(len(r["sha256"]) == 64 and r["enabled"] == "true" for r in rows)
+        assert rows[2]["hmats_rel"] == "cameraArray_calib/20260623_calib_x/frame0/aruco_stitch/aruco_H_mats.npz"
+        assert "\\" not in rows[2]["hmats_path"]
+        # the 2023 pkl and the junk dir contribute nothing, but dashed names still date
+        assert calib_mod.calib_date_from_name("2023-12-26-22-42_AruCo_glass") == "2023-12-26"
+        assert calib_mod.calib_date_from_name("lens_FOV_calculation") == ""
+    finally:
+        t.close()
+
+
+def test_npz_header_shape_is_read_without_numpy():
+    t = CalibTree()
+    try:
+        p = os.path.join(t.root, "odd.npz")
+        _write_npz_with_H(p, shape=(19, 3, 3))
+        assert calib_mod.npz_h_shape(p) == (19, 3, 3)
+        p2 = os.path.join(t.root, "v2.npz")
+        _write_npz_with_H(p2, shape=(25, 3, 3), version=2)          # 4-byte header length
+        assert calib_mod.npz_h_shape(p2) == (25, 3, 3)
+        with open(os.path.join(t.root, "not.npz"), "wb") as f:
+            f.write(b"nope")
+        assert calib_mod.npz_h_shape(os.path.join(t.root, "not.npz")) is None
+    finally:
+        t.close()
+
+
+def test_overrides_adjust_valid_from_and_retire_calibrations():
+    t = CalibTree()
+    try:
+        ov = os.path.join(t.outdir, calib_mod.OVERRIDES_FILENAME)
+        with open(ov, "w") as f:
+            f.write("# comment\ncalib_id,valid_from,enabled,note\n"
+                    "20260414_calibration_dataset,,false,superseded\n"
+                    "20260623_calib_x,2026-07-01,,rig re-levelled\n"
+                    "not_a_calib,2026-01-01,,ignored\n"
+                    "20260623_calib_x,31/07/2026,,bad date ignored\n"
+                    "20260623_calib_x,2026-13-40,,impossible date ignored\n")
+        msgs = []
+        o = calib_mod.load_overrides(ov, log=msgs.append)
+        rows = calib_mod.apply_overrides(calib_mod.discover(t.root), o, log=msgs.append)
+        by = dict(((r["calib_id"], r["variant"]), r) for r in rows)
+        assert by[("20260414_calibration_dataset", "initial")]["enabled"] == "false"
+        assert by[("20260414_calibration_dataset", "aruco_stitch")]["note"] == "superseded"
+        # repeated id: fields merge, so line 1's valid_from survives the later
+        # lines whose dates were rejected; the last note wins; repeats are reported
+        assert by[("20260623_calib_x", "aruco_stitch")]["valid_from"] == "2026-07-01"
+        assert by[("20260623_calib_x", "aruco_stitch")]["note"] == "impossible date ignored"
+        assert any("not_a_calib" in m for m in msgs) and any("31/07/2026" in m for m in msgs)
+        assert any("2026-13-40" in m for m in msgs)
+        assert any("more than once" in m for m in msgs)
+    finally:
+        t.close()
+
+
+def test_expected_calibration_is_latest_valid_from_on_or_before_the_block_date():
+    t = CalibTree()
+    try:
+        rows = calib_mod.discover(t.root)
+        exp = calib_mod.expected_for
+        assert exp(rows, "2026-04-13") == ("", "")                       # before any
+        assert exp(rows, "2026-04-14") == ("20260414_calibration_dataset", "2026-04-14")
+        assert exp(rows, "2026-06-22") == ("20260414_calibration_dataset", "2026-04-14")
+        assert exp(rows, "2026-06-23") == ("20260623_calib_x", "2026-06-23")
+        assert exp(rows, "2026-09-11") == ("20260623_calib_x", "2026-06-23")
+        assert exp(rows, "2025-09") == ("", "")                          # fuzzy: no guess
+        retired = calib_mod.apply_overrides(rows, {"20260623_calib_x": {"enabled": "false"}})
+        assert exp(retired, "2026-09-11") == ("20260414_calibration_dataset", "2026-04-14")
+    finally:
+        t.close()
+
+
+def test_apply_to_rows_sets_expectation_flags_mismatch_and_counts():
+    t = CalibTree()
+    try:
+        rows = calib_mod.discover(t.root)
+        cat = [
+            {"block_id": "20260716/block01", "session_kind": "session", "labels": "",
+             "date_start": "2026-07-16", "tracking_hmats": "20260623_calib_x", "hazard_flags": ""},
+            {"block_id": "20260515/block01", "session_kind": "session", "labels": "",
+             "date_start": "2026-05-15", "tracking_hmats": "20260623_calib_x",
+             "hazard_flags": "NO_SESS_FILE"},                     # tracked with the later one
+            {"block_id": "20260810/block02", "session_kind": "session", "labels": "",
+             "date_start": "2026-08-10", "tracking_hmats": "", "hazard_flags": ""},   # untracked
+            {"block_id": "20260414_x/set0", "session_kind": "aux", "labels": "calibration",
+             "date_start": "2026-04-14", "tracking_hmats": "", "hazard_flags": ""},
+            {"block_id": "2025_Sep/-", "session_kind": "session", "labels": "",
+             "date_start": "2025-09", "tracking_hmats": "", "hazard_flags": ""},
+        ]
+        n_exp, n_mis = calib_mod.apply_to_rows(cat, rows)
+        assert (n_exp, n_mis) == (3, 1)
+        assert cat[0]["calib_expected"] == "20260623_calib_x" and cat[0]["hazard_flags"] == ""
+        assert cat[1]["calib_expected"] == "20260414_calibration_dataset"
+        assert cat[1]["hazard_flags"] == "NO_SESS_FILE|HMAT_MISMATCH"
+        assert cat[2]["calib_expected"] == "20260623_calib_x" and cat[2]["hazard_flags"] == ""
+        assert cat[3]["calib_expected"] == "" and cat[4]["calib_expected"] == ""
+        by = dict((r["calib_id"], r) for r in rows)
+        assert by["20260623_calib_x"]["blocks_expected"] == 2
+        assert by["20260623_calib_x"]["blocks_tracked"] == 2
+        assert by["20260414_calibration_dataset"]["blocks_expected"] == 1
+        # idempotent: a second application does not double the flag
+        calib_mod.apply_to_rows(cat, rows)
+        assert cat[1]["hazard_flags"] == "NO_SESS_FILE|HMAT_MISMATCH"
+    finally:
+        t.close()
+
+
+# ---------------------------------------------------------------------------
 # runner
 # ---------------------------------------------------------------------------
 def _run_all():
