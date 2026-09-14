@@ -36,6 +36,7 @@ import gc
 import logging
 import os
 import re
+import sys
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -44,6 +45,13 @@ import h5py
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.append(str(REPO_ROOT))
+
+from camera_cal.region_paths import panorama_regions_path, panorama_tracking_split
+
 
 # -----------------------------------------------------------------------------#
 #                                CONFIGURATION                                 #
@@ -61,6 +69,36 @@ X_THRESHOLD: float = DEFAULT_X_THRESHOLD
 # -----------------------------------------------------------------------------#
 #                                   HELPERS                                    #
 # -----------------------------------------------------------------------------#
+
+
+def resolve_x_threshold(data_dir: Path, override: float | None = None) -> float:
+    """Use this recording's annotations or the most recent earlier date's."""
+    if override is not None:
+        logging.info(
+            "Not using panorama_regions.csv for the left/right split: "
+            "explicit --x_threshold override X=%.12g", override,
+        )
+        return float(override)
+    block_dir = Path(data_dir).parent
+    current_regions_path = panorama_regions_path(block_dir)
+    regions_path = panorama_regions_path(block_dir, search_earlier_dates=True)
+    if not regions_path.exists():
+        message = (
+            f"No panorama_regions.csv for {block_dir} or any earlier recording date "
+            "in the same dataset root. Annotated boundaries are unavailable; "
+            "provide annotations or an explicit --x_threshold override to map detections."
+        )
+        logging.error(message)
+        raise FileNotFoundError(message)
+    if regions_path != current_regions_path:
+        logging.warning("Using panorama regions from the most recent earlier recording date: %s",
+                        regions_path)
+    threshold, regions_path = panorama_tracking_split(block_dir, regions_path=regions_path)
+    logging.info(
+        "Tracking left/right split X=%.12g from %s (raw tracking pixels)",
+        threshold, regions_path,
+    )
+    return threshold
 
 
 def set_x_threshold(value: float) -> None:
@@ -758,14 +796,14 @@ def main() -> None:
         "--x-threshold",
         dest="x_threshold",
         type=float,
-        default=DEFAULT_X_THRESHOLD,
-        help=f"Panorama X coordinate used to split left/right outputs. Default: {DEFAULT_X_THRESHOLD:g}",
+        default=None,
+        help="Override the split; default reads full-arena regions from this or the latest earlier recording.",
     )
     p.add_argument("--skip_existing", action="store_true", help="Do not overwrite existing panorama PKLs.")
 
     args = p.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-    set_x_threshold(args.x_threshold)
+    set_x_threshold(resolve_x_threshold(Path(args.data_dir), args.x_threshold))
 
     out_dir = Path(args.outdir)
     out_dir.mkdir(parents=True, exist_ok=True)

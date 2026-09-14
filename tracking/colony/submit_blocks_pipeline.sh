@@ -81,10 +81,9 @@ SLURM_SETUP=""
 # Pipeline behavior.
 MAP_MODE="both"
 SIDE="both"
-X_THRESHOLD="2500.0"
 SKIP_EXISTING=1
-# Panorama left/right split centerline (X). Empty = use pipeline.py's default.
-# Calibration-specific: it must match the homography (--hmats) in use.
+# Empty = read full-arena regions from this recording or the latest earlier date.
+# Missing or invalid arena annotations stop automatic mapping.
 X_THRESHOLD=""
 
 # Panorama mapping job resources.
@@ -289,7 +288,8 @@ Optional:
   --map_mode MODE           aruco, sleap, or both. Default: both
   --side SIDE               left, right, or both. Default: both
   --x_threshold FLOAT       Panorama left/right split X (must match the hmats
-                            calibration). Empty = pipeline.py default.
+                            calibration). Empty = full-arena panorama_regions.csv from this
+                            recording or the latest earlier date.
   --skip_existing           Do not overwrite existing outputs. Default: on.
   --force_recompute         Overwrite/recompute existing flash outputs.
   --map_cpus N              CPUs for panorama jobs. Default: 8

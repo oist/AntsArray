@@ -110,6 +110,26 @@ The same pattern is used for generic per-track analysis with `scripts/per_track_
 
 `tracking/colony/pipeline.py` calls `tracking/colony/map_combine.py` to map per-camera ArUco and SLEAP detections through `initial_H_mats.npz`.
 
+Both the pipeline and standalone `map_combine.py` read the left/right split from the block's `panorama_regions.csv`,
+falling back to the date folder's annotations. It uses the midpoint between the
+two full-arena rectangles in raw tracking pixels. In
+`tracking/gui/panorama_region_annotator.py`, the **Left arena** and **Right arena**
+buttons draw rectangles with fixed `arena_left` and `arena_right` labels. The GUI
+previews the tracking split as a red line and saves that line in the annotated
+panorama. Redrawing a side replaces its arena rectangle and can be undone.
+Colony/nest rectangles are excluded: their positions within the arenas do not
+define the divider. Missing arena annotations stop automatic mapping with an
+actionable error. Older `arena`, `arenaL`/`arenaR`, and underscored arena labels
+remain readable. If neither file exists, mapping searches earlier dated recording
+folders under the same dataset root, including their `block*/panorama_regions.csv`
+files. It selects the newest recording date strictly before the current date;
+within that date, it selects the most recently modified annotation file. Recording
+folder names may be `YYYYMMDD` or start with `YYYYMMDD_` / `YYYYMMDD-`.
+The selected source and split are logged. Future dates are excluded. If no earlier
+file exists, or the selected annotations are invalid, mapping stops with a clear
+error; `--x_threshold` provides an explicit override, which is also logged.
+Rebuild panorama PKLs when changing the split.
+
 Outputs:
 
 ```text

@@ -34,19 +34,33 @@ def run_mapping(
     panorama_dir: Path,
     map_mode: str,
     min_instance_frame_frac: float,
-    x_threshold: float,
+    x_threshold: float | None,
     skip_existing: bool,
     chunks: set[str] | None = None,
+    tracking_state_dir: Path | None = None,
 ) -> None:
     from tracking.colony.map_combine import (
         infer_experiment_name,
         load_homographies,
         process_aruco_chunks,
         process_sleap_chunks,
+        resolve_x_threshold,
         set_x_threshold,
     )
 
-    set_x_threshold(x_threshold)
+    resolved_threshold = resolve_x_threshold(data_dir, x_threshold)
+    set_x_threshold(resolved_threshold)
+    if tracking_state_dir is not None:
+        tracking_state_dir.mkdir(parents=True, exist_ok=True)
+        rec = tracking_state.record_map(
+            tracking_state_dir, hmats=hmats_path, x_threshold=resolved_threshold,
+            map_mode=map_mode, min_instance_frame_frac=min_instance_frame_frac,
+            data_dir=data_dir, chunks=sorted(chunks) if chunks is not None else None,
+            code_dir=REPO_ROOT, argv=sys.argv,
+        )
+        logging.info("tracking record: %s (hmats %s, x_threshold %s)",
+                     tracking_state.state_path(tracking_state_dir),
+                     rec["map"]["hmats_calib_id"], resolved_threshold)
     hmats = load_homographies(hmats_path)
     exp = infer_experiment_name(data_dir)
     panorama_dir.mkdir(parents=True, exist_ok=True)
@@ -206,8 +220,9 @@ def main() -> None:
         "--x-threshold",
         dest="x_threshold",
         type=float,
-        default=2500.0,  # keep in sync with map_combine.DEFAULT_X_THRESHOLD
-        help="Panorama X coordinate used by map_combine to split left/right PKLs.",
+        default=None,
+        help=("Override split X; default reads full-arena panorama_regions.csv "
+              "from this recording or the latest earlier recording date."),
     )
 
     parser.add_argument("--side", choices=("left", "right", "both"), default="both")
@@ -293,25 +308,7 @@ def main() -> None:
 
     if not args.skip_map:
         logging.info("Stage 1/3: mapping detections into panorama PKLs")
-        # Record which homography and split are about to make these tracks.
-        # Written before mapping so a run that dies half-way still leaves the
-        # settings its partial outputs were made with. tracks/ travels to the
-        # bucket with the transfer manifest, so the catalog can read it there.
-        tracks_dir.mkdir(parents=True, exist_ok=True)
-        rec = tracking_state.record_map(
-            tracks_dir,
-            hmats=args.hmats,
-            x_threshold=args.x_threshold,
-            map_mode=args.map_mode,
-            min_instance_frame_frac=args.min_instance_frame_frac,
-            data_dir=args.data_dir,
-            chunks=complete_chunks,
-            code_dir=REPO_ROOT,
-            argv=sys.argv,
-        )
-        logging.info("tracking record: %s (hmats %s, x_threshold %s)",
-                     tracking_state.state_path(tracks_dir),
-                     rec["map"]["hmats_calib_id"], args.x_threshold)
+        # Persist the resolved annotation boundary before writing any mapped detections.
         run_mapping(
             hmats_path=args.hmats,
             data_dir=args.data_dir,
@@ -321,6 +318,7 @@ def main() -> None:
             x_threshold=args.x_threshold,
             skip_existing=args.skip_existing,
             chunks=set(complete_chunks),
+            tracking_state_dir=tracks_dir,
         )
 
     if not args.skip_combine:
