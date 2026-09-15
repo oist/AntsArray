@@ -18,7 +18,12 @@
 #SBATCH --signal=TERM@60
 set -eo pipefail
 
-source ~/.bashrc
+# Batch jobs need the site modules, not interactive conda/mamba hooks. Sourcing
+# ~/.bashrc under set -e can exit before SLEAP loads when a user hook is missing.
+if ! type module >/dev/null 2>&1; then
+	source /etc/profile
+fi
+export PYTHONNOUSERSITE=1
 module use /apps/unit/ReiterU/.modulefiles
 module load __SLEAP_MODULE__
 
