@@ -10,7 +10,9 @@ import os
 import statistics
 
 from . import (cache as cache_mod, const, discover, footprint as fp_mod,
-               probe as probe_mod, provenance, qc, recover, sess_parse, viewer)
+               labels as labels_mod, probe as probe_mod, provenance, qc, tracking as tracking_mod,
+               calib as calib_mod,
+               recover, sess_parse, viewer)
 from .classify import name_hints_stim
 
 
@@ -59,6 +61,22 @@ def _missing_cam_ids(unit):
     return const.TOKEN_JOIN.join(str(i) for i in missing)
 
 
+def _unclaimed_cell(unclaimed):
+    """One CSV cell for the chunk indices no wave ever claimed.
+
+    Collapses to a single range when every video agrees (the usual case: all 25
+    cameras are the same length), and only names cameras when they diverge --
+    otherwise a 25-camera block would fill the cell with the same range 25 times.
+    """
+    if not unclaimed:
+        return ""
+    ranges = set(unclaimed.values())
+    if len(ranges) == 1:
+        return ranges.pop()
+    return const.TOKEN_JOIN.join(
+        "%s:%s" % (v, unclaimed[v]) for v in sorted(unclaimed))
+
+
 # --------------------------------------------------------------------------
 # row assembly
 # --------------------------------------------------------------------------
@@ -79,11 +97,16 @@ def _assemble(unit, fp, scanned_at, workers, allow_ffprobe, root, outdir, config
     cam_map = sess.cam_pc_map if sess else {}
 
     hazards = qc.derive_hazards(unit, fp, video_infos)
+    trk = tracking_mod.read_tracking(unit.path)
+    hazards += qc.tracking_hazards(fp, trk)
     status = qc.pipeline_status(unit, fp)
     health = qc.rollup_health(video_infos)
 
     vinfo = {vi.vname: (vi.fps or 0, vi.frame_count or 0) for vi in video_infos}
-    prov = provenance.read_provenance(unit.path) if fp.has_hpc_logs else {}
+    # Unconditional: a block can carry a PIPELINE_STATE.json contract without
+    # having hpc_logs (the contract is written at submit, logs archived only at
+    # cleanup). read_provenance returns empty fields when neither source exists.
+    prov = provenance.read_provenance(unit.path)
     rec = recover.recovery_summary(root, unit.session_id, unit.block, fp, vinfo,
                                    const.HZ_SILENT_PARTIAL in hazards, outdir,
                                    prov, config_default)
@@ -168,7 +191,16 @@ def _assemble(unit, fp, scanned_at, workers, allow_ffprobe, root, outdir, config
         "n_aruco_tracks": fp.n_aruco_tracks, "n_sleap_data": fp.n_sleap_data,
         "completeness_pct": _fmt(fp.completeness_pct),
         "completeness_state": fp.completeness_state,
+        "expected_source": fp.expected_source,
+        "chunks_declared": _fmt(fp.expected_total if fp.expected_source == "declared"
+                                else None),
+        "waves_done": _fmt(len(fp.waves) if fp.waves else None),
+        "unclaimed_chunks": _unclaimed_cell(fp.unclaimed),
         "downstream": const.TOKEN_JOIN.join(fp.downstream),
+        "tracking_hmats": trk["tracking_hmats"],
+        "tracking_hmats_path": trk["tracking_hmats_path"],
+        "tracking_x_threshold": trk["tracking_x_threshold"],
+        "tracked_at": trk["tracked_at"], "tracking_source": trk["tracking_source"],
         "hazard_flags": const.TOKEN_JOIN.join(hazards),
         "sleap_models": provenance.model_label(prov),
         "sleap_model_centroid": prov.get("sleap_model_centroid", ""),
@@ -225,7 +257,7 @@ def _write_parquet(outdir, catalog_rows, video_rows, trial_rows, log):
 # --------------------------------------------------------------------------
 def run(root, outdir, scanned_at, workers=8, only=None, force=False,
         allow_ffprobe=False, parquet=False, check_sizes=False, mode="all",
-        log=print):
+        labels_file=None, log=print):
     os.makedirs(outdir, exist_ok=True)
     cache_path = os.path.join(outdir, ".scan_cache.jsonl")
     old_cache = cache_mod.Cache(cache_path)
@@ -275,6 +307,28 @@ def run(root, outdir, scanned_at, workers=8, only=None, force=False,
         video_rows += rec["video_rows"]
         trial_rows += rec["trial_rows"]
 
+    # Per-block label overlay: applied post-cache so edits to the file take
+    # effect every run (incl. `build` mode / cache hits) without a rescan.
+    labels_path = labels_file or os.path.join(outdir, labels_mod.LABELS_FILENAME)
+    block_labels = labels_mod.load_block_labels(labels_path, log=log)
+    if block_labels:
+        touched = labels_mod.apply_to_rows(catalog_rows, block_labels)
+        log("[labels] merged per-block labels into %d/%d rows from %s"
+            % (touched, len(catalog_rows), labels_path))
+
+    # Calibration registry: also post-cache, so a new *_H_mats.npz under
+    # cameraArray_calib (or an edited calibration_overrides.csv) re-derives every
+    # block's expected calibration -- and HMAT_MISMATCH against the tracking
+    # record -- on the next run, with no rescan.
+    calib_rows = calib_mod.discover(root, log=log)
+    overrides = calib_mod.load_overrides(
+        os.path.join(outdir, calib_mod.OVERRIDES_FILENAME), log=log)
+    calib_rows = calib_mod.apply_overrides(calib_rows, overrides, log=log)
+    n_exp, n_mis = calib_mod.apply_to_rows(catalog_rows, calib_rows)
+    log("[calib] %d homography stacks in %d calibrations; expected calibration set "
+        "on %d rows; %d HMAT_MISMATCH"
+        % (len(calib_rows), len(set(r["calib_id"] for r in calib_rows)), n_exp, n_mis))
+
     catalog_rows.sort(key=lambda r: (r["session_id"], r["block"]))
     video_rows.sort(key=lambda r: (r["session_id"], r["block"], r["vname"]))
 
@@ -282,10 +336,13 @@ def run(root, outdir, scanned_at, workers=8, only=None, force=False,
         _write_csv(os.path.join(outdir, "catalog.csv"), const.CATALOG_COLUMNS, catalog_rows)
         _write_csv(os.path.join(outdir, "videos.csv"), const.VIDEO_COLUMNS, video_rows)
         _write_csv(os.path.join(outdir, "trials.csv"), const.TRIAL_COLUMNS, trial_rows)
+        _write_csv(os.path.join(outdir, calib_mod.OUTPUT_FILENAME), const.CALIB_COLUMNS,
+                   calib_rows)
         _write_run_json(os.path.join(outdir, "catalog_run.json"),
                         scanned_at, root, catalog_rows, ignored)
         viewer.write_html(os.path.join(outdir, "catalog.html"),
-                          catalog_rows, video_rows, trial_rows, scanned_at, root)
+                          catalog_rows, video_rows, trial_rows, scanned_at, root,
+                          calib_rows=calib_rows)
         if parquet:
             _write_parquet(outdir, catalog_rows, video_rows, trial_rows, log)
         log(f"[write] catalog.csv={len(catalog_rows)} videos.csv={len(video_rows)} "

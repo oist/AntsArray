@@ -47,6 +47,28 @@ def test_mapping_reads_block_regions_and_splits_aruco(tmp_path, monkeypatch):
     assert right.X.tolist() == [1950.0, 2200.0]
 
 
+def test_tracking_record_stores_resolved_arena_split_before_mapping(tmp_path, monkeypatch):
+    write_regions(tmp_path / "panorama_regions.csv")
+    tracks = tmp_path / "tracks"
+    hmats = tmp_path / "H.npz"
+    hmats.write_bytes(b"test calibration")
+    monkeypatch.setattr(map_combine, "X_THRESHOLD", 2500.0)
+    monkeypatch.setattr(map_combine, "load_homographies", lambda _: [])
+    monkeypatch.setattr(map_combine, "infer_experiment_name", lambda _: "test")
+
+    def check_record(*args, **kwargs):
+        state = pipeline.tracking_state.load(tracks)
+        assert state["map"]["x_threshold"] == map_combine.X_THRESHOLD == 1950.0
+        assert state["map"]["chunks"] == {"first": "000", "last": "001", "count": 2}
+
+    monkeypatch.setattr(map_combine, "process_aruco_chunks", check_record)
+    pipeline.run_mapping(hmats_path=hmats, data_dir=tmp_path / "data",
+                         panorama_dir=tmp_path / "panorama", map_mode="aruco",
+                         min_instance_frame_frac=0.25, x_threshold=None,
+                         skip_existing=False, chunks={"000", "001"},
+                         tracking_state_dir=tracks)
+
+
 def test_date_fallback_and_annotation_order(tmp_path):
     block = tmp_path / "20260515" / "block03"
     block.mkdir(parents=True)

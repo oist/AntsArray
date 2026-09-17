@@ -36,6 +36,21 @@ rsync_retry() {
 	return 1
 }
 
+# Slurm lives in the cluster's login-shell setup, not necessarily ~/.bashrc.
+# Wrap only remote command execution: rsync and file-transfer SSH must keep
+# their original protocol. Quote once so remote variables, paths and stdin
+# survive the additional shell without being evaluated on the submitting host.
+ssh_login_retry() {
+	if (( $# < 2 )); then
+		echo "usage: ssh_login_retry HOST COMMAND [ARGS...]" >&2
+		return 2
+	fi
+	local host="$1" command
+	shift
+	printf -v command 'bash -lc %q' "$*"
+	ssh_retry "$host" "$command"
+}
+
 host_resolves() {
 	getent hosts "$1" >/dev/null 2>&1
 }

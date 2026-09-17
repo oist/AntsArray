@@ -7,8 +7,9 @@ honest expected-chunk denominator, and completeness_state is reported as
 """
 import os
 
-from . import const
+from . import const, provenance
 from .model import Footprint
+from .provenance import pipeline_state  # shared import shim; see provenance.py
 
 _STAGE_ORDER = ["none", "chunk", "sleap", "aruco", "tracks", "stitched", "interactions"]
 
@@ -129,22 +130,46 @@ def scan_footprint(unit, check_sizes=False):
         fp.completeness_state = "n/a" if fp.pipeline_format == "none" else "unverifiable"
         return fp
 
-    # Deepest-stage expected chunks per video (contiguous 0..max assumed).
-    vnames = set(slp) | set(det) | set(trk) | set(sdat)
-    expected = {}
-    for v in vnames:
-        idxs = set()
-        for d in (slp, det, trk, sdat):
-            idxs |= {int(x) for x in d.get(v, ())}
-        expected[v] = (max(idxs) + 1) if idxs else 0
-    fp.expected_per_video = expected
-    fp.expected_total = sum(expected.values())
+    # Expected chunks per video. Two sources, and the difference matters:
+    #
+    #   declared -- the block's PIPELINE_STATE.json records n_chunks per video.
+    #   observed -- inferred as 0..max(chunk_idx seen); the only option before
+    #               the contract existed, and still the path for older blocks.
+    #
+    # The observed form cannot distinguish a finished block from one that stopped
+    # early, because it derives the denominator from the very outputs it is
+    # judging. A block processed in waves reads as 100% complete the moment its
+    # first wave lands. Prefer the declaration wherever there is one.
+    state = provenance.read_state(unit.path)
+    if state:
+        ch = state.get("chunking", {})
+        fp.expected_per_video = dict((v, int(m.get("n_chunks", 0)))
+                                     for v, m in ch.get("videos", {}).items())
+        fp.expected_source = "declared"
+        fp.chunk_sec = ch.get("chunk_sec")
+        fp.chunk_sec_source = "state"
+        fp.waves = list(state.get("waves", []))
+        fp.unclaimed = pipeline_state.unclaimed_ranges(state)
+        fp.wave_gaps = pipeline_state.interior_gaps(state)
+        fp.state_path = pipeline_state.state_path(unit.data_dir)
+    else:
+        vnames = set(slp) | set(det) | set(trk) | set(sdat)
+        expected = {}
+        for v in vnames:
+            idxs = set()
+            for d in (slp, det, trk, sdat):
+                idxs |= {int(x) for x in d.get(v, ())}
+            expected[v] = (max(idxs) + 1) if idxs else 0
+        fp.expected_per_video = expected
+        fp.expected_source = "observed"
+    fp.expected_total = sum(fp.expected_per_video.values())
 
     present = fp.n_slp + fp.n_aruco_det + fp.n_aruco_tracks + fp.n_sleap_data
     denom = 4 * fp.expected_total
     if denom:
         fp.completeness_pct = round(present / denom, 4)
-        fp.completeness_state = "internal"
+        fp.completeness_state = ("declared" if fp.expected_source == "declared"
+                                 else "internal")
     else:
         fp.completeness_state = "unverifiable"
     return fp

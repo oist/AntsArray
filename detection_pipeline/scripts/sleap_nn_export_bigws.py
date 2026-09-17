@@ -13,10 +13,11 @@ to WORKSPACE_GB (env, default 16 GB), then hands off to the regular sleap-nn
 CLI. Every other flag (--max-batch-size, --precision, --device, ...) behaves
 exactly as upstream documents.
 
-Usage on a saion largegpu node, with sleap-nn/0.2.0 module loaded:
+Usage on a saion largegpu node, with a sleap-nn module loaded. UV_TOOL_DIR is
+only exported by the 0.2.0 modulefile; resolve through PATH so 0.3.x works too:
 
     WORKSPACE_GB=16 \\
-    "$UV_TOOL_DIR/sleap-nn/bin/python" \\
+    "$(dirname "$(readlink -f "$(command -v sleap-nn)")")/python" \\
         $SCRIPTS_DIR/sleap_nn_export_bigws.py \\
         export <centroid-dir> <instance-dir> \\
         -o <out-dir> -f tensorrt --precision fp16 \\

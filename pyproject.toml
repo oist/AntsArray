@@ -19,6 +19,7 @@ dependencies = [
     "statsmodels",
     "tqdm",
     "h5py",
+    "tables",
     "opencv-python",
     "pillow",
     "torch",
@@ -37,3 +38,8 @@ build-backend = "hatchling.build"
 
 [tool.uv]
 package = false
+
+[tool.pytest.ini_options]
+testpaths = ["analysis", "tracking", "camera_cal", "scripts", "detection_pipeline", "group_labelling"]
+# Exploratory *_test.py scripts execute real datasets when imported.
+python_files = ["test_*.py"]

@@ -308,7 +308,11 @@ def main():
 			    (done, n, v.stem, tag, fps, int(frames), duration, n_chunks))
 
 	with args.out.open("w", newline="") as f:
-		w = csv.DictWriter(f, fieldnames=[
+		# lineterminator="\n": csv defaults to CRLF, which leaves the LAST field
+		# carrying a stray \r for anything that reads this with awk instead of the
+		# csv module. That cost chunk.sbatch its alignment guard -- n_chunks
+		# arrived as "198\r" and the arithmetic silently evaluated false.
+		w = csv.DictWriter(f, lineterminator="\n", fieldnames=[
 			"vname", "source_path", "ext", "fps",
 			"frame_count", "duration_sec", "n_chunks",
 		])

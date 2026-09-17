@@ -17,6 +17,9 @@ import csv
 import sys
 from pathlib import Path
 
+# Same dir; sys.path[0] is lib/ when chunk_finalize runs this as a script.
+import pipeline_state
+
 
 def main():
 	ap = argparse.ArgumentParser(description=__doc__)
@@ -24,7 +27,18 @@ def main():
 	ap.add_argument("--out", required=True, type=Path)
 	ap.add_argument("--chunk-sec", type=int, default=7200,
 	                help="ffmpeg segment duration in seconds; used to derive per-chunk frame cap")
+	ap.add_argument("--chunk-range", default="",
+	                help="inclusive chunk-index window 'A-B' (or 'A') to emit; "
+	                     "empty = the whole block. Chunk indices are stable for a "
+	                     "given --chunk-sec, so a window always names the same span "
+	                     "of wall-clock across runs.")
 	args = ap.parse_args()
+
+	try:
+		rng = pipeline_state.parse_range(args.chunk_range)
+	except ValueError as e:
+		print(f"[ERR] --chunk-range: {e}", file=sys.stderr)
+		return 2
 
 	rows = []
 	with args.manifest.open() as f:
@@ -49,12 +63,34 @@ def main():
 
 	rows.sort()
 
+	# Wave processing: keep only the requested chunk-index window. Filtering here
+	# rather than splitting the source videos is what keeps waves safe -- the
+	# index of a chunk is a pure function of (video, --chunk-sec), so `_042`
+	# names the same span of wall-clock in every wave, and re-running a window
+	# overwrites its own outputs instead of colliding with a neighbour's.
+	# A window is clamped per video, so a short camera simply contributes fewer
+	# rows instead of erroring.
+	total = len(rows)
+	max_idx = max((r[0] for r in rows), default=-1)
+	if rng is not None:
+		lo, hi = rng
+		rows = [r for r in rows if lo <= r[0] <= hi]
+		if not rows:
+			print(f"[ERR] --chunk-range {args.chunk_range} selects no chunks "
+			      f"(block has {total} chunks, highest index {max_idx})",
+			      file=sys.stderr)
+			return 2
+
 	args.out.parent.mkdir(parents=True, exist_ok=True)
 	with args.out.open("w") as f:
 		for idx, vname, expected in rows:
 			f.write(f"{vname}\t{idx:03d}\t{expected}\n")
 
-	print(f"[INFO] worklist: {len(rows)} chunks -> {args.out}", file=sys.stderr)
+	if rng is None:
+		print(f"[INFO] worklist: {len(rows)} chunks -> {args.out}", file=sys.stderr)
+	else:
+		print(f"[INFO] worklist: {len(rows)} of {total} chunks "
+		      f"(chunk-range {rng[0]}-{rng[1]}) -> {args.out}", file=sys.stderr)
 	return 0
 
 

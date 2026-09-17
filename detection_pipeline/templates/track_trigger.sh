@@ -1,6 +1,8 @@
 #!/bin/bash -l
 # track_trigger.sh — login-side poller that launches colony tracking for THIS
-# block once detection outputs are all in the bucket.
+# block once detection outputs are all in the bucket, and/or emails
+# NOTIFY_EMAIL that detection is complete (this poller is the only place that
+# sees BOTH modalities land, so it is the authoritative "detection done" hook).
 #
 # Why a poller and not a SLURM dependency: SLEAP inference runs on SAION and
 # deigo cannot `afterok:` a saion job (no cross-cluster Slurm deps). The only
@@ -20,8 +22,15 @@ source "$JOBS_ROOT/pipeline.env"
 
 log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
 
-if [[ "${RUN_TRACKING:-0}" -ne 1 ]]; then
-	log "RUN_TRACKING != 1; nothing to do"
+if [[ -f "$LIB_DIR/notify.sh" ]]; then
+	source "$LIB_DIR/notify.sh"
+else
+	# Older deploy without lib/notify.sh: run without email notifications.
+	notify_send() { :; }
+fi
+
+if [[ "${RUN_TRACKING:-0}" -ne 1 && -z "${NOTIFY_EMAIL:-}" ]]; then
+	log "RUN_TRACKING != 1 and no NOTIFY_EMAIL; nothing to do"
 	exit 0
 fi
 
@@ -48,12 +57,75 @@ count_ext() {  # $1 = filename suffix, e.g. _sleap_data.h5
 	printf '%s' "${n//[[:space:]]/}"
 }
 
+# "Complete" has meant "the expected number of filenames exist", which counts a
+# truncated HDF5 as done. 20260723/block01 reached 175/175 with one 484 KB
+# unreadable _sleap_data.h5, fired tracking, and the deigo map job died three
+# minutes in -- an hour after the damage, on a cluster whose queue this poller
+# cannot even see. Open the files here, where the failure is still attributable
+# and the fix is a CPU-only re-convert from the surviving .slp.
+#
+# Prints one "name (ExceptionType)" line per unreadable file; rc 1 if any. Checks
+# both modalities because map_combine opens both. Readability only -- an
+# all-cameras-empty chunk is a legitimate (N,0,2) placeholder, not corruption.
+validate_h5_outputs() {  # stdout = bad files; diagnostics to stderr
+	local py="" cand
+	for cand in "${TRACKING_PYTHON_BIN:-}" /apps/unit/ReiterU/ant_tracking/venv/bin/python; do
+		[[ -n "$cand" && -x "$cand" ]] || continue
+		"$cand" -c 'import h5py' 2>/dev/null && { py="$cand"; break; }
+	done
+	# No validator is not a verdict: warn and let the run proceed rather than
+	# block good detection on a missing interpreter. The predict-side check is
+	# the primary defence; this is the net under it.
+	if [[ -z "$py" ]]; then
+		log "WARN: no python with h5py reachable; skipping detection integrity check" >&2
+		return 0
+	fi
+	log "verifying $((aruco_n + sleap_n)) detection h5 files are readable (python=$py)" >&2
+	"$py" - "$data_dir" <<'PY'
+import glob, os, sys, time
+import h5py
+
+
+def check(path):
+    try:
+        with h5py.File(path, "r") as h:
+            if not list(h.keys()):
+                return "no datasets"
+    except Exception as exc:
+        return type(exc).__name__
+    return None
+
+
+data_dir = sys.argv[1]
+paths = []
+for pattern in ("*_aruco_tracks.h5", "*_sleap_data.h5"):
+    paths.extend(sorted(glob.glob(os.path.join(data_dir, pattern))))
+
+bad = [(p, why) for p in paths for why in [check(p)] if why]
+
+# The poll loop declares completeness from filenames alone, so the last files may
+# have landed seconds ago. Give a suspect file one more chance before condemning
+# a whole successful detection run on what could be write-visibility lag -- a
+# false refusal costs a manual re-trigger on data that was never broken.
+if bad:
+    time.sleep(10)
+    bad = [(p, why) for p, _ in bad for why in [check(p)] if why]
+
+for path, why in bad:
+    print("%s (%s)" % (os.path.basename(path), why))
+sys.exit(1 if bad else 0)
+PY
+}
+
 # 1) Wait for chunk_finalize to build the worklist. It has one row per
 #    (camera, chunk), so its line count is the expected number of both
 #    _aruco_tracks.h5 and _sleap_data.h5 outputs.
 while [[ ! -s "$worklist" ]]; do
 	if (( $(date +%s) >= deadline )); then
 		log "ERROR: deadline reached waiting for worklist $worklist; aborting"
+		notify_send "[AntsArray] detection watcher TIMEOUT: $EXP_NAME (no worklist)" \
+"track_trigger for $EXP_NAME gave up after ${timeout_secs}s: chunk_finalize never wrote
+$worklist -- the chunk stage likely failed. Check $HPC_LOGS_DIR and squeue on deigo."
 		exit 1
 	fi
 	log "waiting for worklist $worklist ..."
@@ -61,7 +133,25 @@ while [[ ! -s "$worklist" ]]; do
 done
 expected=$(wc -l < "$worklist" 2>/dev/null | tr -d '[:space:]')
 [[ "$expected" =~ ^[0-9]+$ ]] || { log "ERROR: could not read expected count from $worklist"; exit 1; }
-log "expected per-modality outputs = $expected (from $(basename "$worklist"))"
+expected_src="$(basename "$worklist")"
+
+# Under --chunk-range the worklist covers only THIS WAVE, but count_ext globs all
+# of data/ and so counts every earlier wave's outputs too. Comparing the two
+# would declare the block finished on the first poll of wave 2, before it had
+# produced anything. Gate on the block's declared total instead -- which is the
+# right target with or without waves, because tracking needs the whole block:
+# map_combine groups whatever files exist per chunk and silently drops absent
+# cameras, so firing early yields panoramas with holes, not a shorter run.
+declared=$(python3 "$LIB_DIR/pipeline_state.py" declared-rows --data-dir "$data_dir" 2>/dev/null || true)
+if [[ "$declared" =~ ^[0-9]+$ ]] && (( declared > 0 )); then
+	if (( declared != expected )); then
+		log "worklist covers $expected chunk(s) of this block's $declared (wave run);"
+		log "  gating on the BLOCK total -- tracking cannot run on part of a block."
+	fi
+	expected="$declared"
+	expected_src="PIPELINE_STATE.json (block total)"
+fi
+log "expected per-modality outputs = $expected (from $expected_src)"
 
 # 2) Poll the bucket until BOTH modalities are complete, or the deadline passes.
 #    Gate on _sleap_data.h5 (NOT .slp): the tracking map stage reads _sleap_data.h5,
@@ -80,16 +170,102 @@ while true; do
 	fi
 	if (( $(date +%s) >= deadline )); then
 		if (( aruco_n > 0 && sleap_n > 0 )); then
-			fired_reason="timeout-partial"   # tracking processes the contiguous complete prefix
+			# NOT a "contiguous complete prefix": map_combine groups whatever
+			# files exist per chunk and silently drops absent cameras, so a
+			# partial fire yields panoramas with holes, not a shorter run.
+			fired_reason="timeout-partial"
 		else
 			log "ERROR: deadline reached with aruco=$aruco_n sleap=$sleap_n; nothing complete, aborting"
+			notify_send "[AntsArray] detection FAILED: $EXP_NAME (nothing complete at deadline)" \
+"track_trigger for $EXP_NAME hit its ${timeout_secs}s deadline with aruco=$aruco_n
+sleap=$sleap_n of $expected expected outputs in $data_dir.
+At least one detection leg produced nothing; check $HPC_LOGS_DIR and the Slurm FAIL mails."
 			exit 1
 		fi
 		break
 	fi
 	sleep "$poll_secs"
 done
+# Counts are satisfied; integrity is a separate question. Ask it before firing.
+corrupt_files=""
+corrupt_rc=0
+corrupt_files="$(validate_h5_outputs)" || corrupt_rc=$?
+if (( corrupt_rc != 0 )); then
+	n_bad=$(printf '%s\n' "$corrupt_files" | grep -c . )
+	# Non-zero with nothing named means the validator itself died (interpreter
+	# fault, OOM, signal), not that the data is bad. Still refuse -- we have no
+	# evidence the outputs are sound -- but do not report "0 unreadable files".
+	if (( n_bad == 0 )); then
+		log "REFUSING to submit tracking: integrity validator failed (rc=$corrupt_rc) without reporting any file"
+		notify_send "[AntsArray] detection check FAILED: $EXP_NAME (validator error rc=$corrupt_rc)" \
+"track_trigger for $EXP_NAME could not verify detection outputs: the integrity
+validator exited $corrupt_rc without naming any file, so it crashed rather than
+finding corruption.
+
+Counts looked complete (aruco=$aruco_n sleap=$sleap_n of $expected in
+$data_dir). Tracking is NOT being submitted, because nothing has confirmed the
+outputs are readable. Re-run the trigger; if it repeats, check the python at
+${TRACKING_PYTHON_BIN:-/apps/unit/ReiterU/ant_tracking/venv/bin/python}."
+		exit 1
+	fi
+	log "REFUSING to submit tracking: $n_bad detection h5 file(s) are unreadable"
+	while IFS= read -r bad_file; do
+		[[ -n "$bad_file" ]] && log "  corrupt: $bad_file"
+	done <<< "$corrupt_files"
+	log "  regenerate each from its .slp (CPU only, no re-inference) then re-run this trigger:"
+	log "    <python> $SCRIPTS_DIR/sleap2h5.py $data_dir/<stem>.slp $data_dir --expected-frames <N>"
+	notify_send "[AntsArray] detection CORRUPT: $EXP_NAME ($n_bad unreadable h5)" \
+"track_trigger for $EXP_NAME found $n_bad unreadable HDF5 file(s) in
+$data_dir, even though the file counts look complete
+(aruco=$aruco_n sleap=$sleap_n of $expected expected):
+
+$corrupt_files
+
+Tracking is NOT being submitted. The map stage opens every one of these files and
+would die on the first bad one, after the queue wait and the panorama build.
+
+A truncated _sleap_data.h5 is almost always recoverable without re-inference: if
+the matching .slp still opens, re-run scripts/sleap2h5.py over it (CPU only,
+--expected-frames from worklist col 3), then re-run this trigger. Re-run SLEAP
+only for chunks whose .slp is also bad."
+	exit 1
+fi
+
 log "firing tracking (reason=$fired_reason): aruco=$aruco_n sleap=$sleap_n expected=$expected"
+
+if [[ "$fired_reason" == "complete" ]]; then
+	notify_send "[AntsArray] detection complete: $EXP_NAME ($expected/$expected per modality)" \
+"Detection finished for $EXP_NAME: aruco=$aruco_n and sleap=$sleap_n of $expected
+expected outputs are on the bucket in $data_dir.
+RUN_TRACKING=${RUN_TRACKING:-0} (1 = colony tracking is being submitted now)."
+else
+	notify_send "[AntsArray] detection INCOMPLETE at deadline: $EXP_NAME (aruco=$aruco_n sleap=$sleap_n of $expected)" \
+"track_trigger for $EXP_NAME hit its ${timeout_secs}s deadline with partial outputs:
+aruco=$aruco_n sleap=$sleap_n of $expected expected in $data_dir.
+Tracking is NOT being submitted: a chunk missing a camera still maps, producing a
+panorama with a hole and no error, so a partial run would look successful while
+quietly dropping every ant those cameras could see.
+Backfill the missing chunks and re-run the trigger, or set TRACKING_ALLOW_PARTIAL=1
+to accept the gaps (correct only when a camera is permanently dead).
+Check the Slurm FAIL mails / $HPC_LOGS_DIR for the stalled leg."
+fi
+
+# Refuse by default rather than firing on known-incomplete detection. The old
+# behaviour fired unconditionally on the (incorrect) assumption that tracking
+# would trim itself to a complete prefix; it does not, so this is where an
+# upstream shortfall must stop instead of becoming silently wrong tracks.
+if [[ "$fired_reason" == "timeout-partial" && "${TRACKING_ALLOW_PARTIAL:-0}" -ne 1 ]]; then
+	log "REFUSING to submit tracking: detection incomplete (aruco=$aruco_n sleap=$sleap_n of $expected)"
+	log "  map_combine drops absent cameras silently, so this would yield panoramas with holes."
+	log "  Backfill the missing chunks then re-run this trigger, or re-run with"
+	log "  TRACKING_ALLOW_PARTIAL=1 to accept the gaps (permanently dead camera)."
+	exit 1
+fi
+
+if [[ "${RUN_TRACKING:-0}" -ne 1 ]]; then
+	log "RUN_TRACKING != 1; detection notification sent, not submitting tracking"
+	exit 0
+fi
 
 # 3) Launch colony tracking for THIS one block. submit_blocks_pipeline.sh is a
 #    separate script in tracking/colony/; we only invoke it by path (no shared
@@ -102,6 +278,7 @@ submit_args=(
 )
 [[ -n "${TRACKING_OUTPUT_ROOT:-}" ]] && submit_args+=(--output_root "$TRACKING_OUTPUT_ROOT")
 [[ -n "${TRACKING_PYTHON_BIN:-}" ]] && submit_args+=(--python_bin "$TRACKING_PYTHON_BIN")
+[[ -n "${NOTIFY_EMAIL:-}" ]] && submit_args+=(--notify_email "$NOTIFY_EMAIL")
 if [[ -n "${TRACKING_EXTRA_ARGS:-}" ]]; then
 	# Space-separated simple tokens (no embedded quotes). Main override needs
 	# (--python_bin, --output_root) have dedicated flags above.
@@ -123,5 +300,9 @@ if bash "$TRACKING_SUBMIT" "${submit_args[@]}"; then
 else
 	rc=$?
 	log "ERROR: tracking submit failed (rc=$rc) for block=$block"
+	notify_send "[AntsArray] tracking submit FAILED: $EXP_NAME (rc=$rc)" \
+"submit_blocks_pipeline.sh exited rc=$rc for block=$block.
+See $HPC_LOGS_DIR/pipeline/track_trigger.log for its output; detection outputs are
+complete on the bucket, so tracking can be re-submitted manually."
 	exit "$rc"
 fi

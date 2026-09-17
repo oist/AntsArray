@@ -51,6 +51,13 @@ rsync -ah --chmod=Du=rwx,Dg=rwx,Fu=rw,Fg=rw \
 - All cross-cluster SSH (TRT export trigger, saion sbatch, inline uploads) uses
   `ssh_retry` with 5 attempts + 10·n backoff — the lesson from block01's
   `kex_exchange_identification` reset wedging the whole pipeline.
+- Remote Slurm queue checks and submissions initialize `bash -lc`, so the
+  cluster's `/etc/profile.d/` setup provides `squeue` and `sbatch` even when
+  the user's `.bashrc` does not. `ssh_login_retry` preserves the existing SSH
+  retries; file transfers and other SSH commands are unchanged. No persistent
+  user `PATH` edit is needed.
+- Jobs explicitly add `/apps/unit/ReiterU/.modulefiles` before loading
+  FFmpeg/OpenCV/SLEAP, so they do not depend on a user's personal module setup.
 
 ## Layout
 
@@ -64,6 +71,7 @@ detection_pipeline/
     manifest.py                    # video discovery + sidecar/ffprobe cross-check
     perms.sh                       # best-effort chgrp/setgid helpers for shared outputs
     worklist.py                    # chunk-ordered (chunk_idx ASC, vname ASC) TSV builder
+    pipeline_state.py              # data/PIPELINE_STATE.json: processing contract + wave ledger
   templates/
     backup.sbatch                  # update stable raw-video archive under /bucket/<unit>/Backup/<collection>
     chunk.sbatch                   # ffmpeg -c copy segment (no re-encode)
@@ -76,6 +84,8 @@ detection_pipeline/
     cleanup.sbatch                 # rm -rf /flash, afterany
   scripts/
     export_sleap_trt.sh            # one-time TRT/ONNX export on saion-largegpu
+    filter_done_aruco.py           # bucket-aware skip for the aruco leg
+    filter_done_chunks.py          # bucket-aware skip for the sleap leg
 ```
 
 ## Quick start
@@ -97,7 +107,7 @@ Monitor:
 ```bash
 squeue -u $USER
 ls /flash/ReiterU/$USER/jobs/<exp>/         # rendered sbatches + jid_*.txt + manifest.csv + worklist
-ssh saion squeue -u $USER                   # saion side
+ssh saion 'bash -lc "squeue -u $USER"'      # saion side
 ```
 
 Outputs land in `<exp>/data/`, per grid camera per chunk:
@@ -163,9 +173,18 @@ Notes:
 - **Gates on `_sleap_data.h5`, not `.slp`.** The map stage reads `_sleap_data.h5`; the inline
   `slp -> h5` conversion is best-effort, so a silent conversion failure (only `.slp` present)
   correctly counts as "not ready" instead of firing tracking on invisible SLEAP data.
-- **Deadline is generous** (`--tracking-timeout`, default 48h). On deadline with a partial set
-  it still fires — tracking processes the contiguous complete chunk prefix and skips the rest;
-  with zero SLEAP outputs it aborts instead of firing.
+- **Tracking needs the whole block, and refuses anything less.** `map_combine` groups whatever
+  files exist per chunk and silently drops absent cameras, so a partial fire produces panoramas
+  with holes rather than a shorter run — and produces them without an error. On deadline with a
+  partial set the poller therefore *refuses* to submit and mails instead; override with
+  `TRACKING_ALLOW_PARTIAL=1` only for a permanently dead camera.
+- **The gate is the block's declared chunk total**, read from `data/PIPELINE_STATE.json`, not the
+  worklist line count. Under `--chunk-range` the worklist is one wave, while the output counter
+  globs all of `data/`, so gating on the worklist would fire on wave 2's first poll. This also
+  means `--run-tracking` may be passed on any single wave: it waits for every wave. Pass it on
+  one wave only — a second poller submits tracking twice.
+- **Deadline is generous** (`--tracking-timeout`, default 48h). Raise it for multi-wave blocks:
+  detection on a 98-hour block takes ~3 days, well past the default.
 - **Cluster: deigo.** Tracking is CPU-only and reads `/bucket`; it runs on `compute` (the same
   login as detection). saion has no general CPU partition.
 - **Conda-free by default.** Tracking jobs run under the unit `ant_tracking` venv
@@ -232,6 +251,313 @@ Re-running the same block updates the same archive with `zip -0 -FS`; it does
 not create timestamped duplicates. OIST's weekly Backup snapshots preserve older
 versions remotely. Pass `--no-backup` for test runs where no Backup archive
 should be updated.
+
+## Processing contract (`data/PIPELINE_STATE.json`)
+
+The first run of a block **declares** how it is processed; every later run must
+agree or is refused before anything is submitted.
+
+This exists because a chunk's filename encodes its *index*, not the settings that
+produced it. `cam01_..._042` means "the 43rd chunk under this `--chunk-sec`", so
+re-running a block at a different chunk length overwrites part of `data/` with
+content that no longer lines up with the part it did not overwrite — and nothing
+downstream can detect it afterwards, because every file stays individually valid
+and the names are unchanged. The same applies to a model swap: detection counts
+move ~4x between model generations, so a half-and-half block is quietly useless.
+
+```jsonc
+{
+  "chunking":  { "chunk_sec": 1800, "chunk_ext": "mkv", "total_rows": 4950,
+                 "videos": { "cam01_...": { "n_chunks": 198, "fps": 24.0, ... } } },
+  "detection": { "aruco_dict": "...", "sleap_model_centroid": "...", ... },
+  "waves":     [ { "wave": 1, "chunk_range": [0, 4], "rows": 125, ... } ]
+}
+```
+
+| field group | role | on mismatch |
+| ----------- | ---- | ----------- |
+| `chunking`, `aruco_dict`, `aruco_params`, `sleap_model_*` | changes the *content* of an identically-named output | **refused** (exit 2) |
+| `sleap_module`, `sleap_runtime`, `saion_partition` | changes how the work *ran* | warned, allowed |
+| `videos[].n_chunks` / `frame_count` | the source recording was replaced or repaired | **refused** |
+
+Keys the run does not exercise are not compared: an `--only-sleap` rerun supplies
+no ArUco settings, and absence means "not exercised", never "clear it". A key the
+contract never recorded is filled in rather than rejected.
+
+To deliberately re-process a block under new settings, pass
+`--new-processing-run`. It archives the contract to `PIPELINE_STATE.<utc>.json`;
+it does **not** delete the old outputs — move them aside yourself first.
+
+Blocks processed before contracts existed get one with:
+
+```bash
+python detection_pipeline/catalog.py state-init 20260716/block01 --chunk-sec 1800 --dry-run
+```
+
+`--chunk-sec` is required and cross-checked against the archived `manifest.csv`.
+It is not inferred: guessing it is the weakness the contract removes.
+
+## Wave processing (`--chunk-range`)
+
+A 98-hour block at `--chunk-sec 1800` is 4,950 chunks — over `compute`'s 2,016
+submit cap (Slurm counts each array task individually) and ~6 TiB held on
+`/flash` until the run ends. `--chunk-range A-B` processes one window of chunk
+indices instead of the whole block:
+
+```bash
+bash detection_pipeline/pipeline.sh --dir ... --chunk-sec 1800 --chunk-range 0-4    # wave 1
+bash detection_pipeline/pipeline.sh --dir ... --chunk-sec 1800 --chunk-range 5-6    # wave 2
+```
+
+Waves slice the **worklist**, never the source videos. Because a chunk's index is
+a pure function of `(video, --chunk-sec)`, a window names the same span of
+wall-clock in every run, re-running a window overwrites only its own outputs, and
+the block stays one contiguous experiment for tracking. Splitting the block
+directory instead would restart chunk numbering per piece and break track
+continuity at the seam.
+
+- Ranges are clamped per video, so a shorter camera contributes fewer rows.
+- `--chunk-sec` must be a whole number of GOPs. `chunk.sbatch` seeks with `-ss`
+  and then verifies the first chunk's packet count against the expected frame
+  cap, failing rather than emitting silently offset chunks.
+- Every wave is appended to `waves[]`. Coverage is derived from what is actually
+  in `data/`, never from the ledger — a killed job cannot leave the ledger
+  claiming work that does not exist.
+- `--run-tracking` fires when *this wave* completes. Pass it on the final wave only.
+
+### Overlapping waves
+
+Waves may overlap in time: wave *N+1* can be submitted while wave *N* is still on
+the GPUs, so the queue never drains. What makes that safe is that each wave owns
+its **control files** and shares only its **data files**:
+
+| path | scope | holds |
+| ---- | ----- | ----- |
+| `/flash/.../jobs/<exp>/wave_<A>-<B>/` | per wave | `pipeline.env`, `aruco_worklist.txt`, `jid_*.txt`, rendered templates |
+| `/work/.../<exp>/jobs/wave_<A>-<B>/` | per wave | uploaded worklist + rendered saion arrays |
+| `/flash/.../<exp>/` | per block | chunks — filenames carry the index, and `cleanup` frees only its own wave's |
+| `/work/.../<exp>/input`, `output` | per block | same; sharing `input/` is what lets `prefetch` skip an already-staged chunk |
+
+The worklist is the reason for the split: `prefetch`, `sleap_predict`,
+`sleap_datacp` and the verify gate all re-read it **at task start** and index it
+by row. A second wave overwriting it under a shared path would hand a running
+array a different wave's rows — every task would still report `COMPLETED`, with
+the wrong chunks processed. For the same reason `saion_cleanup` deletes only the
+chunks its own worklist names (mirroring `cleanup.sbatch` on `/flash`) instead of
+the whole `/work` root; the root disappears when the last wave leaves.
+
+Two runs that would land in the *same* jobs dir are refused before anything is
+written — the guard reads that dir's `jid_*.txt` and checks both clusters' queues.
+Override with `--force-submit`. A `--chunk-range` that overlaps a range already in
+`waves[]` only warns: recomputing a window for a new model, or to rescue
+half-landed chunks, has to stay possible.
+
+Practical limits when overlapping: the GPU cap and `GrpSubmit` (2,016 array tasks)
+are per user, so waves share them — divide `--sleap-concurrency` accordingly — and
+`/flash` holds every live wave's chunks at once.
+
+Inspect a block at any time:
+
+```bash
+python3 detection_pipeline/lib/pipeline_state.py show --data-dir <exp>/data
+```
+
+The catalog reports `expected_source`, `chunks_declared`, `waves_done` and
+`unclaimed_chunks`, and flags `WAVE_GAP` when a window between two submitted
+waves was never claimed. A trailing tail is normal progress and is not flagged.
+
+## Multi-user wave processing (`pipeline_multi.sh`)
+
+Every limit that throttles a block — `GrpSubmit` 2016, `compute`'s 2000 cpu,
+`largegpu`'s 8 GPUs — is **per user**, and every mutable control path is
+already namespaced by `$USER`. So 2–3 unit members can process one block in
+parallel by taking disjoint waves: on `largegpu` that is 8 → 16/24 A100s.
+(`short-a100`'s 32-GPU cap is already the whole partition, so extra users add
+nothing there.)
+
+The shared policy lives in one plan file, next to the contract:
+
+```jsonc
+// <exp>/data/MULTIUSER_PLAN.json
+{
+  "settings": { "chunk_sec": 1800, "aruco_dict": "A",
+                "sleap_model_centroid": "...", "sleap_model_instance": "...",
+                "saion_partition": "largegpu" },      // pipeline.sh flags, _ for -
+  "slots": {
+    "makoto-hiroi": { "waves": ["0-1649"], "backup": true, "tracking": true },
+    "user2":        { "waves": ["1650-3299"] },
+    "user3":        { "waves": ["3300-4949"] }
+  }
+}
+```
+
+Do not write the plan by hand -- generate it, so the values that actually
+bite (settings that must match the block's recorded contract, the block's
+chunk count, wave widths under the per-user submit cap) are looked up rather
+than typed:
+
+```bash
+pipeline_multi.sh plan --dir /bucket/.../20260xxx/block01 --users makoto-hiroi,user2,user3 \
+    --set sleap_model_centroid=/bucket/.../x.centroid \
+    --set sleap_model_instance=/bucket/.../x.centered_instance
+```
+
+Settings resolve as `templates/multiuser_defaults.json` < the block's
+`PIPELINE_STATE.json` (if a first run already declared a contract, its values
+win -- pipeline.sh would refuse anything else) < `--set key=value`. Chunk
+indices are split contiguously and near-equally across `--users`; each share
+is cut into equal waves no wider than `--wave-rows` (default 1500) / cameras /
+`--max-live`, because deigo's 2016-job GrpSubmit counts rows (chunk x camera)
+and the same user's tracking/sleep jobs share that cap. For a 98 h block at
+1800 s chunks (196 indices, 25 cameras, 3 users) that is 2 waves of ~33 per
+user, ~1 TB of /flash per live wave per user. `backup`/`tracking` go to the
+first user unless `--backup-user`/`--tracking-user` say otherwise.
+
+Each user (from a deigo login, needs `reiteruni` + a working `saion` SSH alias):
+
+```bash
+pipeline_multi.sh submit --plan <exp>/data/MULTIUSER_PLAN.json  # my next wave
+pipeline_multi.sh auto   --plan ...   # nohup poller: my waves back to back
+pipeline_multi.sh status --plan ...   # every slot: wave coverage + both queues
+```
+
+The wrapper derives every `pipeline.sh` flag from the plan (no per-user typo
+drift; the processing contract would refuse drift anyway) and enforces the two
+things that must stay unique: **one backup writer** (backup rides only the
+backup slot's first wave — concurrent `zip -FS` updates can corrupt the
+archive) and **one tracking poller** (launched from the tracking slot's last
+wave; it gates on the block's declared total, so it waits for everyone).
+`load_plan` refuses overlapping waves across slots, duplicate backup/tracking
+slots, and policy keys smuggled into `settings`.
+
+`auto` mirrors `track_trigger.sh`'s login-side nohup pattern: it polls
+`data/`, submits the slot's next wave when the previous one's outputs are
+complete (`--max-live 2` overlaps waves), retries a half-landed wave at most
+3× (the bucket-aware skip redoes only gaps), and exits when the slot is done.
+Progress log: `<exp>/hpc_logs/pipeline/multi_auto_<user>.log`.
+
+For fully central operation, a secondary user may grant a **forced-command
+key** — this key can only drive the wrapper, it never gets a shell:
+
+```text
+restrict,command="/apps/unit/ReiterU/AntsArray/current/detection_pipeline/pipeline_multi.sh agent" ssh-ed25519 AAAA... pipeline-key
+```
+
+Verified 2026-09-04 against the live wrapper: `validate` / `status` / `submit`
+run, while a bare shell command, a non-allowlisted subcommand (`plan`), a `..`
+traversal out of `/bucket`, a shell metacharacter, and an empty command are all
+refused. Two operational constraints, both found the hard way:
+
+- **Pin the login node** (`deigo-login2`). On `deigo-login1`, `/apps/unit` is a
+  symlink to `/hpcshare/appsunit` but `/hpcshare` is not mounted, so the wrapper
+  is invisible there and the forced command dies with "No such file or
+  directory". Pinning is needed regardless: `auto` records host+pid in its lock,
+  and only `stop-auto` on that same host can stop it.
+- **Self-testing the key needs the other auth methods disabled.** On your own
+  account GSSAPI/host-based auth succeeds before publickey, so the forced
+  command never applies and the subcommand runs as a plain shell command
+  (`bash: validate: command not found`):
+
+  ```bash
+  ssh -i ~/.ssh/antsarray_agent -o IdentitiesOnly=yes       -o PreferredAuthentications=publickey -o GSSAPIAuthentication=no       -o HostbasedAuthentication=no $USER@deigo-login2.oist.jp "status --plan <plan>"
+  ```
+
+  Connecting to someone *else's* account needs none of that: you hold neither
+  their Kerberos ticket nor host-based trust, so the agent key is the only one
+  that can authenticate.
+
+### Shared deploy (`scripts/deploy_release.sh`)
+
+Multi-user runs need one checkout every user's jobs can read at run time
+(pipeline.env bakes `LIB_DIR`/`SCRIPTS_DIR`/`TEMPLATES_DIR` paths). Deploy to
+`/apps/unit/ReiterU/AntsArray` as immutable `releases/<commit-date>_<sha>/`
+dirs with a `current` symlink. **`/apps/unit` is a different filesystem on
+deigo and on saion** (unlike `$HOME`), and saion's SLEAP tasks source `lib/`
+and run `scripts/sleap2h5.py` from the exact path deigo baked into
+pipeline.env — so every deploy must land on both clusters under one name.
+`--mirror saion` does that in the same command (the release name comes from
+the commit date, never the wall clock, so both sides agree across midnight):
+
+```bash
+# first time, from a deigo login (the deploy key in the shared $HOME works on both sides)
+scripts/deploy_release.sh --repo-url git@github.com-antsarray:oist/AntsArray.git --mirror saion
+# updates
+/apps/unit/ReiterU/AntsArray/current/detection_pipeline/scripts/deploy_release.sh --mirror saion
+```
+
+`pipeline.sh` pins its release by rewriting only the `current` component of
+its own path, so a later deploy (symlink flip) never changes code under a
+running block. It deliberately does NOT use `pwd -P`: `/apps/unit` is
+itself a symlink to a per-cluster real path (deigo resolves it to
+`/hpcshare/appsunit`), and that string is what saion's SLEAP tasks read
+`lib/` and `scripts/sleap2h5.py` from. It also refuses to submit a SLEAP run whose checkout saion
+cannot see (`ssh saion test -f $SCRIPTS_DIR/sleap2h5.py`), so a one-sided
+deploy fails at submission instead of hours later in every chunk's h5
+conversion. Releases are group-readable, never group-writable.
+
+## Partial blocks: window views for tracking
+
+Tracking, the analysis scripts and the curation GUI are block-scoped and read
+`<block>/data/` from chunk 000. A block whose detection finished in disjoint
+spans (20260810/block02: chunks 0–31 and 149–197 of 198) cannot be tracked as
+one block — the spans would share the same state files and overwrite each
+other's stitched track IDs — so each finished span becomes a sibling **view**
+block that every consumer treats as an ordinary block:
+
+```text
+20260810/block02-w149-197/
+  cam*.mkv, *.json, sess_*.txt   -> ../block02/...          (GUI playback, sidecars, conductor log)
+  data/<chunk 149..197 files>    -> ../../block02/data/...  (original names)
+  data/PIPELINE_STATE.json       copy of the contract + a "window" key
+  WINDOW.json                    provenance
+  tracks/ stitched/ ...          written by the tracking pipeline as usual
+```
+
+Nothing is renamed or re-indexed: chunk indices and the timestamps in file
+names stay absolute, so stitching anchors global frames at
+`chunk_idx × frames_per_chunk` and analysis derives the true wall-clock time.
+`discover_complete_input_chunks` now starts at the lowest chunk present (it
+used to insist on chunk 000) — but tracking still **refuses** a non-000 start
+unless the directory proves it is a view (the `"window"` key / `WINDOW.json`
+that only `materialize` writes): for an ordinary block a missing chunk 000 is
+the upload-loss pattern, not a window. The detection catalog deliberately
+ignores views; they are not detection units.
+
+Declare the windows once (`data/WINDOWS.json`), then materialize each as its
+detection completes:
+
+```bash
+W=tracking/colony/make_window_block.py
+python3 $W init        --block <exp> --ranges 0-31,32-70,71-109,110-148,149-197
+python3 $W status      --block <exp>                 # per-window trk/sdat completeness
+python3 $W materialize --block <exp> --window w149-197
+bash tracking/colony/submit_blocks_pipeline.sh --blocks_root <date> --block_glob 'block02-w*' --hmats ...
+```
+
+`materialize` refuses an incomplete window (tracking would stop at its first
+hole) unless `--force`. Views of one block run concurrently: their job tags,
+state dirs and bucket copy-back dirs are all keyed by the view's name.
+
+Related fix: a chunk with **zero detections** now converts to a valid, empty
+`_sleap_data.h5` (`scripts/sleap2h5.py`). Before, `sleap2csv.flatten_data`
+divided by the instance count and the chunk was stranded — counted as missing
+by every completeness check, and a hole for the tracking preflight.
+
+## Re-runs skip work already on the bucket
+
+Both legs consult `data/` before running, so a re-run only redoes the gaps:
+
+| leg | filter | verified by |
+| --- | ------ | ----------- |
+| SLEAP | `scripts/filter_done_chunks.py` (in `bridge.sbatch`) | h5 `expected_frames` attr |
+| ArUco | `scripts/filter_done_aruco.py` (in `chunk_finalize.sbatch`) | `aruco_tracks` dataset `shape[0]` |
+
+Before the ArUco filter existed, its only skip was flash-local — so once
+`cleanup` freed `/flash`, any later run recomputed the entire block's ArUco.
+
+Both keep a row on any uncertainty: an unreadable bucket dir, a corrupt h5 or a
+missing `h5py` all mean recompute. "Cannot verify" is never a verdict of "done".
+Force a full redo with `--sleap-force-recompute` / `--aruco-force-recompute`.
 
 ## Phase isolation (for testing)
 
@@ -378,14 +704,15 @@ needed. `cleanup.sbatch` polls bucket for final SLEAP outputs before deleting
 ## Run logs (`hpc_logs/`) — survive mid-run failures
 
 Job logs used to live only on scratch (`/work` on saion, `/flash` on deigo) and were
-destroyed by cleanup — saion's `rm -rf "$REMOTE_ROOT"` deletes the `jobs/` dir that
-holds the sleap `.out`/`.err`. So a walltime kill, node failure, mass `scancel`, or
-maintenance drain left nothing to diagnose. The pipeline now captures logs to bucket
-under `<exp>/hpc_logs/` in four layers (defense in depth):
+destroyed by cleanup — `saion_cleanup` removes the `jobs/` dir that holds the sleap
+`.out`/`.err`. So a walltime kill, node failure, mass `scancel`, or maintenance drain
+left nothing to diagnose. The pipeline now captures logs to bucket under
+`<exp>/hpc_logs/` in four layers (defense in depth):
 
 ```
 <exp>/hpc_logs/
-  sleap/     sleap_<A>_<a>.out|.err|.status, sacct_sleap_<jid>.tsv   (saion)
+  sleap/     sleap_<A>_<a>.out|.err|.status, prefetch_<A>_<a>.out|.err,
+             sacct_sleap_<jid>.tsv                                   (saion)
   aruco/     aruco_<A>_<a>.out|.err|.status, sacct_aruco_<jid>.tsv   (deigo)
   pipeline/  chunk_*, bridge_*, aruco_datacp_*, cleanup_*, manifest.csv, pipeline.env
 ```

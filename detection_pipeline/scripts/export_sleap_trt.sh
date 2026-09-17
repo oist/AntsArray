@@ -65,6 +65,8 @@ if [[ -z "${SLURM_JOB_ID:-}" ]]; then
 		--runtime "$RUNTIME" --partition "$PARTITION"
 fi
 
+# Batch jobs need the site modules, not interactive conda/mamba hooks. Sourcing
+# ~/.bashrc under set -e can exit before SLEAP loads when a user hook is missing.
 if ! type module >/dev/null 2>&1; then
 	source /etc/profile
 fi

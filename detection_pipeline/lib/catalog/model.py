@@ -108,12 +108,25 @@ class Footprint(object):
         self.n_aruco_det = 0
         self.n_aruco_tracks = 0
         self.n_sleap_data = 0
-        self.expected_per_video = {}    # vname -> deepest-stage chunk count
+        self.expected_per_video = {}    # vname -> expected chunk count
         self.expected_total = 0
+        # Where expected_per_video came from. "declared" = the block's
+        # PIPELINE_STATE.json says so; "observed" = inferred as 0..max(idx seen),
+        # which cannot tell a finished block from one that stopped early.
+        self.expected_source = "observed"
         self.chunk_sec = None
-        self.chunk_sec_source = "none"  # "frame_counts" | "manifest" | "none"
+        self.chunk_sec_source = "none"  # "state"|"frame_counts"|"manifest"|"none"
         self.completeness_pct = None
-        self.completeness_state = "n/a"  # "verified" | "internal" | "unverifiable" | "n/a"
+        # "declared" outranks "internal": it is measured against a recorded
+        # denominator instead of one derived from the outputs being judged.
+        self.completeness_state = "n/a"  # declared|verified|internal|unverifiable|n/a
+        self.waves = []                 # ledger entries from PIPELINE_STATE.json
+        self.unclaimed = {}             # vname -> "3-9" chunk indices never claimed
+        # Subset of unclaimed that sits BETWEEN claimed waves. A trailing tail is
+        # just the next wave not submitted yet; a hole means a window was skipped
+        # and every count around it still looks healthy.
+        self.wave_gaps = {}
+        self.state_path = ""
         self.has_hpc_logs = False
         self.hpc_log_stages = []
         self.downstream = []

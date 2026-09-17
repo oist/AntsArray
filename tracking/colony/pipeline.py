@@ -20,9 +20,11 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
 from tracking.colony.combine_batch import discover_jobs, filter_jobs_by_chunks, parse_sides, run_local, submit_slurm  # noqa: E402
-from tracking.colony.panorama_io import discover_complete_input_chunks  # noqa: E402
+from tracking.colony.panorama_io import discover_complete_input_chunks, require_contiguous_from_start  # noqa: E402
+from tracking.stitch_tracks import chunk_frames_from_state  # noqa: E402
 from tracking.stitch_tracks import main as stitch_tracks  # noqa: E402
 from tracking.stitch_tracks import write_pngs_from_existing  # noqa: E402
+from detection_pipeline.lib import tracking_state  # noqa: E402
 
 
 def run_mapping(
@@ -35,6 +37,7 @@ def run_mapping(
     x_threshold: float | None,
     skip_existing: bool,
     chunks: set[str] | None = None,
+    tracking_state_dir: Path | None = None,
 ) -> None:
     from tracking.colony.map_combine import (
         infer_experiment_name,
@@ -45,7 +48,19 @@ def run_mapping(
         set_x_threshold,
     )
 
-    set_x_threshold(resolve_x_threshold(data_dir, x_threshold))
+    resolved_threshold = resolve_x_threshold(data_dir, x_threshold)
+    set_x_threshold(resolved_threshold)
+    if tracking_state_dir is not None:
+        tracking_state_dir.mkdir(parents=True, exist_ok=True)
+        rec = tracking_state.record_map(
+            tracking_state_dir, hmats=hmats_path, x_threshold=resolved_threshold,
+            map_mode=map_mode, min_instance_frame_frac=min_instance_frame_frac,
+            data_dir=data_dir, chunks=sorted(chunks) if chunks is not None else None,
+            code_dir=REPO_ROOT, argv=sys.argv,
+        )
+        logging.info("tracking record: %s (hmats %s, x_threshold %s)",
+                     tracking_state.state_path(tracking_state_dir),
+                     rec["map"]["hmats_calib_id"], resolved_threshold)
     hmats = load_homographies(hmats_path)
     exp = infer_experiment_name(data_dir)
     panorama_dir.mkdir(parents=True, exist_ok=True)
@@ -142,6 +157,7 @@ def run_stitching(
     skip_existing: bool,
     pngs_from_existing: bool,
     chunks: set[str] | None = None,
+    chunk_frames: int | None = None,
 ) -> None:
     stitched_dir.mkdir(parents=True, exist_ok=True)
     if pngs_from_existing:
@@ -176,6 +192,7 @@ def run_stitching(
         png_height=track_png_height,
         skip_existing=skip_existing,
         chunks_filter=chunks,
+        chunk_frames=chunk_frames,
     )
 
 
@@ -204,9 +221,8 @@ def main() -> None:
         dest="x_threshold",
         type=float,
         default=None,
-        help=("Override panorama left/right split X; default reads panorama_regions.csv "
-              "beside data/ (or its date folder), then the most recent earlier recording date. "
-              "Stop if no annotations are available."),
+        help=("Override split X; default reads full-arena panorama_regions.csv "
+              "from this recording or the latest earlier recording date."),
     )
 
     parser.add_argument("--side", choices=("left", "right", "both"), default="both")
@@ -281,9 +297,18 @@ def main() -> None:
         int(chunk_summary.get("reference_camera_count", 0)),
         chunk_summary.get("first_incomplete"),
     )
+    # A non-000 start is legitimate only for a window view (make_window_block.py);
+    # for an ordinary block it is the upload-loss pattern, and this raises.
+    if require_contiguous_from_start(complete_chunks, args.data_dir) != "000":
+        logging.warning(
+            "window view starting at chunk%s (%s); global frames remain anchored "
+            "to the absolute chunk index",
+            complete_chunks[0], args.data_dir,
+        )
 
     if not args.skip_map:
         logging.info("Stage 1/3: mapping detections into panorama PKLs")
+        # Persist the resolved annotation boundary before writing any mapped detections.
         run_mapping(
             hmats_path=args.hmats,
             data_dir=args.data_dir,
@@ -293,6 +318,7 @@ def main() -> None:
             x_threshold=args.x_threshold,
             skip_existing=args.skip_existing,
             chunks=set(complete_chunks),
+            tracking_state_dir=tracks_dir,
         )
 
     if not args.skip_combine:
@@ -324,7 +350,28 @@ def main() -> None:
 
     if not args.skip_stitch:
         logging.info("Stage 3/3: stitching chunk tracks")
+        # Anchor global frames to each file's chunk index rather than to the set
+        # of files present. Derived from the block's own contract, so it needs no
+        # flag: detection wrote chunk_sec and fps there, and their product is the
+        # chunk length the parquet files were actually built at. Without it, a
+        # chunk set with a hole (an incomplete chunk excluded upstream) silently
+        # slides every later chunk into the gap.
+        state_fp = args.data_dir / "PIPELINE_STATE.json"
+        chunk_frames = None
+        if state_fp.is_file():
+            chunk_frames, _state_fps = chunk_frames_from_state(state_fp, args.fps)
+            logging.info("frame anchor: %d frames/chunk (from %s)",
+                         chunk_frames, state_fp)
+        else:
+            logging.warning(
+                "no %s; global frames fall back to accumulating over the files "
+                "present. Correct for a contiguous 0..N block, wrong for any "
+                "subset -- run `catalog.py state-init` to give this block a "
+                "contract.", state_fp)
+        tracking_state.record_stitch(tracks_dir, fps=args.fps, chunk_frames=chunk_frames,
+                                     side=args.side, code_dir=REPO_ROOT)
         run_stitching(
+            chunk_frames=chunk_frames,
             tracks_dir=tracks_dir,
             stitched_dir=stitched_dir,
             fps=args.fps,

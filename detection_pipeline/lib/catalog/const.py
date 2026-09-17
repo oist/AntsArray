@@ -60,6 +60,10 @@ BARE_TS_RE = re.compile(r"^(\d{8})-(\d{6})$")                   # 20251118-12151
 DATE_ORD_RE = re.compile(r"^(\d{8})(?:_(\d+))?(?:_(.*))?$")     # 20250321_2_test / 20260420
 FUZZY_DATE_RE = re.compile(r"^(\d{4})_([A-Za-z]{3,})(?:_(.*))?$")  # 2025_Sep_no_pertubation
 
+# Deliberately NOT matching window views (block02-w149-197, made by
+# tracking/colony/make_window_block.py): they are tracking-side symlink views
+# of a real block's data/, not detection units, and listing them would let
+# `recover` propose re-running detection on a read-only slice.
 BLOCK_DIR_RE = re.compile(r"^block\d+$", re.IGNORECASE)
 
 # Tokens (lowercased) in a session name that hint at stim/vibration.
@@ -97,7 +101,7 @@ DEFAULT_EXPECTED_CAMS = 25
 DEFAULT_WORKERS = 8
 TRUNCATED_H5_BYTES = 2048        # below this a data .h5 is almost certainly truncated
 NAME_DATE_TOL_DAYS = 2           # folder-name date vs earliest video date tolerance
-SCAN_VERSION = 5                 # bump to invalidate cache on logic change
+SCAN_VERSION = 8                 # bump to invalidate cache on logic change
 
 # ---------------------------------------------------------------------------
 # Hazard flag names (kept as constants to avoid typos across modules)
@@ -118,6 +122,20 @@ HZ_CHUNK_UNVERIFIABLE = "CHUNK_UNVERIFIABLE"
 HZ_CHUNK_INTERNAL_ONLY = "CHUNK_INTERNAL_ONLY"
 HZ_RAW_CHUNKED = "RAW_CHUNKED"
 HZ_CAM_COUNT_OFF = "CAM_COUNT_OFF"
+HZ_UNCLEAN_CLOSE = "UNCLEAN_CLOSE"   # recorder didn't finalize; counts agree -> remux/verify
+# Wave processing left part of the block unclaimed: no wave in PIPELINE_STATE.json
+# ever covered those chunk indices, so they are not "in progress", they are missed.
+HZ_WAVE_GAP = "WAVE_GAP"
+# tracks/ landed but no tracks/TRACKING_STATE.json says which homography made
+# them. A block tracked with a stale calibration is otherwise indistinguishable,
+# so this is the backfill queue for `catalog.py track-init`.
+HZ_TRACKING_UNRECORDED = "TRACKING_UNRECORDED"
+# tracks/TRACKING_STATE.json exists but cannot be read: distinct from "never
+# recorded", because the fix is to inspect the file, not to backfill over it.
+HZ_TRACKING_STATE_CORRUPT = "TRACKING_STATE_CORRUPT"
+# The tracking record names a different calibration than the registry expects
+# for the block's date: tracked with a stale (or wrong) homography -> retrack.
+HZ_HMAT_MISMATCH = "HMAT_MISMATCH"
 
 TOKEN_JOIN = "|"   # separator for multi-valued cells (Excel-scannable)
 
@@ -135,8 +153,12 @@ CATALOG_COLUMNS = [
     "fps_mode", "frames_median", "duration_median_sec", "health_flag",
     "pipeline_status", "stage_reached", "chunk_sec", "chunk_sec_source",
     "n_slp", "n_aruco_det", "n_aruco_tracks", "n_sleap_data",
-    "completeness_pct", "completeness_state", "downstream",
-    "sleap_models", "saion_partition", "hazard_flags", "recover_type",
+    "completeness_pct", "completeness_state", "expected_source",
+    "chunks_declared", "waves_done", "unclaimed_chunks", "downstream",
+    "sleap_models",
+    "tracking_hmats", "tracking_hmats_path", "tracking_x_threshold", "tracked_at",
+    "tracking_source", "calib_expected", "calib_expected_from",
+    "saion_partition", "hazard_flags", "recover_type",
     "recover_missing", "scan_error", "scanned_at",
 ]
 
@@ -153,4 +175,11 @@ TRIAL_COLUMNS = [
     "session_id", "block", "trial", "iso_time", "duty", "dur_s", "interval_s",
     "cam_frame_start", "cam_frame_end", "fs_hz", "samples",
     "gyro_rms_dps", "gyro_peak_dps", "acc_rms_g", "acc_peak_g", "temp_mean_C", "imu_ok",
+]
+
+# calibrations.csv: one row per homography stack under cameraArray_calib/
+CALIB_COLUMNS = [
+    "calib_id", "calib_date", "valid_from", "enabled", "variant", "n_cams",
+    "blocks_expected", "blocks_tracked", "hmats_path", "hmats_rel", "sha256", "size",
+    "computed_at", "note",
 ]

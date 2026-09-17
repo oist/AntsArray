@@ -10,7 +10,29 @@
 #        --sleap-model-centroid <dir> --sleap-model-instance <dir> [options]
 set -eo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Pin the release WITHOUT resolving cluster-local mount symlinks. `pwd -P` is
+# wrong here: /apps/unit is itself a symlink to a per-cluster real path (deigo:
+# /hpcshare/appsunit), and this directory is baked into pipeline.env as
+# LIB_DIR/SCRIPTS_DIR/TEMPLATES_DIR, which saion's SLEAP tasks then read from
+# that exact string -- a deigo-resolved path does not exist there. So keep the
+# logical /apps/unit prefix and replace only a `current` component with the
+# release it points at, so a later deploy flipping that symlink cannot change
+# code under a block that is already running.
+pin_release_dir() {
+	local d="$1" root tail rel
+	case "$d" in
+		*/current|*/current/*) ;;
+		*) printf '%s' "$d"; return ;;
+	esac
+	root="${d%%/current*}"
+	tail="${d#*/current}"
+	rel=$(readlink "$root/current" 2>/dev/null) || { printf '%s' "$d"; return; }
+	case "$rel" in
+		/*) printf '%s%s' "$rel" "$tail" ;;
+		*)  printf '%s/%s%s' "$root" "$rel" "$tail" ;;
+	esac
+}
+SCRIPT_DIR="$(pin_release_dir "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)")"
 LIB_DIR="$SCRIPT_DIR/lib"
 TEMPLATES_DIR="$SCRIPT_DIR/templates"
 SCRIPTS_DIR="$SCRIPT_DIR/scripts"
@@ -33,6 +55,34 @@ Aruco:
 Chunking:
   --chunk-sec N                     Chunk duration in seconds. default: 7200 (2h)
   --chunk-ext {mkv|mp4|avi}         Output chunk container. default: mkv
+  --chunk-range A-B                 Process ONLY chunk indices A..B (inclusive) --
+                                    one "wave" of a long block instead of all of
+                                    it. Chunk indices are stable for a given
+                                    --chunk-sec, so a window always names the same
+                                    span of wall-clock; run waves back to back to
+                                    keep the array under the partition's submit
+                                    cap and to bound how much /flash is held at
+                                    once. Each wave is recorded in
+                                    <exp>/data/PIPELINE_STATE.json.
+                                    default: empty = the whole block.
+                                    NOTE: --chunk-sec must be a whole number of
+                                    GOPs for waves; chunk.sbatch verifies the
+                                    first chunk of every seeked wave and fails
+                                    rather than emit misaligned chunks.
+
+Processing contract:
+  --new-processing-run              Archive the block's existing
+                                    data/PIPELINE_STATE.json and start a fresh
+                                    contract. Needed only to deliberately
+                                    re-process a block under different settings
+                                    (new chunking, new models). Existing outputs
+                                    in data/ are NOT deleted -- move them aside
+                                    yourself first, or the two runs' outputs will
+                                    be interleaved under identical filenames.
+  --aruco-force-recompute           Recompute every ArUco chunk in the wave, even
+                                    ones already complete on the bucket. Mirrors
+                                    --sleap-force-recompute; use it when changing
+                                    detector parameters.
 
 SLEAP runtime:
   --sleap-runtime {tensorrt|onnx|pytorch}  default: tensorrt
@@ -47,6 +97,36 @@ SLEAP runtime:
   --sleap-wall D-HH                 per-task walltime.   default: auto = partition wall
                                                          (largegpu 0-12, short-a100 0-2)
 
+Chunk prefetch (saion-side staging ahead of the GPU array):
+  --prefetch-partition NAME         saion partition that stages chunks from the
+                                    /deigo_flash cross-mount onto /work before
+                                    the SLEAP task needs them, so the ~1.3 GB
+                                    copy stops eating a scarce GPU allocation.
+                                    One prefetch task per SLEAP task, paired with
+                                    --dependency=aftercorr, so each chunk is
+                                    handed over as soon as IT is staged instead
+                                    of waiting for the whole staging array.
+                                    saion caps resources per partition and has no
+                                    submit-count limit, so this spends none of
+                                    largegpu's / short-a100's GPU quota.
+                                    'off' = every SLEAP task copies its own chunk
+                                    (the behaviour before this existed).
+                                    default: gpu
+  --prefetch-concurrency N          array %N cap for the prefetch. Keep it >= the
+                                    sleap concurrency so staging stays ahead.
+                                    default: 32
+  --prefetch-cpus N                 cpus per prefetch task. default: 2
+  --prefetch-mem SIZE               mem per prefetch task.  default: 4G
+  --prefetch-wall D-HH              walltime per prefetch task. default: 0-2
+
+Waves:
+  --force-submit                    Submit even when the concurrent-wave guard
+                                    objects. The guard refuses two live runs that
+                                    share a --jobs-root (they would race on the
+                                    same pipeline.env and worklist), and warns
+                                    when the requested --chunk-range overlaps a
+                                    range already claimed in PIPELINE_STATE.json.
+
 Concurrency:
   --aruco-concurrency N             default: 16
   --sleap-concurrency N             default: auto = partition GPU cap (largegpu 8, short-a100 32)
@@ -60,6 +140,16 @@ Batching (minimize submitted job count):
                                     auto = ceil(total_chunks / --max-array-tasks))
   --max-array-tasks N               cap when auto-sizing batch (--batch-size ""). default: 500
 
+SLEAP bucket skip:
+  --sleap-force-recompute           Recompute every chunk's SLEAP output, even
+                                    ones already complete on the bucket. Default
+                                    is a bucket-aware skip: a re-run only redoes
+                                    chunks whose .slp/_sleap_data.h5 are missing
+                                    or were produced under a different chunking
+                                    (expected_frames verified). USE THIS when
+                                    re-running to apply a NEW model -- otherwise
+                                    the existing outputs are skipped and kept.
+
 Phase isolation (for testing):
   --only-chunk                      Stop after chunking
   --only-aruco                      Skip sleap branch
@@ -70,7 +160,14 @@ Phase isolation (for testing):
 
 Roots:
   --jobs-root PATH                  default: /flash/ReiterU/$USER/jobs/<exp>
+                                    ... plus /wave_<A>-<B> when --chunk-range is
+                                    given, so overlapping waves of one block never
+                                    share pipeline.env or a worklist. An explicit
+                                    path is used verbatim (no wave suffix).
   --flash-root PATH                 default: /flash/ReiterU/$USER/<exp>
+                                    Block-level on purpose: a chunk filename
+                                    carries its index, so waves cannot collide,
+                                    and cleanup frees only its own wave's chunks.
 
 Backup:
   --no-backup                       Do not submit the automatic raw-video backup
@@ -107,6 +204,15 @@ Tracking (optional auto-trigger after detection completes):
   --tracking-timeout N              Deadline (s) to wait for detection outputs.
                                     default: 172800 (48h)
 
+Notifications:
+  --notify-email ADDR               Email ADDR when detection completes (both
+                                    aruco+sleap on bucket; sent by the login-side
+                                    poller) and on any job failure (Slurm
+                                    --mail-type=FAIL on every submitted job;
+                                    arrays notify once per array). Forwarded to
+                                    the tracking submit script with --run-tracking.
+                                    default: $NOTIFY_EMAIL env, else off
+
 Other:
   -h, --help                        Show this help
 EOT
@@ -119,6 +225,11 @@ ARUCO_DICT="A"
 ARUCO_EXTRA_ARGS=""
 CHUNK_SEC=7200
 CHUNK_EXT=mkv
+CHUNK_RANGE=""            # "A-B" inclusive; empty = the whole block (one wave)
+WAVE_SLUG=""              # derived from CHUNK_RANGE; namespaces this wave's control dirs
+FORCE_SUBMIT=0            # override the concurrent-wave guard
+NEW_PROCESSING_RUN=0      # archive the block's contract and start a fresh one
+ARUCO_FORCE_RECOMPUTE=0   # redo every aruco chunk, ignoring bucket-complete ones
 SLEAP_MODEL_CENTROID=""
 SLEAP_MODEL_INSTANCE=""
 SLEAP_RUNTIME=tensorrt
@@ -141,10 +252,18 @@ SLEAP_CONCURRENCY=""
 SLEAP_CPUS=""
 SLEAP_MEM=""
 SLEAP_WALL=""
+# Chunk staging ahead of the GPU array; "off" disables it and every sleap task
+# copies its own chunk, as before. See --prefetch-partition in the usage text.
+PREFETCH_PARTITION=gpu
+PREFETCH_CONCURRENCY=32
+PREFETCH_CPUS=2
+PREFETCH_MEM=4G
+PREFETCH_WALL=0-2
 DATACP_CONCURRENCY=4
 BATCH_SIZE=1         # default: one chunk per array task (set "" to auto-size under MAX_ARRAY_TASKS)
 MAX_ARRAY_TASKS=500
 OUTPUT_GROUP=reiteruni   # group owner for shared bucket outputs (chgrp + setgid on created dirs)
+SLEAP_FORCE_RECOMPUTE=0   # default: bucket-aware skip in bridge; set 1 to redo every chunk
 ONLY_CHUNK=0
 ONLY_ARUCO=0
 ONLY_SLEAP=0
@@ -168,6 +287,9 @@ TRACKING_OUTPUT_ROOT=""
 TRACKING_EXTRA_ARGS=""
 TRACKING_POLL_SECS=300
 TRACKING_TIMEOUT=172800
+# Email notifications (empty = off): Slurm FAIL mail on every job + a
+# detection-complete email from the login-side poller (track_trigger.sh).
+NOTIFY_EMAIL="${NOTIFY_EMAIL:-}"
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
@@ -175,6 +297,10 @@ while [[ $# -gt 0 ]]; do
 		--aruco-dict) ARUCO_DICT="$2"; shift 2 ;;
 		--aruco-params) ARUCO_EXTRA_ARGS="$2"; shift 2 ;;
 		--chunk-sec) CHUNK_SEC="$2"; shift 2 ;;
+		--chunk-range) CHUNK_RANGE="$2"; shift 2 ;;
+		--force-submit) FORCE_SUBMIT=1; shift ;;
+		--new-processing-run) NEW_PROCESSING_RUN=1; shift ;;
+		--aruco-force-recompute) ARUCO_FORCE_RECOMPUTE=1; shift ;;
 		--chunk-ext) CHUNK_EXT="$2"; shift 2 ;;
 		--sleap-model-centroid) SLEAP_MODEL_CENTROID="$2"; shift 2 ;;
 		--sleap-model-instance) SLEAP_MODEL_INSTANCE="$2"; shift 2 ;;
@@ -188,10 +314,16 @@ while [[ $# -gt 0 ]]; do
 		--sleap-cpus) SLEAP_CPUS="$2"; shift 2 ;;
 		--sleap-mem) SLEAP_MEM="$2"; shift 2 ;;
 		--sleap-wall) SLEAP_WALL="$2"; shift 2 ;;
+		--prefetch-partition) PREFETCH_PARTITION="$2"; shift 2 ;;
+		--prefetch-concurrency) PREFETCH_CONCURRENCY="$2"; shift 2 ;;
+		--prefetch-cpus) PREFETCH_CPUS="$2"; shift 2 ;;
+		--prefetch-mem) PREFETCH_MEM="$2"; shift 2 ;;
+		--prefetch-wall) PREFETCH_WALL="$2"; shift 2 ;;
 		--datacp-concurrency) DATACP_CONCURRENCY="$2"; shift 2 ;;
 		--batch-size) BATCH_SIZE="$2"; shift 2 ;;
 		--max-array-tasks) MAX_ARRAY_TASKS="$2"; shift 2 ;;
 		--group) OUTPUT_GROUP="$2"; shift 2 ;;
+		--sleap-force-recompute) SLEAP_FORCE_RECOMPUTE=1; shift ;;
 		--only-chunk) ONLY_CHUNK=1; shift ;;
 		--only-aruco) ONLY_ARUCO=1; shift ;;
 		--only-sleap) ONLY_SLEAP=1; shift ;;
@@ -213,6 +345,7 @@ while [[ $# -gt 0 ]]; do
 		--tracking-args) TRACKING_EXTRA_ARGS="$2"; shift 2 ;;
 		--tracking-poll-secs) TRACKING_POLL_SECS="$2"; shift 2 ;;
 		--tracking-timeout) TRACKING_TIMEOUT="$2"; shift 2 ;;
+		--notify-email) NOTIFY_EMAIL="$2"; shift 2 ;;
 		-h|--help) usage ;;
 		*) echo "[ERR] unknown arg: $1" >&2; usage ;;
 	esac
@@ -331,6 +464,25 @@ case "$CHUNK_EXT" in
 	mkv|mp4|avi) ;;
 	*) echo "[ERR] --chunk-ext must be mkv|mp4|avi" >&2; exit 2 ;;
 esac
+if [[ -n "$CHUNK_RANGE" ]]; then
+	[[ "$CHUNK_RANGE" =~ ^[0-9]+-[0-9]+$ ]] || {
+		echo "[ERR] --chunk-range must be 'A-B' with 0 <= A <= B, got '$CHUNK_RANGE'" >&2; exit 2; }
+	(( ${CHUNK_RANGE%%-*} <= ${CHUNK_RANGE##*-} )) || {
+		echo "[ERR] --chunk-range start is past its end: '$CHUNK_RANGE'" >&2; exit 2; }
+	echo "[INFO] wave run: chunk indices ${CHUNK_RANGE} only (chunk_sec=${CHUNK_SEC}s -> "\
+	     "$(( ${CHUNK_RANGE%%-*} * CHUNK_SEC ))s..$(( (${CHUNK_RANGE##*-} + 1) * CHUNK_SEC ))s into each video)"
+	# Namespaces every MUTABLE control file this wave owns, on both clusters:
+	# /flash jobs dir (pipeline.env, worklist, jid_*.txt, rendered templates) and
+	# saion's $SAION_WORK_ROOT/jobs (worklist + rendered arrays). Those files are
+	# re-read AT RUN TIME by jobs that are already queued -- prefetch, predict,
+	# datacp and the verify gate all index the worklist by row -- so a second wave
+	# writing them under the block name would hand a running array a different
+	# wave's rows. Every task would still report COMPLETED; the chunks would just
+	# be the wrong ones. The chunk/output files themselves stay block-level: their
+	# names carry the chunk index, so waves cannot collide there, and sharing them
+	# is what lets prefetch skip an already-staged chunk.
+	WAVE_SLUG="wave_${CHUNK_RANGE}"
+fi
 
 # Auto-select the SLEAP inference path from the model dir contents: sleap-nn
 # checkpoints (best.ckpt) can be TRT/ONNX-exported; legacy TF models
@@ -346,8 +498,10 @@ if (( SKIP_TRT_EXPORT == 0 )) && [[ "$SLEAP_RUNTIME" != "pytorch" ]]; then
 	fi
 fi
 
-# Roots
-JOBS_ROOT="${JOBS_ROOT:-/flash/ReiterU/$USER/jobs/$EXP_NAME}"
+# Roots. Only the jobs dir is wave-scoped -- see the WAVE_SLUG comment above.
+# An explicit --jobs-root is honoured verbatim: the caller has already chosen the
+# namespace, and silently appending to it would surprise a rescue run.
+JOBS_ROOT="${JOBS_ROOT:-/flash/ReiterU/$USER/jobs/$EXP_NAME${WAVE_SLUG:+/$WAVE_SLUG}}"
 FLASH_ROOT="${FLASH_ROOT:-/flash/ReiterU/$USER/$EXP_NAME}"
 SAION_WORK_ROOT="/work/ReiterU/$USER/$EXP_NAME"
 DATA_DIR="$DIR/data"
@@ -362,17 +516,135 @@ ensure_group_perms "$JOBS_ROOT" "$FLASH_ROOT" "$DATA_DIR" "$HPC_LOGS_DIR"
 # hold other users' files we can't chgrp, so this is advisory only.
 check_group_perms "$DIR" || true
 
+# --- Concurrent-wave guard ----------------------------------------------------
+# Wave scoping (WAVE_SLUG) makes DIFFERENT ranges safe to overlap. What it cannot
+# make safe is two live runs that land in the SAME jobs dir: the second would
+# rewrite pipeline.env and aruco_worklist.txt under the first one's running array,
+# which reads them by row at task start. So refuse that outright, and warn on a
+# range some earlier wave already claimed (usually a typo, occasionally a
+# deliberate recompute). Both are overridable with --force-submit.
+#
+# Jobs are identified by the jid_*.txt files the previous run left in that dir,
+# not by job name: every deigo template uses a generic -J (bridge, cleanup,
+# chunk_fin), so squeue alone cannot tell this block's jobs from another's. Each
+# cluster's queue is fetched once -- a per-jid `squeue -j` on a finished id exits
+# non-zero and would spend ssh_retry's whole backoff ladder on every file.
+guard_concurrent_wave() {
+	local live_deigo live_saion q_deigo q_saion f base jid
+	[[ -d "$JOBS_ROOT" ]] || return 0
+	shopt -s nullglob
+	local jid_files=( "$JOBS_ROOT"/jid_*.txt )
+	shopt -u nullglob
+	(( ${#jid_files[@]} )) || return 0
+
+	q_deigo=$(squeue -h -u "$USER" -o '%i' 2>/dev/null || true)
+	# Best-effort: no saion login (or a network blip) must not block a submission,
+	# but say so, because the saion half of the check then did not happen.
+	q_saion=$(ssh -x -oBatchMode=yes -oStrictHostKeyChecking=no \
+		-oConnectTimeout=15 saion "bash -lc 'squeue -h -u \"\$USER\" -o %i'" 2>/dev/null) || {
+		echo "[WARN] could not reach saion to check for a live sleap array; guard covers deigo only" >&2
+		q_saion=""
+	}
+
+	live_deigo=""; live_saion=""
+	for f in "${jid_files[@]}"; do
+		base=$(basename "$f")
+		jid=$(tr -d '[:space:]' < "$f")
+		[[ -n "$jid" ]] || continue
+		# Array tasks show as <jid>_<task>, so anchor on the id plus a boundary.
+		local pat='^'"$jid"'(_|$)'
+		if [[ "$base" == jid_saion_* ]]; then
+			if grep -qE "$pat" <<<"$q_saion"; then live_saion+=" $base=$jid"; fi
+		else
+			if grep -qE "$pat" <<<"$q_deigo"; then live_deigo+=" $base=$jid"; fi
+		fi
+	done
+
+	if [[ -n "$live_deigo$live_saion" ]]; then
+		echo "[ERR] a run is still live in this jobs dir: $JOBS_ROOT" >&2
+		[[ -n "$live_deigo" ]] && echo "        deigo:$live_deigo" >&2
+		[[ -n "$live_saion" ]] && echo "        saion:$live_saion" >&2
+		echo "      Submitting now would rewrite its pipeline.env and worklist while its" >&2
+		echo "      array is still reading them, silently pairing tasks to the wrong chunks." >&2
+		if [[ -z "$CHUNK_RANGE" ]]; then
+			echo "      Give this run its own --chunk-range (waves get their own jobs dir)," >&2
+			echo "      or its own --jobs-root, or wait for the run above to finish." >&2
+		else
+			echo "      This is the same wave ($WAVE_SLUG) as the live run. Pick a different" >&2
+			echo "      --chunk-range, or wait for it to finish." >&2
+		fi
+		return 1
+	fi
+	return 0
+}
+
+if ! guard_concurrent_wave; then
+	if (( FORCE_SUBMIT == 1 )); then
+		echo "[WARN] --force-submit: proceeding into a live jobs dir anyway" >&2
+	else
+		echo "[ERR] refusing to submit; pass --force-submit to override" >&2
+		exit 2
+	fi
+fi
+
+# Overlap against the block ledger. Advisory only: a deliberate recompute of an
+# already-processed window is legitimate (that is what --sleap-force-recompute
+# and --new-processing-run are for), and the ledger records intent rather than
+# completion, so this must not be able to block a rescue run.
+if [[ -d "$DATA_DIR" ]]; then
+	_overlap=$(python3 "$LIB_DIR/pipeline_state.py" check-range \
+		--data-dir "$DATA_DIR" --range "$CHUNK_RANGE" 2>&1) || true
+	if [[ -n "$_overlap" ]]; then
+		echo "[WARN] this range overlaps a wave already recorded in PIPELINE_STATE.json:" >&2
+		echo "$_overlap" | sed 's/^/       /' >&2
+		echo "       Re-running it recomputes those chunks and overwrites their outputs." >&2
+	fi
+fi
+
+# --- Cross-cluster checkout preflight ----------------------------------------
+# saion's SLEAP tasks source $LIB_DIR/{hosts,ship_logs}.sh and run
+# $SCRIPTS_DIR/sleap2h5.py from the SAME absolute path baked into pipeline.env,
+# and saion login runs scripts/export_sleap_trt.sh from it. $HOME is shared
+# between the clusters but /apps/unit is not, so a checkout deployed on deigo
+# only would fail hours from now, silently, in every chunk's h5 conversion
+# (20260623 had zero _sleap_data.h5 for exactly this reason). Refuse up front.
+# Connection failure (rc 255) is a warning, like the concurrent-wave guard:
+# a saion blip must not block a submission the bridge will retry anyway.
+if (( ONLY_CHUNK != 1 && ONLY_ARUCO != 1 && ONLY_BACKUP != 1 )); then
+	_saion_rc=0
+	ssh -x -oBatchMode=yes -oStrictHostKeyChecking=no -oConnectTimeout=15 saion 		"test -f '$SCRIPTS_DIR/sleap2h5.py' && test -f '$LIB_DIR/ship_logs.sh' && test -f '$LIB_DIR/hosts.sh'" 		2>/dev/null || _saion_rc=$?
+	if (( _saion_rc == 255 )); then
+		echo "[WARN] could not reach saion to verify this checkout is visible there; SLEAP tasks need $SCRIPTS_DIR on saion" >&2
+	elif (( _saion_rc != 0 )); then
+		echo "[ERR] this checkout is not visible on saion: $SCRIPT_DIR" >&2
+		echo "      saion's SLEAP tasks read lib/ and scripts/sleap2h5.py from that exact path." >&2
+		echo "      /apps/unit is per-cluster: deploy it there too, e.g." >&2
+		echo "        bash $SCRIPTS_DIR/deploy_release.sh --ref <ref> --mirror saion" >&2
+		exit 2
+	fi
+fi
+
 # --- Tracking auto-trigger: validate + derive defaults ------------------------
 if (( RUN_TRACKING == 1 )); then
 	if (( ONLY_CHUNK == 1 || ONLY_ARUCO == 1 || ONLY_SLEAP == 1 || ONLY_BACKUP == 1 )); then
 		echo "[ERR] --run-tracking needs a full aruco+sleap run; drop the --only-* flag(s)" >&2
 		exit 2
 	fi
-	: "${TRACKING_SUBMIT:=$(cd "$SCRIPT_DIR/.." && pwd)/tracking/colony/submit_blocks_pipeline.sh}"
+	: "${TRACKING_SUBMIT:=$(cd "$SCRIPT_DIR/.." && pwd -P)/tracking/colony/submit_blocks_pipeline.sh}"
 	[[ -f "$TRACKING_HMATS" ]] || { echo "[ERR] --run-tracking requires --tracking-hmats <existing .npz>" >&2; exit 2; }
 	[[ -f "$TRACKING_SUBMIT" ]] || { echo "[ERR] tracking submit script not found: $TRACKING_SUBMIT" >&2; exit 2; }
 	: "${TRACKING_OUTPUT_ROOT:=/flash/ReiterU/$USER/colony_pipeline/$(basename "$(dirname "$DIR")")}"
 	echo "[INFO] tracking auto-trigger ON: submit=$TRACKING_SUBMIT hmats=$TRACKING_HMATS output_root=$TRACKING_OUTPUT_ROOT"
+	if [[ -n "$CHUNK_RANGE" ]]; then
+		# The poller gates on the BLOCK's declared total, not this wave's worklist
+		# (track_trigger.sh), so it simply waits until every wave has landed --
+		# tracking cannot run on part of a block in any case, because map_combine
+		# drops absent cameras silently rather than shortening its output.
+		# Harmless on any single wave; the thing to avoid is one poller per wave.
+		echo "[INFO] --run-tracking waits for ALL $CHUNK_RANGE-style waves to finish"
+		echo "       (it gates on the block's declared chunk total, not this wave)."
+		echo "       Pass it on ONE wave only -- a second poller would submit tracking twice."
+	fi
 fi
 
 cat > "$ENV_FILE" <<EOF
@@ -391,6 +663,9 @@ export LIB_DIR="$LIB_DIR"
 export SCRIPTS_DIR="$SCRIPTS_DIR"
 export CHUNK_SEC="$CHUNK_SEC"
 export CHUNK_EXT="$CHUNK_EXT"
+export CHUNK_RANGE="$CHUNK_RANGE"
+export WAVE_SLUG="$WAVE_SLUG"
+export ARUCO_FORCE_RECOMPUTE="$ARUCO_FORCE_RECOMPUTE"
 export ARUCO_DICT_PATH="$ARUCO_DICT_PATH"
 export ARUCO_EXTRA_ARGS="$ARUCO_EXTRA_ARGS"
 export ARUCO_CONCURRENCY="$ARUCO_CONCURRENCY"
@@ -398,6 +673,11 @@ export SLEAP_CONCURRENCY="$SLEAP_CONCURRENCY"
 export SLEAP_CPUS="$SLEAP_CPUS"
 export SLEAP_MEM="$SLEAP_MEM"
 export SLEAP_WALL="$SLEAP_WALL"
+export PREFETCH_PARTITION="$PREFETCH_PARTITION"
+export PREFETCH_CONCURRENCY="$PREFETCH_CONCURRENCY"
+export PREFETCH_CPUS="$PREFETCH_CPUS"
+export PREFETCH_MEM="$PREFETCH_MEM"
+export PREFETCH_WALL="$PREFETCH_WALL"
 export DATACP_CONCURRENCY="$DATACP_CONCURRENCY"
 export BATCH_SIZE="$BATCH_SIZE"
 export MAX_ARRAY_TASKS="$MAX_ARRAY_TASKS"
@@ -411,6 +691,7 @@ export SLEAP_RUNTIME="$SLEAP_RUNTIME"
 export SKIP_TRT_EXPORT="$SKIP_TRT_EXPORT"
 export ONLY_ARUCO="$ONLY_ARUCO"
 export ONLY_SLEAP="$ONLY_SLEAP"
+export SLEAP_FORCE_RECOMPUTE="$SLEAP_FORCE_RECOMPUTE"
 export RUN_BACKUP="$RUN_BACKUP"
 export BACKUP_UNIT_ROOT="$BACKUP_UNIT_ROOT"
 export BACKUP_REL_DIR="$BACKUP_REL_DIR"
@@ -428,8 +709,14 @@ export TRACKING_OUTPUT_ROOT="$TRACKING_OUTPUT_ROOT"
 export TRACKING_EXTRA_ARGS="$TRACKING_EXTRA_ARGS"
 export TRACKING_POLL_SECS="$TRACKING_POLL_SECS"
 export TRACKING_TIMEOUT="$TRACKING_TIMEOUT"
+export NOTIFY_EMAIL="$NOTIFY_EMAIL"
 EOF
 echo "[INFO] env file: $ENV_FILE"
+
+# Slurm-native failure mail on every job submitted here (chunk_finalize adds the
+# same args to the stages it fans out; arrays notify once per array, not per task).
+MAIL_ARGS=()
+[[ -n "$NOTIFY_EMAIL" ]] && MAIL_ARGS=(--mail-type=FAIL --mail-user="$NOTIFY_EMAIL")
 
 # Build manifest
 MANIFEST="$JOBS_ROOT/manifest.csv"
@@ -445,6 +732,49 @@ if (( N_VIDEOS <= 0 )); then
 fi
 echo "[INFO] $N_VIDEOS grid videos discovered"
 
+# --- Processing contract ------------------------------------------------------
+# Declare (first run) or verify (every later run) how this block is processed.
+# A chunk's filename encodes its INDEX, not its settings, so re-running a block
+# under a different --chunk-sec or a different model silently overwrites part of
+# data/ with content that no longer lines up with the part it did not overwrite.
+# That is unrecoverable after the fact -- every file stays individually valid --
+# so a disagreement stops the run here rather than at the first output.
+# See lib/pipeline_state.py. Skipped for --only-backup, which produces no data/.
+if (( ONLY_BACKUP != 1 )); then
+	STATE_LEGS="aruco,sleap"
+	(( ONLY_ARUCO == 1 )) && STATE_LEGS="aruco"
+	(( ONLY_SLEAP == 1 )) && STATE_LEGS="sleap"
+
+	# Only pass keys this run actually exercises: an --only-sleap run supplies no
+	# aruco settings, and absence means "not exercised", never "clear it".
+	STATE_SET=(--set "chunk_sec=$CHUNK_SEC" --set "chunk_ext=$CHUNK_EXT")
+	if (( ONLY_SLEAP != 1 )); then
+		STATE_SET+=(--set "aruco_dict=$ARUCO_DICT_PATH"
+		            --set "aruco_params=$ARUCO_EXTRA_ARGS"
+		            --set "aruco_script=$(basename "${ARUCO_SCRIPT:-run_aruco_mp.py}")")
+	fi
+	if (( ONLY_ARUCO != 1 )); then
+		STATE_SET+=(--set "sleap_model_centroid=$SLEAP_MODEL_CENTROID"
+		            --set "sleap_model_instance=$SLEAP_MODEL_INSTANCE"
+		            --set "sleap_module=$SLEAP_MODULE"
+		            --set "sleap_runtime=$SLEAP_RUNTIME"
+		            --set "saion_partition=$SAION_PARTITION")
+	fi
+	NEW_RUN_ARG=()
+	(( NEW_PROCESSING_RUN == 1 )) && NEW_RUN_ARG=(--new-run)
+
+	if ! python3 "$LIB_DIR/pipeline_state.py" sync \
+			--data-dir "$DATA_DIR" \
+			--manifest "$MANIFEST" \
+			--block-dir "$DIR" \
+			--legs "$STATE_LEGS" \
+			"${STATE_SET[@]}" "${NEW_RUN_ARG[@]}"; then
+		echo "[ERR] refusing to submit: this run conflicts with the block's recorded" >&2
+		echo "      processing contract (see the diff above). Nothing was submitted." >&2
+		exit 2
+	fi
+fi
+
 # Render every template once (single placeholder: __JOBS_ROOT__)
 echo "[INFO] rendering templates -> $JOBS_ROOT/"
 for t in chunk.sbatch chunk_finalize.sbatch backup.sbatch aruco_array.sbatch aruco_datacp.sbatch bridge.sbatch cleanup.sbatch; do
@@ -455,7 +785,7 @@ done
 # --only-backup: build manifest + submit ONLY the raw-video backup job.
 if (( ONLY_BACKUP )); then
 	(( RUN_BACKUP == 1 )) || { echo "[ERR] --only-backup conflicts with --no-backup" >&2; exit 2; }
-	JID_BACKUP=$(sbatch_retry backup --partition="$BACKUP_PARTITION" "$JOBS_ROOT/backup.sbatch")
+	JID_BACKUP=$(sbatch_retry backup --partition="$BACKUP_PARTITION" "${MAIL_ARGS[@]}" "$JOBS_ROOT/backup.sbatch")
 	echo "  backup        $JID_BACKUP"
 	echo "$JID_BACKUP" > "$JOBS_ROOT/jid_backup.txt"
 	echo "[INFO] --only-backup: submitted backup job only -> ${BACKUP_ARCHIVE_PATH:-(disabled)}"
@@ -465,7 +795,7 @@ fi
 # Submit chunk array
 CHUNK_UPPER=$(( N_VIDEOS - 1 ))
 echo "[INFO] sbatch chunk_array=0-${CHUNK_UPPER}"
-JID_CHUNK=$(sbatch_retry chunk --array=0-${CHUNK_UPPER} "$JOBS_ROOT/chunk.sbatch")
+JID_CHUNK=$(sbatch_retry chunk --array=0-${CHUNK_UPPER} "${MAIL_ARGS[@]}" "$JOBS_ROOT/chunk.sbatch")
 echo "  chunk         $JID_CHUNK"
 echo "$JID_CHUNK" > "$JOBS_ROOT/jid_chunk.txt"
 
@@ -475,19 +805,29 @@ if (( ONLY_CHUNK )); then
 fi
 
 # Submit chunk_finalize (builds worklist + submits aruco / bridge / cleanup)
-JID_CHUNK_FIN=$(sbatch_retry chunk_fin --dependency=afterok:$JID_CHUNK "$JOBS_ROOT/chunk_finalize.sbatch")
+JID_CHUNK_FIN=$(sbatch_retry chunk_fin --dependency=afterok:$JID_CHUNK "${MAIL_ARGS[@]}" "$JOBS_ROOT/chunk_finalize.sbatch")
 echo "  chunk_finalize $JID_CHUNK_FIN (dep: $JID_CHUNK)"
 echo "$JID_CHUNK_FIN" > "$JOBS_ROOT/jid_chunk_fin.txt"
 
 # Optional: launch the login-side tracking auto-trigger (nohup poller). It waits for
-# detection outputs to appear in the bucket, then submits colony tracking for this
-# block. Mirrors the tracking transfer watcher's login-nohup pattern; survives logout.
-if (( RUN_TRACKING == 1 )); then
+# detection outputs to appear in the bucket, then emails NOTIFY_EMAIL (detection
+# complete) and/or submits colony tracking for this block. Mirrors the tracking
+# transfer watcher's login-nohup pattern; survives logout. The notify-only launch
+# is restricted to full runs: an --only-* run never completes both modalities, so
+# the poller would just sit until its 48h deadline and mail a spurious timeout.
+# A --chunk-range wave is the same situation for the same reason -- the poller
+# gates on the block's DECLARED total, which one wave cannot reach -- so exclude
+# it too. Slurm's own --mail-type=FAIL is unaffected: that rides on each
+# submitted job via MAIL_ARGS, not on this poller, so failure mail still arrives.
+# With --run-tracking the poller IS wanted on a wave: waiting for the whole block
+# is precisely its job.
+if (( RUN_TRACKING == 1 )) || { [[ -n "$NOTIFY_EMAIL" ]] && [[ -z "$CHUNK_RANGE" ]] \
+		&& (( ONLY_ARUCO == 0 && ONLY_SLEAP == 0 )); }; then
 	mkdir -p "$HPC_LOGS_DIR/pipeline"
 	sed "s#__JOBS_ROOT__#$JOBS_ROOT#g" "$TEMPLATES_DIR/track_trigger.sh" > "$JOBS_ROOT/track_trigger.sh"
 	chmod +x "$JOBS_ROOT/track_trigger.sh"
 	nohup "$JOBS_ROOT/track_trigger.sh" >> "$HPC_LOGS_DIR/pipeline/track_trigger.log" 2>&1 &
-	echo "  track_trigger  PID $! (nohup; log: $HPC_LOGS_DIR/pipeline/track_trigger.log)"
+	echo "  track_trigger  PID $! (nohup; tracking=$RUN_TRACKING notify=${NOTIFY_EMAIL:-off}; log: $HPC_LOGS_DIR/pipeline/track_trigger.log)"
 fi
 
 cat <<EOF

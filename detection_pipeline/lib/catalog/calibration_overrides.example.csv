@@ -1,0 +1,20 @@
+# Per-calibration overrides for the catalog's calibration registry
+# (starter template -- copy to calibration_overrides.csv to use).
+#
+# Put the real file at <outdir>/calibration_overrides.csv (default outdir is
+# <root>/_catalog, e.g. /bucket/ReiterU/Ants/basler/_catalog/).
+#
+# The registry itself is discovered: every *_H_mats.npz under cameraArray_calib/
+# becomes a row, keyed by the calibration directory name (calib_id), dated from
+# that name. This file only ADJUSTS rows:
+#   valid_from  YYYY-MM-DD from which this calibration applies to blocks
+#               (default: the calibration date). A block's expected calibration
+#               is the enabled one with the latest valid_from on or before the
+#               block's recording date.
+#   enabled     false retires a calibration (never expected for any block).
+#   note        free text (why it exists, what changed on the rig).
+# Lines starting with '#' and blank lines are ignored. Keep the header row.
+#
+calib_id,valid_from,enabled,note
+# 20260414_calibration_dataset,,false,superseded by the 2026-06-23 board filming (same rig geometry)
+# 20260810_calib_elevated_by_2mm,2026-08-10,true,rig re-levelled before the UV print test

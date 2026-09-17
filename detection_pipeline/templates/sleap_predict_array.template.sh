@@ -2,8 +2,10 @@
 # Per-task resources are rendered by bridge.sbatch from pipeline.sh knobs so one
 # template serves both A100 partitions (same SM80 hardware, gpu23-26):
 #   largegpu   (8 GPU cap):  -c 16 --mem=128G -t 0-12  -> 8 concurrent saturate cpu/mem/gpu
-#   short-a100 (32 GPU cap): -c 8  --mem=64G  -t 0-1   -> 32 concurrent; 0-1 stays inside
-#                                                         the 1h non-preemptible window
+#   short-a100 (32 GPU cap): -c 8  --mem=64G  -t 0-2   -> 32 concurrent; one chunk/task
+#                                                         (BATCH_SIZE=1) fits well inside 2h;
+#                                                         a run preempted past the 1h
+#                                                         non-preemptible window is REQUEUEd
 #SBATCH -t __SLEAP_WALL__
 #SBATCH -c __SLEAP_CPUS__
 #SBATCH --partition=__SAION_PARTITION__
@@ -16,6 +18,8 @@
 #SBATCH --signal=TERM@60
 set -eo pipefail
 
+# Batch jobs need the site modules, not interactive conda/mamba hooks. Sourcing
+# ~/.bashrc under set -e can exit before SLEAP loads when a user hook is missing.
 if ! type module >/dev/null 2>&1; then
 	source /etc/profile
 fi
@@ -26,6 +30,56 @@ module load __SLEAP_MODULE__
 # Home is shared deigo<->saion, so the rendered deigo repo path also works on saion.
 source "__HOSTS_LIB__"
 source "__SHIP_LIB__"
+
+# UV_TOOL_DIR is not a reliable handle on the sleap-nn interpreter: 0.2.0's
+# modulefile exports it, but 0.3.3's deliberately does not -- it only prepends
+# PATH, precisely so uv stops writing into the shared install tree. Resolving
+# through PATH covers both layouts: $apphome/bin/sleap-nn is a symlink into the
+# venv and its python sits beside the CLI.
+#
+# This is load-bearing, not cosmetic. Under 0.3.3 the old expression expanded to
+# "/sleap-nn/bin/python", which is not executable, so BOTH h5 validators took
+# their "cannot validate, assume good" path AND -- far worse -- the sleap2h5
+# conversion below failed outright. The chunk then shipped a .slp with no
+# _sleap_data.h5, which is the artifact tracking gates on.
+SLEAP_PY="${UV_TOOL_DIR:+$UV_TOOL_DIR/sleap-nn/bin/python}"
+if [[ ! -x "$SLEAP_PY" ]]; then
+	_cli="$(command -v sleap-nn 2>/dev/null || true)"
+	if [[ -n "$_cli" ]]; then
+		SLEAP_PY="$(dirname "$(readlink -f "$_cli")")/python"
+	fi
+fi
+if [[ -x "$SLEAP_PY" ]]; then
+	echo "[INFO] sleap-nn python: $SLEAP_PY"
+else
+	echo "[WARN] no sleap-nn python (UV_TOOL_DIR='${UV_TOOL_DIR:-}', no sleap-nn on PATH); h5 conversion will fail" >&2
+fi
+
+# sleap-nn rewrote the whole `predict` surface between 0.2.x and 0.3.x: both
+# positional arguments became required options, --batch-size gained an
+# underscore, and --n-frames was replaced by a --frames range. Only -o,
+# --runtime and --device survive unchanged, so no single spelling satisfies both
+# versions -- under 0.3.3 the old line dies in ~10 s on
+#   Error: No such option '--batch-size'
+# and takes the whole array plus its afterok datacp down with it.
+#
+# Decide from the module name rather than probing `--help`: the probe costs a
+# full import (tens of seconds on 0.2.0) and would pay it once per chunk, while
+# the module string is already exact. Anything that does not parse as a version
+# is treated as the new CLI, since that is where the project is going; the old
+# path stays reachable for the deployed 0.2.0 runs.
+SLEAP_MODULE_NAME="__SLEAP_MODULE__"
+_v="${SLEAP_MODULE_NAME##*/}"          # sleap-nn/0.3.3 -> 0.3.3
+_v="${_v%%-*}"                         # 0.2.0-cu128    -> 0.2.0
+_v_major="${_v%%.*}"
+_v_rest="${_v#*.}"
+_v_minor="${_v_rest%%.*}"
+if [[ "$_v_major" == "0" && "$_v_minor" =~ ^[0-9]+$ ]] && (( _v_minor < 3 )); then
+	SLEAP_CLI="legacy"
+else
+	SLEAP_CLI="v03"
+fi
+echo "[INFO] sleap-nn module '$SLEAP_MODULE_NAME' -> predict CLI: $SLEAP_CLI"
 
 REMOTE_JOBS="__REMOTE_JOBS__"
 REMOTE_INPUT="__REMOTE_INPUT__"
@@ -62,6 +116,150 @@ end_idx=$(( start_idx + BATCH_SIZE ))
 
 mkdir -p "$REMOTE_INPUT" "$REMOTE_OUTPUT"
 
+# A killed/preempted writer leaves a small HDF5 holding only the metadata groups
+# (20260723/block02 cam09_001: 7 KB, no `frames`, against ~250 MB for every
+# sibling chunk). Presence alone therefore does not mean "inference finished",
+# so require a non-empty `frames` dataset -- the same thing sleap2h5 reads.
+#
+# "Cannot validate" must never be reported as "file is bad": h5py in the
+# sleap-nn venv needs the compute nodes' glibc (it fails to import on the saion
+# login with GLIBC_2.28 not found). Treating an import failure as corruption
+# would delete good .slp files and re-infer every chunk on such a host, so the
+# probe exits 3 for "validator unavailable" and we then fall back to the old
+# presence-only behaviour -- degraded, but never destructive.
+slp_is_complete() {
+	local f="$1" py="$SLEAP_PY" rc=0
+	[[ -s "$f" ]] || return 1
+	if [[ ! -x "$py" ]]; then
+		echo "[WARN] no sleap-nn python at $py; cannot validate $f, assuming complete" >&2
+		return 0
+	fi
+	"$py" -c '
+import sys
+try:
+    import h5py
+except Exception:
+    sys.exit(3)               # validator unavailable, NOT a verdict on the file
+try:
+    with h5py.File(sys.argv[1], "r") as h:
+        ok = "frames" in h and len(h["frames"]) > 0
+except Exception:
+    ok = False                # unreadable/truncated HDF5 -> genuinely bad
+sys.exit(0 if ok else 1)
+' "$f" 2>/dev/null || rc=$?
+	case "$rc" in
+		0) return 0 ;;
+		1) return 1 ;;
+		*) echo "[WARN] cannot validate $f (h5py unavailable, rc=$rc); assuming complete" >&2
+		   return 0 ;;
+	esac
+}
+
+# The h5 is what tracking actually reads, and it has the same killed-writer
+# failure mode as the .slp: a preempted sleap2h5 leaves a truncated file that is
+# still non-empty, so `-s` calls it done. 20260723/block01 cam13_005 shipped
+# 484 KB of unreadable HDF5 that way, and map_combine -- an hour later, on the far
+# side of a cluster boundary -- was the first thing to open it.
+#
+# Readability is the whole test: h5py.File() is exactly what map_combine does, so
+# a file that opens here opens there. Deliberately NOT checking row counts -- a
+# chunk with no detections yields a valid empty table, and rejecting that would
+# re-convert a good chunk on every requeue forever. Same non-destructive contract
+# as slp_is_complete: "cannot validate" is never a verdict of "bad".
+h5_is_readable() {
+	local f="$1" py="$SLEAP_PY" rc=0
+	[[ -s "$f" ]] || return 1
+	if [[ ! -x "$py" ]]; then
+		echo "[WARN] no sleap-nn python at $py; cannot validate $f, assuming readable" >&2
+		return 0
+	fi
+	"$py" -c '
+import sys
+try:
+    import h5py
+except Exception:
+    sys.exit(3)               # validator unavailable, NOT a verdict on the file
+try:
+    with h5py.File(sys.argv[1], "r") as h:
+        ok = len(list(h.keys())) > 0
+except Exception:
+    ok = False                # unreadable/truncated HDF5 -> genuinely bad
+sys.exit(0 if ok else 1)
+' "$f" 2>/dev/null || rc=$?
+	case "$rc" in
+		0) return 0 ;;
+		1) return 1 ;;
+		*) echo "[WARN] cannot validate $f (h5py unavailable, rc=$rc); assuming readable" >&2
+		   return 0 ;;
+	esac
+}
+
+# Scratch is not the deliverable -- the bucket is. Tracking gates on
+# _sleap_data.h5, so a chunk is only "done" when BOTH artifacts landed.
+# Returns 0 present, 1 absent, 2 bucket unreachable. The remote test always
+# exits 0 so a legitimate absence does not burn ssh_retry's 5-attempt backoff.
+#
+# PRESENCE ONLY, deliberately: this runs `ssh saion` against the login node,
+# where h5py cannot import (GLIBC_2.28), and the bucket is not mounted on saion
+# compute -- so there is nowhere here to actually open the remote file. The
+# consequence is a real gap: a chunk whose bucket h5 was already corrupt before
+# this check existed takes the [SKIP] path below and is never repaired by this
+# stage. track_trigger.sh re-opens every bucket file before firing tracking and
+# refuses on any bad one, so such a chunk surfaces there (named, with the
+# CPU-only sleap2h5 recovery command) rather than reaching the map stage.
+bucket_has_outputs() {
+	local vname="$1" chunk="$2" out
+	out=$(ssh_retry saion "[[ -s '$DATA_DIR/${vname}_${chunk}.slp' && -s '$DATA_DIR/${vname}_${chunk}_sleap_data.h5' ]] && echo PRESENT || echo ABSENT" 2>/dev/null) || return 2
+	[[ "$out" == *PRESENT* ]]
+}
+
+# slp -> h5, then push both to the bucket. Called for freshly inferred chunks
+# and for repair of chunks whose .slp survived on scratch but never uploaded.
+postprocess_and_upload() {
+	local vname="$1" chunk="$2" n_frames="$3"
+	local out_slp="$REMOTE_OUTPUT/${vname}_${chunk}.slp"
+	local out_h5="$REMOTE_OUTPUT/${vname}_${chunk}_sleap_data.h5"
+
+	# Convert when the h5 is absent OR unreadable. The old `! -s` test skipped
+	# conversion whenever a file existed, so a truncated leftover from a killed
+	# converter was passed straight through to the bucket as if it were finished.
+	if ! h5_is_readable "$out_h5"; then
+		if [[ -e "$out_h5" ]]; then
+			echo "[WARN] ${vname}_${chunk}: discarding unreadable _sleap_data.h5 ($(stat -c%s "$out_h5" 2>/dev/null || echo '?') bytes) and re-converting" >&2
+			# `|| true` is load-bearing: this function always runs backgrounded and
+			# is reaped by a bare `wait`, which reports 0 regardless. Under `set -e`
+			# a failing rm (stale NFS handle, quota, read-only scratch) would kill
+			# this subshell silently -- before the conversion, before the upload,
+			# before the [GAP] warning -- and the task would still exit COMPLETED
+			# with the chunk missing entirely. Losing the file is worse than
+			# failing to delete it; sleap2h5 overwrites in place either way.
+			rm -f "$out_h5" || echo "[WARN] could not remove $out_h5; re-converting over it" >&2
+		fi
+		echo "[$(date)] [bg] slp -> h5 ${vname}_${chunk}"
+		# Record the chunk's design frame count (worklist col 3) as the
+		# expected_frames h5 attr so a later --only-sleap re-run can verify this
+		# chunk was processed under the same chunking and skip it. Empty on the
+		# legacy 2-col worklist -> attr omitted (filter falls back to presence).
+		"$SLEAP_PY" "$SCRIPTS_DIR/sleap2h5.py" "$out_slp" "$REMOTE_OUTPUT" \
+			${n_frames:+--expected-frames "$n_frames"} \
+			|| echo "[WARN] sleap2h5 failed for ${vname}_${chunk}; .slp will still upload" >&2
+	fi
+
+	# Never ship an h5 we could not read. Leaving it off the bucket keeps the
+	# chunk visibly incomplete, which track_trigger reports as a stall against a
+	# named chunk -- far cheaper to act on than a map job dying on a silent hole.
+	local upload_files=( "$out_slp" )
+	if h5_is_readable "$out_h5"; then
+		upload_files+=( "$out_h5" )
+	else
+		echo "[GAP] ${vname}_${chunk}: no usable _sleap_data.h5 after conversion; tracking gates on it and will stall" >&2
+	fi
+	echo "[$(date)] [bg] uploading ${vname}_${chunk} (${#upload_files[@]} file(s)) -> bucket"
+	rsync_retry -ah --chmod=Du=rwx,Dg=rwx,Fu=rw,Fg=rw --chown=:"$OUTPUT_GROUP" \
+		"${upload_files[@]}" "saion:$DATA_DIR/" \
+		|| echo "[WARN] inline upload of ${vname}_${chunk} failed; sleap_datacp end-of-run will retry" >&2
+}
+
 for (( row_idx=start_idx; row_idx<end_idx; row_idx++ )); do
 	row=$(sed -n "$((row_idx + 1))p" "$WORKLIST")
 	[[ -n "$row" ]] || break
@@ -80,9 +278,28 @@ for (( row_idx=start_idx; row_idx<end_idx; row_idx++ )); do
 	input="$REMOTE_INPUT/${vname}_${chunk}.${CHUNK_EXT}"
 	out_slp="$REMOTE_OUTPUT/${vname}_${chunk}.slp"
 
-	if [[ -f "$out_slp" ]]; then
-		echo "[SKIP] $out_slp already exists"
+	# Three-way, because "a file is here" answered the wrong question. A requeued
+	# task (preemption on short-a100, node death) re-walks rows it already
+	# attempted; the old `-f` test skipped inference AND the upload, then exited
+	# 0, so Slurm reported COMPLETED for a chunk the bucket never received.
+	# 20260723/block02 lost 3 chunks that way and stalled tracking indefinitely.
+	if slp_is_complete "$out_slp"; then
+		brc=0; bucket_has_outputs "$vname" "$chunk" || brc=$?
+		if (( brc == 0 )); then
+			echo "[SKIP] ${vname}_${chunk}: complete on scratch, both artifacts on bucket"
+			continue
+		fi
+		(( brc == 2 )) && echo "[WARN] ${vname}_${chunk}: bucket unreachable; re-uploading rather than assuming done" >&2
+		# Inference is the expensive part and it already succeeded -- redo only
+		# the h5 conversion and the upload.
+		echo "[REPAIR] ${vname}_${chunk}: valid .slp on scratch but bucket incomplete; re-uploading without re-inference"
+		postprocess_and_upload "$vname" "$chunk" "$n_frames" &
 		continue
+	fi
+
+	if [[ -e "$out_slp" ]]; then
+		echo "[WARN] ${vname}_${chunk}: discarding incomplete .slp ($(stat -c%s "$out_slp" 2>/dev/null || echo '?') bytes) and re-running inference" >&2
+		rm -f "$out_slp"
 	fi
 
 	# Self-fetch if not already on /work
@@ -103,12 +320,27 @@ for (( row_idx=start_idx; row_idx<end_idx; row_idx++ )); do
 	_t0=$SECONDS
 	if (( SKIP_TRT_EXPORT == 0 )) && [[ "$SLEAP_RUNTIME" != "pytorch" ]]; then
 		# Exported-model path: ONNX or TensorRT
-		sleap-nn predict "$EXPORT_DIR" "$input" \
-			-o "$out_slp" \
-			--runtime "$SLEAP_RUNTIME" \
-			--batch-size "$SLEAP_BATCH_SIZE" \
-			${n_frames:+--n-frames "$n_frames"} \
-			--device cuda
+		if [[ "$SLEAP_CLI" == "v03" ]]; then
+			# --frames is an inclusive range, so the worklist's frame COUNT
+			# becomes 0-(n-1). It serves the same purpose --n-frames did: _000
+			# chunks carry inflated container metadata, and without a bound the
+			# reader runs off the end of the real stream with an IndexError.
+			sleap-nn predict \
+				-m "$EXPORT_DIR" \
+				-i "$input" \
+				-o "$out_slp" \
+				--runtime "$SLEAP_RUNTIME" \
+				--batch_size "$SLEAP_BATCH_SIZE" \
+				${n_frames:+--frames "0-$(( n_frames - 1 ))"} \
+				--device cuda
+		else
+			sleap-nn predict "$EXPORT_DIR" "$input" \
+				-o "$out_slp" \
+				--runtime "$SLEAP_RUNTIME" \
+				--batch-size "$SLEAP_BATCH_SIZE" \
+				${n_frames:+--n-frames "$n_frames"} \
+				--device cuda
+		fi
 	else
 		# Fallback: legacy PyTorch path via raw model dirs.
 		# Note: sleap-nn track does not accept --n-frames; on _000 chunks with
@@ -140,22 +372,10 @@ for (( row_idx=start_idx; row_idx<end_idx; row_idx++ )); do
 	# BACKGROUND so the next chunk's GPU work overlaps with this chunk's CPU
 	# work + upload. With ~30 fps inference and ~few-min post-processing, at
 	# most ~1 background job is in flight at a time. The end-of-loop `wait`
-	# below ensures none are orphaned when the task exits. UV_TOOL_DIR is set
-	# by `module load sleap-nn/...`; pandas + h5py are in that venv.
+	# below ensures none are orphaned when the task exits. SLEAP_PY is resolved
+	# once at the top of this script; pandas + h5py live in that venv.
 	# sleap_datacp end-of-run remains the safety net for anything missed here.
-	(
-		out_h5="$REMOTE_OUTPUT/${vname}_${chunk}_sleap_data.h5"
-		echo "[$(date)] [bg] slp -> h5 ${vname}_${chunk}"
-		"$UV_TOOL_DIR/sleap-nn/bin/python" "$SCRIPTS_DIR/sleap2h5.py" "$out_slp" "$REMOTE_OUTPUT" \
-			|| echo "[WARN] sleap2h5 failed for ${vname}_${chunk}; .slp will still upload" >&2
-
-		upload_files=( "$out_slp" )
-		[[ -s "$out_h5" ]] && upload_files+=( "$out_h5" )
-		echo "[$(date)] [bg] uploading ${vname}_${chunk} (.slp + .h5) -> bucket"
-		rsync_retry -ah --chmod=Du=rwx,Dg=rwx,Fu=rw,Fg=rw --chown=:"$OUTPUT_GROUP" \
-			"${upload_files[@]}" "saion:$DATA_DIR/" \
-			|| echo "[WARN] inline upload of ${vname}_${chunk} failed; sleap_datacp end-of-run will retry" >&2
-	) &
+	postprocess_and_upload "$vname" "$chunk" "$n_frames" &
 done
 # Wait for any backgrounded post-processing (slp2h5 + rsync) before exiting.
 wait

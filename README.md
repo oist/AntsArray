@@ -19,7 +19,7 @@ without recording data or Slurm access with:
 
 ```bash
 uv sync --locked --extra interactive --extra test
-MPLBACKEND=Agg uv run --locked --extra interactive --extra test python -m pytest -q analysis tracking camera_cal scripts detection_pipeline
+MPLBACKEND=Agg uv run --locked --extra interactive --extra test python -m pytest -q
 ```
 
 The source checkout includes the analysis helpers, dashboard templates, contact
@@ -214,17 +214,28 @@ After stitching, `scripts/per_track_slurm_fanout.sh` runs the standard per-track
 ```text
 block02/stitched/colony_presence_vectors/
 block02/stitched/speed_vectors/
+block02/stitched/sleep_motion/
+block02/stitched/sleep_motion_labels/
 block02/stitched/grid_occupancy_histograms/
 block02/stitched/sleep_predictions/
 ```
 
 Disable this stage with `--no_per_track_analysis`, or disable only sleep prediction with `--no_sleep_predictions`. Override the sleep classifier model with `--sleep_model /path/to/sleep_random_forest.joblib`; leaving it empty uses the production default in `analysis/compute_track_sleep_predictions.py`.
 
+Motion-based sleep labels run after the body/antenna motion caches finish and
+are included in the completion markers required for publication. They are
+separate from the optional trained-classifier predictions. Occupancy grids
+default to 0.25 mm bins; `--grid_size_mm` overrides the bin size.
+
 ### 5. Chunk Interaction Analysis
 
 `tracking/colony/interaction_batch.py` submits one worker per chunk/side track parquet. Each worker runs `tracking/colony/interaction_one_chunk.py`.
 
-For each frame, the worker first finds ant pairs within an interaction radius using `TrackX/TrackY`. It then records a directed interaction when an antenna bodypoint from one ant is within the micro-interaction distance of any bodypoint on the other ant.
+For each frame, the worker measures the minimum distance between all finished
+skeleton segments and nodes, recording each unordered ant pair once when that
+distance is at most 0.1 mm by default. The worker's
+`--micro_interaction_distance_mm` overrides the threshold. A spatial index
+finds candidates without a track-center cutoff.
 
 Outputs are flat and intentionally minimal:
 
@@ -237,8 +248,13 @@ block02/interactions/
 Each interaction parquet contains only:
 
 ```text
-Frame, antenna_track_id, body_track_id
+Frame, ant_a, ant_b, distance_mm
 ```
+
+Each parquet has a `.metadata.json` sidecar recording the geometry, parameters,
+and source-file identity. Existing outputs are reused only when that metadata
+matches. Older directed antenna/body interaction caches are incompatible with
+this skeleton-contact definition.
 
 The completion marker lives in `jobs/block02/state/interactions_complete_block02.ok`, not in the interaction output folder.
 
@@ -663,7 +679,7 @@ and plots all clusters as tiled occupancy maps with optional additional time bin
 
 Local debugging script for tuning interaction radii and antenna bodypoint behavior on one chunk. It can generate labeled SLEAP skeleton debug images with interaction radii marked. Production interaction extraction is in `tracking/colony/interaction_batch.py` and `tracking/colony/interaction_one_chunk.py`.
 
-### `analysis/interaction_analysis.py`
+### `analysis/exploratory/interaction_analysis.py` (legacy directed interactions)
 
 Loads bucket `interactions/` chunk parquet files with the matching `tracks/` chunk parquet and `stitched/grid_occupancy_histograms/track_cluster_ids.csv`. Use `CHUNKS = "all"` to run every chunk for the selected side, `CHUNKS = "000"` for a single chunk, or `MAX_CHUNKS` while tuning.
 
@@ -788,7 +804,7 @@ For current tracking outputs, the main overlay follows `TrackX/TrackY`; toggles 
 | `tracking/colony/map_combine.py` | Panorama mapping for ArUco and SLEAP files. |
 | `tracking/colony/combine_one_chunk.py` | One chunk/side tracking worker. |
 | `tracking/colony/combine_batch.py` | Batch tracking launcher for local or Slurm workers. |
-| `tracking/colony/interaction_one_chunk.py` | One chunk/side directed interaction worker. |
+| `tracking/colony/interaction_one_chunk.py` | One chunk/side undirected skeleton-contact worker. |
 | `tracking/colony/interaction_batch.py` | Batch interaction launcher for local or Slurm workers. |
 | `scripts/per_track_slurm_fanout.sh` | Generic one-job-per-track fanout wrapper. |
 | `analysis/compute_track_speed_vector.py` | Per-track speed vector operation. |
@@ -802,7 +818,7 @@ For current tracking outputs, the main overlay follows `TrackX/TrackY`; toggles 
 | `analysis/colony_speed.py` | VS Code/Jupyter interactive speed and colony-presence plots. |
 | `analysis/grid_occupancy.py` | VS Code/Jupyter interactive grid occupancy clustering plots. |
 | `analysis/cluster_time_of_day_occupancy.py` | Local time-of-day occupancy analysis by cluster. |
-| `analysis/interaction_analysis.py` | VS Code/Jupyter interactive interaction spatial and time-of-day plots. |
+| `analysis/exploratory/interaction_analysis.py` | Legacy directed-interaction spatial and time-of-day plots. |
 | `tracking/stitch_tracks.py` | Chunk/block stitcher and trajectory PNG writer. |
 | `run_aruco.py` | ArUco detection for one video. |
 
