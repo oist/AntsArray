@@ -5,7 +5,7 @@
 #   1. submit one SLURM job to create panorama PKLs
 #   2. submit a dependent SLURM job that fans out per-chunk/side tracking jobs
 #   3. submit a dependent stitch job that writes stitched/per_track outputs
-#   4. submit dependent per-track analysis fanout jobs for speed/presence/occupancy/sleep
+#   4. submit dependent per-track analysis fanout jobs for speed/presence/occupancy/sleep motion/sleep
 #   5. submit a dependent SLURM job that fans out per-chunk interaction jobs
 #   6. transfer completed flash outputs back to bucket
 #
@@ -81,10 +81,9 @@ SLURM_SETUP=""
 # Pipeline behavior.
 MAP_MODE="both"
 SIDE="both"
-X_THRESHOLD="2500.0"
 SKIP_EXISTING=1
-# Panorama left/right split centerline (X). Empty = use pipeline.py's default.
-# Calibration-specific: it must match the homography (--hmats) in use.
+# Panorama left/right split override. Empty = read panorama_regions.csv from this
+# recording or the most recent earlier recording date; fail if none is available.
 X_THRESHOLD=""
 
 # Panorama mapping job resources.
@@ -123,6 +122,11 @@ PER_TRACK_ANALYSIS_SUBMIT_TIME="0-01:00:00"
 PER_TRACK_ANALYSIS_CPUS=4
 PER_TRACK_ANALYSIS_MEM="16G"
 PER_TRACK_ANALYSIS_TIME="0-12:00:00"
+GRID_OCCUPANCY_GRID_SIZE_MM="${GRID_OCCUPANCY_GRID_SIZE_MM:-0.25}"
+GRID_OCCUPANCY_OUTPUT_NAME="${GRID_OCCUPANCY_OUTPUT_NAME:-grid_occupancy_histograms}"
+GRID_OCCUPANCY_BOUNDS_JSON="${GRID_OCCUPANCY_BOUNDS_JSON:-}"
+SLEEP_MOTION_MM_PER_PX="${SLEEP_MOTION_MM_PER_PX:-0.016}"
+SLEEP_MOTION_CACHE_MAX_GAP_FRAMES="${SLEEP_MOTION_CACHE_MAX_GAP_FRAMES:-120}"
 
 # Sleep prediction jobs run after speed vectors complete. Leave SLEEP_MODEL empty
 # to use analysis/compute_track_sleep_predictions.py's built-in production model.
@@ -145,7 +149,7 @@ INTERACTION_MEM="16G"
 INTERACTION_TIME="0-12:00:00"
 INTERACTION_MM_PER_PX="0.016"
 INTERACTION_RADIUS_MM="8.0"
-INTERACTION_MICRO_DISTANCE_MM="1.0"
+INTERACTION_MICRO_DISTANCE_MM="0.1"
 INTERACTION_FRAME_BATCH_SIZE="3000"
 INTERACTION_PROGRESS_EVERY_FRAMES="500"
 INTERACTION_MAX_FRAMES="none"
@@ -155,7 +159,7 @@ TRANSFER_TO_BUCKET=1
 TRANSFER_POLL_SECONDS=120
 DELETE_FLASH_AFTER_TRANSFER=0
 
-# Per-track analysis fan-out (colony_presence, speed_vector, grid_occupancy),
+# Per-track analysis fan-out (colony_presence, speed_vector, sleep_motion, grid_occupancy),
 # auto-run after stitching. A login-side watcher waits for the stitch marker,
 # then fans out one job per stitched per-track parquet for each routine,
 # conda-free via the ant_tracking venv (--python_bin). NOTE: speed_vector needs
@@ -185,7 +189,6 @@ sbatch_bin="$SBATCH_BIN"
 slurm_setup="$SLURM_SETUP"
 map_mode="$MAP_MODE"
 side="$SIDE"
-x_threshold="$X_THRESHOLD"
 skip_existing="$SKIP_EXISTING"
 x_threshold="$X_THRESHOLD"
 map_cpus="$MAP_CPUS"
@@ -213,6 +216,11 @@ per_track_analysis_submit_time="$PER_TRACK_ANALYSIS_SUBMIT_TIME"
 per_track_analysis_cpus="$PER_TRACK_ANALYSIS_CPUS"
 per_track_analysis_mem="$PER_TRACK_ANALYSIS_MEM"
 per_track_analysis_time="$PER_TRACK_ANALYSIS_TIME"
+grid_occupancy_grid_size_mm="$GRID_OCCUPANCY_GRID_SIZE_MM"
+grid_occupancy_output_name="$GRID_OCCUPANCY_OUTPUT_NAME"
+grid_occupancy_bounds_json="$GRID_OCCUPANCY_BOUNDS_JSON"
+sleep_motion_mm_per_px="$SLEEP_MOTION_MM_PER_PX"
+sleep_motion_cache_max_gap_frames="$SLEEP_MOTION_CACHE_MAX_GAP_FRAMES"
 run_sleep_predictions="$RUN_SLEEP_PREDICTIONS"
 sleep_model="$SLEEP_MODEL"
 sleep_skip_existing="$SLEEP_SKIP_EXISTING"
@@ -278,7 +286,9 @@ Optional:
   --map_mode MODE           aruco, sleap, or both. Default: both
   --side SIDE               left, right, or both. Default: both
   --x_threshold FLOAT       Panorama left/right split X (must match the hmats
-                            calibration). Empty = pipeline.py default.
+                            calibration). Empty = read panorama_regions.csv from
+                            this recording, then the most recent earlier date.
+                            Stop if no annotations are available.
   --skip_existing           Do not overwrite existing outputs. Default: on.
   --force_recompute         Overwrite/recompute existing flash outputs.
   --map_cpus N              CPUs for panorama jobs. Default: 8
@@ -307,6 +317,13 @@ Optional:
   --per_track_analysis_submit_cpus N
   --per_track_analysis_submit_mem MEM
   --per_track_analysis_submit_time TIME
+  --grid_size_mm FLOAT    Occupancy histogram bin size in mm. Default: ${GRID_OCCUPANCY_GRID_SIZE_MM}
+  --grid_output_name NAME Occupancy output folder. Default: ${GRID_OCCUPANCY_OUTPUT_NAME}
+  --grid_bounds_json PATH Optional inferred bounds JSON for occupancy histograms.
+  --sleep_motion_mm_per_px FLOAT
+                          Scale used for cached all-bodypoint speeds. Default: ${SLEEP_MOTION_MM_PER_PX}
+  --sleep_motion_cache_max_gap_frames N
+                          Largest frame gap retained for later tuning. Default: ${SLEEP_MOTION_CACHE_MAX_GAP_FRAMES}
   --sleep_predictions       Submit sleep classifier prediction jobs after speed vectors. Default: on
   --no_sleep_predictions    Do not submit sleep classifier prediction jobs.
   --sleep_model PATH        Override sleep classifier model. Empty uses compute_track_sleep_predictions.py default.
@@ -390,6 +407,11 @@ while [[ $# -gt 0 ]]; do
     --per_track_analysis_submit_cpus) per_track_analysis_submit_cpus="$2"; shift 2 ;;
     --per_track_analysis_submit_mem) per_track_analysis_submit_mem="$2"; shift 2 ;;
     --per_track_analysis_submit_time) per_track_analysis_submit_time="$2"; shift 2 ;;
+    --grid_size_mm) grid_occupancy_grid_size_mm="$2"; shift 2 ;;
+    --grid_output_name) grid_occupancy_output_name="$2"; shift 2 ;;
+    --grid_bounds_json) grid_occupancy_bounds_json="$2"; shift 2 ;;
+    --sleep_motion_mm_per_px) sleep_motion_mm_per_px="$2"; shift 2 ;;
+    --sleep_motion_cache_max_gap_frames) sleep_motion_cache_max_gap_frames="$2"; shift 2 ;;
     --sleep_predictions) run_sleep_predictions=1; shift ;;
     --no_sleep_predictions) run_sleep_predictions=0; shift ;;
     --sleep_model) sleep_model="$2"; shift 2 ;;
@@ -516,6 +538,7 @@ for block_dir in "${blocks[@]}"; do
   stitch_done_file="$state_dir/stitch_${block_name}.ok"
   stitch_job_id_file="$state_dir/stitch_job_id_${block_name}.txt"
   per_track_analysis_submit_script="$script_dir/submit_per_track_analysis_${block_name}.sbatch"
+  sleep_motion_labels_script="$script_dir/sleep_motion_labels_${block_name}.sbatch"
   per_track_analysis_submit_job_id_file="$state_dir/per_track_analysis_submit_job_id_${block_name}.txt"
   per_track_analysis_marker_manifest="$state_dir/per_track_analysis_markers_${block_name}.tsv"
   interaction_job_ids_file="$state_dir/interaction_job_ids_${block_name}.txt"
@@ -543,7 +566,9 @@ for block_dir in "${blocks[@]}"; do
   if [[ "$run_per_track_analysis" -eq 1 ]]; then
     printf '%s\t%s\n' "colony_presence" "$stitched_dir/colony_presence_vectors/colony_presence_complete.ok" >> "$per_track_analysis_marker_manifest"
     printf '%s\t%s\n' "speed_vector" "$stitched_dir/speed_vectors/speed_vector_complete.ok" >> "$per_track_analysis_marker_manifest"
-    printf '%s\t%s\n' "grid_occupancy" "$stitched_dir/grid_occupancy_histograms/grid_occupancy_complete.ok" >> "$per_track_analysis_marker_manifest"
+    printf '%s\t%s\n' "sleep_motion" "$stitched_dir/sleep_motion/sleep_motion_complete.ok" >> "$per_track_analysis_marker_manifest"
+    printf '%s\t%s\n' "sleep_motion_labels" "$stitched_dir/sleep_motion_labels/sleep_motion_labels_complete.ok" >> "$per_track_analysis_marker_manifest"
+    printf '%s\t%s\n' "grid_occupancy" "$stitched_dir/${grid_occupancy_output_name}/grid_occupancy_complete.ok" >> "$per_track_analysis_marker_manifest"
     if [[ "$run_sleep_predictions" -eq 1 ]]; then
       printf '%s\t%s\n' "sleep_prediction" "$stitched_dir/sleep_predictions/sleep_prediction_complete.ok" >> "$per_track_analysis_marker_manifest"
     fi
@@ -581,6 +606,11 @@ for block_dir in "${blocks[@]}"; do
       ;;
   esac
   sleep_model_q="$(printf '%q' "$sleep_model")"
+  grid_occupancy_grid_size_mm_q="$(printf '%q' "$grid_occupancy_grid_size_mm")"
+  grid_occupancy_output_name_q="$(printf '%q' "$grid_occupancy_output_name")"
+  grid_occupancy_bounds_json_q="$(printf '%q' "$grid_occupancy_bounds_json")"
+  sleep_motion_mm_per_px_q="$(printf '%q' "$sleep_motion_mm_per_px")"
+  sleep_motion_cache_max_gap_frames_q="$(printf '%q' "$sleep_motion_cache_max_gap_frames")"
 
   cat > "$map_script" <<EOF
 #!/usr/bin/env bash
@@ -744,6 +774,27 @@ fi
 EOF
   chmod 755 "$track_submit_script"
 
+  cat > "$sleep_motion_labels_script" <<EOF
+#!/usr/bin/env bash
+#SBATCH -J motion_labels_${block_name}
+#SBATCH -p ${partition}
+#SBATCH -c ${per_track_analysis_cpus}
+#SBATCH --mem=${per_track_analysis_mem}
+#SBATCH -t ${per_track_analysis_time}
+#SBATCH -o ${per_track_analysis_logs_dir}/sleep_motion_labels_%j.out
+#SBATCH -e ${per_track_analysis_logs_dir}/sleep_motion_labels_%j.err
+set -euo pipefail
+umask 0002
+export PYTHONNOUSERSITE=1
+cd "${REPO_ROOT}"
+"${python_bin}" analysis/compute_sleep_motion_labels.py \\
+  --block-dir "${block_dir}" \\
+  --sleep-motion-root "${stitched_dir}/sleep_motion" \\
+  --out-root "${stitched_dir}/sleep_motion_labels" \\
+  --body-threshold 0.5 --antenna-threshold 0.7 --history-seconds 10
+EOF
+  chmod 755 "$sleep_motion_labels_script"
+
   cat > "$per_track_analysis_submit_script" <<EOF
 #!/usr/bin/env bash
 #SBATCH -J submit_pta_${block_name}
@@ -761,6 +812,25 @@ export PYTHONNOUSERSITE=1
 cd "${REPO_ROOT}"
 mkdir -p "${per_track_analysis_logs_dir}"
 
+grid_occupancy_grid_size_mm=${grid_occupancy_grid_size_mm_q}
+grid_occupancy_output_name=${grid_occupancy_output_name_q}
+grid_occupancy_bounds_json=${grid_occupancy_bounds_json_q}
+sleep_motion_mm_per_px=${sleep_motion_mm_per_px_q}
+sleep_motion_cache_max_gap_frames=${sleep_motion_cache_max_gap_frames_q}
+grid_occupancy_operation_args=(--grid_size_mm "\${grid_occupancy_grid_size_mm}")
+if [[ -n "\${grid_occupancy_bounds_json}" ]]; then
+  grid_occupancy_operation_args+=(--bounds_json "\${grid_occupancy_bounds_json}")
+fi
+grid_occupancy_operation_args_text="\$(printf ' %q' "\${grid_occupancy_operation_args[@]}")"
+grid_occupancy_operation_args_text="\${grid_occupancy_operation_args_text# }"
+sleep_motion_operation_args=(
+  --fps "${fps}"
+  --mm_per_px "\${sleep_motion_mm_per_px}"
+  --cache_max_gap_frames "\${sleep_motion_cache_max_gap_frames}"
+)
+sleep_motion_operation_args_text="\$(printf ' %q' "\${sleep_motion_operation_args[@]}")"
+sleep_motion_operation_args_text="\${sleep_motion_operation_args_text# }"
+
 bash "${PER_TRACK_FANOUT_SH}" \\
   --per_track_dir "${stitched_dir}/per_track" \\
   --operation_script analysis/compute_track_colony_presence_vector.py \\
@@ -770,6 +840,7 @@ bash "${PER_TRACK_FANOUT_SH}" \\
   --conda_bin "${conda_bin}" \\
   --conda_env "${conda_env}" \\
   --python_bin "${python_bin}" \\
+  --no_conda --worker_python_bin "${python_bin}" \\
   --sbatch_bin "${sbatch_bin}" \\
   --partition "${partition}" \\
   --cpus "${per_track_analysis_cpus}" \\
@@ -786,6 +857,25 @@ bash "${PER_TRACK_FANOUT_SH}" \\
   --conda_bin "${conda_bin}" \\
   --conda_env "${conda_env}" \\
   --python_bin "${python_bin}" \\
+  --no_conda --worker_python_bin "${python_bin}" \\
+  --sbatch_bin "${sbatch_bin}" \\
+  --partition "${partition}" \\
+  --cpus "${per_track_analysis_cpus}" \\
+  --mem "${per_track_analysis_mem}" \\
+  --time "${per_track_analysis_time}" \\
+  --no_transfer_to_bucket${skip_existing_arg}
+
+bash "${PER_TRACK_FANOUT_SH}" \\
+  --per_track_dir "${stitched_dir}/per_track" \\
+  --operation_script analysis/compute_track_sleep_motion.py \\
+  --operation_name sleep_motion \\
+  --output_name sleep_motion \\
+  --operation_args "\${sleep_motion_operation_args_text}" \\
+  --run_workdir "${REPO_ROOT}" \\
+  --conda_bin "${conda_bin}" \\
+  --conda_env "${conda_env}" \\
+  --python_bin "${python_bin}" \\
+  --no_conda --worker_python_bin "${python_bin}" \\
   --sbatch_bin "${sbatch_bin}" \\
   --partition "${partition}" \\
   --cpus "${per_track_analysis_cpus}" \\
@@ -797,17 +887,33 @@ bash "${PER_TRACK_FANOUT_SH}" \\
   --per_track_dir "${stitched_dir}/per_track" \\
   --operation_script analysis/compute_track_grid_occupancy.py \\
   --operation_name grid_occupancy \\
-  --output_name grid_occupancy_histograms \\
+  --output_name "\${grid_occupancy_output_name}" \\
+  --operation_args "\${grid_occupancy_operation_args_text}" \\
   --run_workdir "${REPO_ROOT}" \\
   --conda_bin "${conda_bin}" \\
   --conda_env "${conda_env}" \\
   --python_bin "${python_bin}" \\
+  --no_conda --worker_python_bin "${python_bin}" \\
   --sbatch_bin "${sbatch_bin}" \\
   --partition "${partition}" \\
   --cpus "${per_track_analysis_cpus}" \\
   --mem "${per_track_analysis_mem}" \\
   --time "${per_track_analysis_time}" \\
   --no_transfer_to_bucket${skip_existing_arg}
+
+motion_complete_id_path="${stitched_dir}/sleep_motion/jobs/sleep_motion_complete_job_id.txt"
+motion_dependency_args=()
+if [[ -s "\${motion_complete_id_path}" ]]; then
+  motion_complete_id="\$(tr -d '[:space:]' < "\${motion_complete_id_path}")"
+  [[ "\${motion_complete_id}" =~ ^[0-9]+$ ]] || { echo "Invalid sleep-motion completion job ID" >&2; exit 4; }
+  motion_dependency_args=(--dependency "afterok:\${motion_complete_id}")
+elif [[ ! -s "${stitched_dir}/sleep_motion/sleep_motion_complete.ok" ]]; then
+  echo "ERROR: missing sleep-motion completion job ID or marker" >&2
+  exit 4
+fi
+motion_labels_id="\$("${sbatch_bin}" --parsable "\${motion_dependency_args[@]}" "${sleep_motion_labels_script}")"
+printf '%s\n' "\${motion_labels_id}" > "${state_dir}/sleep_motion_labels_job_id_${block_name}.txt"
+echo "Submitted motion-based sleep labels: \${motion_labels_id}"
 
 if [[ "${run_sleep_predictions}" -eq 1 ]]; then
   speed_vector_complete_job_id_file="${stitched_dir}/speed_vectors/jobs/speed_vector_complete_job_id.txt"
@@ -843,6 +949,7 @@ if [[ "${run_sleep_predictions}" -eq 1 ]]; then
     --conda_bin "${conda_bin}" \\
     --conda_env "${sleep_conda_env}" \\
     --python_bin "${python_bin}" \\
+    --no_conda --worker_python_bin "${python_bin}" \\
     --sbatch_bin "${sbatch_bin}" \\
     --partition "${partition}" \\
     --cpus "${sleep_prediction_cpus}" \\
@@ -1063,11 +1170,21 @@ EOF
     transfer_pid="$!"
     echo "Started transfer watcher for $block_name PID $transfer_pid; log: $transfer_log"
   fi
-  if [[ "$run_analysis" -eq 1 ]]; then
+  if [[ "$run_analysis" -eq 1 && "$run_per_track_analysis" -eq 0 ]]; then
     analysis_after_stitch_script="$REPO_ROOT/scripts/analysis_after_stitch.sh"
     analysis_log="$logs_dir/analysis_after_stitch_${block_name}.log"
     if [[ -f "$analysis_after_stitch_script" ]]; then
       mkdir -p "$logs_dir"
+      analysis_grid_args=(
+        --grid_size_mm "$grid_occupancy_grid_size_mm"
+        --grid_output_name "$grid_occupancy_output_name"
+        --fps "$fps"
+        --sleep_motion_mm_per_px "$sleep_motion_mm_per_px"
+        --sleep_motion_cache_max_gap_frames "$sleep_motion_cache_max_gap_frames"
+      )
+      if [[ -n "$grid_occupancy_bounds_json" ]]; then
+        analysis_grid_args+=(--grid_bounds_json "$grid_occupancy_bounds_json")
+      fi
       nohup bash "$analysis_after_stitch_script" \
         --stitch_ok "$stitch_done_file" \
         --per_track_dir "$stitched_dir/per_track" \
@@ -1080,12 +1197,15 @@ EOF
         --mem "$analysis_mem" \
         --time "$analysis_time" \
         --poll_seconds "$transfer_poll_seconds" \
+        "${analysis_grid_args[@]}" \
         >> "$analysis_log" 2>&1 &
       analysis_pid="$!"
       echo "Started analysis fan-out watcher for $block_name PID $analysis_pid; log: $analysis_log"
     else
       echo "[WARN] --run_analysis is on but analysis script not found: $analysis_after_stitch_script" >&2
     fi
+  elif [[ "$run_analysis" -eq 1 && "$run_per_track_analysis" -eq 1 ]]; then
+    echo "Skipping legacy analysis watcher for $block_name; dependent per-track analysis is already enabled."
   fi
   submitted=$((submitted + 1))
 done

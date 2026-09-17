@@ -102,13 +102,20 @@ ssh saion squeue -u $USER                   # saion side
 
 Outputs land in `<exp>/data/`, per grid camera per chunk:
 
-- `<vname>_NNN_aruco_tracks.h5`     dense `(frames, instances, 2)` arrays (deigo aruco array)
-- `<vname>_NNN_aruco_detections.h5` DataFrame `(Frame, Instance, X, Y, Confidence)` (deigo aruco array)
+- `<vname>_NNN_aruco_tracks.h5`     lossless `aruco_detections` records plus legacy dense summaries
+- `<vname>_NNN_aruco_detections.h5` lossless DataFrame `(Frame, Instance, X, Y, Confidence)`
 - `<vname>_NNN.slp`                 SLEAP predictions (saion sleap predict)
 - `<vname>_NNN_sleap_data.h5`       SLEAP DataFrame via `sleap2h5.py` (saion, inline post-process)
 
 The colony tracking map stage consumes the `.h5` files (`_aruco_tracks.h5` / `_aruco_detections.h5`
 and `_sleap_data.h5`); it does **not** read `.slp` directly.
+
+ArUco `Instance` means tag ID, not a unique row key. Multiple detections of the
+same ID in one camera/frame are preserved, mapped and split by colony before
+the tracker chooses among candidates. The mapper prefers the native lossless
+records; direct readers of the old dense arrays still see a lossy summary.
+See [ArUco output format and compatibility](aruco_output_format.md) for the
+schema, regression tests and requirements for recomputing old outputs.
 
 ## CLI
 

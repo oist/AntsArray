@@ -73,6 +73,10 @@ SLEAP_UNMATCHED_COLOR = (170, 170, 170)
 INTERACTION_COLOR = (0, 215, 255)
 INTERACTION_CONTACT_COLOR = (0, 80, 255)
 SLEEP_BOUT_COLOR = (255, 90, 30)
+SPEED_SLEEP_COLOR = (255, 120, 30)
+SPEED_WAKE_COLOR = (80, 240, 120)
+SPEED_PENDING_COLOR = (0, 200, 255)
+SPEED_UNKNOWN_COLOR = (180, 180, 180)
 ANTENNA_BODYPOINTS = (4, 5, 6, 7, 8, 9)
 ARUCO_PARAM_CORNER_CHOICES = ("contour", "subpix", "none", "apriltag")
 ARUCO_PARAM_DEFAULTS = {
@@ -134,6 +138,17 @@ def parse_camera_index(path_or_name: str | Path) -> Optional[int]:
         return None
     cam_one_based = int(match.group("cam"))
     return cam_one_based - 1 if cam_one_based > 0 else cam_one_based
+
+
+def infer_side_from_path(path_or_name: str | Path | None) -> str:
+    if path_or_name is None:
+        return ""
+    text = str(path_or_name).lower()
+    if re.search(r"(?:^|[_/\\.-])left(?:[_/\\.-]|$)", text):
+        return "left"
+    if re.search(r"(?:^|[_/\\.-])right(?:[_/\\.-]|$)", text):
+        return "right"
+    return ""
 
 
 def load_homography_stack(path: Path) -> List[np.ndarray]:
@@ -1426,9 +1441,14 @@ class PanoramaTrackStore:
             for col in wanted:
                 if col not in df.columns:
                     df[col] = np.nan
+            if "side" not in df.columns:
+                df["side"] = infer_side_from_path(path)
+            else:
+                inferred_side = infer_side_from_path(path)
+                df["side"] = df["side"].fillna(inferred_side).astype(str)
             df["Frame"] = pd.to_numeric(df["Frame"], errors="coerce") + offset
-            parts.append(df[wanted])
-        out = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=wanted)
+            parts.append(df[[*wanted, "side"]])
+        out = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=[*wanted, "side"])
         for col in wanted:
             out[col] = pd.to_numeric(out[col], errors="coerce")
         out = out.dropna(subset=["Frame", "TrackID"]).copy()
@@ -1436,6 +1456,7 @@ class PanoramaTrackStore:
             out["Frame"] = out["Frame"].astype(np.int64)
             out["TrackID"] = out["TrackID"].astype(np.int64)
             out["Bodypoint"] = out["Bodypoint"].fillna(-1).astype(np.int64)
+            out["side"] = out["side"].fillna("").astype(str)
             out = out.sort_values(["TrackID", "Bodypoint"], kind="mergesort").reset_index(drop=True)
         self.cache[frame] = out
         if len(self.cache) > self.cache_limit:
@@ -1661,6 +1682,530 @@ class SleepBoutStore:
         ].copy()
 
 
+@dataclass
+class SpeedVectorRecord:
+    side: str
+    track_id: int
+    speed_path: Path
+    frame_min: int
+    frame_max: int
+    fps: float
+    speed: Optional[np.ndarray] = None
+
+    def load_speed(self) -> np.ndarray:
+        if self.speed is None:
+            self.speed = np.load(self.speed_path, mmap_mode="r")
+        return self.speed
+
+
+class SpeedStateStore:
+    def __init__(self, records: Iterable[SpeedVectorRecord]):
+        self.records = list(records)
+        self.by_side_track: Dict[Tuple[str, int], SpeedVectorRecord] = {}
+        self.by_track: Dict[int, List[SpeedVectorRecord]] = {}
+        for record in self.records:
+            self.by_side_track[(str(record.side), int(record.track_id))] = record
+            self.by_track.setdefault(int(record.track_id), []).append(record)
+
+    @classmethod
+    def from_root(cls, root: Path) -> "SpeedStateStore":
+        root = Path(root)
+        per_track_root = root / "per_track" if (root / "per_track").is_dir() else root
+        metadata_paths = sorted(per_track_root.glob("*/speed_metadata.json"))
+        if not metadata_paths and (per_track_root / "speed_metadata.json").exists():
+            metadata_paths = [per_track_root / "speed_metadata.json"]
+        if not metadata_paths:
+            raise FileNotFoundError(f"No speed_metadata.json files found under {root}")
+
+        records: List[SpeedVectorRecord] = []
+        for metadata_path in metadata_paths:
+            try:
+                metadata = json.loads(metadata_path.read_text())
+            except Exception:
+                continue
+            local_speed_path = metadata_path.with_name("speed_mm_s.npy")
+            speed_path = local_speed_path
+            if not speed_path.exists() and metadata.get("speed_path"):
+                candidate = Path(str(metadata["speed_path"]))
+                if candidate.exists():
+                    speed_path = candidate
+            if not speed_path.exists():
+                continue
+
+            track_id = metadata.get("track_id")
+            if track_id is None:
+                match = re.search(r"TrackID_(\d+)", metadata_path.parent.name)
+                if match is None:
+                    continue
+                track_id = int(match.group(1))
+            side = (
+                infer_side_from_path(metadata_path.parent)
+                or infer_side_from_path(metadata.get("track_name"))
+                or infer_side_from_path(metadata.get("track_path"))
+            )
+            if not side:
+                continue
+
+            frame_min = int(metadata.get("frame_min", 0))
+            frame_max = metadata.get("frame_max")
+            if frame_max is None:
+                speed = np.load(speed_path, mmap_mode="r")
+                frame_max = frame_min + int(speed.shape[0]) - 1
+            records.append(
+                SpeedVectorRecord(
+                    side=str(side),
+                    track_id=int(track_id),
+                    speed_path=Path(speed_path),
+                    frame_min=int(frame_min),
+                    frame_max=int(frame_max),
+                    fps=float(metadata.get("fps", 24.0)),
+                )
+            )
+
+        if not records:
+            raise FileNotFoundError(f"No usable speed vectors found under {root}")
+        return cls(records)
+
+    def record_for(self, side: str, track_id: int) -> Optional[SpeedVectorRecord]:
+        side = str(side)
+        track_id = int(track_id)
+        record = self.by_side_track.get((side, track_id))
+        if record is not None:
+            return record
+        matches = self.by_track.get(track_id, [])
+        return matches[0] if len(matches) == 1 else None
+
+    def records_for_track(self, track_id: int, *, side_hint: str = "auto") -> List[SpeedVectorRecord]:
+        track_id = int(track_id)
+        side_hint = str(side_hint).strip().lower()
+        if side_hint in {"left", "right"}:
+            record = self.by_side_track.get((side_hint, track_id))
+            return [] if record is None else [record]
+        return list(self.by_track.get(track_id, []))
+
+    def state_for(
+        self,
+        *,
+        side: str,
+        track_id: int,
+        frame: int,
+        speed_threshold_mm_s: float,
+        window_seconds: float,
+        quiet_fraction_threshold: float,
+        min_valid_fraction: float,
+    ) -> Dict[str, object]:
+        record = self.record_for(side, track_id)
+        if record is None:
+            return {
+                "label": "no speed",
+                "instant_speed_mm_s": np.nan,
+                "mean_speed_mm_s": np.nan,
+                "quiet_fraction": np.nan,
+                "valid_fraction": 0.0,
+            }
+
+        frame = int(frame)
+        if frame < record.frame_min or frame > record.frame_max:
+            return {
+                "label": "no speed",
+                "instant_speed_mm_s": np.nan,
+                "mean_speed_mm_s": np.nan,
+                "quiet_fraction": np.nan,
+                "valid_fraction": 0.0,
+            }
+
+        speed = record.load_speed()
+        window_frames = max(1, int(round(float(window_seconds) * max(float(record.fps), 1e-6))))
+        start_frame = max(int(record.frame_min), frame - window_frames + 1)
+        stop_frame = min(int(record.frame_max) + 1, frame + 1)
+        local_start = start_frame - int(record.frame_min)
+        local_stop = stop_frame - int(record.frame_min)
+        values = np.asarray(speed[local_start:local_stop], dtype=np.float32)
+        if values.size == 0:
+            return {
+                "label": "no speed",
+                "instant_speed_mm_s": np.nan,
+                "mean_speed_mm_s": np.nan,
+                "quiet_fraction": np.nan,
+                "valid_fraction": 0.0,
+            }
+
+        finite = np.isfinite(values)
+        valid_count = int(finite.sum())
+        expected_count = int(values.size)
+        valid_fraction = valid_count / max(1, expected_count)
+        instant_speed = float(speed[frame - int(record.frame_min)])
+        if valid_count == 0:
+            return {
+                "label": "no speed",
+                "instant_speed_mm_s": instant_speed,
+                "mean_speed_mm_s": np.nan,
+                "quiet_fraction": np.nan,
+                "valid_fraction": valid_fraction,
+            }
+
+        valid_values = values[finite]
+        mean_speed = float(np.mean(valid_values))
+        quiet_fraction = float(np.mean(valid_values <= float(speed_threshold_mm_s)))
+        if valid_fraction < float(min_valid_fraction):
+            label = "no speed"
+        elif quiet_fraction >= float(quiet_fraction_threshold):
+            label = "sleep"
+        else:
+            label = "wake"
+        return {
+            "label": label,
+            "instant_speed_mm_s": instant_speed,
+            "mean_speed_mm_s": mean_speed,
+            "quiet_fraction": quiet_fraction,
+            "valid_fraction": valid_fraction,
+        }
+
+
+def _track_id_from_path(path: Path) -> Optional[int]:
+    match = re.search(r"TrackID_(\d+)", Path(path).stem)
+    return int(match.group(1)) if match else None
+
+
+@dataclass
+class PoseMotionRecord:
+    side: str
+    track_id: int
+    track_path: Path
+    fps: float
+    mm_per_px: float
+    sleep_motion_dir: Optional[Path] = None
+    frame_min: Optional[int] = None
+    frame_max: Optional[int] = None
+    sleep_motion_speed: Optional[np.ndarray] = None
+    sleep_motion_gap: Optional[np.ndarray] = None
+    sleep_motion_frames: Optional[np.ndarray] = None
+    sleep_motion_metadata: Optional[Dict[str, object]] = None
+
+    def sleep_motion_cache_ready(self) -> bool:
+        if self.sleep_motion_dir is None:
+            return False
+        return all(
+            (self.sleep_motion_dir / name).is_file()
+            for name in (
+                "bodypoint_speed_mm_s.npy",
+                "bodypoint_frame_gap_u1.npy",
+                "bodypoint_ids.npy",
+                "frames.npy",
+                "sleep_motion_metadata.json",
+            )
+        )
+
+    def load_sleep_motion_cache(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, object]]:
+        if (
+            self.sleep_motion_speed is not None
+            and self.sleep_motion_gap is not None
+            and self.sleep_motion_frames is not None
+        ):
+            return (
+                self.sleep_motion_speed,
+                self.sleep_motion_gap,
+                self.sleep_motion_frames,
+                dict(self.sleep_motion_metadata or {}),
+            )
+        if not self.sleep_motion_cache_ready() or self.sleep_motion_dir is None:
+            raise FileNotFoundError(f"No batch sleep-motion cache for {self.track_path.name}")
+        metadata = json.loads((self.sleep_motion_dir / "sleep_motion_metadata.json").read_text())
+        speed = np.load(self.sleep_motion_dir / "bodypoint_speed_mm_s.npy", mmap_mode="r")
+        gap = np.load(self.sleep_motion_dir / "bodypoint_frame_gap_u1.npy", mmap_mode="r")
+        frames = np.load(self.sleep_motion_dir / "frames.npy", mmap_mode="r")
+        expected_shape = tuple(int(value) for value in metadata.get("speed_shape", []))
+        if (
+            speed.ndim != 2
+            or gap.shape != speed.shape
+            or len(frames) != speed.shape[0]
+            or (expected_shape and speed.shape != expected_shape)
+        ):
+            raise ValueError(f"Invalid batch sleep-motion cache under {self.sleep_motion_dir}")
+        self.frame_min = int(metadata["frame_min"])
+        self.frame_max = int(metadata["frame_max"])
+        self.fps = float(metadata.get("fps", self.fps))
+        self.mm_per_px = float(metadata.get("mm_per_px", self.mm_per_px))
+        self.sleep_motion_speed = speed
+        self.sleep_motion_gap = gap
+        self.sleep_motion_frames = frames
+        self.sleep_motion_metadata = metadata
+        return speed, gap, frames, dict(metadata)
+
+    def load_sleep_motion_window(
+        self,
+        *,
+        start_frame: int,
+        stop_frame: int,
+        bodypoint_percentile: float,
+        min_valid_bodypoint_fraction: float,
+        max_gap_frames: int,
+        max_bodypoint_speed_mm_s: float | None,
+    ) -> np.ndarray:
+        speed, gap, frames, metadata = self.load_sleep_motion_cache()
+        cache_max_gap = int(metadata.get("cache_max_gap_frames", 0))
+        if int(max_gap_frames) > cache_max_gap:
+            raise ValueError(
+                f"Gap {max_gap_frames} exceeds cached maximum {cache_max_gap} for {self.track_path.name}"
+            )
+        frame_min = int(self.frame_min if self.frame_min is not None else metadata["frame_min"])
+        frame_max = int(self.frame_max if self.frame_max is not None else metadata["frame_max"])
+        start_frame = max(frame_min, int(start_frame))
+        stop_frame = min(frame_max + 1, int(stop_frame))
+        if stop_frame <= start_frame:
+            return np.empty(0, dtype=np.float32)
+        start_row = int(np.searchsorted(frames, start_frame, side="left"))
+        stop_row = int(np.searchsorted(frames, stop_frame, side="left"))
+        motion = np.full(stop_frame - start_frame, np.nan, dtype=np.float32)
+        if stop_row <= start_row:
+            return motion
+        values = np.asarray(speed[start_row:stop_row], dtype=np.float32)
+        gaps = np.asarray(gap[start_row:stop_row], dtype=np.uint8)
+        valid = np.isfinite(values) & (gaps > 0) & (gaps <= int(max_gap_frames))
+        if max_bodypoint_speed_mm_s is not None and math.isfinite(float(max_bodypoint_speed_mm_s)):
+            valid &= values <= float(max_bodypoint_speed_mm_s)
+        work = np.where(valid, values, np.nan)
+        row_motion = np.full(len(work), np.nan, dtype=np.float32)
+        min_valid_bodypoints = max(
+            1,
+            int(math.ceil(values.shape[1] * float(min_valid_bodypoint_fraction))),
+        )
+        has_value = valid.sum(axis=1) >= min_valid_bodypoints
+        if has_value.any():
+            row_motion[has_value] = np.nanpercentile(
+                work[has_value],
+                float(bodypoint_percentile),
+                axis=1,
+            ).astype(np.float32, copy=False)
+        output_index = np.asarray(frames[start_row:stop_row], dtype=np.int64) - start_frame
+        motion[output_index] = row_motion
+        return motion
+
+    def motion_cache_ready(
+        self,
+        *,
+        bodypoint_percentile: float,
+        max_gap_frames: int,
+        max_bodypoint_speed_mm_s: float | None,
+    ) -> bool:
+        return self.sleep_motion_cache_ready()
+
+
+class PoseMotionStateStore:
+    def __init__(self, records: Iterable[PoseMotionRecord]):
+        self.records = list(records)
+        self.by_side_track: Dict[Tuple[str, int], PoseMotionRecord] = {}
+        self.by_track: Dict[int, List[PoseMotionRecord]] = {}
+        for record in self.records:
+            self.by_side_track[(str(record.side), int(record.track_id))] = record
+            self.by_track.setdefault(int(record.track_id), []).append(record)
+
+    @classmethod
+    def from_root(
+        cls,
+        root: Path,
+        *,
+        fps: float,
+        mm_per_px: float,
+        sleep_motion_root: Optional[Path] = None,
+    ) -> "PoseMotionStateStore":
+        root = Path(root)
+        paths = sorted(root.glob("*.parquet"))
+        if not paths and (root / "per_track").is_dir():
+            paths = sorted((root / "per_track").glob("*.parquet"))
+        if not paths:
+            raise FileNotFoundError(f"No per-track parquet files found under {root}")
+
+        sleep_motion_per_track = None
+        if sleep_motion_root is not None:
+            sleep_motion_root = Path(sleep_motion_root)
+            sleep_motion_per_track = (
+                sleep_motion_root
+                if sleep_motion_root.name == "per_track"
+                else sleep_motion_root / "per_track"
+            )
+
+        records: List[PoseMotionRecord] = []
+        for path in paths:
+            track_id = _track_id_from_path(path)
+            side = infer_side_from_path(path)
+            if track_id is None or not side:
+                continue
+            records.append(
+                PoseMotionRecord(
+                    side=side,
+                    track_id=int(track_id),
+                    track_path=Path(path),
+                    fps=float(fps),
+                    mm_per_px=float(mm_per_px),
+                    sleep_motion_dir=(
+                        sleep_motion_per_track / path.stem
+                        if sleep_motion_per_track is not None
+                        else None
+                    ),
+                )
+            )
+        if not records:
+            raise FileNotFoundError(f"No usable side-aware per-track pose files found under {root}")
+        return cls(records)
+
+    def record_for(self, side: str, track_id: int) -> Optional[PoseMotionRecord]:
+        side = str(side)
+        track_id = int(track_id)
+        record = self.by_side_track.get((side, track_id))
+        if record is not None:
+            return record
+        matches = self.by_track.get(track_id, [])
+        return matches[0] if len(matches) == 1 else None
+
+    def records_for_track(self, track_id: int, *, side_hint: str = "auto") -> List[PoseMotionRecord]:
+        track_id = int(track_id)
+        side_hint = str(side_hint).strip().lower()
+        if side_hint in {"left", "right"}:
+            record = self.by_side_track.get((side_hint, track_id))
+            return [] if record is None else [record]
+        return list(self.by_track.get(track_id, []))
+
+    def state_for(
+        self,
+        *,
+        side: str,
+        track_id: int,
+        frame: int,
+        speed_threshold_mm_s: float,
+        window_seconds: float,
+        quiet_fraction_threshold: float,
+        min_valid_fraction: float,
+        bodypoint_percentile: float,
+        min_valid_bodypoint_fraction: float,
+        max_gap_frames: int,
+        max_bodypoint_speed_mm_s: float | None,
+        allow_build: bool = True,
+    ) -> Dict[str, object]:
+        record = self.record_for(side, track_id)
+        if record is None:
+            return {
+                "label": "no speed",
+                "instant_speed_mm_s": np.nan,
+                "mean_speed_mm_s": np.nan,
+                "quiet_fraction": np.nan,
+                "valid_fraction": 0.0,
+            }
+
+        if not record.motion_cache_ready(
+            bodypoint_percentile=bodypoint_percentile,
+            max_gap_frames=max_gap_frames,
+            max_bodypoint_speed_mm_s=max_bodypoint_speed_mm_s,
+        ):
+            return {
+                "label": "pending",
+                "instant_speed_mm_s": np.nan,
+                "mean_speed_mm_s": np.nan,
+                "quiet_fraction": np.nan,
+                "valid_fraction": 0.0,
+            }
+
+        _, _, _, metadata = record.load_sleep_motion_cache()
+        frame_min = int(metadata["frame_min"])
+        frame_max = int(metadata["frame_max"])
+        frame = int(frame)
+        if frame < frame_min or frame > frame_max:
+            return {
+                "label": "no speed",
+                "instant_speed_mm_s": np.nan,
+                "mean_speed_mm_s": np.nan,
+                "quiet_fraction": np.nan,
+                "valid_fraction": 0.0,
+            }
+
+        window_frames = max(1, int(round(float(window_seconds) * max(float(record.fps), 1e-6))))
+        start_frame = max(frame_min, frame - window_frames + 1)
+        stop_frame = min(frame_max + 1, frame + 1)
+        values = record.load_sleep_motion_window(
+            start_frame=start_frame,
+            stop_frame=stop_frame,
+            bodypoint_percentile=bodypoint_percentile,
+            min_valid_bodypoint_fraction=min_valid_bodypoint_fraction,
+            max_gap_frames=max_gap_frames,
+            max_bodypoint_speed_mm_s=max_bodypoint_speed_mm_s,
+        )
+        instant_speed = float(values[-1]) if len(values) else np.nan
+        if values.size == 0:
+            return {
+                "label": "no speed",
+                "instant_speed_mm_s": instant_speed,
+                "mean_speed_mm_s": np.nan,
+                "quiet_fraction": np.nan,
+                "valid_fraction": 0.0,
+            }
+        finite = np.isfinite(values)
+        valid_count = int(finite.sum())
+        valid_fraction = valid_count / max(1, int(values.size))
+        if valid_count == 0:
+            return {
+                "label": "no speed",
+                "instant_speed_mm_s": instant_speed,
+                "mean_speed_mm_s": np.nan,
+                "quiet_fraction": np.nan,
+                "valid_fraction": valid_fraction,
+            }
+        valid_values = values[finite]
+        mean_speed = float(np.mean(valid_values))
+        quiet_fraction = float(np.mean(valid_values <= float(speed_threshold_mm_s)))
+        if valid_fraction < float(min_valid_fraction):
+            label = "no speed"
+        elif quiet_fraction >= float(quiet_fraction_threshold):
+            label = "sleep"
+        else:
+            label = "wake"
+        return {
+            "label": label,
+            "instant_speed_mm_s": instant_speed,
+            "mean_speed_mm_s": mean_speed,
+            "quiet_fraction": quiet_fraction,
+            "valid_fraction": valid_fraction,
+        }
+
+    def ready_count(
+        self,
+        *,
+        bodypoint_percentile: float,
+        max_gap_frames: int,
+        max_bodypoint_speed_mm_s: float | None,
+    ) -> int:
+        return sum(
+            int(
+                record.motion_cache_ready(
+                    bodypoint_percentile=bodypoint_percentile,
+                    max_gap_frames=max_gap_frames,
+                    max_bodypoint_speed_mm_s=max_bodypoint_speed_mm_s,
+                )
+            )
+            for record in self.records
+        )
+
+
+def infer_speed_vectors_root(block_dir: Optional[Path]) -> Optional[Path]:
+    if block_dir is None:
+        return None
+    candidate = Path(block_dir) / "stitched" / "speed_vectors"
+    return candidate if candidate.is_dir() else None
+
+
+def infer_pose_tracks_root(block_dir: Optional[Path]) -> Optional[Path]:
+    if block_dir is None:
+        return None
+    candidate = Path(block_dir) / "stitched" / "per_track"
+    return candidate if candidate.is_dir() else None
+
+
+def infer_sleep_motion_root(block_dir: Optional[Path]) -> Optional[Path]:
+    if block_dir is None:
+        return None
+    candidate = Path(block_dir) / "stitched" / "sleep_motion"
+    return candidate if candidate.is_dir() else None
+
+
 def infer_detections_from_video(video_path: Path) -> Path:
     return video_path.with_name(f"{video_path.stem}_aruco_detections.csv")
 
@@ -1716,6 +2261,8 @@ def lookup_frame_count_from_sidecar(sidecar: Path, video_name: str) -> Optional[
 
 
 class OpenCvVideoReader:
+    MAX_STREAM_SKIP_FRAMES = 300
+
     def __init__(self, video_path: Path):
         self.video_path = Path(video_path)
         self.cap = cv2.VideoCapture(str(self.video_path))
@@ -1724,13 +2271,38 @@ class OpenCvVideoReader:
         self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1
         self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1
         self.fps = float(self.cap.get(cv2.CAP_PROP_FPS)) or 24.0
+        reported_frame_count = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+        self._reported_frame_count = reported_frame_count if reported_frame_count > 0 else 0
+        self.use_ffmpeg_stream = self._reported_frame_count <= 0 and self.video_path.suffix.lower() in {
+            ".mkv",
+            ".mp4",
+            ".mov",
+        }
+        self.frame_bytes = int(self.width * self.height * 3)
         self.decoded_frame_index: Optional[int] = None
+        self.last_frame_index: Optional[int] = None
+        self.last_frame: Optional[np.ndarray] = None
+        self.ffmpeg_proc: Optional[subprocess.Popen[bytes]] = None
+        self.ffmpeg_next_frame_index: Optional[int] = None
 
     def frame_count(self) -> int:
-        return int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        return int(self._reported_frame_count)
 
     def read_frame(self, frame_idx: int) -> np.ndarray:
         frame_idx = int(frame_idx)
+        if self.last_frame is not None and self.last_frame_index == frame_idx:
+            return self.last_frame.copy()
+        if self.use_ffmpeg_stream:
+            return self._read_frame_ffmpeg(frame_idx)
+        return self._read_frame_opencv(frame_idx)
+
+    def _cache_frame(self, frame_idx: int, frame: np.ndarray) -> np.ndarray:
+        self.decoded_frame_index = int(frame_idx)
+        self.last_frame_index = int(frame_idx)
+        self.last_frame = frame.copy()
+        return frame
+
+    def _read_frame_opencv(self, frame_idx: int) -> np.ndarray:
         need_seek = self.decoded_frame_index is None or frame_idx != (self.decoded_frame_index + 1)
         if need_seek:
             self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
@@ -1741,10 +2313,81 @@ class OpenCvVideoReader:
             ok, frame = self.cap.read()
         if not ok or frame is None:
             raise RuntimeError(f"Could not read frame {frame_idx} from {self.video_path}")
-        self.decoded_frame_index = frame_idx
-        return frame
+        return self._cache_frame(frame_idx, frame)
+
+    def _start_ffmpeg_stream(self, frame_idx: int) -> None:
+        self._close_ffmpeg_stream()
+        start_time = max(0.0, float(frame_idx) / max(float(self.fps), 1e-6))
+        cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-ss",
+            f"{start_time:.9f}",
+            "-i",
+            str(self.video_path),
+            "-an",
+            "-sn",
+            "-dn",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "bgr24",
+            "-",
+        ]
+        self.ffmpeg_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        self.ffmpeg_next_frame_index = int(frame_idx)
+
+    def _read_next_ffmpeg_frame(self) -> Tuple[int, np.ndarray]:
+        if self.ffmpeg_proc is None or self.ffmpeg_proc.stdout is None or self.ffmpeg_next_frame_index is None:
+            raise RuntimeError("ffmpeg video stream is not open")
+        frame_idx = int(self.ffmpeg_next_frame_index)
+        buf = bytearray()
+        while len(buf) < self.frame_bytes:
+            chunk = self.ffmpeg_proc.stdout.read(self.frame_bytes - len(buf))
+            if not chunk:
+                self._close_ffmpeg_stream()
+                raise RuntimeError(f"Could not read frame {frame_idx} from ffmpeg stream for {self.video_path}")
+            buf.extend(chunk)
+        self.ffmpeg_next_frame_index = frame_idx + 1
+        frame = np.frombuffer(bytes(buf), dtype=np.uint8).reshape((self.height, self.width, 3)).copy()
+        return frame_idx, frame
+
+    def _read_frame_ffmpeg(self, frame_idx: int) -> np.ndarray:
+        if self.ffmpeg_proc is None or self.ffmpeg_next_frame_index is None:
+            self._start_ffmpeg_stream(frame_idx)
+        elif frame_idx == self.ffmpeg_next_frame_index:
+            pass
+        elif frame_idx > self.ffmpeg_next_frame_index and frame_idx - self.ffmpeg_next_frame_index <= self.MAX_STREAM_SKIP_FRAMES:
+            while self.ffmpeg_next_frame_index is not None and self.ffmpeg_next_frame_index < frame_idx:
+                self._read_next_ffmpeg_frame()
+        else:
+            self._start_ffmpeg_stream(frame_idx)
+
+        actual_frame_idx, frame = self._read_next_ffmpeg_frame()
+        if actual_frame_idx != frame_idx:
+            raise RuntimeError(f"Expected ffmpeg frame {frame_idx}, decoded frame {actual_frame_idx}")
+        return self._cache_frame(frame_idx, frame)
+
+    def _close_ffmpeg_stream(self) -> None:
+        if self.ffmpeg_proc is None:
+            self.ffmpeg_next_frame_index = None
+            return
+        try:
+            if self.ffmpeg_proc.stdout is not None:
+                self.ffmpeg_proc.stdout.close()
+        except Exception:
+            pass
+        try:
+            self.ffmpeg_proc.terminate()
+        except Exception:
+            pass
+        self.ffmpeg_proc = None
+        self.ffmpeg_next_frame_index = None
 
     def close(self) -> None:
+        self._close_ffmpeg_stream()
         self.cap.release()
 
 
@@ -2264,11 +2907,26 @@ class ArucoCurationApp:
         tracks_paths: Optional[List[Path]] = None,
         interaction_paths: Optional[List[Path]] = None,
         sleep_bouts_path: Optional[Path] = None,
+        pose_tracks_root: Optional[Path] = None,
+        sleep_motion_root: Optional[Path] = None,
+        speed_vectors_root: Optional[Path] = None,
         track_frame_offset: int = 0,
         interaction_frame_offset: int = 0,
         sleep_frame_offset: int = 0,
         interaction_bout_gap_frames: int = 3,
         sleep_label: str = "sleep",
+        show_speed_sleep_overlay: bool = True,
+        speed_sleep_threshold_mm_s: float = 0.1,
+        speed_sleep_window_seconds: float = 60.0,
+        speed_sleep_fraction_threshold: float = 0.80,
+        speed_sleep_min_valid_fraction: float = 0.20,
+        speed_sleep_side: str = "auto",
+        speed_sleep_source: str = "pose",
+        speed_sleep_bodypoint_percentile: float = 95.0,
+        speed_sleep_min_valid_bodypoint_fraction: float = 0.60,
+        speed_sleep_bodypoint_max_gap_frames: int = 5,
+        speed_sleep_bodypoint_max_speed_mm_s: float = 20.0,
+        pose_motion_mm_per_px: float = 0.016,
     ):
         self.root = root
         self.video_path = Path(video_path)
@@ -2292,6 +2950,8 @@ class ArucoCurationApp:
         self.panorama_track_store: Optional[PanoramaTrackStore] = None
         self.interaction_bout_store: Optional[InteractionBoutStore] = None
         self.sleep_bout_store: Optional[SleepBoutStore] = None
+        self.pose_motion_state_store: Optional[PoseMotionStateStore] = None
+        self.speed_state_store: Optional[SpeedStateStore] = None
         self.behavior_overlay_error: Optional[str] = None
 
         self.store = (
@@ -2307,7 +2967,13 @@ class ArucoCurationApp:
         else:
             self.video_reader = OpenCvVideoReader(self.video_path)
 
-        self.frame_count = self.video_reader.frame_count() or resolve_frame_count(self.video_path, self.video_reader)
+        reported_frame_count = self.video_reader.frame_count()
+        if reported_frame_count > 0:
+            self.frame_count = reported_frame_count
+        elif self.chunk_specs:
+            self.frame_count = self.chunk_specs[-1].stop
+        else:
+            self.frame_count = resolve_frame_count(self.video_path, self.video_reader)
         self.video_width = int(self.video_reader.width) or 1
         self.video_height = int(self.video_reader.height) or 1
 
@@ -2406,6 +3072,22 @@ class ArucoCurationApp:
         self.param_test_running = False
         self.show_interaction_bouts_var = tk.BooleanVar(value=bool(interaction_paths))
         self.show_sleep_bouts_var = tk.BooleanVar(value=bool(sleep_bouts_path))
+        self.show_speed_sleep_state_var = tk.BooleanVar(
+            value=bool(sleep_motion_root or pose_tracks_root or speed_vectors_root) and bool(show_speed_sleep_overlay)
+        )
+        self.speed_sleep_threshold_var = tk.DoubleVar(value=float(speed_sleep_threshold_mm_s))
+        self.speed_sleep_window_seconds_var = tk.DoubleVar(value=float(speed_sleep_window_seconds))
+        self.speed_sleep_fraction_threshold_var = tk.DoubleVar(value=float(speed_sleep_fraction_threshold))
+        self.speed_sleep_min_valid_fraction_var = tk.DoubleVar(value=float(speed_sleep_min_valid_fraction))
+        self.speed_sleep_side_var = tk.StringVar(value=str(speed_sleep_side).strip().lower() or "auto")
+        self.speed_sleep_source_var = tk.StringVar(value=str(speed_sleep_source).strip().lower() or "pose")
+        self.speed_sleep_bodypoint_percentile_var = tk.DoubleVar(value=float(speed_sleep_bodypoint_percentile))
+        self.speed_sleep_min_valid_bodypoint_fraction_var = tk.DoubleVar(
+            value=float(speed_sleep_min_valid_bodypoint_fraction)
+        )
+        self.speed_sleep_bodypoint_max_gap_frames_var = tk.IntVar(value=int(speed_sleep_bodypoint_max_gap_frames))
+        self.speed_sleep_bodypoint_max_speed_var = tk.DoubleVar(value=float(speed_sleep_bodypoint_max_speed_mm_s))
+        self.pose_motion_mm_per_px = float(pose_motion_mm_per_px)
         self.behavior_overlay_status_var = tk.StringVar(value="Behavior overlay: not loaded")
 
         self.canvas_item_id: Optional[int] = None
@@ -2416,6 +3098,9 @@ class ArucoCurationApp:
             tracks_paths=list(tracks_paths or []),
             interaction_paths=list(interaction_paths or []),
             sleep_bouts_path=sleep_bouts_path,
+            pose_tracks_root=pose_tracks_root,
+            sleep_motion_root=sleep_motion_root,
+            speed_vectors_root=speed_vectors_root,
             track_frame_offset=int(track_frame_offset),
             interaction_frame_offset=int(interaction_frame_offset),
             sleep_frame_offset=int(sleep_frame_offset),
@@ -2477,6 +3162,9 @@ class ArucoCurationApp:
         tracks_paths: List[Path],
         interaction_paths: List[Path],
         sleep_bouts_path: Optional[Path],
+        pose_tracks_root: Optional[Path],
+        sleep_motion_root: Optional[Path],
+        speed_vectors_root: Optional[Path],
         track_frame_offset: int,
         interaction_frame_offset: int,
         sleep_frame_offset: int,
@@ -2484,49 +3172,111 @@ class ArucoCurationApp:
         sleep_label: str,
     ) -> None:
         status_parts: List[str] = []
-        try:
-            if self.hmats_path is not None:
+        errors: List[str] = []
+        if self.hmats_path is not None:
+            try:
                 if self.camera_index is None:
-                    raise ValueError("Could not infer camera index; pass --camera for panorama overlays")
+                    raise ValueError("could not infer camera index; pass --camera for panorama overlays")
                 H = load_homography_stack(self.hmats_path)
                 if self.camera_index < 0 or self.camera_index >= len(H):
                     raise ValueError(
-                        f"Camera index {self.camera_index} is outside homography stack with {len(H)} cameras"
+                        f"camera index {self.camera_index} is outside homography stack with {len(H)} cameras"
                     )
                 self.panorama_to_video_H = np.linalg.inv(H[self.camera_index])
                 status_parts.append(f"H cam{self.camera_index + 1:02d}")
-            elif tracks_paths or interaction_paths or sleep_bouts_path is not None:
-                status_parts.append("no homography")
+            except Exception as exc:
+                errors.append(f"H load failed: {exc}")
+        elif (
+            tracks_paths
+            or interaction_paths
+            or sleep_bouts_path is not None
+            or pose_tracks_root is not None
+            or sleep_motion_root is not None
+            or speed_vectors_root is not None
+        ):
+            status_parts.append("no homography")
 
-            if tracks_paths:
+        if tracks_paths:
+            try:
                 self.panorama_track_store = PanoramaTrackStore(
                     tracks_paths,
                     frame_offsets=self._path_offsets(tracks_paths, track_frame_offset),
                     frame_spans=self._path_spans(tracks_paths),
                 )
                 status_parts.append(f"tracks {len(tracks_paths)}")
-            if interaction_paths:
+            except Exception as exc:
+                errors.append(f"tracks load failed: {exc}")
+
+        if interaction_paths:
+            try:
                 self.interaction_bout_store = InteractionBoutStore(
                     interaction_paths,
                     frame_offsets=self._path_offsets(interaction_paths, interaction_frame_offset),
                     max_gap_frames=int(interaction_bout_gap_frames),
                 )
                 status_parts.append(f"interaction bouts {len(self.interaction_bout_store.bouts):,}")
-            if sleep_bouts_path is not None:
+            except Exception as exc:
+                errors.append(f"interaction load failed: {exc}")
+
+        if sleep_bouts_path is not None:
+            try:
                 self.sleep_bout_store = SleepBoutStore(
                     sleep_bouts_path,
                     frame_offset=int(sleep_frame_offset),
                     sleep_label=str(sleep_label),
                 )
                 status_parts.append(f"sleep bouts {len(self.sleep_bout_store.bouts):,}")
-        except Exception as exc:
-            self.behavior_overlay_error = str(exc)
-            status_parts.append(f"load failed: {exc}")
+            except Exception as exc:
+                errors.append(f"sleep bout load failed: {exc}")
+
+        if pose_tracks_root is not None:
+            try:
+                self.pose_motion_state_store = PoseMotionStateStore.from_root(
+                    pose_tracks_root,
+                    fps=float(self.video_reader.fps),
+                    mm_per_px=float(self.pose_motion_mm_per_px),
+                    sleep_motion_root=sleep_motion_root,
+                )
+                sleep_motion_ready = sum(
+                    int(record.sleep_motion_cache_ready())
+                    for record in self.pose_motion_state_store.records
+                )
+                status_parts.append(
+                    f"sleep motion cache {sleep_motion_ready:,}/{len(self.pose_motion_state_store.records):,}"
+                )
+            except Exception as exc:
+                errors.append(f"pose motion load failed: {exc}")
+
+        if speed_vectors_root is not None:
+            try:
+                self.speed_state_store = SpeedStateStore.from_root(speed_vectors_root)
+                status_parts.append(f"anchor speed states {len(self.speed_state_store.records):,}")
+            except Exception as exc:
+                errors.append(f"speed load failed: {exc}")
+
+        if errors:
+            self.behavior_overlay_error = " | ".join(errors)
+            status_parts.extend(errors)
 
         if not status_parts:
-            self.behavior_overlay_status_var.set("Behavior overlay: no interactions/sleep inputs")
+            self.behavior_overlay_status_var.set("Behavior overlay: no interactions/sleep/speed inputs")
         else:
             self.behavior_overlay_status_var.set("Behavior overlay: " + " | ".join(status_parts))
+
+    def pose_motion_cache_status_text(self) -> str:
+        if self.pose_motion_state_store is None:
+            return ""
+        total = len(self.pose_motion_state_store.records)
+        done = sum(int(record.sleep_motion_cache_ready()) for record in self.pose_motion_state_store.records)
+        if total <= 0:
+            return ""
+        if done >= total:
+            return f"sleep motion cache ready {done}/{total}"
+        return f"sleep motion cache missing {total - done}/{total}; run compute_track_sleep_motion fan-out"
+
+    def ensure_pose_motion_precompute(self, params: Dict[str, object]) -> None:
+        # Batch cache creation belongs in compute_track_sleep_motion.py, never in the GUI.
+        return
 
     def _build_ui(self) -> None:
         self.root.title(f"ArUco Curation - {self.video_path.name}")
@@ -2731,10 +3481,80 @@ class ArucoCurationApp:
         ).pack(anchor=tk.W, padx=8, pady=(0, 4))
         ttk.Checkbutton(
             behavior_box,
-            text="Show Sleep Bouts",
+            text="Show Sleep Bout Table",
             variable=self.show_sleep_bouts_var,
             command=self.on_behavior_overlay_changed,
-        ).pack(anchor=tk.W, padx=8, pady=(0, 8))
+        ).pack(anchor=tk.W, padx=8, pady=(0, 4))
+        ttk.Checkbutton(
+            behavior_box,
+            text="Show Speed Sleep/Wake Labels",
+            variable=self.show_speed_sleep_state_var,
+            command=self.on_behavior_overlay_changed,
+        ).pack(anchor=tk.W, padx=8, pady=(0, 6))
+        speed_grid = ttk.Frame(behavior_box)
+        speed_grid.pack(fill=tk.X, padx=8, pady=(0, 8))
+        for col in range(4):
+            speed_grid.columnconfigure(col, weight=1)
+        ttk.Label(speed_grid, text="Thresh").grid(row=0, column=0, sticky=tk.W)
+        threshold_entry = ttk.Entry(speed_grid, textvariable=self.speed_sleep_threshold_var, width=7)
+        threshold_entry.grid(row=0, column=1, sticky=tk.EW, padx=(4, 8))
+        ttk.Label(speed_grid, text="Window").grid(row=0, column=2, sticky=tk.W)
+        window_entry = ttk.Entry(speed_grid, textvariable=self.speed_sleep_window_seconds_var, width=7)
+        window_entry.grid(row=0, column=3, sticky=tk.EW, padx=(4, 0))
+        ttk.Label(speed_grid, text="Quiet frac").grid(row=1, column=0, sticky=tk.W, pady=(4, 0))
+        quiet_entry = ttk.Entry(speed_grid, textvariable=self.speed_sleep_fraction_threshold_var, width=7)
+        quiet_entry.grid(row=1, column=1, sticky=tk.EW, padx=(4, 8), pady=(4, 0))
+        ttk.Label(speed_grid, text="Valid frac").grid(row=1, column=2, sticky=tk.W, pady=(4, 0))
+        valid_entry = ttk.Entry(speed_grid, textvariable=self.speed_sleep_min_valid_fraction_var, width=7)
+        valid_entry.grid(row=1, column=3, sticky=tk.EW, padx=(4, 0), pady=(4, 0))
+        ttk.Label(speed_grid, text="Source").grid(row=2, column=0, sticky=tk.W, pady=(4, 0))
+        source_combo = ttk.Combobox(
+            speed_grid,
+            textvariable=self.speed_sleep_source_var,
+            values=("pose", "anchor"),
+            width=7,
+            state="readonly",
+        )
+        source_combo.grid(row=2, column=1, sticky=tk.EW, padx=(4, 8), pady=(4, 0))
+        source_combo.bind("<<ComboboxSelected>>", lambda _event: self.on_speed_sleep_params_changed())
+        ttk.Label(speed_grid, text="Side").grid(row=2, column=2, sticky=tk.W, pady=(4, 0))
+        side_combo = ttk.Combobox(
+            speed_grid,
+            textvariable=self.speed_sleep_side_var,
+            values=("auto", "left", "right"),
+            width=7,
+            state="readonly",
+        )
+        side_combo.grid(row=2, column=3, sticky=tk.EW, padx=(4, 0), pady=(4, 0))
+        side_combo.bind("<<ComboboxSelected>>", lambda _event: self.on_speed_sleep_params_changed())
+        ttk.Label(speed_grid, text="BP pct").grid(row=3, column=0, sticky=tk.W, pady=(4, 0))
+        bp_percentile_entry = ttk.Entry(speed_grid, textvariable=self.speed_sleep_bodypoint_percentile_var, width=7)
+        bp_percentile_entry.grid(row=3, column=1, sticky=tk.EW, padx=(4, 8), pady=(4, 0))
+        ttk.Label(speed_grid, text="Gap fr").grid(row=3, column=2, sticky=tk.W, pady=(4, 0))
+        bp_gap_entry = ttk.Entry(speed_grid, textvariable=self.speed_sleep_bodypoint_max_gap_frames_var, width=7)
+        bp_gap_entry.grid(row=3, column=3, sticky=tk.EW, padx=(4, 0), pady=(4, 0))
+        ttk.Label(speed_grid, text="Max spd").grid(row=4, column=0, sticky=tk.W, pady=(4, 0))
+        bp_max_speed_entry = ttk.Entry(speed_grid, textvariable=self.speed_sleep_bodypoint_max_speed_var, width=7)
+        bp_max_speed_entry.grid(row=4, column=1, sticky=tk.EW, padx=(4, 8), pady=(4, 0))
+        ttk.Label(speed_grid, text="BP valid").grid(row=4, column=2, sticky=tk.W, pady=(4, 0))
+        bp_valid_entry = ttk.Entry(
+            speed_grid,
+            textvariable=self.speed_sleep_min_valid_bodypoint_fraction_var,
+            width=7,
+        )
+        bp_valid_entry.grid(row=4, column=3, sticky=tk.EW, padx=(4, 0), pady=(4, 0))
+        for entry in (
+            threshold_entry,
+            window_entry,
+            quiet_entry,
+            valid_entry,
+            bp_percentile_entry,
+            bp_gap_entry,
+            bp_max_speed_entry,
+            bp_valid_entry,
+        ):
+            entry.bind("<Return>", lambda _event: self.on_speed_sleep_params_changed())
+            entry.bind("<FocusOut>", lambda _event: self.on_speed_sleep_params_changed())
 
         param_box = ttk.LabelFrame(right, text="ArUco Parameter Test")
         param_box.pack(fill=tk.X, pady=(0, 10))
@@ -3016,11 +3836,151 @@ class ArucoCurationApp:
             enabled.append("interaction bouts")
         if self.show_sleep_bouts_var.get():
             enabled.append("sleep bouts")
+        if self.show_speed_sleep_state_var.get():
+            enabled.append("speed sleep/wake")
         self.status_note = "Behavior overlay: " + (", ".join(enabled) if enabled else "hidden")
+        if self.show_speed_sleep_state_var.get():
+            try:
+                self.ensure_pose_motion_precompute(self.get_speed_sleep_params())
+            except Exception:
+                pass
         if not self.is_playing:
             self.render_current_frame()
         else:
             self.refresh_status(force=True)
+
+    def on_speed_sleep_params_changed(self) -> None:
+        try:
+            params = self.get_speed_sleep_params()
+        except Exception as exc:
+            self.status_note = f"Speed sleep/wake params invalid: {exc}"
+        else:
+            self.status_note = (
+                f"Sleep/wake {params['source']}: <= {params['threshold']:g} mm/s, "
+                f"{params['window_seconds']:g}s window, quiet >= {params['quiet_fraction']:g}, "
+                f"valid >= {params['min_valid_fraction']:g}, "
+                f"BP valid >= {params['min_valid_bodypoint_fraction']:g}, side {params['side_hint']}"
+            )
+            self.ensure_pose_motion_precompute(params)
+        if not self.is_playing:
+            self.render_current_frame()
+        else:
+            self.refresh_status(force=True)
+
+    def get_speed_sleep_params(self) -> Dict[str, object]:
+        threshold = float(self.speed_sleep_threshold_var.get())
+        window_seconds = float(self.speed_sleep_window_seconds_var.get())
+        quiet_fraction = float(self.speed_sleep_fraction_threshold_var.get())
+        min_valid_fraction = float(self.speed_sleep_min_valid_fraction_var.get())
+        side_hint = str(self.speed_sleep_side_var.get()).strip().lower() or "auto"
+        source = str(self.speed_sleep_source_var.get()).strip().lower() or "pose"
+        bodypoint_percentile = float(self.speed_sleep_bodypoint_percentile_var.get())
+        min_valid_bodypoint_fraction = float(self.speed_sleep_min_valid_bodypoint_fraction_var.get())
+        max_gap_frames = int(self.speed_sleep_bodypoint_max_gap_frames_var.get())
+        max_bodypoint_speed = float(self.speed_sleep_bodypoint_max_speed_var.get())
+        if not math.isfinite(threshold) or threshold < 0:
+            raise ValueError("threshold must be >= 0")
+        if not math.isfinite(window_seconds) or window_seconds <= 0:
+            raise ValueError("window must be > 0 seconds")
+        if not math.isfinite(quiet_fraction) or not 0 <= quiet_fraction <= 1:
+            raise ValueError("quiet fraction must be in [0, 1]")
+        if not math.isfinite(min_valid_fraction) or not 0 <= min_valid_fraction <= 1:
+            raise ValueError("valid fraction must be in [0, 1]")
+        if side_hint not in {"auto", "left", "right"}:
+            raise ValueError("side must be auto, left, or right")
+        if source not in {"pose", "anchor"}:
+            raise ValueError("source must be pose or anchor")
+        if not math.isfinite(bodypoint_percentile) or not 0 <= bodypoint_percentile <= 100:
+            raise ValueError("bodypoint percentile must be in [0, 100]")
+        if not math.isfinite(min_valid_bodypoint_fraction) or not 0 <= min_valid_bodypoint_fraction <= 1:
+            raise ValueError("valid bodypoint fraction must be in [0, 1]")
+        if max_gap_frames < 1:
+            raise ValueError("bodypoint max gap must be >= 1 frame")
+        if not math.isfinite(max_bodypoint_speed) or max_bodypoint_speed <= 0:
+            raise ValueError("max bodypoint speed must be > 0 mm/s")
+        self.speed_sleep_threshold_var.set(threshold)
+        self.speed_sleep_window_seconds_var.set(window_seconds)
+        self.speed_sleep_fraction_threshold_var.set(quiet_fraction)
+        self.speed_sleep_min_valid_fraction_var.set(min_valid_fraction)
+        self.speed_sleep_side_var.set(side_hint)
+        self.speed_sleep_source_var.set(source)
+        self.speed_sleep_bodypoint_percentile_var.set(bodypoint_percentile)
+        self.speed_sleep_min_valid_bodypoint_fraction_var.set(min_valid_bodypoint_fraction)
+        self.speed_sleep_bodypoint_max_gap_frames_var.set(max_gap_frames)
+        self.speed_sleep_bodypoint_max_speed_var.set(max_bodypoint_speed)
+        return {
+            "threshold": threshold,
+            "window_seconds": window_seconds,
+            "quiet_fraction": quiet_fraction,
+            "min_valid_fraction": min_valid_fraction,
+            "side_hint": side_hint,
+            "source": source,
+            "bodypoint_percentile": bodypoint_percentile,
+            "min_valid_bodypoint_fraction": min_valid_bodypoint_fraction,
+            "max_gap_frames": max_gap_frames,
+            "max_bodypoint_speed": max_bodypoint_speed,
+        }
+
+    def sleep_state_records_for_track(self, track_id: int, *, side_hint: str, source: str) -> list[object]:
+        source = str(source)
+        if source == "pose":
+            if self.pose_motion_state_store is None:
+                return []
+            return list(self.pose_motion_state_store.records_for_track(track_id, side_hint=side_hint))
+        if self.speed_state_store is None:
+            return []
+        return list(self.speed_state_store.records_for_track(track_id, side_hint=side_hint))
+
+    def sleep_state_for_track(
+        self,
+        *,
+        side: str,
+        track_id: int,
+        frame: int,
+        params: Dict[str, object],
+        allow_build: bool = True,
+    ) -> Dict[str, object]:
+        source = str(params["source"])
+        if source == "pose":
+            if self.pose_motion_state_store is None:
+                return {
+                    "label": "no speed",
+                    "instant_speed_mm_s": np.nan,
+                    "mean_speed_mm_s": np.nan,
+                    "quiet_fraction": np.nan,
+                    "valid_fraction": 0.0,
+                }
+            return self.pose_motion_state_store.state_for(
+                side=side,
+                track_id=track_id,
+                frame=frame,
+                speed_threshold_mm_s=float(params["threshold"]),
+                window_seconds=float(params["window_seconds"]),
+                quiet_fraction_threshold=float(params["quiet_fraction"]),
+                min_valid_fraction=float(params["min_valid_fraction"]),
+                bodypoint_percentile=float(params["bodypoint_percentile"]),
+                min_valid_bodypoint_fraction=float(params["min_valid_bodypoint_fraction"]),
+                max_gap_frames=int(params["max_gap_frames"]),
+                max_bodypoint_speed_mm_s=float(params["max_bodypoint_speed"]),
+                allow_build=allow_build,
+            )
+        if self.speed_state_store is None:
+            return {
+                "label": "no speed",
+                "instant_speed_mm_s": np.nan,
+                "mean_speed_mm_s": np.nan,
+                "quiet_fraction": np.nan,
+                "valid_fraction": 0.0,
+            }
+        return self.speed_state_store.state_for(
+            side=side,
+            track_id=track_id,
+            frame=frame,
+            speed_threshold_mm_s=float(params["threshold"]),
+            window_seconds=float(params["window_seconds"]),
+            quiet_fraction_threshold=float(params["quiet_fraction"]),
+            min_valid_fraction=float(params["min_valid_fraction"]),
+        )
 
     def start_sleap_load(self) -> None:
         if self.sleap_loading or self.sleap_store is not None:
@@ -3900,22 +4860,154 @@ class ArucoCurationApp:
         b_xy = body_xy[idx[1]]
         return (float(a_xy[0]), float(a_xy[1])), (float(b_xy[0]), float(b_xy[1]))
 
+    def speed_state_style(self, label: str) -> Tuple[Tuple[int, int, int], str, int]:
+        label = str(label)
+        if label == "sleep":
+            return SPEED_SLEEP_COLOR, "SLEEP", 22
+        if label == "wake":
+            return SPEED_WAKE_COLOR, "WAKE", 17
+        if label == "pending":
+            return SPEED_PENDING_COLOR, "PENDING", 15
+        return SPEED_UNKNOWN_COLOR, "NO SPEED", 15
+
+    def format_speed_state_label(self, side: str, track_id: int, state: Dict[str, object]) -> str:
+        _color, display_label, _radius = self.speed_state_style(str(state["label"]))
+        side_prefix = side[:1].upper() if side else ""
+        text = f"{side_prefix}T{int(track_id)} {display_label}"
+        instant_speed = float(state["instant_speed_mm_s"])
+        quiet_fraction = float(state["quiet_fraction"])
+        if math.isfinite(instant_speed):
+            text += f" {instant_speed:.2f}"
+        if math.isfinite(quiet_fraction):
+            text += f" q{quiet_fraction:.2f}"
+        return text
+
+    def draw_speed_state_label(
+        self,
+        image: np.ndarray,
+        *,
+        point: Tuple[int, int],
+        side: str,
+        track_id: int,
+        state: Dict[str, object],
+        y_offset: int = -20,
+    ) -> str:
+        label = str(state["label"])
+        color, _display_label, radius = self.speed_state_style(label)
+        cv2.circle(image, point, radius, color, 3, cv2.LINE_AA)
+        self.draw_text_with_outline(
+            image,
+            self.format_speed_state_label(side, track_id, state),
+            (point[0] + 18, point[1] + int(y_offset)),
+            color,
+            scale=0.62,
+            thickness=2,
+        )
+        return label
+
+    def draw_raw_aruco_speed_state_labels(
+        self,
+        image: np.ndarray,
+        *,
+        params: Dict[str, object],
+    ) -> Tuple[Dict[str, int], int]:
+        counts = {"sleep": 0, "wake": 0, "pending": 0, "no speed": 0}
+        source = str(params["source"])
+        side_hint = str(params["side_hint"])
+        if source == "pose":
+            if self.pose_motion_state_store is None:
+                return counts, 0
+        elif self.speed_state_store is None:
+            return counts, 0
+
+        drawn = 0
+        current_dets = self.store.get_frame_detections(self.current_frame)
+        for det in current_dets:
+            if not finite_xy(det.x, det.y):
+                continue
+            records = self.sleep_state_records_for_track(
+                int(det.instance),
+                side_hint=side_hint,
+                source=source,
+            )
+            if not records:
+                continue
+            point = (int(round(det.x)), int(round(det.y)))
+            if len(records) == 1:
+                record = records[0]
+                state = self.sleep_state_for_track(
+                    side=record.side,
+                    track_id=record.track_id,
+                    frame=self.current_frame,
+                    params=params,
+                    allow_build=False,
+                )
+                label = self.draw_speed_state_label(
+                    image,
+                    point=point,
+                    side=record.side,
+                    track_id=record.track_id,
+                    state=state,
+                    y_offset=26,
+                )
+                counts[label if label in counts else "no speed"] += 1
+                drawn += 1
+                continue
+
+            state_parts = []
+            labels = []
+            for record in records:
+                state = self.sleep_state_for_track(
+                    side=record.side,
+                    track_id=record.track_id,
+                    frame=self.current_frame,
+                    params=params,
+                    allow_build=False,
+                )
+                label = str(state["label"])
+                labels.append(label)
+                counts[label if label in counts else "no speed"] += 1
+                _color, display_label, _radius = self.speed_state_style(label)
+                state_parts.append(f"{record.side[:1].upper()}:{display_label}")
+            if "sleep" in labels:
+                color = SPEED_SLEEP_COLOR
+            elif "wake" in labels:
+                color = SPEED_WAKE_COLOR
+            elif "pending" in labels:
+                color = SPEED_PENDING_COLOR
+            else:
+                color = SPEED_UNKNOWN_COLOR
+            cv2.circle(image, point, 19, color, 3, cv2.LINE_AA)
+            self.draw_text_with_outline(
+                image,
+                f"T{int(det.instance)} " + " ".join(state_parts),
+                (point[0] + 18, point[1] + 26),
+                color,
+                scale=0.58,
+                thickness=2,
+            )
+            drawn += 1
+        return counts, drawn
+
     def draw_behavior_overlay(self, image: np.ndarray) -> None:
         show_interactions = self.show_interaction_bouts_var.get() and self.interaction_bout_store is not None
         show_sleep = self.show_sleep_bouts_var.get() and self.sleep_bout_store is not None
-        if not show_interactions and not show_sleep:
+        show_speed_state = self.show_speed_sleep_state_var.get()
+        if not show_interactions and not show_sleep and not show_speed_state:
             return
+        y_text = 144
         if self.behavior_overlay_error is not None:
             self.draw_text_with_outline(
                 image,
                 "Behavior overlay load failed",
-                (10, 144),
+                (10, y_text),
                 (0, 200, 255),
                 scale=0.85,
                 thickness=2,
             )
-            return
+            y_text += 28
 
+        track_error = None
         try:
             track_rows = (
                 self.panorama_track_store.rows_for_frame(self.current_frame)
@@ -3923,19 +5015,22 @@ class ArucoCurationApp:
                 else pd.DataFrame()
             )
         except Exception as exc:
-            self.draw_text_with_outline(
-                image,
-                f"Behavior track load failed: {exc}",
-                (10, 144),
-                (0, 200, 255),
-                scale=0.72,
-                thickness=2,
-            )
-            return
-        rows_by_track = {
-            int(track_id): group
-            for track_id, group in track_rows.groupby("TrackID", sort=False)
-        } if not track_rows.empty else {}
+            track_error = str(exc)
+            track_rows = pd.DataFrame()
+        rows_by_track = {}
+        rows_by_side_track = {}
+        if not track_rows.empty:
+            if "side" not in track_rows.columns:
+                track_rows = track_rows.copy()
+                track_rows["side"] = ""
+            rows_by_track = {
+                int(track_id): group
+                for track_id, group in track_rows.groupby("TrackID", sort=False)
+            }
+            rows_by_side_track = {
+                (str(side), int(track_id)): group
+                for (side, track_id), group in track_rows.groupby(["side", "TrackID"], sort=False)
+            }
 
         missing_track_store = self.panorama_track_store is None
         active_interactions = (
@@ -3945,7 +5040,16 @@ class ArucoCurationApp:
         )
         active_sleep = self.sleep_bout_store.active_bouts(self.current_frame) if show_sleep else pd.DataFrame()
 
-        y_text = 144
+        if track_error is not None:
+            self.draw_text_with_outline(
+                image,
+                f"Behavior track load failed: {track_error}",
+                (10, y_text),
+                (0, 200, 255),
+                scale=0.72,
+                thickness=2,
+            )
+            y_text += 26
         if self.panorama_to_video_H is None and (show_interactions or show_sleep):
             self.draw_text_with_outline(
                 image,
@@ -3956,7 +5060,17 @@ class ArucoCurationApp:
                 thickness=2,
             )
             y_text += 26
-        if missing_track_store:
+        elif self.panorama_to_video_H is None and show_speed_state:
+            self.draw_text_with_outline(
+                image,
+                "Speed sleep/wake labels using raw ArUco positions",
+                (10, y_text),
+                SPEED_UNKNOWN_COLOR,
+                scale=0.72,
+                thickness=2,
+            )
+            y_text += 26
+        if missing_track_store and (show_interactions or show_sleep):
             self.draw_text_with_outline(
                 image,
                 "Behavior overlay needs --tracks for per-ant locations",
@@ -3966,7 +5080,132 @@ class ArucoCurationApp:
                 thickness=2,
             )
             y_text += 26
+        elif missing_track_store and show_speed_state:
+            self.draw_text_with_outline(
+                image,
+                "Speed sleep/wake labels using raw ArUco positions without --tracks",
+                (10, y_text),
+                SPEED_UNKNOWN_COLOR,
+                scale=0.72,
+                thickness=2,
+            )
+            y_text += 26
 
+        speed_state_summary = ""
+        if show_speed_state:
+            params: Dict[str, object] = {}
+            params_valid = False
+            source = "pose"
+            side_hint = "auto"
+            try:
+                params = self.get_speed_sleep_params()
+                params_valid = True
+                source = str(params["source"])
+                side_hint = str(params["side_hint"])
+            except Exception as exc:
+                speed_state_summary = f"speed sleep/wake params invalid: {exc}"
+                self.draw_text_with_outline(
+                    image,
+                    speed_state_summary,
+                    (10, y_text),
+                    SPEED_UNKNOWN_COLOR,
+                    scale=0.72,
+                    thickness=2,
+                )
+                y_text += 26
+            store_missing = (
+                params_valid
+                and (
+                    (source == "pose" and self.pose_motion_state_store is None)
+                    or (source == "anchor" and self.speed_state_store is None)
+                )
+            )
+            if store_missing:
+                speed_state_summary = (
+                    "pose sleep/wake needs --pose-tracks-root"
+                    if source == "pose"
+                    else "anchor sleep/wake needs --speed-vectors-root"
+                )
+                self.draw_text_with_outline(
+                    image,
+                    speed_state_summary,
+                    (10, y_text),
+                    SPEED_UNKNOWN_COLOR,
+                    scale=0.72,
+                    thickness=2,
+                )
+                y_text += 26
+            elif params_valid:
+                if source == "pose":
+                    self.ensure_pose_motion_precompute(params)
+                counts = {"sleep": 0, "wake": 0, "pending": 0, "no speed": 0}
+                drawn_projected = 0
+                for (side, track_id), rows in rows_by_side_track.items():
+                    if side_hint in {"left", "right"} and str(side) != side_hint:
+                        continue
+                    anchor = self.track_anchor_xy(rows)
+                    point = self.project_panorama_xy(*anchor) if anchor is not None else None
+                    if point is None:
+                        continue
+                    state = self.sleep_state_for_track(
+                        side=side,
+                        track_id=track_id,
+                        frame=self.current_frame,
+                        params=params,
+                        allow_build=False,
+                    )
+                    label = self.draw_speed_state_label(
+                        image,
+                        point=point,
+                        side=side,
+                        track_id=track_id,
+                        state=state,
+                    )
+                    counts[label if label in counts else "no speed"] += 1
+                    drawn_projected += 1
+                draw_mode = "projected"
+                if drawn_projected == 0:
+                    counts, drawn_raw = self.draw_raw_aruco_speed_state_labels(
+                        image,
+                        params=params,
+                    )
+                    draw_mode = "raw ArUco fallback"
+                    if drawn_raw == 0:
+                        speed_state_summary = (
+                            f"{source} sleep/wake drew 0 labels; check side, "
+                            "visible ArUco IDs, tracks, and homography"
+                        )
+                speed_state_summary = (
+                    speed_state_summary
+                    or f"{source} sleep/wake {draw_mode} sleep {counts['sleep']} | "
+                    f"wake {counts['wake']} | pending {counts['pending']} | no speed {counts['no speed']}"
+                )
+                if source == "pose":
+                    cache_status = self.pose_motion_cache_status_text()
+                    self.draw_text_with_outline(
+                        image,
+                        (
+                            f"pose motion: p{float(params['bodypoint_percentile']):g}, "
+                            f"BP valid {float(params['min_valid_bodypoint_fraction']):g}, "
+                            f"gap {int(params['max_gap_frames'])}fr, "
+                            f"max {float(params['max_bodypoint_speed']):g} mm/s"
+                        ),
+                        (10, y_text),
+                        SPEED_UNKNOWN_COLOR,
+                        scale=0.72,
+                        thickness=2,
+                    )
+                    y_text += 26
+                    if cache_status:
+                        self.draw_text_with_outline(
+                            image,
+                            cache_status,
+                            (10, y_text),
+                            SPEED_PENDING_COLOR,
+                            scale=0.72,
+                            thickness=2,
+                        )
+                        y_text += 26
         if show_sleep and not active_sleep.empty:
             for bout in active_sleep.itertuples(index=False):
                 track_id = int(getattr(bout, "track_id"))
@@ -4029,6 +5268,8 @@ class ArucoCurationApp:
             summary.append(f"interaction bouts active {0 if active_interactions.empty else len(active_interactions)}")
         if show_sleep:
             summary.append(f"sleep bouts active {0 if active_sleep.empty else len(active_sleep)}")
+        if show_speed_state:
+            summary.append(speed_state_summary)
         if summary:
             self.draw_text_with_outline(
                 image,
@@ -4297,8 +5538,30 @@ class ArucoCurationApp:
         if cached is not None:
             return cached
 
-        frames_list = self.store.present_frames_for_id(tag)
-        if not frames_list:
+        if isinstance(self.store, ChunkedArucoDetectionStore):
+            df = self.store.to_dataframe()
+            if not df.empty:
+                df = df.copy()
+                df["Instance"] = pd.to_numeric(df["Instance"], errors="coerce")
+                df = df[df["Instance"] == tag].copy()
+                for col in ("Frame", "X", "Y"):
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+                df = df.dropna(subset=["Frame", "X", "Y"]).sort_values("Frame", kind="mergesort")
+            frames_list = [] if df.empty else df["Frame"].astype(np.int64).tolist()
+            frames = np.asarray(frames_list, dtype=np.int32)
+            xs = np.asarray([] if df.empty else df["X"].to_numpy(np.float32), dtype=np.float32)
+            ys = np.asarray([] if df.empty else df["Y"].to_numpy(np.float32), dtype=np.float32)
+        else:
+            frames_list = self.store.present_frames_for_id(tag)
+            frames = np.asarray(frames_list, dtype=np.int32)
+            xs = np.empty(len(frames), dtype=np.float32)
+            ys = np.empty(len(frames), dtype=np.float32)
+            for idx, frame in enumerate(frames):
+                det = self.store.get_detection(int(frame), tag)
+                xs[idx] = np.nan if det is None else float(det.x)
+                ys[idx] = np.nan if det is None else float(det.y)
+
+        if len(frames) == 0:
             data = {
                 "tag": tag,
                 "frames": np.empty((0,), dtype=np.int32),
@@ -4313,13 +5576,24 @@ class ArucoCurationApp:
             self.trajectory_data_cache[tag] = data
             return data
 
-        frames = np.asarray(frames_list, dtype=np.int32)
-        xs = np.empty(len(frames), dtype=np.float32)
-        ys = np.empty(len(frames), dtype=np.float32)
-        for idx, frame in enumerate(frames):
-            det = self.store.frame_map[int(frame)][tag]
-            xs[idx] = float(det.x)
-            ys[idx] = float(det.y)
+        valid = np.isfinite(xs) & np.isfinite(ys)
+        frames = frames[valid]
+        xs = xs[valid]
+        ys = ys[valid]
+        if len(frames) == 0:
+            data = {
+                "tag": tag,
+                "frames": np.empty((0,), dtype=np.int32),
+                "xs": np.empty((0,), dtype=np.float32),
+                "ys": np.empty((0,), dtype=np.float32),
+                "frame_to_index": {},
+                "x_min": 0.0,
+                "x_max": 1.0,
+                "y_min": 0.0,
+                "y_max": 1.0,
+            }
+            self.trajectory_data_cache[tag] = data
+            return data
 
         x_min = float(xs.min())
         x_max = float(xs.max())
@@ -5329,6 +6603,113 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Sleep/low-quiescent bout table. Frame-level label tables are collapsed into distinct bouts.",
     )
     parser.add_argument(
+        "--speed-vectors-root",
+        type=Path,
+        default=None,
+        help=(
+            "Root containing stitched speed_vectors/per_track/*/speed_mm_s.npy for the anchor speed "
+            "sleep/wake source. This is the older one-bodypoint speed source."
+        ),
+    )
+    parser.add_argument(
+        "--pose-tracks-root",
+        type=Path,
+        default=None,
+        help=(
+            "Root containing stitched per-track pose parquet files. Default: "
+            "<block>/stitched/per_track when present. Used by the all-bodypoint pose sleep/wake source."
+        ),
+    )
+    parser.add_argument(
+        "--sleep-motion-root",
+        type=Path,
+        default=None,
+        help=(
+            "Root containing batch all-bodypoint caches from compute_track_sleep_motion.py. "
+            "Default: <block>/stitched/sleep_motion when present."
+        ),
+    )
+    parser.add_argument(
+        "--pose-motion-mm-per-px",
+        type=float,
+        default=0.016,
+        help="Millimeters per pixel for legacy per-parameter pose-motion caches.",
+    )
+    parser.add_argument(
+        "--hide-speed-sleep-overlay",
+        action="store_true",
+        help="Load sleep/wake inputs when available but leave the speed sleep/wake overlay unchecked initially.",
+    )
+    parser.add_argument(
+        "--speed-sleep-source",
+        choices=("pose", "anchor"),
+        default="pose",
+        help=(
+            "Sleep/wake motion source. 'pose' reads cached high-percentile speed over all bodypoints; "
+            "'anchor' uses precomputed one-bodypoint speed_mm_s.npy vectors."
+        ),
+    )
+    parser.add_argument(
+        "--speed-sleep-threshold",
+        type=float,
+        default=0.1,
+        help="Speed threshold in mm/s used to count a frame as quiet for the speed sleep/wake overlay.",
+    )
+    parser.add_argument(
+        "--speed-sleep-window-seconds",
+        type=float,
+        default=60.0,
+        help="Trailing window size in seconds for the speed sleep/wake overlay.",
+    )
+    parser.add_argument(
+        "--speed-sleep-fraction",
+        type=float,
+        default=0.80,
+        help="Minimum fraction of valid speed samples below threshold required to label sleep.",
+    )
+    parser.add_argument(
+        "--speed-sleep-min-valid-fraction",
+        type=float,
+        default=0.20,
+        help="Minimum valid speed-sample fraction required before assigning sleep or wake.",
+    )
+    parser.add_argument(
+        "--speed-sleep-side",
+        choices=("auto", "left", "right"),
+        default="auto",
+        help="Side to use for speed labels drawn from raw ArUco positions when left/right TrackIDs are ambiguous.",
+    )
+    parser.add_argument(
+        "--speed-sleep-bodypoint-percentile",
+        type=float,
+        default=95.0,
+        help=(
+            "For the pose source, per-frame ant speed is this percentile across bodypoint speeds. "
+            "Use 100 for maximum sensitivity to antenna/leg motion."
+        ),
+    )
+    parser.add_argument(
+        "--speed-sleep-min-valid-bodypoint-fraction",
+        type=float,
+        default=0.60,
+        help=(
+            "For the pose source, require at least this fraction of bodypoints to have valid speed "
+            "before a frame contributes sleep/wake evidence."
+        ),
+    )
+    parser.add_argument(
+        "--speed-sleep-bodypoint-max-gap-frames",
+        type=int,
+        default=5,
+        help="For the pose source, ignore bodypoint speed diffs across larger frame gaps.",
+    )
+    parser.add_argument(
+        "--speed-sleep-bodypoint-max-speed",
+        type=float,
+        default=20.0,
+        help="For the pose source, discard bodypoint speeds above this mm/s value as likely tracking jumps.",
+    )
+    parser.add_argument(
         "--track-frame-offset",
         type=int,
         default=0,
@@ -5394,6 +6775,9 @@ def main() -> None:
     tracks_paths = list(args.tracks or infer_block_parquet_paths(block_dir, "tracks"))
     interaction_paths = list(args.interactions or infer_block_parquet_paths(block_dir, "interactions"))
     sleep_bouts_path = args.sleep_bouts or infer_sleep_bouts_path(block_dir)
+    speed_vectors_root = args.speed_vectors_root or infer_speed_vectors_root(block_dir)
+    pose_tracks_root = args.pose_tracks_root or infer_pose_tracks_root(block_dir)
+    sleep_motion_root = args.sleep_motion_root or infer_sleep_motion_root(block_dir)
 
     root = tk.Tk()
     app = ArucoCurationApp(
@@ -5410,11 +6794,26 @@ def main() -> None:
         tracks_paths=tracks_paths,
         interaction_paths=interaction_paths,
         sleep_bouts_path=sleep_bouts_path,
+        pose_tracks_root=pose_tracks_root,
+        sleep_motion_root=sleep_motion_root,
+        speed_vectors_root=speed_vectors_root,
         track_frame_offset=int(args.track_frame_offset),
         interaction_frame_offset=int(args.interaction_frame_offset),
         sleep_frame_offset=int(args.sleep_frame_offset),
         interaction_bout_gap_frames=int(args.interaction_bout_gap_frames),
         sleep_label=str(args.sleep_label),
+        show_speed_sleep_overlay=not bool(args.hide_speed_sleep_overlay),
+        speed_sleep_threshold_mm_s=float(args.speed_sleep_threshold),
+        speed_sleep_window_seconds=float(args.speed_sleep_window_seconds),
+        speed_sleep_fraction_threshold=float(args.speed_sleep_fraction),
+        speed_sleep_min_valid_fraction=float(args.speed_sleep_min_valid_fraction),
+        speed_sleep_side=str(args.speed_sleep_side),
+        speed_sleep_source=str(args.speed_sleep_source),
+        speed_sleep_bodypoint_percentile=float(args.speed_sleep_bodypoint_percentile),
+        speed_sleep_min_valid_bodypoint_fraction=float(args.speed_sleep_min_valid_bodypoint_fraction),
+        speed_sleep_bodypoint_max_gap_frames=int(args.speed_sleep_bodypoint_max_gap_frames),
+        speed_sleep_bodypoint_max_speed_mm_s=float(args.speed_sleep_bodypoint_max_speed),
+        pose_motion_mm_per_px=float(args.pose_motion_mm_per_px),
     )
     print(SHORTCUTS_TEXT, flush=True)
     app.refresh_status()

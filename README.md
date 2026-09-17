@@ -12,6 +12,34 @@ Local development:
 uv sync
 ```
 
+For the interactive long-timescale dashboards, use `uv sync --extra interactive`.
+The dependency versions are recorded in `uv.lock`; use `uv sync --locked` (with
+the same extras) when reproducing a checkout. Run the synthetic regression suite
+without recording data or Slurm access with:
+
+```bash
+uv sync --locked --extra interactive --extra test
+MPLBACKEND=Agg uv run --locked --extra interactive --extra test python -m pytest -q analysis tracking camera_cal scripts detection_pipeline
+```
+
+The source checkout includes the analysis helpers, dashboard templates, contact
+geometry, sleep-motion processing, block-combination tools, and their tests.
+See [analysis workflows](analysis/README.md),
+[long-timescale analysis](analysis/long_timescale.md), and
+[block combination](tracking/colony/block_combination.md) for entry points.
+The older directed-interaction workflow lives at
+`analysis/exploratory/interaction_analysis.py`; current skeleton-contact and
+sleep-response analysis is documented in the analysis guide.
+
+Matching a local run also requires the same external inputs and settings:
+recordings/detections or finished tracks, calibration homographies, panorama
+annotations, and any trained SLEAP or sleep-classifier model. These are dataset
+assets, not bundled source files. Pass the dataset/model paths explicitly (for
+example `ANTS_DATASET_ROOT` and `--sleep_model`/`SLEEP_MODEL`) and retain the run
+metadata alongside the data. Slurm, cluster modules, and mounted storage remain
+required for cluster launchers. Generated figures, caches, logs, and run outputs
+under `analysis_outputs/` are excluded from Git.
+
 On deigo, the colony pipeline is expected to run with the `aruco_env` conda environment:
 
 ```text
@@ -110,6 +138,26 @@ The same pattern is used for generic per-track analysis with `scripts/per_track_
 
 `tracking/colony/pipeline.py` calls `tracking/colony/map_combine.py` to map per-camera ArUco and SLEAP detections through `initial_H_mats.npz`.
 
+Both the pipeline and standalone `map_combine.py` read the left/right split from the block's `panorama_regions.csv`,
+falling back to the date folder's annotations. It uses the midpoint between the
+two full-arena rectangles in raw tracking pixels. In
+`tracking/gui/panorama_region_annotator.py`, the **Left arena** and **Right arena**
+buttons draw rectangles with fixed `arena_left` and `arena_right` labels. The GUI
+previews the tracking split as a red line and saves that line in the annotated
+panorama. Redrawing a side replaces its arena rectangle and can be undone.
+Colony/nest rectangles are excluded: their positions within the arenas do not
+define the divider. Missing arena annotations stop automatic mapping with an
+actionable error. Older `arena`, `arenaL`/`arenaR`, and underscored arena labels
+remain readable. If neither file exists, mapping searches earlier dated recording
+folders under the same dataset root, including their `block*/panorama_regions.csv`
+files. It selects the newest recording date strictly before the current date;
+within that date, it selects the most recently modified annotation file. Recording
+folder names may be `YYYYMMDD` or start with `YYYYMMDD_` / `YYYYMMDD-`.
+The selected source and split are logged. Future dates are excluded. If no earlier
+file exists, or the selected annotations are invalid, mapping stops with a clear
+error; `--x_threshold` provides an explicit override, which is also logged.
+Rebuild panorama PKLs when changing the split.
+
 Outputs:
 
 ```text
@@ -139,6 +187,13 @@ If all expected chunk outputs already exist and `--skip_existing` is active, no 
 ### 3. Block Stitching
 
 The dependent stitch job runs `tracking/colony/pipeline.py --skip_map --skip_combine`, which calls `tracking/stitch_tracks.py` over the block's chunk parquet files.
+
+To combine finished **consecutive recording blocks**, run
+`tracking/colony/combine_blocks.py DATA_FOLDER` on Deigo. It fans out by ant,
+preserves recording-time gaps and colony identity, combines compatible analysis
+caches, and publishes `DATA_FOLDER/continous_stitched` after validation.
+See [block combination](tracking/colony/block_combination.md) for usage, cache
+handling, provenance, and retry instructions.
 
 Outputs:
 

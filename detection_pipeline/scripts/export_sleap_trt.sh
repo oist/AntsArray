@@ -65,7 +65,11 @@ if [[ -z "${SLURM_JOB_ID:-}" ]]; then
 		--runtime "$RUNTIME" --partition "$PARTITION"
 fi
 
-source ~/.bashrc
+if ! type module >/dev/null 2>&1; then
+	source /etc/profile
+fi
+export PYTHONNOUSERSITE=1
+module use /apps/unit/ReiterU/.modulefiles
 module load "$SLEAP_MODULE"
 
 echo "[INFO] sleap-nn export"

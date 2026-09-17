@@ -32,7 +32,7 @@ def run_mapping(
     panorama_dir: Path,
     map_mode: str,
     min_instance_frame_frac: float,
-    x_threshold: float,
+    x_threshold: float | None,
     skip_existing: bool,
     chunks: set[str] | None = None,
 ) -> None:
@@ -41,10 +41,11 @@ def run_mapping(
         load_homographies,
         process_aruco_chunks,
         process_sleap_chunks,
+        resolve_x_threshold,
         set_x_threshold,
     )
 
-    set_x_threshold(x_threshold)
+    set_x_threshold(resolve_x_threshold(data_dir, x_threshold))
     hmats = load_homographies(hmats_path)
     exp = infer_experiment_name(data_dir)
     panorama_dir.mkdir(parents=True, exist_ok=True)
@@ -202,8 +203,10 @@ def main() -> None:
         "--x-threshold",
         dest="x_threshold",
         type=float,
-        default=2500.0,  # keep in sync with map_combine.DEFAULT_X_THRESHOLD
-        help="Panorama X coordinate used by map_combine to split left/right PKLs.",
+        default=None,
+        help=("Override panorama left/right split X; default reads panorama_regions.csv "
+              "beside data/ (or its date folder), then the most recent earlier recording date. "
+              "Stop if no annotations are available."),
     )
 
     parser.add_argument("--side", choices=("left", "right", "both"), default="both")

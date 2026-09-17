@@ -112,8 +112,8 @@ def _distance_from_rectangle_px(x: np.ndarray, y: np.ndarray, rectangle: dict[st
     return np.hypot(dx, dy)
 
 
-def _scan_track_to_position_bins(task: dict[str, Any]) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
-    """Stream one parquet and return completed trips plus outside positions."""
+def _scan_position_counts(task: dict[str, Any]) -> tuple[np.ndarray, ...]:
+    """Read bodypoint positions once into the bins used to infer colony state."""
     import pyarrow.dataset as ds
 
     track_path = Path(task["track_path"])
@@ -146,7 +146,8 @@ def _scan_track_to_position_bins(task: dict[str, Any]) -> tuple[pd.DataFrame, pd
         frame = batch.column(0).to_numpy(zero_copy_only=False)
         x = batch.column(1).to_numpy(zero_copy_only=False)
         y = batch.column(2).to_numpy(zero_copy_only=False)
-        valid = np.isfinite(frame) & np.isfinite(x) & np.isfinite(y)
+        valid = (np.isfinite(frame) & np.isfinite(x) & np.isfinite(y)
+                 & (frame >= task.get("frame_min", 0)) & (frame <= task["frame_max"]))
         if not np.any(valid):
             continue
         frame = np.rint(frame[valid]).astype(np.int64, copy=False)
@@ -173,6 +174,16 @@ def _scan_track_to_position_bins(task: dict[str, Any]) -> tuple[pd.DataFrame, pd
             outside_x_sum += np.bincount(outside_bin, weights=x[outside], minlength=n_bins)
             outside_y_sum += np.bincount(outside_bin, weights=y[outside], minlength=n_bins)
 
+    return observed_count, inside_count, outside_count, outside_x_sum, outside_y_sum
+
+
+def _scan_track_to_position_bins(task: dict[str, Any]) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    """Stream one parquet and return completed trips plus outside positions."""
+    fps = float(task["fps"])
+    position_bin_seconds = float(task["position_bin_seconds"])
+    rectangle = task["rectangle"]
+    observed_count, inside_count, outside_count, outside_x_sum, outside_y_sum = _scan_position_counts(task)
+    n_bins = len(observed_count)
     observed = observed_count > 0
     state = np.full(n_bins, -1, dtype=np.int8)
     # A mixed transition second is inside only when most observations are inside.
@@ -422,6 +433,8 @@ def load_or_extract_completed_trips(
 def _trip_summary(tracks: pd.DataFrame, trips: pd.DataFrame, positions: pd.DataFrame, fps: float) -> pd.DataFrame:
     base_columns = ["side", "track_id", "track_name", "cluster_id", "frame_max"]
     base = tracks[base_columns].drop_duplicates("track_name").set_index("track_name")
+    base["frame_min"] = (tracks.drop_duplicates("track_name").set_index("track_name")["frame_min"]
+                         if "frame_min" in tracks else 0)
     grouped = trips.groupby("track_name")
     summary = grouped.agg(
         n_completed_trips=("trip_id", "size"),
@@ -441,7 +454,9 @@ def _trip_summary(tracks: pd.DataFrame, trips: pd.DataFrame, positions: pd.DataF
     summary["n_completed_trips"] = summary["n_completed_trips"].fillna(0).astype(int)
     zero_fill = ["total_trip_minutes"]
     summary[zero_fill] = summary[zero_fill].fillna(0.0)
-    recording_days = (summary["frame_max"].astype(float) + 1.0) / float(fps) / 86400.0
+    recording_days = (summary["frame_max"] - summary["frame_min"] + 1.0) / float(fps) / 86400.0
+    if (recording_days <= 0).any():
+        raise ValueError("Invalid recording frame window in trip summary")
     summary["completed_trips_per_day"] = summary["n_completed_trips"] / recording_days
     outside_seconds = grouped["n_observed_seconds"].sum().reindex(summary.index, fill_value=0).astype(float)
     summary["observed_trip_hours"] = outside_seconds / 3600.0
@@ -459,6 +474,164 @@ def summarize_trip_candidates(
     return _trip_summary(candidate_tracks, trips, positions, fps).sort_values(
         ["side", "track_id"], kind="mergesort"
     ).reset_index(drop=True)
+
+
+def _daily_position_summary(task: dict[str, Any]) -> pd.DataFrame:
+    """Summarize observed colony state in lights-on-to-lights-on cycles."""
+    observed, inside, _, _, _ = _scan_position_counts(task)
+    bin_seconds = max(1, round(task["fps"])) / task["fps"]
+    start = float(task["start_clock_seconds"])
+    recording_start = start + task.get("frame_min", 0) / task["fps"]
+    stop = start + (task["frame_max"] + 1) / task["fps"]
+    bin_start = start + np.arange(len(observed)) * bin_seconds
+    bin_stop = np.minimum(bin_start + bin_seconds, stop)
+    bin_start = np.maximum(bin_start, recording_start)
+    known = observed > 0
+    outside_fraction = np.divide(observed - inside, observed, out=np.zeros(len(observed)), where=known)
+    cycle_offset = float(task["light_on_hour"]) * 3600
+    light_seconds = ((float(task["light_off_hour"]) - float(task["light_on_hour"])) % 24) * 3600
+    rows = []
+    for day in range(int(np.floor((recording_start - cycle_offset) / 86400)),
+                     int(np.ceil((stop - cycle_offset) / 86400))):
+        low = cycle_offset + day * 86400
+        high = low + 86400
+        seconds = np.maximum(0, np.minimum(bin_stop, high) - np.maximum(bin_start, low))
+        # Each cycle contains one uninterrupted light phase, then one dark
+        # phase. This also handles schedules where the light phase crosses midnight.
+        light = np.maximum(0, np.minimum(bin_stop, low + light_seconds) - np.maximum(bin_start, low))
+        light = np.minimum(seconds, light)
+        dark = seconds - light
+        duration = float(seconds.sum())
+        observed_seconds = float(seconds[known].sum())
+        rows.append({
+            "day_index": day,
+            "cycle_start_elapsed_seconds": low - start,
+            "cycle_stop_elapsed_seconds": high - start,
+            "available_seconds": duration,
+            "observed_seconds": observed_seconds,
+            "outside_seconds": float(np.dot(seconds, outside_fraction)),
+            "coverage": observed_seconds / duration if duration else np.nan,
+            "light_coverage": float(light[known].sum() / light.sum()) if light.sum() else np.nan,
+            "dark_coverage": float(dark[known].sum() / dark.sum()) if dark.sum() else np.nan,
+            "full_day": bool(np.isclose(duration, 86400, rtol=0, atol=1e-6)),
+        })
+    return pd.DataFrame(rows)
+
+
+def load_daily_foraging_investment(
+    tracks: pd.DataFrame,
+    trips: pd.DataFrame,
+    regions: pd.DataFrame,
+    per_track_root: Path,
+    output_root: Path,
+    *,
+    fps: float,
+    start_clock_seconds: float,
+    light_on_hour: float,
+    light_off_hour: float,
+    min_coverage: float = 0.70,
+    bodypoint: int = 0,
+    max_workers: int = 4,
+    recompute: bool = False,
+    recording_date: str | None = None,
+    recording_start_frame: int | None = None,
+    recording_stop_frame: int | None = None,
+) -> pd.DataFrame:
+    """Daily outside time and completed-trip departures for the supplied cohort.
+
+    Outside time includes ALL observed positions outside the colony, not only
+    completed trips or resources. Within each ~1 s bin it uses the fraction of
+    detections outside. Missing bins are not imputed. Both rates use observed
+    position-bin exposure (not total recording duration). This does not recover
+    missed departures or eliminate location-dependent tracking bias.
+
+    Days run from lights-on to the next lights-on, with one complete light
+    phase followed by one complete dark phase. A cycle must be fully recorded
+    and pass coverage thresholds separately for the cycle, light, and dark.
+    Zero-trip days remain zero; excluded days retain raw values for auditing.
+    Trips crossing lights-on are counted once, in the cycle of departure;
+    outside observations are assigned to the cycle when they actually occur.
+    Day index 0 starts at lights-on on the recording's calendar date; an early
+    recording start before lights-on belongs to the previous cycle (index -1).
+    """
+    if fps <= 0 or not 0 < min_coverage <= 1:
+        raise ValueError("fps must be positive and min_coverage must be in (0, 1]")
+    if not (0 <= start_clock_seconds < 86400 and 0 <= light_on_hour < 24 and 0 <= light_off_hour < 24):
+        raise ValueError("Start clock and light schedule must be within one day")
+    if light_on_hour == light_off_hour:
+        raise ValueError("Light-on and light-off hours must differ")
+    if tracks.empty or tracks["track_name"].duplicated().any() or tracks.duplicated(["side", "track_id"]).any():
+        raise ValueError("Supply a nonempty cohort with one unique track per ant per colony")
+    rectangles = colony_rectangles_from_regions(regions)
+    if recording_start_frame is None:
+        recording_start_frame = int(tracks["frame_min"].min()) if "frame_min" in tracks else 0
+    if recording_stop_frame is None:
+        recording_stop_frame = int(tracks["frame_max"].max()) + 1
+    if not 0 <= recording_start_frame < recording_stop_frame:
+        raise ValueError("Invalid recording frame window for daily foraging")
+    output_root = Path(output_root)
+    output_root.mkdir(parents=True, exist_ok=True)
+    parts = []
+    tasks = []
+    for ant in tracks.sort_values(["side", "track_id"]).itertuples(index=False):
+        path = Path(per_track_root) / ant.track_name
+        stat = path.stat()
+        task = {
+            "version": 3, "day_definition": "lights_on_to_lights_on",
+            "track_path": str(path.resolve()), "source_size": stat.st_size,
+            "source_mtime_ns": stat.st_mtime_ns, "fps": float(fps), "bodypoint": int(bodypoint),
+            "frame_min": recording_start_frame, "frame_max": recording_stop_frame - 1,
+            "position_bin_seconds": 1.0,
+            "rectangle": rectangles[str(ant.side)], "start_clock_seconds": float(start_clock_seconds),
+            "light_on_hour": float(light_on_hour), "light_off_hour": float(light_off_hour),
+        }
+        cache = output_root / "daily_position_cache" / Path(ant.track_name).stem
+        cache_table, cache_meta = cache.with_suffix(".csv"), cache.with_suffix(".json")
+        identity = {"side": ant.side, "track_id": int(ant.track_id), "track_name": ant.track_name}
+        if not recompute and cache_table.is_file() and cache_meta.is_file():
+            try:
+                if json.loads(cache_meta.read_text()) == task:
+                    parts.append(pd.read_csv(cache_table).assign(**identity))
+                    continue
+            except (ValueError, OSError):
+                pass
+        tasks.append((task, cache_table, cache_meta, identity))
+    if tasks:
+        print(f"Daily outside-time coverage: reading {len(tasks)} tracks (cached on subsequent runs)", flush=True)
+        with ThreadPoolExecutor(max_workers=max(1, int(max_workers))) as executor:
+            futures = {executor.submit(_daily_position_summary, task): (task, csv, meta, identity)
+                       for task, csv, meta, identity in tasks}
+            for number, future in enumerate(as_completed(futures), 1):
+                task, csv, meta, identity = futures[future]
+                daily = future.result()
+                csv.parent.mkdir(parents=True, exist_ok=True)
+                daily.to_csv(csv, index=False)
+                meta.write_text(json.dumps(task, indent=2) + "\n")
+                parts.append(daily.assign(**identity))
+                if number == 1 or number % 8 == 0 or number == len(tasks):
+                    print(f"Daily coverage: {number}/{len(tasks)} tracks", flush=True)
+    daily = pd.concat(parts, ignore_index=True)
+    departures = trips.assign(day_index=np.floor(
+        (trips["exit_frame"].astype(float) / fps + start_clock_seconds - light_on_hour * 3600) / 86400
+    ).astype(int)).groupby(["track_name", "day_index"]).size().rename("completed_trip_departures")
+    daily = daily.merge(departures, on=["track_name", "day_index"], how="left", validate="one_to_one")
+    daily["completed_trip_departures"] = daily["completed_trip_departures"].fillna(0).astype(int)
+    daily["eligible"] = daily["full_day"] & daily[
+        ["coverage", "light_coverage", "dark_coverage"]
+    ].ge(min_coverage).all(axis=1)
+    exposure = daily["observed_seconds"].replace(0, np.nan)
+    daily["outside_hours_per_observed_day"] = daily["outside_seconds"] / exposure * 24
+    daily["trips_per_observed_day"] = daily["completed_trip_departures"] / exposure * 86400
+    date = pd.to_datetime(recording_date, format="%Y%m%d", errors="coerce") if recording_date else pd.NaT
+    daily["day_label"] = [
+        (date + pd.Timedelta(days=int(day))).strftime("%b %d") if pd.notna(date) else f"Day {int(day) + 1}"
+        for day in daily["day_index"]
+    ]
+    daily["min_coverage"] = min_coverage
+    daily["day_definition"] = "lights_on_to_lights_on"
+    daily["light_on_hour"] = light_on_hour
+    daily["light_off_hour"] = light_off_hour
+    return daily.sort_values(["side", "track_id", "day_index"]).reset_index(drop=True)
 
 
 def _bootstrap_interval(
@@ -510,7 +683,9 @@ def compute_trip_investment_confidence(
             ant_trips = trips[trips["track_name"].astype(str) == str(ant.track_name)]
             durations = ant_trips["duration_minutes"].to_numpy(float)
             n_trips = len(durations)
-            recording_days = (float(ant.frame_max) + 1.0) / float(fps) / 86400.0
+            recording_days = (float(ant.frame_max) - float(getattr(ant, "frame_min", 0)) + 1.0) / float(fps) / 86400.0
+            if recording_days <= 0:
+                raise ValueError("Invalid recording frame window in trip investment")
             trips_per_day = n_trips / recording_days
             trips_per_day_low = (
                 0.5 * chi2.ppf(0.025, 2 * n_trips) / recording_days if n_trips > 0 else 0.0
@@ -602,9 +777,13 @@ def compute_ant_time_of_day_percent(
     return normalized_long(trip_counts, "completed_trip"), normalized_long(resource_counts, "resource")
 
 
-def plot_trip_investment_confidence(investment: pd.DataFrame) -> None:
+def plot_trip_investment_confidence(investment: pd.DataFrame, *, side: str | None = None) -> None:
     """Plot trips/day versus median duration with per-ant horizontal and vertical CIs."""
     sides = [side for side in ("left", "right") if side in set(investment["side"].astype(str))]
+    sides = [s for s in sides if side is None or s == side]
+    if not sides:
+        return
+    prefix = f"{side.capitalize()} colony — " if side is not None else ""
     fig, axes = plt.subplots(1, len(sides), figsize=(7.2 * len(sides), 6.4), squeeze=False)
     for column, side in enumerate(sides):
         ax = axes[0, column]
@@ -650,7 +829,7 @@ def plot_trip_investment_confidence(investment: pd.DataFrame) -> None:
         ax.set_title(f"{side} colony ({len(ants)} ants)")
         ax.grid(True, which="both", alpha=0.2)
     fig.suptitle(
-        "Trip frequency versus duration; horizontal Poisson and vertical bootstrap 95% confidence intervals"
+        prefix + "Trip frequency versus duration\nHorizontal Poisson and vertical bootstrap 95% confidence intervals"
     )
     fig.tight_layout()
     plt.show()
@@ -662,18 +841,25 @@ def plot_ant_time_of_day_heatmap(
     source: str,
     light_off_hour: float,
     light_on_hour: float,
+    side: str | None = None,
 ) -> None:
     """Plot left/right ant-by-clock heatmaps with every row normalized to 100%."""
     chosen = time_table[time_table["source"] == source].copy()
     sides = [side for side in ("left", "right") if side in set(chosen["side"].astype(str))]
     matrices: dict[str, pd.DataFrame] = {}
-    for side in sides:
-        side_table = chosen[chosen["side"].astype(str) == side]
+    for colony_side in sides:
+        side_table = chosen[chosen["side"].astype(str) == colony_side]
         matrix = side_table.pivot(index="track_id", columns="clock_hour", values="percent_of_ant_time")
-        matrices[side] = matrix.sort_index()
+        matrices[colony_side] = matrix.sort_index()
+    if not matrices:
+        return
     all_values = np.concatenate([matrix.to_numpy(float).ravel() for matrix in matrices.values()])
     color_high = max(1.0, float(np.nanpercentile(all_values, 99.0)))
-
+    # Compute the color scale over both colonies even when displaying only one.
+    sides = [s for s in sides if side is None or s == side]
+    if not sides:
+        return
+    prefix = f"{side.capitalize()} colony — " if side is not None else ""
     fig, axes = plt.subplots(1, len(sides), figsize=(7.4 * len(sides), 8.2), squeeze=False)
     image = None
     for column, side in enumerate(sides):
@@ -702,7 +888,177 @@ def plot_ant_time_of_day_heatmap(
         colorbar_ax = fig.add_axes([0.91, 0.13, 0.018, 0.68])
         fig.colorbar(image, cax=colorbar_ax, label=f"Percent of ant's {label} per clock bin")
     fig.suptitle(
-        f"Each ant's {label} over time of day; every row sums to 100%\n"
-        f"cyan lines: lights on {light_on_hour:g}, lights off {light_off_hour:g}"
+        prefix + f"{label.capitalize()} by time of day\nEvery ant's row sums to 100%\n"
+        f"Cyan lines: lights on {light_on_hour:g}, lights off {light_off_hour:g}"
     )
     plt.show()
+
+
+_DAILY_INVESTMENT_METRICS = {
+    "outside_hours_per_observed_day": "Outside hours / 24 h observed",
+    "trips_per_observed_day": "Completed trips / 24 h observed",
+}
+
+
+def _foraging_cycle_clock(daily: pd.DataFrame) -> str:
+    """Clock label shared by the cycle heatmaps and paired-cycle scatterplots."""
+    minutes = int(round(float(daily["light_on_hour"].iloc[0]) * 60)) % 1440
+    clock = f"{minutes // 60:02d}:{minutes % 60:02d}"
+    return f"{clock}–{clock}"
+
+
+def _daily_matched_pair(daily: pd.DataFrame, side: str, first: int, second: int, metric: str) -> pd.DataFrame:
+    chosen = daily[(daily["side"] == side) & daily["eligible"] & daily["day_index"].isin([first, second])]
+    return chosen.pivot(index="track_name", columns="day_index", values=metric).reindex(
+        columns=[first, second]
+    ).dropna()
+
+
+def compute_daily_foraging_repeatability(
+    daily: pd.DataFrame, *, n_bootstrap: int = 2_000, random_state: int = 0
+) -> pd.DataFrame:
+    """Adjacent light–dark-cycle consistency; paired-ant bootstrap by colony.
+
+    Spearman rho measures whether relatively active ants remain relatively
+    active, not absolute agreement or an ICC variance-component repeatability.
+    Each day-pair uses only ants eligible on BOTH days; no daily activity filter
+    is applied. Do not pool repeated day-pairs as independent observations.
+    """
+    from scipy.stats import rankdata
+
+    if n_bootstrap < 1:
+        raise ValueError("n_bootstrap must be positive")
+    rng = np.random.default_rng(random_state)
+    rows = []
+    days = sorted(daily.loc[daily["full_day"], "day_index"].unique())
+    labels = daily.drop_duplicates("day_index").set_index("day_index")["day_label"]
+
+    def rho(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+        a, b = rankdata(x, axis=-1), rankdata(y, axis=-1)
+        a -= a.mean(axis=-1, keepdims=True)
+        b -= b.mean(axis=-1, keepdims=True)
+        denominator = np.sqrt(np.sum(a * a, axis=-1) * np.sum(b * b, axis=-1))
+        return np.divide(np.sum(a * b, axis=-1), denominator,
+                         out=np.full(np.shape(denominator), np.nan), where=denominator > 0)
+
+    for first, second in zip(days[:-1], days[1:]):
+        if second != first + 1:
+            continue
+        for side in sorted(daily["side"].unique()):
+            for metric in _DAILY_INVESTMENT_METRICS:
+                pair = _daily_matched_pair(daily, side, first, second, metric)
+                n = len(pair)
+                estimate, low, high = np.nan, np.nan, np.nan
+                status = "too few matched ants"
+                if n >= 3:
+                    x, y = pair[first].to_numpy(float), pair[second].to_numpy(float)
+                    estimate = float(rho(x, y))
+                    status = "constant values" if not np.isfinite(estimate) else "ok"
+                    if np.isfinite(estimate):
+                        sample = rng.integers(n, size=(int(n_bootstrap), n))
+                        estimates = rho(x[sample], y[sample])
+                        estimates = estimates[np.isfinite(estimates)]
+                        if len(estimates) >= 0.8 * n_bootstrap:
+                            low, high = np.quantile(estimates, [0.025, 0.975])
+                rows.append({
+                    "side": side, "metric": metric, "first_day": first, "second_day": second,
+                    "first_label": labels[first], "second_label": labels[second],
+                    "n_matched_ants": n, "spearman_rho": estimate,
+                    "rho_ci_low": low, "rho_ci_high": high,
+                    "median_day_change": float((pair[second] - pair[first]).median()) if n else np.nan,
+                    "status": status,
+                })
+    return pd.DataFrame(rows, columns=[
+        "side", "metric", "first_day", "second_day", "first_label", "second_label",
+        "n_matched_ants", "spearman_rho", "rho_ci_low", "rho_ci_high", "median_day_change", "status",
+    ])
+
+
+def plot_daily_foraging_investment(daily: pd.DataFrame, *, side: str | None = None) -> None:
+    """Ant-by-cycle heatmaps with fixed ant order; incomplete/poor cycles are gray."""
+    days = sorted(daily.loc[daily["full_day"], "day_index"].unique())
+    if not days:
+        print("Daily foraging heatmaps skipped: no fully recorded lights-on-to-lights-on cycles")
+        return
+    sides = sorted(daily["side"].unique())
+    sides = [s for s in sides if side is None or s == side]
+    if not sides:
+        return
+    prefix = f"{side.capitalize()} colony — " if side is not None else ""
+    fig, axes = plt.subplots(2, len(sides), figsize=(6.4 * len(sides), 10.5), squeeze=False,
+                             layout="constrained")
+    labels = daily.drop_duplicates("day_index").set_index("day_index")["day_label"]
+    cmap = plt.get_cmap("viridis").copy()
+    cmap.set_bad("0.85")
+    eligible = daily[daily["eligible"]]
+    for column, side in enumerate(sides):
+        ants = daily[daily["side"] == side].drop_duplicates("track_name").set_index("track_name")
+        order = eligible[eligible["side"] == side].groupby("track_name")[
+            "outside_hours_per_observed_day"
+        ].mean().reindex(ants.index).sort_values(ascending=False, kind="stable").index
+        for row, (metric, label) in enumerate(_DAILY_INVESTMENT_METRICS.items()):
+            ax = axes[row, column]
+            matrix = eligible[eligible["side"] == side].pivot(
+                index="track_name", columns="day_index", values=metric
+            ).reindex(index=order, columns=days)
+            vmax = max(1.0, float(eligible[metric].max())) if len(eligible) else 1.0
+            image = ax.imshow(np.ma.masked_invalid(matrix.to_numpy(float)), aspect="auto",
+                              interpolation="nearest", cmap=cmap, vmin=0, vmax=vmax)
+            ax.set_xticks(np.arange(len(days)), labels.loc[days], rotation=25, ha="right")
+            ax.set_xlabel("Cycle start date (lights-on)")
+            ax.set_yticks(np.arange(len(order)), ants.loc[order, "track_id"].astype(int), fontsize=6)
+            ax.set_ylabel("Ant ID (same order in both panels)")
+            ax.set_title(f"{side} colony — {label}")
+            fig.colorbar(image, ax=ax, label=label, shrink=0.85)
+    threshold = 100 * float(daily["min_coverage"].iloc[0])
+    fig.suptitle(
+        prefix + f"Light–dark cycle investment\n{_foraging_cycle_clock(daily)}, lights-on to lights-on\n"
+        f"Full cycles; gray = <{threshold:g}% coverage in cycle, light, or dark.\n"
+        "Rows ordered by mean outside time."
+    )
+    plt.show()
+
+
+def plot_daily_foraging_repeatability(daily: pd.DataFrame, repeatability: pd.DataFrame,
+                                     *, side: str | None = None) -> None:
+    """One paired-ant comparison figure per adjacent complete light–dark cycle pair."""
+    if repeatability.empty:
+        print("Day-to-day comparisons skipped: fewer than two adjacent complete light–dark cycles")
+        return
+    sides = sorted(daily["side"].unique())
+    sides = [s for s in sides if side is None or s == side]
+    if not sides:
+        return
+    prefix = f"{side.capitalize()} colony — " if side is not None else ""
+    ant_ids = daily.drop_duplicates("track_name").set_index("track_name")["track_id"]
+    for (first, second), summary in repeatability.groupby(["first_day", "second_day"], sort=True):
+        first_label, second_label = summary.iloc[0][["first_label", "second_label"]]
+        fig, axes = plt.subplots(2, len(sides), figsize=(6.2 * len(sides), 10.2), squeeze=False,
+                                 layout="constrained")
+        for column, side in enumerate(sides):
+            for row, (metric, label) in enumerate(_DAILY_INVESTMENT_METRICS.items()):
+                ax = axes[row, column]
+                pair = _daily_matched_pair(daily, side, first, second, metric)
+                stats = summary[(summary["side"] == side) & (summary["metric"] == metric)].iloc[0]
+                ax.scatter(pair[first], pair[second], s=30, alpha=0.8,
+                           color="tab:blue" if side == "left" else "tab:orange")
+                for name, point in pair.iterrows():
+                    ax.annotate(str(int(ant_ids[name])), (point[first], point[second]),
+                                xytext=(3, 3), textcoords="offset points", fontsize=6)
+                limit = max(1.0, float(pair.to_numpy().max()) * 1.08) if len(pair) else 1.0
+                ax.plot([0, limit], [0, limit], "--", color="0.5", lw=1)
+                ax.set(xlim=(0, limit), ylim=(0, limit), xlabel=f"Cycle starting {first_label}: {label}",
+                       ylabel=f"Cycle starting {second_label}: {label}")
+                ax.set_aspect("equal", adjustable="box")
+                ax.grid(alpha=0.2)
+                detail = f"Spearman ρ = {stats.spearman_rho:.2f}" if np.isfinite(stats.spearman_rho) else stats.status
+                if np.isfinite(stats.rho_ci_low):
+                    detail += f" (95% CI {stats.rho_ci_low:.2f}–{stats.rho_ci_high:.2f})"
+                ax.set_title(f"{side} colony — n = {len(pair)} matched ants\n{detail}")
+        fig.suptitle(
+            prefix + f"Light–dark cycle consistency\n{first_label} → {second_label}\n"
+            f"{_foraging_cycle_clock(daily)}, lights-on to lights-on; dates label cycle starts.\n"
+            "Dashed line = same amount; ρ = consistency of ant ranks.\n"
+            "95% intervals resample paired ants."
+        )
+        plt.show()

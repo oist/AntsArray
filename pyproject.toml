@@ -3,12 +3,20 @@ name = "antsarray"
 version = "0.1.0"
 description = "AntsArray analysis and tracking pipeline"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = [
     "numpy",
     "pandas",
+    "pyarrow",
     "matplotlib",
     "scipy",
+    "shapely>=2,<3",
+    "scikit-learn",
+    "joblib",
+    "umap-learn",
+    "igraph",
+    "leidenalg",
+    "statsmodels",
     "tqdm",
     "h5py",
     "opencv-python",
@@ -18,6 +26,10 @@ dependencies = [
     "segmentation-models-pytorch",
     "sleap-io",
 ]
+
+[project.optional-dependencies]
+interactive = ["plotly>=5,<7"]
+test = ["pytest"]
 
 [build-system]
 requires = ["hatchling"]

@@ -16,7 +16,11 @@
 #SBATCH --signal=TERM@60
 set -eo pipefail
 
-source ~/.bashrc
+if ! type module >/dev/null 2>&1; then
+	source /etc/profile
+fi
+export PYTHONNOUSERSITE=1
+module use /apps/unit/ReiterU/.modulefiles
 module load __SLEAP_MODULE__
 
 # Home is shared deigo<->saion, so the rendered deigo repo path also works on saion.

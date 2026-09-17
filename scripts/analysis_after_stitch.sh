@@ -6,6 +6,7 @@
 # scripts/per_track_slurm_fanout.sh):
 #   colony_presence  (analysis/compute_track_colony_presence_vector.py)
 #   speed_vector     (analysis/compute_track_speed_vector.py)   [needs scipy]
+#   sleep_motion     (analysis/compute_track_sleep_motion.py)
 #   grid_occupancy   (analysis/compute_track_grid_occupancy.py)
 #   sleep_prediction (optional; --run_sleep, needs joblib+scikit-learn + a model)
 #
@@ -35,6 +36,12 @@ poll_seconds=120
 timeout_secs=172800   # 48h overall deadline
 run_sleep=0
 sleep_model=""
+fps="${FPS:-24.0}"
+sleep_motion_mm_per_px="${SLEEP_MOTION_MM_PER_PX:-0.016}"
+sleep_motion_cache_max_gap_frames="${SLEEP_MOTION_CACHE_MAX_GAP_FRAMES:-120}"
+grid_size_mm="${GRID_OCCUPANCY_GRID_SIZE_MM:-0.25}"
+grid_bounds_json="${GRID_OCCUPANCY_BOUNDS_JSON:-}"
+grid_output_name="${GRID_OCCUPANCY_OUTPUT_NAME:-grid_occupancy_histograms}"
 
 usage() {
   cat <<EOF
@@ -56,8 +63,16 @@ Options:
   --time TIME             Time per per-track job. Default: 0-12:00:00
   --poll_seconds N        Poll interval while waiting for the marker. Default: 120
   --timeout N             Overall wait deadline (s). Default: 172800 (48h)
+  --fps FLOAT             Frame rate for all-bodypoint sleep motion. Default: $fps
+  --sleep_motion_mm_per_px FLOAT
+                          Spatial scale for all-bodypoint sleep motion. Default: $sleep_motion_mm_per_px
+  --sleep_motion_cache_max_gap_frames N
+                          Largest retained pose gap. Default: $sleep_motion_cache_max_gap_frames
   --run_sleep             Also fan out sleep predictions (needs --sleep_model).
   --sleep_model PATH      Trained sleep classifier for --run_sleep.
+  --grid_size_mm FLOAT    Occupancy histogram bin size in mm. Default: $grid_size_mm
+  --grid_bounds_json PATH Optional inferred bounds JSON for occupancy histograms.
+  --grid_output_name NAME Occupancy output folder. Default: $grid_output_name
   -h, --help
 EOF
 }
@@ -76,8 +91,14 @@ while [[ $# -gt 0 ]]; do
     --time) time_limit="$2"; shift 2 ;;
     --poll_seconds) poll_seconds="$2"; shift 2 ;;
     --timeout) timeout_secs="$2"; shift 2 ;;
+    --fps) fps="$2"; shift 2 ;;
+    --sleep_motion_mm_per_px) sleep_motion_mm_per_px="$2"; shift 2 ;;
+    --sleep_motion_cache_max_gap_frames) sleep_motion_cache_max_gap_frames="$2"; shift 2 ;;
     --run_sleep) run_sleep=1; shift ;;
     --sleep_model) sleep_model="$2"; run_sleep=1; shift 2 ;;
+    --grid_size_mm) grid_size_mm="$2"; shift 2 ;;
+    --grid_bounds_json) grid_bounds_json="$2"; shift 2 ;;
+    --grid_output_name) grid_output_name="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -129,10 +150,13 @@ fi
 log "found $n_tracks per-track parquet(s); fanning out analysis routines"
 
 # 3) Fan out each routine. One routine failing must not stop the others.
-run_routine() {  # $1 operation_script(basename)  $2 operation_name  $3 output_name
-  local script="$1" opname="$2" outname="$3"
+run_routine() {  # $1 operation_script(basename)  $2 operation_name  $3 output_name  $4 extra operation args
+  local script="$1" opname="$2" outname="$3" extra_args="${4:-}"
   # Absolute venv python + relative script (worker cd's into --run_workdir=repo).
   local op_cmd="$python_bin analysis/$script --track \"\$TRACK_PATH\" --out \"\$TASK_OUTPUT_DIR\""
+  if [[ -n "$extra_args" ]]; then
+    op_cmd+=" $extra_args"
+  fi
   log "=== fan-out $opname ($script) ==="
   if bash "$fanout" \
       --per_track_dir "$per_track_dir" \
@@ -153,7 +177,21 @@ run_routine() {  # $1 operation_script(basename)  $2 operation_name  $3 output_n
 
 run_routine compute_track_colony_presence_vector.py colony_presence colony_presence_vectors
 run_routine compute_track_speed_vector.py           speed_vector    speed_vectors
-run_routine compute_track_grid_occupancy.py         grid_occupancy  grid_occupancy_histograms
+sleep_motion_args=(
+  --fps "$fps"
+  --mm_per_px "$sleep_motion_mm_per_px"
+  --cache_max_gap_frames "$sleep_motion_cache_max_gap_frames"
+)
+sleep_motion_args_text="$(printf ' %q' "${sleep_motion_args[@]}")"
+sleep_motion_args_text="${sleep_motion_args_text# }"
+run_routine compute_track_sleep_motion.py           sleep_motion    sleep_motion "$sleep_motion_args_text"
+grid_args=(--grid_size_mm "$grid_size_mm")
+if [[ -n "$grid_bounds_json" ]]; then
+  grid_args+=(--bounds_json "$grid_bounds_json")
+fi
+grid_args_text="$(printf ' %q' "${grid_args[@]}")"
+grid_args_text="${grid_args_text# }"
+run_routine compute_track_grid_occupancy.py         grid_occupancy  "$grid_output_name" "$grid_args_text"
 
 if (( run_sleep == 1 )); then
   if [[ -z "$sleep_model" ]]; then

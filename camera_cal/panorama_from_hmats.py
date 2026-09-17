@@ -486,6 +486,47 @@ def make_panorama_from_hmats(
     pano = warp_and_blend(imgs, Hs_list)
     return pano
 
+
+def panorama_geometry(
+    imgs: list[np.ndarray],
+    Hs: list[np.ndarray],
+) -> tuple[np.ndarray, tuple[int, int], tuple[float, float, float, float]]:
+    """Return display translation, output size, and raw homography bounds.
+
+    ``Hs`` map camera pixels into the raw panorama coordinate system used by
+    tracking. The rendered image is translated so its upper-left pixel is at
+    (0, 0). The returned matrix maps raw tracking coordinates into displayed
+    image coordinates.
+    """
+    if not imgs:
+        raise ValueError("panorama_geometry: empty image list")
+    if len(imgs) != len(Hs):
+        raise ValueError(
+            f"panorama_geometry: {len(imgs)} images but {len(Hs)} homographies"
+        )
+
+    all_xy = []
+    for im, H in zip(imgs, Hs):
+        h, w = im.shape[:2]
+        corners = np.array(
+            [[0, 0], [w, 0], [w, h], [0, h]],
+            dtype=float,
+        )
+        corners_h = np.c_[corners, np.ones(4)]
+        warped_h = (H @ corners_h.T).T
+        all_xy.append(warped_h[:, :2] / warped_h[:, 2:3])
+
+    all_xy_arr = np.vstack(all_xy)
+    xmin, ymin = all_xy_arr.min(axis=0)
+    xmax, ymax = all_xy_arr.max(axis=0)
+    translation = np.array(
+        [[1, 0, -xmin], [0, 1, -ymin], [0, 0, 1]],
+        dtype=float,
+    )
+    output_size = (int(np.ceil(xmax - xmin)), int(np.ceil(ymax - ymin)))
+    bounds = (float(xmin), float(ymin), float(xmax), float(ymax))
+    return translation, output_size, bounds
+
 def warp_and_blend(
     imgs: list[np.ndarray],
     Hs: list[np.ndarray],
@@ -505,42 +546,9 @@ def warp_and_blend(
             f"warp_and_blend: {len(imgs)} images but {len(Hs)} homographies"
         )
 
-    # ------------------------------------------------------------------
-    # 1. Compute bounding box of all warped image corners
-    # ------------------------------------------------------------------
-    all_xy = []
-
-    for im, H in zip(imgs, Hs):
-        h, w = im.shape[:2]
-
-        corners = np.array(
-            [[0, 0],
-             [w, 0],
-             [w, h],
-             [0, h]],
-            dtype=float,
-        )
-        corners_h = np.c_[corners, np.ones(4)]
-
-        warped_h = (H @ corners_h.T).T
-        warped_xy = warped_h[:, :2] / warped_h[:, 2:3]
-
-        all_xy.append(warped_xy)
-
-    all_xy = np.vstack(all_xy)
-    xmin, ymin = all_xy.min(axis=0)
-    xmax, ymax = all_xy.max(axis=0)
-
-    # Translation so panorama starts at (0,0)
-    T = np.array(
-        [[1, 0, -xmin],
-         [0, 1, -ymin],
-         [0, 0, 1]],
-        dtype=float,
-    )
-
-    out_w = int(np.ceil(xmax - xmin))
-    out_h = int(np.ceil(ymax - ymin))
+    # Translation makes the rendered image start at (0, 0), while the input
+    # homographies remain in the raw panorama coordinate system used downstream.
+    T, (out_w, out_h), _bounds = panorama_geometry(imgs, Hs)
 
     # ------------------------------------------------------------------
     # 2. Accumulate warped images + weights

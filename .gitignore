@@ -3,3 +3,5 @@
 *.asv
 .venv/
 __pycache__/
+.pytest_cache/
+/analysis_outputs/

@@ -15,6 +15,22 @@ If you launch with no arguments, file-pickers are shown.
 Shortcut help is printed to the terminal when the GUI starts.
 Default playback is 20 FPS. Override it with `--fps` if you want a slower or faster review speed.
 
+Sleep-classifier tuning now has a separate, focused viewer. See
+[`aruco_sleep_viewer.md`](aruco_sleep_viewer.md). The curation GUI remains for
+editing ArUco detections.
+
+Before using the sleep viewer, compute the reusable motion cache once for every ant:
+
+```bash
+bash scripts/per_track_slurm_fanout.sh \
+  --per_track_dir /bucket/ReiterU/Ants/basler/20260723/block02/stitched/per_track \
+  --operation_script analysis/compute_track_sleep_motion.py \
+  --operation_args "--fps 24 --mm_per_px 0.016 --cache_max_gap_frames 120" \
+  --skip_existing
+```
+
+The fan-out writes and transfers `stitched/sleep_motion/per_track/<track>/bodypoint_speed_mm_s.npy`, the corresponding frame-gap matrix, bodypoint IDs, and metadata.
+
 ## Main Actions
 
 - Click a detection to select it.

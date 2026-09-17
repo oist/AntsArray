@@ -216,6 +216,108 @@ def read_track_rows_streaming(
     return pd.concat(pieces, ignore_index=True)
 
 
+def concatenate_shifted_parquets(
+    sources: list[tuple[Path, int, str]],
+    out_path: Path,
+    *,
+    frame_columns: tuple[str, ...] = ("Frame",),
+    metadata: dict[str, str] | None = None,
+    track_name: str | None = None,
+    expected_track_id: int | None = None,
+    keep_block_frame: bool = False,
+    frame_limits: dict[str, int] | None = None,
+    batch_size: int = 131072,
+) -> dict:
+    """Stream ordered recording segments to one parquet with explicit offsets.
+
+    Unlike chunk discovery, block timing is supplied by the caller. Preserve
+    all input columns, promote compatible Arrow types, and retain source-block
+    provenance. Memory use is bounded by one batch, including for long tracks.
+    """
+    import os
+    import pyarrow as pa
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+
+    if not sources:
+        raise ValueError("At least one parquet segment is required")
+    files = [pq.ParquetFile(path) for path, _, _ in sources]
+    # Empty legacy tables sometimes encode string columns as null or float.
+    # They contribute no values; let populated segments define their types.
+    populated = [file for file in files if file.metadata.num_rows]
+    schemas = [file.schema_arrow.remove_metadata() for file in (populated or files[:1])]
+    schema = pa.unify_schemas(schemas, promote_options="permissive")
+    for name in frame_columns:
+        if name not in schema.names:
+            raise ValueError(f"Missing frame column {name}")
+        schema = schema.set(schema.get_field_index(name), pa.field(name, pa.int64()))
+    if keep_block_frame:
+        if "block_frame" in schema.names or "source_block" in schema.names:
+            raise ValueError("Input is already a block-combined track")
+        schema = schema.append(pa.field("block_frame", pa.int64()))
+    if "source_block" not in schema.names:
+        schema = schema.append(pa.field("source_block", pa.string()))
+    schema = schema.with_metadata({k.encode(): str(v).encode() for k, v in (metadata or {}).items()})
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = out_path.with_name(f".{out_path.name}.{os.getpid()}.tmp")
+    result = {"rows": 0, "segments": [], "frame_min": None, "frame_max": None}
+    try:
+        with pq.ParquetWriter(temporary, schema, compression="zstd") as writer:
+            for path, offset, block in sources:
+                count = 0
+                previous = None
+                for batch in pq.ParquetFile(path).iter_batches(batch_size=batch_size):
+                    if not batch.num_rows:
+                        continue
+                    table = pa.Table.from_batches([batch])
+                    if expected_track_id is not None:
+                        ids = table["TrackID"]
+                        if ids.null_count or not pc.all(pc.equal(ids, expected_track_id)).as_py():
+                            raise ValueError(f"TrackID does not match filename: {path}")
+                    if keep_block_frame:
+                        local = pc.cast(table["Frame"], pa.int64(), safe=True)
+                        values = local.to_numpy()
+                        if local.null_count or (len(values) and (values[0] < 0 or np.any(np.diff(values) < 0))):
+                            raise ValueError(f"Invalid or unordered frames: {path}")
+                        if previous is not None and len(values) and values[0] < previous:
+                            raise ValueError(f"Unordered parquet batches: {path}")
+                        if len(values):
+                            previous = int(values[-1])
+                            if frame_limits is not None and previous >= frame_limits[block]:
+                                raise ValueError(f"Frames exceed recording length: {path}")
+                        table = table.append_column("block_frame", local)
+                    for name in frame_columns:
+                        values = pc.add(pc.cast(table[name], pa.int64(), safe=True), int(offset))
+                        table = table.set_column(table.schema.get_field_index(name), name, values)
+                    for name, value in (("source_block", block), ("track_name", track_name)):
+                        if value is None or (name == "track_name" and name not in table.column_names):
+                            continue
+                        values = pa.array([value] * len(table))
+                        if name in table.column_names:
+                            table = table.set_column(table.schema.get_field_index(name), name, values)
+                        else:
+                            table = table.append_column(name, values)
+                    for field in schema:
+                        if field.name not in table.column_names:
+                            table = table.append_column(field.name, pa.nulls(len(table), field.type))
+                    table = table.select(schema.names).cast(schema)
+                    writer.write_table(table)
+                    count += len(table)
+                    if len(table):
+                        lo = pc.min(table[frame_columns[0]]).as_py()
+                        hi = pc.max(table[frame_columns[-1]]).as_py()
+                        if lo is not None:
+                            result["frame_min"] = lo if result["frame_min"] is None else min(lo, result["frame_min"])
+                            result["frame_max"] = hi if result["frame_max"] is None else max(hi, result["frame_max"])
+                result["segments"].append({"block": block, "rows": count, "frame_offset": offset})
+                result["rows"] += count
+        temporary.replace(out_path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return result
+
+
 # -----------------------
 # trajectory PNG rendering
 # -----------------------

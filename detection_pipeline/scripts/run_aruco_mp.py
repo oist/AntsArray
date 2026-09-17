@@ -4,9 +4,10 @@ run_aruco_mp.py — multiprocessing ArUco detection (frame-range parallel).
 
 Faster drop-in for the serial run_aruco.py used by the detection pipeline.
 Splits the video into <workers> contiguous frame ranges, each decoded +
-detected in its own process (cv2.setNumThreads(1)), then merges into the same
+detected in its own process (cv2.setNumThreads(1)). Every detection is retained
+as a separate record, including repeated IDs within one camera/frame. The old
 (num_frames, dict_size, 2) tracks / (num_frames, dict_size) confidences arrays
-the serial version produces.
+are also exported for compatibility, but are explicitly lossy summaries.
 
 Verified frame-exact vs the serial detector (benchmark 2026-06-09: 0 mismatch,
 maxcoord=0.0 at P=4/8/16) and ~3.9x faster at -c 16 (9.5 -> 36.5 it/s) on
@@ -25,15 +26,17 @@ from __future__ import annotations
 
 import argparse
 import os
-import sys
 from multiprocessing import Pool
 from pathlib import Path
 
 import cv2
 import cv2.aruco as aruco
-import h5py
 import numpy as np
-import pandas as pd
+
+if __package__:
+    from .aruco_output import pack_detections, save_aruco_outputs
+else:  # Direct CLI execution from an arbitrary working directory.
+    from aruco_output import pack_detections, save_aruco_outputs
 
 
 def load_custom_aruco_dict(npz_path: str):
@@ -105,7 +108,7 @@ def _probe_frame_count(video: str) -> int:
 
 
 def detect_aruco_mp(video, dict_spec, dictionary_size, *, n_frames=0, workers=None):
-    """Returns (tracks, confidences) identical to the serial detector."""
+    """Return (legacy_tracks, legacy_confidences, lossless_detections)."""
     if workers is None or workers <= 0:
         workers = int(os.environ.get("SLURM_CPUS_PER_TASK") or os.cpu_count() or 4)
     workers = max(1, workers)
@@ -132,13 +135,7 @@ def detect_aruco_mp(video, dict_spec, dictionary_size, *, n_frames=0, workers=No
 
     dets = [d for r in results for d in r[0]]
     num_frames = max((r[1] for r in results), default=0)
-    tracks = np.zeros((num_frames, dictionary_size, 2), dtype=np.float32)
-    confidences = np.zeros((num_frames, dictionary_size), dtype=np.float32)
-    for fidx, mid, x, y in dets:
-        tracks[fidx, mid, 0] = x
-        tracks[fidx, mid, 1] = y
-        confidences[fidx, mid] = 1.0
-    return tracks, confidences
+    return pack_detections(dets, num_frames, dictionary_size)
 
 
 def main():
@@ -173,38 +170,12 @@ def main():
 
     print(f"[INFO] MP aruco on {name} "
           f"(workers={args.workers or 'auto'}, n_frames={args.n_frames or 'probe'})", flush=True)
-    tracks, confidences = detect_aruco_mp(
+    tracks, confidences, detections = detect_aruco_mp(
         args.video_file, dict_spec, dict_size, n_frames=args.n_frames, workers=args.workers
     )
     print(f"[INFO] processed {tracks.shape[0]} frames", flush=True)
 
-    raw_h5 = out_dir / f"{name}_aruco_tracks.h5"
-    with h5py.File(raw_h5, "w") as h:
-        h.create_dataset("aruco_tracks", data=tracks, compression="gzip", shuffle=True, chunks=True)
-        h.create_dataset("aruco_confidences", data=confidences, compression="gzip", shuffle=True, chunks=True)
-    print(f"[INFO] Saved raw arrays to: {raw_h5}", flush=True)
-
-    fr, inst = np.where(confidences > 0)
-    if len(fr):
-        df = pd.DataFrame({
-            "Frame": fr.astype(np.int32),
-            "Instance": inst.astype(np.int32),
-            "X": tracks[fr, inst, 0].astype(np.float32),
-            "Y": tracks[fr, inst, 1].astype(np.float32),
-            "Confidence": confidences[fr, inst].astype(np.float32),
-        })
-    else:
-        df = pd.DataFrame(columns=["Frame", "Instance", "X", "Y", "Confidence"])
-
-    if args.output_format in ("csv", "both"):
-        df.to_csv(out_dir / f"{name}_aruco_detections.csv", index=False, float_format="%.1f")
-    if args.output_format in ("h5", "both"):
-        try:
-            import tables  # noqa: F401
-            df.to_hdf(out_dir / f"{name}_aruco_detections.h5", key="detections",
-                      mode="w", format="table", complevel=4, complib="zlib")
-        except ImportError:
-            print("[WARN] 'tables' not found; skipping detections H5 export.", flush=True)
+    save_aruco_outputs(out_dir, name, tracks, confidences, detections, args.output_format)
 
 
 if __name__ == "__main__":

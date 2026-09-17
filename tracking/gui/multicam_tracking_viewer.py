@@ -197,7 +197,8 @@ class VideoSource(CameraSource):
             if not cap.isOpened():
                 raise FileNotFoundError(f"Could not open video: {self.path}")
             self.cap = cap
-            self._frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or None
+            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+            self._frame_count = frame_count if frame_count > 0 else None
             width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 0
             height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 0
             self._frame_size = (width, height) if width > 0 and height > 0 else None

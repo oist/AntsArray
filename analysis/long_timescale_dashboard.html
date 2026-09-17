@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Ant behavior over time</title>
+<script src="plotly.min.js"></script>
+<style>
+:root{font:15px system-ui,sans-serif;color:#1c3040;background:#f3f5f8}body{margin:0}header,main{max-width:1540px;margin:auto;padding:24px}h1{margin:0;font-size:30px}h2{font-size:20px;margin:0 0 8px}p{line-height:1.55}a{color:#126e9a}.controls{position:sticky;top:0;z-index:5;background:#ffffffed;padding:14px 24px;display:flex;gap:20px;align-items:end;flex-wrap:wrap;border-block:1px solid #d9e1e8;backdrop-filter:blur(6px)}label{display:grid;gap:4px;font-size:13px}select,button{font:inherit;padding:8px 12px;border:1px solid #b4c4cf;border-radius:5px;background:white;color:#203847}.check{display:flex;align-items:center;padding-bottom:10px}section{background:white;padding:20px;margin:0 0 22px;border-radius:8px;border:1px solid #dce3ea}.note{font-size:13px;color:#526779}.chart{width:100%;height:400px}.tall{height:560px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:20px}.stats{display:flex;gap:25px;flex-wrap:wrap;color:#416070}.stats strong{font-size:23px;color:#1b6485}table{border-collapse:collapse;width:100%;font-size:13px}th,td{text-align:left;padding:8px;border-bottom:1px solid #dce3ea}summary{cursor:pointer;font-size:18px;font-weight:600}.gallery img{max-width:100%;height:auto}.gallery figure{margin:20px 0}.status{font-size:12px;color:#496578;margin-left:auto}nav{display:flex;gap:15px;flex-wrap:wrap;margin-top:16px}@media(max-width:900px){.grid{grid-template-columns:1fr}header,main{padding:14px}.controls{position:static}}
+</style></head>
+<body>
+<header><h1>Ant behavior over time</h1><p>Activity rhythms, sleep and spatial presence across all available recordings. Select an ant to follow its behavior, or inspect the whole colony. Drag to zoom, double-click to reset, and click a heatmap row to select that ant.</p><div class="stats" id="stats"></div><nav><a href="#timeline-section">Calendar timeline</a><a href="#rhythm-section">Day/night rhythms</a><a href="#trend-section">Individual trends</a><a href="#task-section">Individual task profiles</a><a href="#space-section">Spatial maps</a><a href="#files">Figures and tables</a></nav></header>
+<div class="controls">
+<label>Colony<select id="side"><option value="left">Left</option><option value="right">Right</option></select></label>
+<label>Behavior<select id="metric"></select></label>
+<label>Ant<select id="ant"><option value="all">All tracked ants</option></select></label>
+<label class="check"><input type="checkbox" id="common">Optional: use only ants with shared clock coverage</label>
+<label>Trend view<select id="trendMode"><option value="observed">All observed data</option><option value="shared">Shared clock hours</option></select></label>
+<label>Trend phase<select id="trendPhase"><option value="all">All hours</option><option value="light">Lights on</option><option value="dark">Lights off</option></select></label>
+<span class="status" id="status">Loading…</span></div>
+<main>
+<section><details><summary>Recording coverage and how to read these plots</summary><p id="methods"></p><table><thead><tr><th>Recording / block</th><th>Tracking begins (local time)</th><th>Tracking ends</th></tr></thead><tbody id="windows"></tbody></table><p class="note">Calendar plots show actual observation dates. A recording name such as 20260729 is the source directory date, not necessarily the date of its tracked window. Missing observations remain unknown. Workers are joined by colony side and tag ID; cluster numbers are not assumed to match across recordings. These are within-colony diagnostics, not independent-colony replication or evidence of a causal time effect.</p></details></section>
+<section id="timeline-section"><h2>Behavior on the calendar timeline</h2><p class="note">Equal-ant mean; shading around the line is the interquartile range among observed ants. Pale vertical bands mark lights off. Gaps stay blank.</p><div id="timeline" class="chart"></div><div id="coverage" class="chart" style="height:230px"></div></section>
+<section><h2>Individual behavior through time</h2><p class="note">Stable ant order across recordings. White cells have no observed metric data. Click a row to inspect that ant.</p><div id="heatmap" class="chart tall"></div></section>
+<section id="rhythm-section"><h2>Clock-time rhythms across every recording</h2><p class="note">Each ant contributes equally after averaging its repeated cycles. These profiles show all recordings together; the observed ants and hours can vary.</p><div class="grid"><div id="rhythm" class="chart"></div><div id="actogram" class="chart"></div></div></section>
+<section><h2>Light and dark phases across calendar days</h2><p class="note">Means over every observed hour; there is no minimum observation duration by default. Changing clock coverage can influence these descriptive daily values.</p><div id="daynight" class="chart"></div></section>
+<section id="trend-section"><h2>Does the same ant change over time?</h2><p class="note">The default view includes every observed ant and recording bin. The optional shared-clock view compares the same hours in each recording. Gray lines follow individual ants; the colored line is their mean. Horizontal positions are actual recording centers, so gaps between recordings are preserved. Connecting lines summarize observed endpoints; they do not fill unrecorded behavior.</p><div id="standardized" class="chart"></div><div id="drift" class="chart tall"></div></section>
+<section id="task-section"><h2>Individual task allocation across recordings</h2><p>These views extend the single-dataset grid occupancy plots for the same ant across all recording dates. Counts and durations use the existing completed colony–outside–colony trips. Trip rates use observed position hours. Unknown trip analysis is blank; an analyzed ant with no completed trips has a zero count.</p>
+<div class="controls" style="position:static"><label>Individual ant<select id="taskAnt"></select></label><label>Daily profile<select id="taskPhase"><option value="all">All observed hours</option><option value="light">Lights on</option><option value="dark">Lights off</option></select></label><a id="antFigure">Save this ant’s figure</a></div>
+<p id="taskAvailability" class="note"></p><div id="taskTimeline" class="chart" style="height:1250px"></div>
+<p id="tripDiagnostics" hidden></p>
+<h2>Does this ant’s daily behavior profile change?</h2><p class="note">Colors show deviations from this ant’s own average for each behavior, scaled by that behavior’s variation across observed days. Hover for the original value and observation hours. Light/dark views help separate daily rhythms from changes between days. Missing days stay blank.</p><div id="taskDaily" class="chart tall"></div>
+<h2>Colony occupancy and trip investment</h2><p class="note">Calendar-day points for the selected ant; numbers show observation order. This follows the grid occupancy colony-use versus trip-investment plot through all dates. Incomplete trips at tracking gaps or block boundaries are absent from completed-trip measures.</p><div id="taskInvestment" class="chart"></div>
+<p><a href="task_daily.csv">Daily and day/night task profiles</a> · <a href="completed_trips.csv">Existing completed trips on calendar time</a> · <a href="trip_availability.csv">Trip-analysis availability</a> · <a href="task_standardized.csv">Task profiles on shared clock hours</a> · <a href="task_slopes.csv">Within-ant task trends</a></p></section>
+<section id="space-section"><h2>Spatial presence across all recordings</h2><p class="note">Whole-recording occupancy maps reuse existing grids and give each tracked ant equal weight after pooling its blocks. These maps are descriptive and are not clock-matched. They show the complete tracked cohort, regardless of the individual-ant filter above. Cyan outlines come from panorama annotations.</p><div id="spatial" class="chart tall"></div></section>
+<section id="files"><h2>Saved figures and analysis tables</h2><p><a href="run_manifest.json">Run provenance</a> · <a href="report.md">Analysis report</a> · <a href="phases.csv">Ant/day/phase values</a> · <a href="standardized.csv">Standardized ant trajectories</a> · <a href="slopes.csv">Per-ant trends</a> · <a href="slope_summary.csv">Colony trend summaries</a> · <a href="inventory.csv">Identity inventory</a></p><details><summary>View all saved overview figures</summary><div id="gallery" class="gallery"></div></details></section>
+</main>
+<script id="data" type="application/json">__LONG_TIMESCALE_DATA__</script>
+<script>
+'use strict';
+const D=JSON.parse(document.getElementById('data').textContent), M=D.meta;
+const $=id=>document.getElementById(id), colors=['#187ca5','#d47830','#7566b0','#42906b','#c55e82'];
+if(D.trip_diagnostics){const link=document.createElement('a');link.href=D.trip_diagnostics;link.textContent='Explore longer trips: alternative plots, day/night comparisons, and individual trip events';$('tripDiagnostics').append(link);$('tripDiagnostics').hidden=false}
+const rows=D.bins.data.map(row=>Object.fromEntries(D.bins.columns.map((c,i)=>[c,row[i]])));
+const taskRows=D.task_bins.data.map(row=>Object.fromEntries(D.task_bins.columns.map((c,i)=>[c,row[i]])));
+const finite=x=>x!==null&&x!==undefined&&Number.isFinite(x);
+const mean=a=>a.length?a.reduce((x,y)=>x+y,0)/a.length:null;
+function quantile(a,p){if(!a.length)return null;const v=[...a].sort((a,b)=>a-b),x=(v.length-1)*p,i=Math.floor(x);return v[i]+(v[Math.ceil(x)]-v[i])*(x-i)}
+function group(data,key){const m=new Map();for(const r of data){const k=key(r);if(!m.has(k))m.set(k,[]);m.get(k).push(r)}return m}
+function iso(d){return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}T${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}:00`}
+const step=M.bin_minutes*60*1000, first=new Date(rows[0].timestamp), last=new Date(rows[rows.length-1].timestamp), times=[];
+for(let t=+first;t<=+last;t+=step)times.push(iso(new Date(t)));
+const nights=[];
+for(let t=+new Date(first.getFullYear(),first.getMonth(),first.getDate()-1);t<=+last;t+=86400000){let a=new Date(t+M.light_off_hour*3600000),b=new Date(t+(24+M.light_on_hour)*3600000);nights.push({type:'rect',xref:'x',yref:'paper',x0:iso(a),x1:iso(b),y0:0,y1:1,fillcolor:'#b5bed0',opacity:.18,line:{width:0},layer:'below'})}
+const config={responsive:true,displaylogo:false,toImageButtonOptions:{format:'png',scale:2}};
+function plot(id,data,layout={}){return Plotly.react(id,data,{template:'plotly_white',margin:{l:65,r:30,t:40,b:55},font:{family:'system-ui',color:'#25445b'},hovermode:'closest',...layout},config)}
+for(const [key,spec] of Object.entries(M.metrics)){const o=new Option(spec[2],key);$('metric').add(o)}
+$('metric').value='sleep';
+$('stats').innerHTML=`<span><strong>${M.recordings.length}</strong> recordings</span><span><strong>${M.windows.length}</strong> tracked blocks/windows</span><span><strong>${new Set(rows.map(r=>r.ant)).size}</strong> tracked ant identities</span><span>Lights on ${M.light_on_hour.toFixed(1)}–${M.light_off_hour.toFixed(1)} h</span>`;
+$('methods').textContent=`All tracked ants and partial recording days are included. Display cutoffs: ${100*M.settings.min_bin_coverage}% coverage and ${M.settings.min_phase_hours} hours per phase (zero means any observed data). Optional shared-clock trajectories require ≥${M.settings.min_shared_hours} hours shared across all recordings, or ≥${M.settings.min_phase_hours} shared hours within the selected light/dark phase. Sleep and colony state use the existing classifier/context. Food/water presence is exact cached resource frames divided by detected position frames; it does not establish feeding or drinking.`;
+for(const w of M.windows){const tr=document.createElement('tr');for(const value of [w.block.split('/').slice(-2).join('/'),w.start,w.stop]){const td=document.createElement('td');td.textContent=value;tr.append(td)}$('windows').append(tr)}
+for(const name of D.figures){const f=document.createElement('figure'),a=document.createElement('a'),im=document.createElement('img'),caption=document.createElement('figcaption');a.href=name;im.src=name;im.loading='lazy';im.alt=name;caption.textContent=name;a.append(im);f.append(a,caption);$('gallery').append(f)}
+function refreshAnts(){const selected=$('ant').value, ants=[...new Set(rows.filter(r=>r.side===$('side').value).map(r=>r.ant))].sort();$('ant').replaceChildren(new Option('All tracked ants','all'));for(const ant of ants)$('ant').add(new Option(ant,ant));if(ants.includes(selected))$('ant').value=selected}
+function refreshTaskAnts(){
+ const ants=[...new Set(rows.filter(r=>r.side===$('side').value).map(r=>r.ant))].sort(), prior=$('taskAnt').value;
+ const scores=[...group(taskRows.filter(r=>r.side===$('side').value),r=>r.ant)].map(([ant,v])=>({ant,score:v.reduce((s,r)=>s+(r.trip_available?r.position_coverage:0),0)})).sort((a,b)=>b.score-a.score||a.ant.localeCompare(b.ant));
+ $('taskAnt').replaceChildren(...ants.map(a=>new Option(a,a)));
+ $('taskAnt').value=ants.includes(prior)?prior:(scores[0]?.ant||ants[0]);
+}
+async function renderTasks(){
+ if($('taskAnt').value.split(':')[0]!==$('side').value)refreshTaskAnts();
+ const ant=$('ant').value==='all'?$('taskAnt').value:$('ant').value;
+ if([...$('taskAnt').options].some(o=>o.value===ant))$('taskAnt').value=ant;
+ const selected=taskRows.filter(r=>r.ant===ant), map=new Map(selected.map(r=>[r.timestamp,r]));
+ $('antFigure').href=M.individual_figures[ant];
+ const available=[...new Set(selected.filter(r=>r.trip_available).map(r=>r.source_block.split('/').slice(-2).join('/')))];
+ $('taskAvailability').textContent=ant+' · Existing trip analysis: '+(available.join(', ')||'unavailable in these recordings')+'. Other behavior panels include every observed bin.';
+ const panels=[['colony','food','water'],['speed','body','antenna'],['sleep'],['trip_count'],['trip_rate'],['trip_duration'],['trip_investment'],['coverage']];
+ const trace=[], layout={grid:{rows:4,columns:2,pattern:'independent'},showlegend:false,shapes:[],annotations:[],height:1250};
+ panels.forEach((metrics,i)=>{const suffix=i?String(i+1):'',xaxis='x'+suffix,yaxis='y'+suffix;
+  metrics.forEach((metric,k)=>{const spec=metric==='coverage'?['position_coverage','','Position coverage','%']:D.task_metrics[metric];
+   trace.push({x:times,y:times.map(t=>{const r=map.get(t);return r&&finite(r[spec[0]])?r[spec[0]]*(metric==='coverage'?100:1):null}),xaxis,yaxis,name:spec[2],mode:'lines+markers',connectgaps:false,marker:{size:2},line:{color:colors[k],width:1},hovertemplate:spec[2]+'<br>%{x}<br>%{y:.3f} '+spec[3]+'<extra></extra>'});
+  });
+  layout['xaxis'+suffix]={type:'date',range:[times[0],times.at(-1)],nticks:5};layout['yaxis'+suffix]={title:{text:metrics[0]==='coverage'?'%':D.task_metrics[metrics[0]][3]}};
+  layout.annotations.push({text:metrics.map(m=>m==='coverage'?'Position coverage':D.task_metrics[m][2]).join(' / '),xref:xaxis+' domain',yref:yaxis+' domain',x:0,y:1.08,showarrow:false,xanchor:'left',font:{size:12}});
+  for(const n of nights)layout.shapes.push({...n,xref:xaxis,yref:yaxis+' domain'});
+ });
+ const dayRows=D.task_daily.filter(r=>r.ant===ant&&r.phase===$('taskPhase').value),days=[];
+ for(let t=+new Date(first.getFullYear(),first.getMonth(),first.getDate());t<=+last;t+=86400000)days.push(iso(new Date(t)).slice(0,10));
+ const metrics=['colony','trip_count','trip_rate','trip_duration','trip_investment','speed','body','antenna','sleep','food','water'],z=[],custom=[];
+ for(const metric of metrics){const values=new Map(dayRows.filter(r=>r.metric===metric).map(r=>[r.calendar_date,r])),observed=[...values.values()].map(r=>r.value).filter(finite),mu=mean(observed),sd=observed.length?Math.sqrt(mean(observed.map(v=>(v-mu)**2))):0;
+ z.push(days.map(d=>{const v=values.get(d)?.value;return finite(v)?(sd>0?(v-mu)/sd:0):null}));
+ custom.push(days.map(d=>{const r=values.get(d);return r&&finite(r.value)?r.value.toFixed(3)+' '+D.task_metrics[metric][3]+'; '+r.valid_hours.toFixed(2)+' observed h':'Unknown'}));}
+ const wide=new Map();for(const r of dayRows){if(!wide.has(r.calendar_date))wide.set(r.calendar_date,{});wide.get(r.calendar_date)[r.metric]=r.value}
+ const points=days.map(d=>({day:d,...(wide.get(d)||{})})).filter(r=>finite(r.colony)&&finite(r.trip_rate));
+ const investment=[{x:points.map(r=>r.colony),y:points.map(r=>r.trip_rate),text:points.map((r,i)=>String(i+1)),customdata:points.map(r=>r.day),mode:'lines+markers+text',textposition:'top center',line:{color:'#bac2cc',width:1},marker:{size:points.map(r=>finite(r.trip_duration)?8+Math.min(18,Math.sqrt(r.trip_duration)*2):8),color:points.map(r=>(new Date(r.day)-first)/86400000),colorscale:'Viridis'},hovertemplate:'%{customdata}<br>Colony %{x:.2f}%<br>%{y:.3f} trips/observed h<extra></extra>'}];
+ await Promise.all([plot('taskTimeline',trace,layout),plot('taskDaily',[{type:'heatmap',x:days,y:metrics.map(m=>D.task_metrics[m][2]),z,customdata:custom,colorscale:'RdBu',reversescale:true,zmid:0,hoverongaps:false,hovertemplate:'%{y}<br>%{x}<br>%{customdata}<extra></extra>',colorbar:{title:{text:'Within-ant SD'}}}],{margin:{l:230,r:70,t:40,b:55},xaxis:{type:'date'},yaxis:{autorange:'reversed'}}),plot('taskInvestment',investment,{xaxis:{title:{text:'Observed time inside colony (%)'}},yaxis:{title:{text:'Completed trips / observed hour'}},title:{text:'Marker size reflects mean completed-trip duration'}})]);
+}
+function scalar(r,metric){const [value,cov]=M.metrics[metric];return r[cov]>=M.settings.min_bin_coverage&&finite(r[value])?r[value]:null}
+async function render(){
+ window.__LONG_TIMESCALE_READY__=false;$('status').textContent='Updating…';
+ const side=$('side').value, metric=$('metric').value, ant=$('ant').value, phase=$('trendPhase').value;
+ const spec=M.metrics[metric],ylabel=`${spec[2]} (${spec[3]})`, common=new Set(D.standardized.filter(r=>r.side===side&&r.metric===metric&&r.phase==='all'&&r.included).map(r=>r.ant));
+ const base=rows.filter(r=>r.side===side&&(!$('common').checked||common.has(r.ant))), selected=base.filter(r=>ant==='all'||r.ant===ant);
+ const plotted=selected.map(r=>({...r,value:scalar(r,metric)})), bytime=group(plotted,r=>r.timestamp);
+ const values=times.map(t=>(bytime.get(t)||[]).map(r=>r.value).filter(finite)), means=values.map(mean), q1=values.map(v=>quantile(v,.25)),q3=values.map(v=>quantile(v,.75)), counts=values.map(v=>v.length);
+ const jobs=[],bands=[];
+ // Plotly's tonexty fill can span missing intervals even with connectgaps=false.
+ // Independent closed polygons keep uncertainty bands out of recording gaps.
+ let start=null;
+ for(let i=0;i<=times.length;i++){
+   if(i<times.length&&finite(q1[i])&&finite(q3[i])){if(start===null)start=i;continue}
+   if(start!==null){const x=times.slice(start,i),lo=q1.slice(start,i),hi=q3.slice(start,i);
+     if(x.length>1)bands.push({x:x.concat([...x].reverse()),y:hi.concat([...lo].reverse()),type:'scatter',mode:'lines',line:{width:0},fill:'toself',fillcolor:'rgba(24,124,165,.15)',name:'Ant interquartile range',legendgroup:'iqr',showlegend:bands.length===0,hoverinfo:'skip'});
+     start=null;
+   }
+ }
+ jobs.push(plot('timeline',[...bands,
+ {x:times,y:means,type:'scatter',mode:'lines',line:{color:colors[0]},name:ant==='all'?'Equal-ant mean':ant,customdata:counts,hovertemplate:'%{x}<br>%{y:.3f}<br>%{customdata} ants<extra></extra>',connectgaps:false}],
+ {yaxis:{title:{text:ylabel}},xaxis:{type:'date',range:[times[0],times.at(-1)]},shapes:nights,legend:{orientation:'h',y:1.18}}));
+ jobs.push(plot('coverage',[{x:times,y:counts.map((v,i)=>bytime.has(times[i])?v:null),mode:'lines',line:{color:'#677b93'},name:'Contributing ants'}],{yaxis:{title:{text:'Ants with valid bins'}},xaxis:{type:'date',range:[times[0],times.at(-1)]},shapes:nights}));
+ const ants=[...new Set(base.map(r=>r.ant))].sort(), lookup=new Map(base.map(r=>[r.ant+'|'+r.timestamp,scalar(r,metric)]));
+ const z=ants.map(a=>times.map(t=>lookup.get(a+'|'+t)??null));
+ jobs.push(plot('heatmap',[{type:'heatmap',x:times,y:ants,z,colorscale:'Magma',zmin:0,zmax:spec[3]==='%'?100:undefined,hoverongaps:false,colorbar:{title:{text:spec[3]}},hovertemplate:'%{y}<br>%{x}<br>%{z:.3f}<extra></extra>'}],{xaxis:{type:'date'},yaxis:{autorange:'reversed'}}));
+ const cycles=group(plotted,r=>r.recording+'|'+r.ant+'|'+r.clock_hour);
+ const prof=[...cycles.values()].map(v=>({recording:v[0].recording,ant:v[0].ant,clock:v[0].clock_hour,value:mean(v.map(r=>r.value).filter(finite))}));
+ const clock=M.clock_hours, rhythms=[];
+ M.recordings.forEach((rec,i)=>{const g=group(prof.filter(r=>r.recording===rec),r=>r.clock);rhythms.push({x:clock,y:clock.map(c=>mean((g.get(c)||[]).map(r=>r.value).filter(finite))),name:rec,mode:'lines+markers',marker:{size:4},line:{color:colors[i%colors.length]},connectgaps:false})});
+ jobs.push(plot('rhythm',rhythms,{yaxis:{title:{text:ylabel}},xaxis:{title:{text:'Local clock hour'},range:[0,24],dtick:4},shapes:[{type:'rect',xref:'x',yref:'paper',x0:0,x1:M.light_on_hour,y0:0,y1:1,fillcolor:'#b5bed0',opacity:.2,line:{width:0},layer:'below'},{type:'rect',xref:'x',yref:'paper',x0:M.light_off_hour,x1:24,y0:0,y1:1,fillcolor:'#b5bed0',opacity:.2,line:{width:0},layer:'below'}],legend:{orientation:'h',y:1.15}}));
+ const days=[];for(let t=+new Date(first.getFullYear(),first.getMonth(),first.getDate());t<=+last;t+=86400000)days.push(iso(new Date(t)).slice(0,10));
+ const dayclock=group(plotted,r=>r.calendar_date+'|'+r.clock_hour);
+ jobs.push(plot('actogram',[{type:'heatmap',x:clock,y:days,z:days.map(d=>clock.map(c=>mean((dayclock.get(d+'|'+c)||[]).map(r=>r.value).filter(finite)))),colorscale:'Magma',zmin:0,zmax:spec[3]==='%'?100:undefined,hoverongaps:false,colorbar:{title:{text:spec[3]}}}],{xaxis:{title:{text:'Local clock hour'},range:[0,24],dtick:4},yaxis:{type:'category',autorange:'reversed'},title:{text:'Calendar-day actogram'}}));
+ const phaseAnt=group(plotted,r=>r.ant+'|'+r.calendar_date+'|'+r.phase);
+ const phaseRows=[...phaseAnt.values()].map(v=>{let good=v.map(r=>r.value).filter(finite);return {day:v[0].calendar_date,phase:v[0].phase,value:good.length*M.bin_minutes/60>=M.settings.min_phase_hours?mean(good):null}});
+ const dn=['light','dark'].map((p,i)=>{const g=group(phaseRows.filter(r=>r.phase===p),r=>r.day);return {x:days,y:days.map(d=>mean((g.get(d)||[]).map(r=>r.value).filter(finite))),mode:'lines+markers',name:p==='light'?'Lights on':'Lights off',line:{color:i?'#535b9f':'#ce9232'},customdata:days.map(d=>(g.get(d)||[]).filter(r=>finite(r.value)).length),hovertemplate:'%{x}<br>%{y:.3f}<br>%{customdata} ants<extra></extra>',connectgaps:false}});
+ jobs.push(plot('daynight',dn,{yaxis:{title:{text:ylabel}},xaxis:{type:'date'},legend:{orientation:'h',y:1.15}}));
+ const mode=$('trendMode').value;
+ const std=(mode==='shared'?D.standardized:D.observed).filter(r=>r.side===side&&r.metric===metric&&r.phase===phase&&r.included&&(ant==='all'||r.ant===ant));
+ const byant=group(std,r=>r.ant), centers=M.recordings.map(r=>M.recording_centers[r].replace(' ','T')), sx=[],sy=[],sc=[];
+ const trajectories=[];
+ for(const [id,v] of byant){const map=new Map(v.map(r=>[r.recording,r.value])),a=M.recordings.map(r=>map.get(r)??null);trajectories.push({id,values:a});sx.push(...centers,null);sy.push(...a,null);sc.push(...M.recordings.map(r=>id+' / '+r),null)}
+ const stdtraces=[{x:sx,y:sy,customdata:sc,mode:'lines+markers',line:{color:'rgba(105,120,134,.4)',width:1},marker:{size:4},name:'Individual ants',hovertemplate:'%{customdata}<br>%{y:.3f}<extra></extra>'},
+ {x:centers,y:M.recordings.map((r,i)=>mean(trajectories.map(t=>t.values[i]).filter(finite))),mode:'lines+markers',line:{color:colors[0],width:3},name:`Mean (${byant.size} ants)`,customdata:M.recordings,hovertemplate:'Recording %{customdata}<br>%{y:.3f}<extra></extra>'}];
+ jobs.push(plot('standardized',stdtraces,{title:{text:`${phase} phase; ${mode==='shared'?'same clock slots in every recording':'all observed recording bins'}`},xaxis:{type:'date',tickvals:centers,ticktext:M.recordings.map((r,i)=>r+'<br>'+centers[i].slice(0,10))},yaxis:{title:{text:ylabel}},annotations:byant.size?[]:[{text:'No observed values for this selection',xref:'paper',yref:'paper',x:.5,y:.5,showarrow:false}],legend:{orientation:'h',y:1.2}}));
+ const drift=trajectories.sort((a,b)=>a.id.localeCompare(b.id));
+ jobs.push(plot('drift',[{type:'heatmap',x:M.recordings,y:drift.map(r=>r.id),z:drift.map(r=>r.values.map(v=>finite(v)&&finite(r.values[0])?v-r.values[0]:null)),colorscale:'RdBu',reversescale:true,zmid:0,hoverongaps:false,colorbar:{title:{text:'Δ '+spec[3]}},hovertemplate:'%{y}<br>Recording %{x}<br>Δ %{z:.3f}<extra></extra>'}],{title:{text:mode==='shared'?'Change from first recording on shared clock slots':'Change from first recording over all observed hours'},xaxis:{type:'category'},yaxis:{autorange:'reversed'}}));
+ const maps=D.spatial.filter(r=>r.side===side), layout={grid:{rows:1,columns:maps.length,pattern:'independent'},showlegend:false,annotations:[],shapes:[]};
+ const vmax=Math.max(...maps.flatMap(m=>m.z.flat().map(Math.sqrt))), spatial=[];
+ maps.forEach((m,i)=>{const suffix=i?String(i+1):'',xa='x'+suffix,ya='y'+suffix;spatial.push({type:'heatmap',x:m.x,y:m.y,z:m.z.map(row=>row.map(Math.sqrt)),xaxis:xa,yaxis:ya,colorscale:'Magma',zmin:0,zmax:vmax,showscale:i===maps.length-1,colorbar:{title:{text:'√ probability'}},name:m.recording,hovertemplate:m.recording+'<br>x %{x:.1f} mm, y %{y:.1f} mm<br>√ probability %{z:.4f}<extra></extra>'});layout['xaxis'+suffix]={title:{text:'Arena x (mm)'},domain:[i/maps.length+.025,(i+1)/maps.length-.035]};layout['yaxis'+suffix]={title:{text:'y (mm)'},autorange:'reversed',scaleanchor:xa};layout.annotations.push({text:m.recording+` · ${m.n_ants} ants`,xref:'paper',yref:'paper',x:(i+.5)/maps.length,y:1.08,showarrow:false});for(const a of m.annotations){const rect=a.shape==='rectangle';layout.shapes.push({type:rect?'rect':'circle',xref:xa,yref:ya,x0:rect?a.x_min:a.center_x-a.radius,x1:rect?a.x_max:a.center_x+a.radius,y0:rect?a.y_min:a.center_y-a.radius,y1:rect?a.y_max:a.center_y+a.radius,line:{color:'cyan',width:1},fillcolor:'rgba(0,0,0,0)'})}});
+ jobs.push(plot('spatial',spatial,layout));
+ jobs.push(renderTasks());
+ await Promise.all(jobs);
+ $('heatmap').removeAllListeners('plotly_click');$('heatmap').on('plotly_click',event=>{const id=event.points[0].y;if([...$('ant').options].some(o=>o.value===id)){$('ant').value=id;render().catch(fail)}});
+ $('status').textContent=`${side} · ${ant==='all'?ants.length+' available ants':ant} · all ${M.recordings.length} recordings`;
+ window.__LONG_TIMESCALE_READY__=true;
+}
+function fail(error){$('status').textContent='Error: '+error.message;window.__LONG_TIMESCALE_ERROR__=String(error);console.error(error)}
+$('side').addEventListener('change',()=>{refreshAnts();refreshTaskAnts();render().catch(fail)});
+for(const id of ['metric','ant','common','trendMode','trendPhase'])$(id).addEventListener('change',()=>render().catch(fail));
+for(const id of ['taskAnt','taskPhase'])$(id).addEventListener('change',()=>{$('ant').value='all';render().catch(fail)});
+refreshAnts();refreshTaskAnts();render().catch(fail);
+</script></body></html>

@@ -196,6 +196,42 @@ def label_features_for_track(
     context_seconds: float,
     feature_mode: str,
 ) -> pd.DataFrame:
+    if feature_mode == "speed_only":
+        labeled_rows = []
+        labels = labels.sort_values(["frame_start", "frame_end"], kind="mergesort").reset_index(drop=True)
+        for order, label_row in labels.iterrows():
+            features = extract_track_features(
+                track_path,
+                speed_root=speed_root,
+                fps=fps,
+                mm_per_px=mm_per_px,
+                frame_min=int(label_row["frame_start"]),
+                frame_max=int(label_row["frame_end"]),
+                feature_mode=feature_mode,
+            )
+            if features.empty:
+                continue
+            subset = features.copy()
+            subset["label"] = str(label_row["label"])
+            subset["label_value"] = int(label_row["label_value"])
+            subset["_label_order"] = int(order)
+            for col in ["label_file", "video_path", "crop_frame_start", "track_id", "side"]:
+                if col in label_row and pd.notna(label_row[col]):
+                    subset[col] = label_row[col]
+            if "crop_frame_start" in subset.columns:
+                subset["local_frame"] = subset["Frame"].astype(np.int64) - int(label_row["crop_frame_start"])
+            labeled_rows.append(subset)
+        if not labeled_rows:
+            return pd.DataFrame()
+        out = pd.concat(labeled_rows, ignore_index=True)
+        out = (
+            out.sort_values(["Frame", "_label_order"], kind="mergesort")
+            .drop_duplicates(["track_name", "Frame"], keep="last")
+            .drop(columns=["_label_order"])
+            .reset_index(drop=True)
+        )
+        return out
+
     frame_min = int(labels["frame_start"].min() - round(float(context_seconds) * float(fps)))
     frame_max = int(labels["frame_end"].max() + round(float(context_seconds) * float(fps)))
     features = extract_track_features(

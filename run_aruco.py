@@ -3,7 +3,8 @@
 ArUco marker detection for video files.
 
 Outputs:
-- Raw numpy arrays (H5): aruco_tracks, aruco_confidences
+- Lossless raw records (H5): aruco_detections, including repeated frame/tag IDs
+- Legacy dense summaries (H5): aruco_tracks, aruco_confidences (lossy)
 - DataFrame (CSV and/or H5): Frame, Instance, X, Y, Confidence
 
 Debug features:
@@ -28,10 +29,11 @@ import sys
 
 import cv2
 import cv2.aruco as aruco
-import h5py
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
+
+from detection_pipeline.scripts.aruco_output import pack_detections, save_aruco_outputs
 
 
 # -----------------------------------------------------------------------------
@@ -198,7 +200,8 @@ def _annotate_debug_frame(
 # -----------------------------------------------------------------------------
 def tracks_to_dataframe(tracks: np.ndarray, confidences: np.ndarray) -> pd.DataFrame:
     """
-    Convert tracks/confidences arrays to a DataFrame.
+    Convert LEGACY dense arrays to a DataFrame (cannot recover duplicate IDs).
+    Do not use this helper for exporting new detector results.
     """
     frame_idx, inst_idx = np.where(confidences > 0)
     if len(frame_idx) == 0:
@@ -229,13 +232,14 @@ def detect_aruco_in_video(
     debug_max_frames: int = 0,
     debug_pause: bool = False,
     debug_show_rejected: bool = False,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, pd.DataFrame]:
     """
-    Detect ArUco markers in a video and return tracks/confidences arrays.
+    Detect ArUco markers and retain every detection, including repeated IDs.
 
     Returns:
       tracks: (num_frames, dictionary_size, 2) float32
       confidences: (num_frames, dictionary_size) float32
+      detections: lossless DataFrame; the dense arrays above are legacy summaries
     """
     cap = cv2.VideoCapture(str(video_file))
     if not cap.isOpened():
@@ -321,16 +325,8 @@ def detect_aruco_in_video(
         cv2.destroyAllWindows()
 
     num_frames = len(detections_per_frame)
-    tracks = np.zeros((num_frames, dictionary_size, 2), dtype=np.float32)
-    confidences = np.zeros((num_frames, dictionary_size), dtype=np.float32)
-
-    for f, dets in enumerate(detections_per_frame):
-        for mid, x, y in dets:
-            tracks[f, mid, 0] = x
-            tracks[f, mid, 1] = y
-            confidences[f, mid] = 1.0
-
-    return tracks, confidences
+    rows = [(f, mid, x, y) for f, dets in enumerate(detections_per_frame) for mid, x, y in dets]
+    return pack_detections(rows, num_frames, dictionary_size)
 
 
 # -----------------------------------------------------------------------------
@@ -722,7 +718,7 @@ def main() -> None:
         print(f"[INFO] Processing {basename}...", flush=True)
         print(f"[INFO] Detector config: {detector_config}", flush=True)
 
-        tracks, confidences = detect_aruco_in_video(
+        tracks, confidences, detections = detect_aruco_in_video(
             args.video_file,
             detector_config=detector_config,
             dictionary_size=args.dictionary_size,
@@ -735,30 +731,7 @@ def main() -> None:
             debug_show_rejected=args.debug_show_rejected,
         )
 
-        raw_h5_path = out_dir / f"{name_no_ext}_aruco_tracks.h5"
-        with h5py.File(raw_h5_path, "w") as hdf:
-            hdf.create_dataset("aruco_tracks", data=tracks, compression="gzip", shuffle=True, chunks=True)
-            hdf.create_dataset("aruco_confidences", data=confidences, compression="gzip", shuffle=True, chunks=True)
-        print(f"[INFO] Saved raw arrays to: {raw_h5_path}", flush=True)
-
-        print("[INFO] Converting to DataFrame...", flush=True)
-        df = tracks_to_dataframe(tracks, confidences)
-        print(f"[INFO] Created DataFrame with {len(df)} detections", flush=True)
-
-        if args.output_format in ("csv", "both"):
-            csv_path = out_dir / f"{name_no_ext}_aruco_detections.csv"
-            df.to_csv(csv_path, index=False, float_format="%.1f")
-            print(f"[INFO] Saved CSV to: {csv_path}", flush=True)
-
-        if args.output_format in ("h5", "both"):
-            df_h5_path = out_dir / f"{name_no_ext}_aruco_detections.h5"
-            try:
-                import tables  # noqa: F401
-
-                df.to_hdf(df_h5_path, key="detections", mode="w", format="table", complevel=4, complib="zlib")
-                print(f"[INFO] Saved DataFrame H5 to: {df_h5_path}", flush=True)
-            except ImportError:
-                print("[WARN] 'tables' module not found. Skipping HDF5 DataFrame export.", flush=True)
+        save_aruco_outputs(out_dir, name_no_ext, tracks, confidences, detections, args.output_format)
 
         if debug_video_path is not None:
             print(f"[INFO] Saved debug video to: {debug_video_path}", flush=True)

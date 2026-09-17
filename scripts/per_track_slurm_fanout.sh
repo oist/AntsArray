@@ -171,6 +171,10 @@ if [[ -n "$OPERATION_SCRIPT" ]]; then
       default_operation_name="speed_vector"
       default_output_name="speed_vectors"
       ;;
+    compute_track_sleep_motion)
+      default_operation_name="sleep_motion"
+      default_output_name="sleep_motion"
+      ;;
     compute_track_colony_presence_vector)
       default_operation_name="colony_presence"
       default_output_name="colony_presence_vectors"
@@ -198,7 +202,8 @@ fi
 if [[ -z "$OPERATION_CMD" ]]; then
   operation_script_q="$(printf '%q' "$OPERATION_SCRIPT")"
   OPERATION_ARGS="${OPERATION_ARGS//$'\n'/ }"
-  OPERATION_CMD="python ${operation_script_q} --track \"\$TRACK_PATH\" --out \"\$TASK_OUTPUT_DIR\""
+  operation_python_q="$(printf '%q' "${WORKER_PYTHON_BIN:-python}")"
+  OPERATION_CMD="${operation_python_q} ${operation_script_q} --track \"\$TRACK_PATH\" --out \"\$TASK_OUTPUT_DIR\""
   if [[ -n "$OPERATION_ARGS" ]]; then
     OPERATION_CMD+=" ${OPERATION_ARGS}"
   fi

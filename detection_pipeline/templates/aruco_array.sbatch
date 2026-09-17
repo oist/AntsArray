@@ -60,9 +60,9 @@ for (( row_idx=start_idx; row_idx<end_idx; row_idx++ )); do
 		continue
 	fi
 
-	# run_aruco.py produces TWO h5 files per chunk:
-	#   <base>_aruco_tracks.h5      raw numpy arrays
-	#   <base>_aruco_detections.h5  DataFrame (Frame, Instance, X, Y, Confidence)
+	# Both detector entry points use scripts/aruco_output.py to produce:
+	#   <base>_aruco_tracks.h5      lossless records + legacy dense summaries
+	#   <base>_aruco_detections.h5  lossless DataFrame (Frame, Instance, X, Y, Confidence)
 	out_tracks="$aruco_dir/${vname}_${chunk}_aruco_tracks.h5"
 	out_detect="$aruco_dir/${vname}_${chunk}_aruco_detections.h5"
 	sentinel="$aruco_dir/${vname}_${chunk}.aruco.ok"

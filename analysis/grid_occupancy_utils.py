@@ -4,12 +4,19 @@ from __future__ import annotations
 
 import importlib
 import json
+from datetime import datetime
 from pathlib import Path
 import re
 
 import matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter
 import numpy as np
 import pandas as pd
+
+from camera_cal.region_paths import panorama_regions_path
+
+
+ARENA_BORDER_TOLERANCE_PX = 3.0
 
 
 def side_from_track(track_name: str, track_dir: Path | None = None) -> str | None:
@@ -62,6 +69,86 @@ def infer_speed_root(grid_root: Path) -> Path:
     return Path(grid_root).parent / "speed_vectors"
 
 
+def resolve_analysis_dataset(dataset_root: Path, *, continuous: bool = False) -> Path:
+    """Select an explicitly requested combined recording, never a sibling block.
+
+    Both the historical ``continous_stitched`` spelling and
+    ``continuous_stitched`` are accepted. Multiple groups require an exact path.
+    """
+    root = Path(dataset_root)
+    if not continuous or (root / "block_combination.json").is_file():
+        return root
+    containers = ([root] if root.name in {"continous_stitched", "continuous_stitched"}
+                  else [root / name for name in ("continous_stitched", "continuous_stitched")])
+    candidates = []
+    for container in containers:
+        if (container / "per_track").is_dir():
+            candidates.append(container)
+        else:
+            candidates.extend(path.parent for path in sorted(container.glob("*/block_combination.json")))
+    if len(candidates) == 1:
+        return candidates[0]
+    if candidates:
+        raise ValueError("Multiple continuous recordings; pass the exact group folder:\n"
+                         + "\n".join(map(str, candidates)))
+    raise FileNotFoundError(f"No continuous recording under {root}; run tracking/colony/combine_blocks.py first")
+
+
+def resolve_stitched_root(dataset_root: Path) -> Path:
+    """Accept a block folder or a direct stitched/combined recording folder."""
+    root = Path(dataset_root)
+    if ((root / "per_track").is_dir() or (root / "block_combination.json").is_file()
+            or root.name in {"stitched", "continous_stitched", "continuous_stitched"}):
+        return root
+    return root / "stitched"
+
+
+def is_combined_recording(dataset_root: Path) -> bool:
+    root = resolve_stitched_root(dataset_root)
+    return ((root / "block_combination.json").is_file()
+            or root.name in {"continous_stitched", "continuous_stitched"})
+
+
+def recording_context(dataset_root: Path, tracks: pd.DataFrame) -> dict:
+    """Use the combination's full timeline, including unobserved boundary gaps."""
+    root = Path(dataset_root)
+    manifest = resolve_stitched_root(root) / "block_combination.json"
+    if manifest.is_file():
+        meta = json.loads(manifest.read_text())
+        start = datetime.fromisoformat(meta["start_datetime"])
+        return dict(start_clock_seconds=start.hour * 3600 + start.minute * 60 + start.second,
+                    recording_date=start.strftime("%Y%m%d"), frame_min=0,
+                    frame_stop=int(meta["num_frames"]), fps=float(meta["fps"]),
+                    blocks=[block["name"] for block in meta["blocks"]])
+    if root.name == "stitched":
+        root = root.parent
+    return dict(start_clock_seconds=start_time_from_track_table(tracks),
+                recording_date=root.parent.name, frame_min=int(tracks.frame_min.min()),
+                frame_stop=int(tracks.frame_max.max()) + 1, blocks=[])
+
+
+def resolve_grid_root(dataset_root: Path, output_name: str | None = None) -> Path:
+    """Prefer the pipeline cache, with explicit selection for alternate grids."""
+    stitched = resolve_stitched_root(dataset_root)
+    if output_name is not None:
+        chosen = stitched / output_name
+        if not metadata_paths(chosen):
+            raise FileNotFoundError(f"No grid occupancy metadata in requested cache: {chosen}")
+        return chosen
+    canonical = stitched / "grid_occupancy_histograms"
+    if metadata_paths(canonical):
+        return canonical
+    alternatives = sorted(path for path in stitched.glob("grid_occupancy_histograms_*")
+                          if metadata_paths(path))
+    if len(alternatives) == 1:
+        return alternatives[0]
+    if len(alternatives) > 1:
+        raise ValueError("Multiple alternate grid caches; set GRID_OUTPUT_NAME or ANTS_GRID_OUTPUT_NAME:\n"
+                         + "\n".join(map(str, alternatives)))
+    raise FileNotFoundError(f"No grid occupancy cache under {stitched}; expected {canonical}. "
+                            "Run analysis/compute_track_grid_occupancy.py first.")
+
+
 def load_grid_tracks(grid_root: Path) -> pd.DataFrame:
     rows = []
     for metadata_path in metadata_paths(Path(grid_root)):
@@ -104,6 +191,7 @@ def load_grid_tracks(grid_root: Path) -> pd.DataFrame:
                 "input_x_origin_px": float(meta.get("input_x_origin_px", 0.0)),
                 "side_x0_px": float(meta.get("side_x0_px", meta.get("input_x_origin_px", 0.0))),
                 "y_origin_px": float(meta.get("y_origin_px", 0.0)),
+                "arena_bounds_px": meta.get("arena_bounds_px"),
             }
         )
 
@@ -340,6 +428,14 @@ def display_histogram(hist: np.ndarray, mode: str) -> np.ndarray:
     raise ValueError("mode must be one of: linear, sqrt, log1p")
 
 
+def _limit_to_arena(ax, row):
+    bounds = row.get("arena_bounds_px")
+    if isinstance(bounds, dict):
+        scale = float(row["mm_per_px"])
+        ax.set_xlim(0, (bounds["x_max_px"] - bounds["x_min_px"]) * scale)
+        ax.set_ylim(0, (bounds["y_max_px"] - bounds["y_min_px"]) * scale)
+
+
 def plot_single_histogram(
     tracks: pd.DataFrame,
     *,
@@ -370,6 +466,7 @@ def plot_single_histogram(
         cmap=cmap,
     )
     label = f"{row['side']} track {row['track_id']} row {row.name}"
+    _limit_to_arena(ax, row)
     ax.set_title(f"Grid occupancy: {label}")
     ax.set_xlabel("x within colony side (mm)")
     ax.set_ylabel("y (mm)")
@@ -666,6 +763,7 @@ def plot_cluster_mean_histograms(
             cmap=cmap,
         )
         n = int((cluster_table[cluster_col] == cluster).sum())
+        _limit_to_arena(ax, first_row)
         ax.set_title(f"cluster {cluster} n={n}")
         ax.set_xlabel("x (mm)")
         ax.set_ylabel("y (mm)")
@@ -749,6 +847,7 @@ def plot_cluster_example_histograms(
             vmax=vmax,
             cmap=cmap,
         )
+        _limit_to_arena(ax, track_row)
         ax.set_title(f"c{cluster} row {track_row.name} id {track_row['track_id']}", fontsize=9)
         ax.set_xlabel("x (mm)")
         ax.set_ylabel("y (mm)")
@@ -1247,6 +1346,7 @@ def plot_cluster_speed_timeseries(
             ax,
             start_clock_seconds,
             float(plot_df["time_h"].max()),
+            min_time_h=float(plot_df["time_h"].min()),
             light_off_hour=light_off_hour,
             light_on_hour=light_on_hour,
         )
@@ -1265,7 +1365,9 @@ def plot_cluster_speed_timeseries(
     if start_clock_seconds is None:
         ax.set_xlabel("Elapsed time (h)")
     else:
-        ax.set_xlabel(f"Elapsed time from {format_clock_time(start_clock_seconds)} (h)")
+        ax.xaxis.set_major_formatter(FuncFormatter(
+            lambda hours, _: format_clock_time(start_clock_seconds + hours * 3600)))
+        ax.set_xlabel("Recording clock time (HH:MM)")
     ax.set_ylabel("Mean speed (mm/s)")
     ax.set_title(title or f"Speed by {cluster_col}, {smooth_seconds / 60:g} min smoothing")
     if ylim is not None:
@@ -1320,8 +1422,10 @@ def load_panorama_regions(
     """Load panorama annotations expressed in raw tracking-pixel coordinates.
 
     Explicit label suffixes (``_L``, ``_R``, ``left``, or ``right``) take
-    precedence. Unsuffixed labels such as ``water`` require ``x_split_px`` and
-    are assigned to a colony from the region center in tracking coordinates.
+    precedence. Unsuffixed labels are assigned from their tracking x position.
+    With two arena rectangles and no explicit split, use the midpoint of the
+    horizontal gap between them; colony rectangles are the legacy fallback.
+    Otherwise supply ``x_split_px`` explicitly.
     When a split is supplied, explicit labels are checked against geometry so
     a swapped annotation fails loudly.
     """
@@ -1386,17 +1490,33 @@ def load_panorama_regions(
         names = regions.loc[center_x.isna(), "name"].astype(str).to_list()
         raise ValueError(f"Could not determine tracking x center for regions: {names}")
 
-    if x_split_px is None:
-        unsuffixed = regions["label_side"].isna()
-        if unsuffixed.any():
+    if x_split_px is None and regions["label_side"].isna().any():
+        anchor_type = "arena" if regions["region_type"].eq("arena").any() else "colony"
+        anchors = regions.assign(_center_x=center_x)
+        anchors = anchors[anchors["region_type"].eq(anchor_type)].sort_values("_center_x")
+        if len(anchors) == 2 and anchors["shape"].eq("rectangle").all():
+            left_edge = float(anchors.iloc[0]["tracking_x_max_px"])
+            right_edge = float(anchors.iloc[1]["tracking_x_min_px"])
+            tolerance = ARENA_BORDER_TOLERANCE_PX if anchor_type == "arena" else 0.0
+            if (not np.isfinite([left_edge, right_edge]).all()
+                    or left_edge - right_edge > tolerance
+                    or anchors.iloc[0]["_center_x"] >= anchors.iloc[1]["_center_x"]):
+                raise ValueError(f"{anchor_type.capitalize()} regions overlap in x; specify x_split_px for side assignment")
+            x_split_px = (left_edge + right_edge) / 2
+        else:
+            unsuffixed = regions["label_side"].isna()
             labels = regions.loc[unsuffixed, "semantic_label"].astype(str).unique().tolist()
             raise ValueError(
-                "Panorama labels without an explicit colony side require x_split_px; "
+                f"Inferring colony sides requires two separated {anchor_type} rectangles or x_split_px; "
                 f"unsuffixed labels: {labels}"
             )
+
+    if x_split_px is None:
         regions["geometry_side"] = pd.NA
     else:
         split = float(x_split_px)
+        if not np.isfinite(split):
+            raise ValueError("x_split_px must be finite")
         regions["geometry_side"] = np.where(center_x.to_numpy(float) < split, "left", "right")
         mismatch = regions["label_side"].notna() & regions["label_side"].ne(regions["geometry_side"])
         if bool(validate_side_geometry) and mismatch.any():
@@ -1405,6 +1525,7 @@ def load_panorama_regions(
                 ["name", "semantic_label", "label_side", "geometry_side"],
             ].to_dict("records")
             raise ValueError(f"Panorama region label/geometry side mismatch: {details}")
+    regions["side_split_x_px"] = x_split_px
 
     regions["side"] = regions["label_side"].where(
         regions["label_side"].notna(),
@@ -1720,9 +1841,13 @@ def plot_cluster_colony_use(
     return summary
 
 
-def plot_ant_inside_outside_colony_distribution(colony_use: pd.DataFrame) -> None:
+def plot_ant_inside_outside_colony_distribution(colony_use: pd.DataFrame, *, side: str | None = None) -> None:
     """Show every ant's observed inside/outside composition, sorted within side."""
     sides = [side for side in ("left", "right") if side in set(colony_use["side"].astype(str))]
+    sides = [s for s in sides if side is None or s == side]
+    if not sides:
+        return
+    prefix = f"{side.capitalize()} colony — " if side is not None else ""
     fig, axes = plt.subplots(1, len(sides), figsize=(7.2 * len(sides), 10.0), squeeze=False, sharex=True)
     for column, side in enumerate(sides):
         ax = axes[0, column]
@@ -1764,7 +1889,7 @@ def plot_ant_inside_outside_colony_distribution(colony_use: pd.DataFrame) -> Non
         ax.grid(True, axis="x", alpha=0.2)
         if column == 0:
             ax.legend(loc="lower right", fontsize=8)
-    fig.suptitle("Distribution of observed time inside versus outside the colony across ants")
+    fig.suptitle(prefix + "Observed time inside versus outside the colony")
     fig.subplots_adjust(left=0.07, right=0.98, top=0.91, bottom=0.07, wspace=0.18)
     plt.show()
 
@@ -1772,6 +1897,7 @@ def plot_ant_inside_outside_colony_distribution(colony_use: pd.DataFrame) -> Non
 def plot_colony_use_vs_trip_investment(
     colony_use: pd.DataFrame,
     trip_investment: pd.DataFrame,
+    *, side: str | None = None,
 ) -> pd.DataFrame:
     """Relate per-ant outside-colony time to trip frequency and duration."""
     from scipy.stats import pearsonr, spearmanr
@@ -1808,6 +1934,10 @@ def plot_colony_use_vs_trip_investment(
         ),
     )
     sides = [side for side in ("left", "right") if side in set(merged["side"].astype(str))]
+    sides = [s for s in sides if side is None or s == side]
+    if not sides:
+        return pd.DataFrame()
+    prefix = f"{side.capitalize()} colony — " if side is not None else ""
     fig, axes = plt.subplots(len(sides), 2, figsize=(13.5, 5.2 * len(sides)), squeeze=False)
     correlation_rows: list[dict[str, object]] = []
     for row, side in enumerate(sides):
@@ -1877,7 +2007,7 @@ def plot_colony_use_vs_trip_investment(
             )
             ax.grid(True, which="both", alpha=0.2)
     fig.suptitle(
-        "Does inside/outside colony use predict trip investment? Horizontal bars are 95% confidence intervals"
+        prefix + "Does inside/outside colony use predict trip investment?\nHorizontal bars are 95% confidence intervals"
     )
     fig.tight_layout()
     plt.show()

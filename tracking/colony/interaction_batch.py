@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Batch submit directed ant-ant interaction jobs for chunk track parquets."""
+"""Batch submit undirected skeleton-distance interaction jobs for track chunks."""
 
 from __future__ import annotations
 
@@ -17,7 +17,9 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
-from tracking.colony.interaction_one_chunk import process_chunk  # noqa: E402
+from tracking.colony.interaction_one_chunk import (  # noqa: E402
+    DEFAULT_MICRO_DISTANCE_MM, cache_matches, interaction_parameters, process_chunk,
+)
 
 
 SIDES = ("left", "right")
@@ -61,6 +63,7 @@ def discover_jobs(
     sides: Iterable[str],
     skip_existing: bool,
     chunks: set[str] | None,
+    parameters: dict | None = None,
 ) -> list[InteractionJob]:
     jobs: list[InteractionJob] = []
     sides_set = set(sides)
@@ -75,7 +78,7 @@ def discover_jobs(
             continue
 
         output_file = output_path / chunk_file.name
-        if skip_existing and output_file.exists():
+        if skip_existing and parameters is not None and cache_matches(output_file, chunk_file, parameters):
             continue
         jobs.append(
             InteractionJob(
@@ -169,7 +172,7 @@ def write_worker_script(
                 f'echo "Chunk file: {job.chunk_file}"',
                 f'echo "Output file: {job.output_file}"',
                 f'echo "Python command: {python_cmd}"',
-                "python --version || true",
+                f"{python_cmd} --version || true",
                 "",
                 " ".join(
                     [
@@ -418,9 +421,9 @@ def main() -> None:
     parser.add_argument("--transfer_job_id_file", type=Path, default=None)
     parser.add_argument("--bucket_output_path", type=Path, default=None)
     parser.add_argument("--mm_per_px", type=float, default=0.016)
-    parser.add_argument("--interaction_radius_mm", type=float, default=8.0)
-    parser.add_argument("--micro_interaction_distance_mm", type=float, default=1.0)
-    parser.add_argument("--antenna_bodypoint", action="append", type=int, default=None)
+    parser.add_argument("--interaction_radius_mm", type=float, default=8.0, help="Deprecated; ignored by skeleton-distance detection")
+    parser.add_argument("--micro_interaction_distance_mm", type=float, default=DEFAULT_MICRO_DISTANCE_MM)
+    parser.add_argument("--antenna_bodypoint", action="append", type=int, default=None, help="Deprecated; all skeleton nodes are used")
     parser.add_argument("--frame_start", type=int, default=0)
     parser.add_argument("--max_frames", default=None, help="None/all means process each full chunk.")
     parser.add_argument("--frame_step", type=int, default=1)
@@ -447,6 +450,10 @@ def main() -> None:
         sides=parse_sides(args.side),
         skip_existing=bool(args.skip_existing),
         chunks=chunks,
+        parameters=interaction_parameters(mm_per_px=args.mm_per_px, interaction_radius_mm=args.interaction_radius_mm,
+                                          micro_interaction_distance_mm=args.micro_interaction_distance_mm,
+                                          antenna_bodypoints=antenna_bodypoints, frame_start=args.frame_start,
+                                          max_frames=parse_optional_int(args.max_frames), frame_step=args.frame_step),
     )
     complete_marker_path = args.complete_marker_path or (args.output_path / "interactions_complete.ok")
     if not jobs:

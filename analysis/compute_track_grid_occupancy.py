@@ -20,7 +20,7 @@ DEFAULT_X_MIN_PX = -6884.0
 DEFAULT_X_MAX_PX = 10831.0
 DEFAULT_Y_MIN_PX = -5280.0
 DEFAULT_Y_MAX_PX = 8097.0
-DEFAULT_GRID_SIZE_MM = 1.0
+DEFAULT_GRID_SIZE_MM = 0.25
 DEFAULT_GRID_PAD_MM = 10.0
 DEFAULT_BOUNDS_QUANTILE = 0.001
 DEFAULT_BOUNDS_SAMPLE_STRIDE = 240
@@ -376,6 +376,7 @@ def compute_grid_occupancy(
     input_x_is_side_local: bool,
     same_shape_sides: bool,
     grid_pad_mm: float,
+    arena_bounds_px: dict[str, float] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, int | float]]:
     side_x0_px, side_x1_px = side_bounds_px(
         side,
@@ -383,6 +384,15 @@ def compute_grid_occupancy(
         x_split_px=float(x_split_px),
         x_max_px=float(x_max_px),
     )
+    if arena_bounds_px is not None:
+        if same_shape_sides or input_x_is_side_local or grid_pad_mm != 0:
+            raise ValueError("Arena grids require raw/global coordinates, zero padding, and separate side shapes")
+        side_x0_px = float(arena_bounds_px["x_min_px"])
+        side_x1_px = float(arena_bounds_px["x_max_px"])
+        y_min_px = float(arena_bounds_px["y_min_px"])
+        y_max_px = float(arena_bounds_px["y_max_px"])
+        if not np.isfinite([side_x0_px, side_x1_px, y_min_px, y_max_px]).all() or side_x0_px >= side_x1_px:
+            raise ValueError("Invalid arena rectangle bounds")
     if not y_min_px < y_max_px:
         raise ValueError(f"Expected y_min_px < y_max_px, got {y_min_px}, {y_max_px}")
 
@@ -420,6 +430,11 @@ def compute_grid_occupancy(
         & (y_mm >= float(y_edges_mm[0]))
         & (y_mm <= float(y_edges_mm[-1]))
     )
+    if arena_bounds_px is not None:
+        # The last fixed-width bin can extend beyond the drawn border. Do not
+        # admit those detections merely because they fit in that partial bin.
+        in_grid &= ((x_px >= side_x0_px) & (x_px <= side_x1_px)
+                    & (y_px >= y_min_px) & (y_px <= y_max_px))
 
     counts, _, _ = np.histogram2d(
         y_mm[in_grid],

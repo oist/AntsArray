@@ -1346,6 +1346,659 @@ def plot_single_ant_sleep_predictions_interactions(
     return plot_df
 
 
+def _read_bodypoint_xy_rows(
+    track_path: Path,
+    *,
+    frame_start: Optional[int] = None,
+    frame_stop: Optional[int] = None,
+) -> pd.DataFrame:
+    from analysis import sleep_classifier_features as scf
+
+    track_path = Path(track_path)
+    read_cols = ["Frame", "Bodypoint", "X", "Y"]
+    try:
+        import pyarrow.compute as pc
+        import pyarrow.dataset as ds
+
+        filt = None
+        if frame_start is not None:
+            filt = pc.field("Frame") >= int(frame_start)
+        if frame_stop is not None:
+            right = pc.field("Frame") < int(frame_stop)
+            filt = right if filt is None else filt & right
+        table = ds.dataset(track_path, format="parquet").to_table(
+            columns=read_cols,
+            filter=filt,
+            use_threads=True,
+        )
+        rows = table.to_pandas()
+    except Exception:
+        rows = pd.read_parquet(track_path, columns=read_cols)
+        if frame_start is not None:
+            rows = rows[pd.to_numeric(rows["Frame"], errors="coerce") >= int(frame_start)]
+        if frame_stop is not None:
+            rows = rows[pd.to_numeric(rows["Frame"], errors="coerce") < int(frame_stop)]
+
+    missing = set(read_cols).difference(rows.columns)
+    if missing:
+        raise ValueError(f"{track_path.name} missing required columns: {sorted(missing)}")
+
+    for col in ["Frame", "Bodypoint"]:
+        rows[col] = pd.to_numeric(rows[col], errors="coerce")
+    for col in ["X", "Y"]:
+        rows[col] = pd.to_numeric(rows[col], errors="coerce")
+    rows = rows.dropna(subset=["Frame", "Bodypoint", "X", "Y"]).copy()
+    if rows.empty:
+        return rows
+    rows["Frame"] = rows["Frame"].round().astype(np.int64)
+    rows["Bodypoint"] = rows["Bodypoint"].round().astype(np.int64)
+    return rows.sort_values(["Bodypoint", "Frame"], kind="mergesort").reset_index(drop=True)
+
+
+def _fill_short_false_gaps(mask: np.ndarray, max_gap_frames: int) -> np.ndarray:
+    out = np.asarray(mask, dtype=bool).copy()
+    max_gap_frames = int(max(0, max_gap_frames))
+    if out.size == 0 or max_gap_frames <= 0:
+        return out
+
+    false_runs = contiguous_true_runs(~out)
+    for start, stop in false_runs:
+        if start == 0 or stop == len(out):
+            continue
+        if stop - start <= max_gap_frames and out[start - 1] and out[stop]:
+            out[start:stop] = True
+    return out
+
+
+def _keep_true_runs_at_least(mask: np.ndarray, min_frames: int) -> np.ndarray:
+    out = np.zeros(len(mask), dtype=bool)
+    min_frames = max(1, int(min_frames))
+    for start, stop in contiguous_true_runs(np.asarray(mask, dtype=bool)):
+        if stop - start >= min_frames:
+            out[start:stop] = True
+    return out
+
+
+def _smooth_by_bodypoint(
+    speed_rows: pd.DataFrame,
+    *,
+    smooth_frames: int,
+    min_periods: int,
+) -> pd.Series:
+    speed = pd.to_numeric(speed_rows["bodypoint_speed_mm_s"], errors="coerce")
+    if smooth_frames <= 1:
+        return speed
+    return (
+        speed_rows.assign(_speed=speed)
+        .groupby("Bodypoint", sort=False)["_speed"]
+        .rolling(window=int(smooth_frames), center=True, min_periods=int(min_periods))
+        .mean()
+        .reset_index(level=0, drop=True)
+        .sort_index()
+    )
+
+
+def bodypoint_sleep_state_for_track_path(
+    track_path: Path,
+    *,
+    fps: float = 24.0,
+    mm_per_px: float = 0.016,
+    speed_threshold_mm_s: float = 1.0,
+    min_low_bodypoint_fraction: float = 0.80,
+    min_valid_bodypoint_fraction: float = 0.60,
+    min_sleep_seconds: float = 60.0,
+    allowed_movement_seconds: float = 3.0,
+    speed_smooth_seconds: float = 2.0,
+    max_bodypoint_speed_mm_s: Optional[float] = 50.0,
+    expected_bodypoints: Optional[int] = None,
+    frame_start: Optional[int] = None,
+    frame_stop: Optional[int] = None,
+) -> dict[str, object]:
+    """Classify sleep from all-bodypoint low motion for one stitched track.
+
+    A frame has low-motion evidence when enough bodypoints are valid and at
+    least ``min_low_bodypoint_fraction`` of those bodypoints are moving slower
+    than ``speed_threshold_mm_s``. Short interruptions are bridged, then only
+    low-motion runs lasting ``min_sleep_seconds`` or longer are marked sleep.
+    """
+
+    track_path = Path(track_path)
+    fps = float(fps)
+    mm_per_px = float(mm_per_px)
+    rows = _read_bodypoint_xy_rows(track_path, frame_start=frame_start, frame_stop=frame_stop)
+    if rows.empty:
+        start = int(frame_start or 0)
+        stop = int(frame_stop or start)
+        state = np.full(max(0, stop - start), -1, dtype=np.int8)
+        summary = {
+            "track_path": str(track_path),
+            "track_name": track_path.name,
+            "frame_min": start,
+            "frame_max": stop - 1 if stop > start else None,
+            "n_frames": int(len(state)),
+            "n_observed_pose_frames": 0,
+            "n_bodypoints": int(expected_bodypoints or 0),
+            "n_sleep_frames": 0,
+            "n_classified_frames": 0,
+            "sleep_fraction_classified_frames": np.nan,
+            "classifiable_fraction_frames": np.nan,
+            "median_valid_bodypoints": np.nan,
+            "median_low_bodypoint_fraction": np.nan,
+            "median_bodypoint_speed_mm_s": np.nan,
+            "q90_bodypoint_speed_mm_s": np.nan,
+            "n_sleep_bouts": 0,
+        }
+        return {"state": state, "frame_min": start, "fps": fps, "summary": summary, "bouts": pd.DataFrame()}
+
+    data_start = int(rows["Frame"].min())
+    data_stop = int(rows["Frame"].max()) + 1
+    start = data_start if frame_start is None else int(frame_start)
+    stop = data_stop if frame_stop is None else int(frame_stop)
+    if stop <= start:
+        raise ValueError(f"Empty frame interval for {track_path}: start={start}, stop={stop}")
+
+    n_frames = int(stop - start)
+    bodypoints = sorted(rows["Bodypoint"].dropna().astype(int).unique())
+    n_bodypoints = int(expected_bodypoints or len(bodypoints))
+    min_valid_bodypoints = max(1, int(np.ceil(n_bodypoints * float(min_valid_bodypoint_fraction))))
+
+    grouped = rows.groupby("Bodypoint", sort=False)
+    previous_frame = grouped["Frame"].shift(1)
+    dx = grouped["X"].diff().to_numpy(np.float64)
+    dy = grouped["Y"].diff().to_numpy(np.float64)
+    frames = rows["Frame"].to_numpy(np.int64, copy=False)
+    consecutive = (frames == (previous_frame.to_numpy(np.float64) + 1))
+    speed = np.sqrt(dx * dx + dy * dy) * mm_per_px * fps
+    valid_speed = consecutive & np.isfinite(speed)
+    if max_bodypoint_speed_mm_s is not None:
+        valid_speed &= speed <= float(max_bodypoint_speed_mm_s)
+
+    speed_rows = rows.loc[valid_speed, ["Frame", "Bodypoint"]].copy()
+    speed_rows["bodypoint_speed_mm_s"] = speed[valid_speed].astype(np.float32, copy=False)
+    if speed_rows.empty:
+        state = np.full(n_frames, -1, dtype=np.int8)
+        summary = {
+            "track_path": str(track_path),
+            "track_name": track_path.name,
+            "frame_min": start,
+            "frame_max": stop - 1,
+            "n_frames": n_frames,
+            "n_observed_pose_frames": int(rows["Frame"].nunique()),
+            "n_bodypoints": n_bodypoints,
+            "n_sleep_frames": 0,
+            "n_classified_frames": 0,
+            "sleep_fraction_classified_frames": np.nan,
+            "classifiable_fraction_frames": 0.0,
+            "median_valid_bodypoints": 0.0,
+            "median_low_bodypoint_fraction": np.nan,
+            "median_bodypoint_speed_mm_s": np.nan,
+            "q90_bodypoint_speed_mm_s": np.nan,
+            "n_sleep_bouts": 0,
+        }
+        return {"state": state, "frame_min": start, "fps": fps, "summary": summary, "bouts": pd.DataFrame()}
+
+    smooth_frames = max(1, int(round(float(speed_smooth_seconds) * fps)))
+    min_periods = max(1, int(np.ceil(smooth_frames * 0.25)))
+    speed_rows["motion_speed_mm_s"] = _smooth_by_bodypoint(
+        speed_rows,
+        smooth_frames=smooth_frames,
+        min_periods=min_periods,
+    ).to_numpy(np.float32, copy=False)
+    speed_rows = speed_rows[np.isfinite(speed_rows["motion_speed_mm_s"])].copy()
+    speed_rows["is_low_motion_bodypoint"] = (
+        speed_rows["motion_speed_mm_s"].to_numpy(np.float32, copy=False) <= float(speed_threshold_mm_s)
+    )
+
+    frame_stats = (
+        speed_rows.groupby("Frame", sort=True)
+        .agg(
+            n_valid_bodypoints=("Bodypoint", "nunique"),
+            n_low_bodypoints=("is_low_motion_bodypoint", "sum"),
+            median_bodypoint_speed_mm_s=("motion_speed_mm_s", "median"),
+        )
+        .reset_index()
+    )
+    frame_stats = frame_stats[(frame_stats["Frame"] >= start) & (frame_stats["Frame"] < stop)].copy()
+
+    n_valid = np.zeros(n_frames, dtype=np.uint8)
+    low_fraction = np.full(n_frames, np.nan, dtype=np.float32)
+    median_speed = np.full(n_frames, np.nan, dtype=np.float32)
+    if not frame_stats.empty:
+        idx = frame_stats["Frame"].to_numpy(np.int64) - start
+        keep = (idx >= 0) & (idx < n_frames)
+        idx = idx[keep]
+        valid_counts = frame_stats["n_valid_bodypoints"].to_numpy(np.float64)[keep]
+        low_counts = frame_stats["n_low_bodypoints"].to_numpy(np.float64)[keep]
+        n_valid[idx] = np.clip(valid_counts, 0, np.iinfo(np.uint8).max).astype(np.uint8)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            low_fraction[idx] = (low_counts / valid_counts).astype(np.float32)
+        median_speed[idx] = frame_stats["median_bodypoint_speed_mm_s"].to_numpy(np.float32)[keep]
+
+    classifiable = n_valid >= min_valid_bodypoints
+    low_motion = classifiable & (low_fraction >= float(min_low_bodypoint_fraction))
+    bridged_low_motion = _fill_short_false_gaps(
+        low_motion,
+        max_gap_frames=int(round(float(allowed_movement_seconds) * fps)),
+    )
+    sleep_mask = _keep_true_runs_at_least(
+        bridged_low_motion,
+        min_frames=int(round(float(min_sleep_seconds) * fps)),
+    )
+
+    state = np.full(n_frames, -1, dtype=np.int8)
+    state[classifiable] = 0
+    state[sleep_mask] = 1
+    classified = state >= 0
+    sleep_frames = state == 1
+
+    bouts = []
+    for bout_id, (run_start, run_stop) in enumerate(contiguous_true_runs(sleep_frames)):
+        bout_speeds = median_speed[run_start:run_stop]
+        bouts.append(
+            {
+                "bout_id": int(bout_id),
+                "bout_start_frame": int(start + run_start),
+                "bout_end_frame": int(start + run_stop - 1),
+                "bout_duration_frames": int(run_stop - run_start),
+                "bout_duration_seconds": float((run_stop - run_start) / fps),
+                "time_h": float((start + run_start) / fps / 3600.0),
+                "bout_end_time_h": float((start + run_stop) / fps / 3600.0),
+                "mean_median_bodypoint_speed_mm_s": float(np.nanmean(bout_speeds)),
+                "max_median_bodypoint_speed_mm_s": float(np.nanmax(bout_speeds)),
+            }
+        )
+    bouts_df = pd.DataFrame(bouts)
+
+    finite_classifiable = classifiable & np.isfinite(low_fraction)
+    summary = {
+        "track_path": str(track_path),
+        "track_name": track_path.name,
+        "frame_min": start,
+        "frame_max": stop - 1,
+        "n_frames": n_frames,
+        "n_observed_pose_frames": int(rows["Frame"].nunique()),
+        "n_bodypoints": n_bodypoints,
+        "min_valid_bodypoints": int(min_valid_bodypoints),
+        "n_classified_frames": int(classified.sum()),
+        "n_sleep_frames": int(sleep_frames.sum()),
+        "sleep_fraction_classified_frames": float(sleep_frames.sum() / classified.sum()) if classified.any() else np.nan,
+        "classifiable_fraction_frames": float(classified.sum() / max(n_frames, 1)),
+        "raw_low_motion_fraction_classifiable_frames": (
+            float(low_motion[finite_classifiable].mean()) if finite_classifiable.any() else np.nan
+        ),
+        "median_valid_bodypoints": float(np.nanmedian(n_valid[classifiable])) if classifiable.any() else np.nan,
+        "median_low_bodypoint_fraction": (
+            float(np.nanmedian(low_fraction[finite_classifiable])) if finite_classifiable.any() else np.nan
+        ),
+        "median_bodypoint_speed_mm_s": float(np.nanmedian(median_speed[classifiable])) if classifiable.any() else np.nan,
+        "q90_bodypoint_speed_mm_s": float(np.nanquantile(speed_rows["motion_speed_mm_s"], 0.90)),
+        "n_sleep_bouts": int(len(bouts_df)),
+        "speed_threshold_mm_s": float(speed_threshold_mm_s),
+        "min_low_bodypoint_fraction": float(min_low_bodypoint_fraction),
+        "min_valid_bodypoint_fraction": float(min_valid_bodypoint_fraction),
+        "min_sleep_seconds": float(min_sleep_seconds),
+        "allowed_movement_seconds": float(allowed_movement_seconds),
+        "speed_smooth_seconds": float(speed_smooth_seconds),
+        "max_bodypoint_speed_mm_s": float(max_bodypoint_speed_mm_s) if max_bodypoint_speed_mm_s is not None else np.nan,
+    }
+    return {"state": state, "frame_min": start, "fps": fps, "summary": summary, "bouts": bouts_df}
+
+
+def bodypoint_sleep_state_for_track_row(
+    track_row: pd.Series,
+    *,
+    per_track_root: Optional[Path] = None,
+    fps: Optional[float] = None,
+    mm_per_px: float = 0.016,
+    speed_threshold_mm_s: float = 1.0,
+    min_low_bodypoint_fraction: float = 0.80,
+    min_valid_bodypoint_fraction: float = 0.60,
+    min_sleep_seconds: float = 60.0,
+    allowed_movement_seconds: float = 3.0,
+    speed_smooth_seconds: float = 2.0,
+    max_bodypoint_speed_mm_s: Optional[float] = 50.0,
+    expected_bodypoints: Optional[int] = None,
+    frame_start: Optional[int] = None,
+    frame_stop: Optional[int] = None,
+) -> dict[str, object]:
+    track_path = resolve_track_path_for_speed_row(track_row, per_track_root=per_track_root)
+    result = bodypoint_sleep_state_for_track_path(
+        track_path,
+        fps=float(fps if fps is not None else track_row.get("fps", 24.0)),
+        mm_per_px=mm_per_px,
+        speed_threshold_mm_s=speed_threshold_mm_s,
+        min_low_bodypoint_fraction=min_low_bodypoint_fraction,
+        min_valid_bodypoint_fraction=min_valid_bodypoint_fraction,
+        min_sleep_seconds=min_sleep_seconds,
+        allowed_movement_seconds=allowed_movement_seconds,
+        speed_smooth_seconds=speed_smooth_seconds,
+        max_bodypoint_speed_mm_s=max_bodypoint_speed_mm_s,
+        expected_bodypoints=expected_bodypoints,
+        frame_start=frame_start,
+        frame_stop=frame_stop,
+    )
+    summary = dict(result["summary"])
+    summary.update(
+        {
+            "track_id": track_row.get("track_id"),
+            "side": track_row.get("side"),
+            "speed_present_frac": track_row.get("present_frac"),
+        }
+    )
+    result["summary"] = summary
+    bouts = result["bouts"]
+    if isinstance(bouts, pd.DataFrame) and not bouts.empty:
+        bouts = bouts.copy()
+        bouts["track_name"] = track_row.get("track_name")
+        bouts["track_id"] = track_row.get("track_id")
+        bouts["side"] = track_row.get("side")
+        result["bouts"] = bouts
+    return result
+
+
+def compute_bodypoint_sleep_percent_timeseries(
+    tracks: pd.DataFrame,
+    *,
+    per_track_root: Path,
+    bin_seconds: float = 5 * 60.0,
+    side: Optional[str] = "both",
+    sleep_threshold: float = 0.5,
+    min_bin_classified_fraction: float = 0.25,
+    start_clock_seconds: Optional[int] = None,
+    mm_per_px: float = 0.016,
+    speed_threshold_mm_s: float = 1.0,
+    min_low_bodypoint_fraction: float = 0.80,
+    min_valid_bodypoint_fraction: float = 0.60,
+    min_sleep_seconds: float = 60.0,
+    allowed_movement_seconds: float = 3.0,
+    speed_smooth_seconds: float = 2.0,
+    max_bodypoint_speed_mm_s: Optional[float] = 50.0,
+    expected_bodypoints: Optional[int] = None,
+    frame_start: Optional[int] = None,
+    frame_stop: Optional[int] = None,
+    max_tracks_per_side: Optional[int] = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Compute colony sleep rates from bodypoint-speed threshold states."""
+    from analysis import colony_speed_utils as cs
+
+    chosen = tracks.copy()
+    if side not in (None, "both"):
+        chosen = chosen[chosen["side"] == side].copy()
+    if max_tracks_per_side is not None:
+        chosen = (
+            chosen.sort_values(["side", "track_id", "track_name"], kind="mergesort")
+            .groupby("side", sort=False)
+            .head(int(max_tracks_per_side))
+            .reset_index(drop=True)
+        )
+    if chosen.empty:
+        raise ValueError(f"No tracks selected for side={side!r}")
+
+    fps_values = chosen["fps"].dropna().unique()
+    if len(fps_values) == 0:
+        fps = 24.0
+    else:
+        fps = float(fps_values[0])
+        if len(fps_values) > 1:
+            print(f"WARNING: multiple FPS values for bodypoint sleep analysis: {fps_values}; using {fps}")
+    bin_frames = max(1, int(round(float(bin_seconds) * fps)))
+
+    if frame_start is None:
+        frame_start_for_bins = 0
+    else:
+        frame_start_for_bins = int(frame_start)
+    if frame_stop is None:
+        if "frame_max" in chosen.columns and chosen["frame_max"].notna().any():
+            frame_stop_for_bins = int(chosen["frame_max"].max()) + 1
+        else:
+            frame_stop_for_bins = frame_start_for_bins + bin_frames
+    else:
+        frame_stop_for_bins = int(frame_stop)
+    n_bins = max(1, int(np.ceil(max(0, frame_stop_for_bins - frame_start_for_bins) / bin_frames)))
+
+    sides = [value for value in ("left", "right") if value in set(chosen["side"])]
+    if not sides:
+        sides = sorted(chosen["side"].dropna().astype(str).unique())
+
+    n_sleeping_tracks = {side_name: np.zeros(n_bins, dtype=np.uint16) for side_name in sides}
+    n_classified_tracks = {side_name: np.zeros(n_bins, dtype=np.uint16) for side_name in sides}
+    n_sleep_frames = {side_name: np.zeros(n_bins, dtype=np.uint64) for side_name in sides}
+    n_classified_frames = {side_name: np.zeros(n_bins, dtype=np.uint64) for side_name in sides}
+    n_tracks_by_side = {side_name: int((chosen["side"] == side_name).sum()) for side_name in sides}
+    summaries: list[dict[str, object]] = []
+    bouts: list[pd.DataFrame] = []
+
+    for i, (_, row) in enumerate(chosen.iterrows(), start=1):
+        if i == 1 or i == len(chosen) or i % 10 == 0:
+            print(f"bodypoint sleep: loading {i}/{len(chosen)} {row['track_name']}", flush=True)
+        result = bodypoint_sleep_state_for_track_row(
+            row,
+            per_track_root=per_track_root,
+            fps=fps,
+            mm_per_px=mm_per_px,
+            speed_threshold_mm_s=speed_threshold_mm_s,
+            min_low_bodypoint_fraction=min_low_bodypoint_fraction,
+            min_valid_bodypoint_fraction=min_valid_bodypoint_fraction,
+            min_sleep_seconds=min_sleep_seconds,
+            allowed_movement_seconds=allowed_movement_seconds,
+            speed_smooth_seconds=speed_smooth_seconds,
+            max_bodypoint_speed_mm_s=max_bodypoint_speed_mm_s,
+            expected_bodypoints=expected_bodypoints,
+            frame_start=frame_start,
+            frame_stop=frame_stop,
+        )
+        summaries.append(dict(result["summary"]))
+        result_bouts = result["bouts"]
+        if isinstance(result_bouts, pd.DataFrame) and not result_bouts.empty:
+            bouts.append(result_bouts)
+
+        state = np.asarray(result["state"], dtype=np.int8)
+        if state.size == 0:
+            continue
+        side_name = str(row["side"])
+        if side_name not in n_sleeping_tracks:
+            n_sleeping_tracks[side_name] = np.zeros(n_bins, dtype=np.uint16)
+            n_classified_tracks[side_name] = np.zeros(n_bins, dtype=np.uint16)
+            n_sleep_frames[side_name] = np.zeros(n_bins, dtype=np.uint64)
+            n_classified_frames[side_name] = np.zeros(n_bins, dtype=np.uint64)
+            n_tracks_by_side[side_name] = 0
+
+        valid_idx = np.flatnonzero(state >= 0)
+        if len(valid_idx) == 0:
+            continue
+        global_frames = int(result["frame_min"]) + valid_idx
+        bin_idx = (global_frames - frame_start_for_bins) // bin_frames
+        keep = (bin_idx >= 0) & (bin_idx < n_bins)
+        if not keep.any():
+            continue
+        bin_idx = bin_idx[keep]
+        valid_idx = valid_idx[keep]
+        track_classified_frames = np.bincount(bin_idx, minlength=n_bins).astype(np.uint32, copy=False)[:n_bins]
+        track_sleep_frames = np.bincount(
+            bin_idx[state[valid_idx] == 1],
+            minlength=n_bins,
+        ).astype(np.uint32, copy=False)[:n_bins]
+        min_classified = max(1, int(round(bin_frames * float(min_bin_classified_fraction))))
+        classified_bins = track_classified_frames >= min_classified
+        if not classified_bins.any():
+            continue
+        sleep_fraction = np.zeros(n_bins, dtype=np.float32)
+        sleep_fraction[classified_bins] = (
+            track_sleep_frames[classified_bins] / track_classified_frames[classified_bins]
+        )
+        n_classified_tracks[side_name][classified_bins] += 1
+        n_sleeping_tracks[side_name][classified_bins & (sleep_fraction >= float(sleep_threshold))] += 1
+        n_sleep_frames[side_name] += track_sleep_frames.astype(np.uint64, copy=False)
+        n_classified_frames[side_name] += track_classified_frames.astype(np.uint64, copy=False)
+
+    time_h = (frame_start_for_bins + np.arange(n_bins) * bin_frames) / fps / 3600.0
+    out = pd.DataFrame({"time_h": time_h})
+    for side_name in sorted(n_classified_tracks):
+        classified_tracks = n_classified_tracks[side_name]
+        sleeping_tracks = n_sleeping_tracks[side_name]
+        percent_sleeping = np.full(n_bins, np.nan, dtype=np.float32)
+        keep = classified_tracks > 0
+        percent_sleeping[keep] = 100.0 * sleeping_tracks[keep] / classified_tracks[keep]
+
+        sleep_frame_percent = np.full(n_bins, np.nan, dtype=np.float32)
+        frame_keep = n_classified_frames[side_name] > 0
+        sleep_frame_percent[frame_keep] = (
+            100.0 * n_sleep_frames[side_name][frame_keep] / n_classified_frames[side_name][frame_keep]
+        )
+
+        out[f"{side_name}_percent_sleeping_ants"] = percent_sleeping
+        out[f"{side_name}_n_sleeping_tracks"] = sleeping_tracks
+        out[f"{side_name}_n_classified_tracks"] = classified_tracks
+        out[f"{side_name}_n_unclassified_tracks"] = int(n_tracks_by_side.get(side_name, 0)) - classified_tracks
+        out[f"{side_name}_sleep_frame_percent"] = sleep_frame_percent
+        out[f"{side_name}_n_sleep_frames"] = n_sleep_frames[side_name]
+        out[f"{side_name}_n_classified_frames"] = n_classified_frames[side_name]
+
+    if start_clock_seconds is not None:
+        out = cs.add_clock_columns(out, int(start_clock_seconds))
+
+    summary_df = pd.DataFrame(summaries)
+    bouts_df = pd.concat(bouts, ignore_index=True) if bouts else pd.DataFrame()
+    return out.reset_index(drop=True), summary_df, bouts_df
+
+
+def smooth_bodypoint_sleep_percent_timeseries(
+    timeseries: pd.DataFrame,
+    *,
+    smooth_seconds: float,
+    bin_seconds: float,
+) -> pd.DataFrame:
+    from analysis import colony_speed_utils as cs
+
+    out = timeseries.copy()
+    window_bins = max(1, int(round(float(smooth_seconds) / float(bin_seconds))))
+    for col in list(out.columns):
+        if col.endswith("_percent_sleeping_ants") or col.endswith("_sleep_frame_percent"):
+            out[f"smoothed_{col}"] = cs.rolling_nanmean(out[col].to_numpy(dtype=np.float32), window_bins)
+    return out
+
+
+def plot_bodypoint_sleep_percent_timeseries(
+    tracks: pd.DataFrame,
+    *,
+    per_track_root: Path,
+    bin_seconds: float = 5 * 60.0,
+    smooth_seconds: float = 30 * 60.0,
+    side: Optional[str] = "both",
+    sleep_threshold: float = 0.5,
+    min_bin_classified_fraction: float = 0.25,
+    start_clock_seconds: Optional[int] = None,
+    light_off_hour: float = 18.0,
+    light_on_hour: float = 6.0,
+    ylim: Optional[tuple[float, float]] = (0.0, 100.0),
+    mm_per_px: float = 0.016,
+    speed_threshold_mm_s: float = 1.0,
+    min_low_bodypoint_fraction: float = 0.80,
+    min_valid_bodypoint_fraction: float = 0.60,
+    min_sleep_seconds: float = 60.0,
+    allowed_movement_seconds: float = 3.0,
+    speed_smooth_seconds: float = 2.0,
+    max_bodypoint_speed_mm_s: Optional[float] = 50.0,
+    expected_bodypoints: Optional[int] = None,
+    frame_start: Optional[int] = None,
+    frame_stop: Optional[int] = None,
+    max_tracks_per_side: Optional[int] = None,
+) -> dict[str, pd.DataFrame]:
+    import matplotlib.pyplot as plt
+    from analysis import colony_speed_utils as cs
+
+    timeseries, summary, bouts = compute_bodypoint_sleep_percent_timeseries(
+        tracks,
+        per_track_root=per_track_root,
+        bin_seconds=bin_seconds,
+        side=side,
+        sleep_threshold=sleep_threshold,
+        min_bin_classified_fraction=min_bin_classified_fraction,
+        start_clock_seconds=start_clock_seconds,
+        mm_per_px=mm_per_px,
+        speed_threshold_mm_s=speed_threshold_mm_s,
+        min_low_bodypoint_fraction=min_low_bodypoint_fraction,
+        min_valid_bodypoint_fraction=min_valid_bodypoint_fraction,
+        min_sleep_seconds=min_sleep_seconds,
+        allowed_movement_seconds=allowed_movement_seconds,
+        speed_smooth_seconds=speed_smooth_seconds,
+        max_bodypoint_speed_mm_s=max_bodypoint_speed_mm_s,
+        expected_bodypoints=expected_bodypoints,
+        frame_start=frame_start,
+        frame_stop=frame_stop,
+        max_tracks_per_side=max_tracks_per_side,
+    )
+    plot_df = smooth_bodypoint_sleep_percent_timeseries(
+        timeseries,
+        smooth_seconds=smooth_seconds,
+        bin_seconds=bin_seconds,
+    )
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+    colors = {"left": "tab:blue", "right": "tab:orange"}
+    plotted_sides = []
+    for side_name in ("left", "right"):
+        col = f"smoothed_{side_name}_percent_sleeping_ants"
+        if col not in plot_df.columns:
+            continue
+        plotted_sides.append(side_name)
+        ax.plot(
+            plot_df["time_h"],
+            plot_df[col],
+            lw=1.8,
+            color=colors.get(side_name),
+            label=f"{side_name} colony",
+        )
+
+    if start_clock_seconds is not None and not plot_df.empty:
+        cs.add_light_lines(
+            ax,
+            int(start_clock_seconds),
+            float(plot_df["time_h"].max()),
+            light_off_hour=light_off_hour,
+            light_on_hour=light_on_hour,
+        )
+        ax.set_xlabel(f"Elapsed time from {cs.format_clock_time(int(start_clock_seconds))} (h)")
+    else:
+        ax.set_xlabel("Elapsed time (h)")
+    ax.set_ylabel("Sleeping ants (%)")
+    if ylim is not None:
+        ax.set_ylim(*ylim)
+    else:
+        ax.set_ylim(bottom=0.0)
+    ax.set_title(
+        "Bodypoint-threshold sleep over time "
+        f"(>= {min_sleep_seconds / 60:g} min low motion, "
+        f"{speed_threshold_mm_s:g} mm/s, {min_low_bodypoint_fraction:.0%} bodypoints)"
+    )
+    ax.legend(loc="best")
+    ax.grid(True, alpha=0.25)
+
+    count_ax = ax.twinx()
+    for side_name in plotted_sides:
+        count_col = f"{side_name}_n_classified_tracks"
+        if count_col in plot_df.columns:
+            count_ax.plot(
+                plot_df["time_h"],
+                plot_df[count_col],
+                lw=0.9,
+                alpha=0.45,
+                color=colors.get(side_name),
+                linestyle="--",
+                label=f"{side_name} classified tracks",
+            )
+    count_ax.set_ylabel("Classified tracks")
+    count_ax.set_ylim(bottom=0.0)
+
+    lines, labels = ax.get_legend_handles_labels()
+    count_lines, count_labels = count_ax.get_legend_handles_labels()
+    ax.legend(lines + count_lines, labels + count_labels, loc="best", fontsize=8)
+    fig.tight_layout()
+    plt.show()
+
+    return {"timeseries": plot_df, "track_summary": summary, "sleep_bouts": bouts}
+
+
 def resolve_track_path_for_speed_row(
     track_row: pd.Series,
     *,
@@ -3299,6 +3952,29 @@ def aligned_posture_points_for_states(
     if state_samples.empty:
         raise ValueError("No sampled posture frames remain for aligned heatmaps")
 
+    return aligned_posture_points_from_frame_states(
+        state_samples, mm_per_px=mm_per_px, body_bodypoint=body_bodypoint,
+        head_bodypoint=head_bodypoint, bodypoints=bodypoints, state_order=state_order,
+    )
+
+
+def aligned_posture_points_from_frame_states(
+    state_samples: pd.DataFrame, *, mm_per_px: float = 0.016,
+    body_bodypoint: int = 0, head_bodypoint: int = 1,
+    bodypoints: tuple[int, ...] = (0, 1, 4, 5, 6, 7, 8, 9),
+    state_order: tuple[str, ...] = ("sleep", "wake"),
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Align explicitly labelled track/frame samples without assigning sleep states."""
+    from analysis import sleep_classifier_features as scf
+
+    required = {"track_path", "Frame", "posture_state"}
+    if not required.issubset(state_samples.columns):
+        raise ValueError(f"Missing posture sample columns: {sorted(required - set(state_samples.columns))}")
+    if not np.isfinite(mm_per_px) or mm_per_px <= 0:
+        raise ValueError("mm_per_px must be positive and finite")
+    state_samples = state_samples[state_samples.posture_state.isin(state_order)].copy()
+    if state_samples.duplicated(["track_path", "Frame"]).any():
+        raise ValueError("Posture samples must have one state per track/frame")
     rows = []
     needed_bodypoints = tuple(dict.fromkeys([int(body_bodypoint), int(head_bodypoint), *[int(bp) for bp in bodypoints]]))
     metadata_cols = [
@@ -3371,12 +4047,15 @@ def aligned_posture_points_for_states(
         aligned_points.groupby("posture_state", observed=True)
         .agg(
             n_aligned_points=("aligned_x_mm", "size"),
-            n_frames=("Frame", "nunique"),
             n_tracks=("track_path", "nunique"),
             median_axis_length_mm=("axis_length_mm", "median"),
         )
         .reset_index()
     )
+    frame_counts = aligned_points.drop_duplicates(["track_path", "Frame"]).groupby(
+        "posture_state", observed=True,
+    ).size().rename("n_frames")
+    state_summary = state_summary.merge(frame_counts, on="posture_state", validate="one_to_one")
     return aligned_points, state_summary
 
 
@@ -3396,9 +4075,6 @@ def plot_aligned_posture_state_heatmaps(
     extent_quantile: float = 0.995,
     state_order: tuple[str, ...] = ("sleep", "non_sleep_quiescent", "non_quiescent"),
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    import matplotlib.pyplot as plt
-    from matplotlib.colors import LogNorm
-
     aligned_points, state_summary = aligned_posture_points_for_states(
         posture_samples,
         scored_quiescent_bins,
@@ -3410,6 +4086,33 @@ def plot_aligned_posture_state_heatmaps(
         random_state=random_state,
         state_order=state_order,
     )
+    fig, aligned_points, bodypoint_summary, state_summary = plot_aligned_posture_points(
+        aligned_points, state_summary, body_bodypoint=body_bodypoint, head_bodypoint=head_bodypoint,
+        bodypoints=bodypoints, skeleton_edges=skeleton_edges, bins=bins, extent_mm=extent_mm,
+        extent_quantile=extent_quantile, state_order=state_order,
+    )
+    import matplotlib.pyplot as plt
+    plt.show()
+    return aligned_points, bodypoint_summary, state_summary
+
+
+def plot_aligned_posture_points(
+    aligned_points: pd.DataFrame, state_summary: pd.DataFrame, *,
+    body_bodypoint: int = 0, head_bodypoint: int = 1,
+    bodypoints: tuple[int, ...] = (0, 1, 4, 5, 6, 7, 8, 9),
+    skeleton_edges: tuple[tuple[int, int], ...] = ((0, 1), (1, 4), (4, 5), (5, 6), (1, 7), (7, 8), (8, 9)),
+    bins: int = 160, extent_mm: float | None = None, extent_quantile: float = 0.995,
+    state_order: tuple[str, ...] = ("sleep", "non_sleep_quiescent", "non_quiescent"),
+    weight_col: str | None = None, title: str | None = None,
+):
+    """Shared density display for legacy states and cached motion-label samples."""
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import LogNorm
+
+    if bins < 2 or int(bins) != bins or not 0 < extent_quantile <= 1:
+        raise ValueError("Invalid posture histogram bins or extent quantile")
+    if extent_mm is not None and (not np.isfinite(extent_mm) or extent_mm <= 0):
+        raise ValueError("extent_mm must be positive and finite")
     aligned_points = aligned_points[aligned_points["bodypoint"].isin([int(bp) for bp in bodypoints])].copy()
     if aligned_points.empty:
         raise ValueError("No aligned points remain after applying bodypoint filter")
@@ -3427,6 +4130,18 @@ def plot_aligned_posture_state_heatmaps(
         )
         .reset_index()
     )
+    if weight_col is not None:
+        weights = aligned_points[weight_col].to_numpy(float)
+        if not np.isfinite(weights).all() or (weights <= 0).any():
+            raise ValueError("Posture weights must be positive and finite")
+        for index, row in bodypoint_summary.iterrows():
+            group = aligned_points[(aligned_points.posture_state == row.posture_state)
+                                   & (aligned_points.bodypoint == row.bodypoint)]
+            for coordinate in ("aligned_x_mm", "aligned_y_mm", "plot_x_mm", "plot_y_mm"):
+                ordered = group.sort_values(coordinate)
+                cumulative = ordered[weight_col].cumsum().to_numpy()
+                bodypoint_summary.loc[index, "median_" + coordinate] = ordered[coordinate].iloc[
+                    np.searchsorted(cumulative, cumulative[-1] / 2)]
 
     if extent_mm is None:
         xy_abs = np.abs(
@@ -3453,8 +4168,10 @@ def plot_aligned_posture_state_heatmaps(
             group["plot_x_mm"].to_numpy(np.float64),
             group["plot_y_mm"].to_numpy(np.float64),
             bins=[edges, edges],
+            weights=group[weight_col].to_numpy(float) if weight_col else None,
         )
-        prob = hist / hist.sum() if hist.sum() > 0 else hist
+        total = float(group[weight_col].sum()) if weight_col else float(hist.sum())
+        prob = hist / total if total > 0 else hist
         histograms[state] = prob
         positive_values.append(prob[prob > 0])
     positive = np.concatenate(positive_values) if positive_values else np.asarray([], dtype=np.float64)
@@ -3465,6 +4182,7 @@ def plot_aligned_posture_state_heatmaps(
 
     labels = {
         "sleep": "sleep",
+        "wake": "wake",
         "non_sleep_quiescent": "non-sleep quiescent",
         "non_quiescent": "non-quiescent",
     }
@@ -3523,7 +4241,11 @@ def plot_aligned_posture_state_heatmaps(
                 )
         state_row = state_summary[state_summary["posture_state"].astype(str) == str(state)]
         n_frames = int(state_row["n_frames"].iloc[0]) if not state_row.empty else 0
-        ax.set_title(f"{labels.get(state, state)}\nframes={n_frames:,}")
+        n_tracks = int(state_row["n_tracks"].iloc[0]) if not state_row.empty else 0
+        counts = f"frames={n_frames:,}" + (f", ants={n_tracks}" if weight_col else "")
+        ax.set_title(f"{labels.get(state, state)}\n{counts}")
+        if not n_frames:
+            ax.text(.5, .5, "No valid classified poses", color="white", ha="center", transform=ax.transAxes)
         ax.axhline(0, color="white", lw=0.4, alpha=0.35)
         ax.axvline(0, color="white", lw=0.4, alpha=0.35)
         ax.set_aspect("equal", adjustable="box")
@@ -3536,10 +4258,9 @@ def plot_aligned_posture_state_heatmaps(
     if image is not None:
         fig.colorbar(image, ax=axes.ravel().tolist(), label="probability per spatial bin")
     fig.suptitle(
-        f"Posture density after aligning bodypoint {body_bodypoint} -> {head_bodypoint} to +x, rotated 90 deg CCW"
+        title or f"Posture density after aligning bodypoint {body_bodypoint} -> {head_bodypoint} to +x, rotated 90 deg CCW"
     )
-    plt.show()
-    return aligned_points, bodypoint_summary, state_summary
+    return fig, aligned_points, bodypoint_summary, state_summary
 
 
 def get_event_trig_avg(sig, event_inds, backlag, forwardlag):

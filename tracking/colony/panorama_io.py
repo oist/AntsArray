@@ -258,6 +258,11 @@ def load_sleap_pkl(path: Path) -> pd.DataFrame:
 
 
 def load_aruco_pkl(path: Path) -> tuple[pd.DataFrame, int]:
+    """Load all candidates, including repeated Frame/Instance/Cam tuples.
+
+    Instance is a tag ID, not a unique detection-row key. Identity assignment
+    happens in the tracker after panorama mapping and the colony split.
+    """
     det, num_frames = unwrap_panorama_payload(path, detector="ARUCO")
     if num_frames is None or num_frames <= 0:
         raise ValueError(f"ARUCO payload missing positive num_frames: {path}")
