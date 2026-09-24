@@ -89,7 +89,7 @@ def intrinsic_directions(xy):
     return body, np.concatenate([axis_length[...,None],lengths],axis=-1)
 
 
-def prepare(block,run):
+def prepare(block,run,all_tracks=False):
     """Cohort is determined from detection coverage, never spatial membership."""
     if block.parent.name!='20260724' or block.name!='block01':
         raise ValueError('This protocol is scoped to 20260724/block01')
@@ -100,7 +100,7 @@ def prepare(block,run):
         sm_path=block/'stitched/speed_vectors/per_track'/name/'speed_metadata.json'
         sm=json.loads(sm_path.read_text());coverage=sm['n_observed_frames']/sm['n_frames']
         ant=f'{side}:{tag:03d}'
-        row=dict(ant=ant,side=side,track_id=tag,track_name=p.name,detection_fraction=coverage,selected=coverage>.4,
+        row=dict(ant=ant,side=side,track_id=tag,track_name=p.name,detection_fraction=coverage,selected=all_tracks or coverage>.4,
                  source=stamp(p),speed_metadata=stamp(sm_path),n_frames=sm['n_frames'])
         inventory.append(row)
         if row['selected']:
@@ -187,11 +187,12 @@ def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--block',type=Path)
     p.add_argument('--prepare',type=Path)
+    p.add_argument('--all-tracks',action='store_true',help='Audit all tracked identities; use hourly availability for inclusion')
     p.add_argument('--tasks',type=Path)
     p.add_argument('--task-index',type=int)
     p.add_argument('--output',type=Path)
     a=p.parse_args()
-    if a.prepare:prepare(a.block,a.prepare)
+    if a.prepare:prepare(a.block,a.prepare,a.all_tracks)
     else:extract(json.loads(a.tasks.read_text())[a.task_index],a.output)
 
 

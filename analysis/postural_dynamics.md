@@ -1,4 +1,91 @@
-# Posture and body-velocity landscape: 20260724/block01
+# Hourly posture and body-velocity activity: 20260724/block01
+
+The current analysis uses **24 concatenated hourly motif-frequency vectors**
+per ant. The plotted labels follow the selected K: K=1 displays one unsplit
+cohort. It never substitutes a forced two-group comparison. All 57 tracked
+identities per colony appear in the availability audit.
+
+## Run the hourly analysis
+
+Use NumPy, pandas, SciPy, scikit-learn, matplotlib and pyarrow, plus pytest
+for validation. The following pipeline keeps the preceding velocity run's
+posture PCA, scaling and motif dictionary fixed. That dictionary was trained
+on 52 day-1 ants; additional ants are scored using the same representation.
+No old ant-group assignments are reused.
+
+```bash
+python -m analysis.postural_dynamics_extract \
+  --block /bucket/ReiterU/Ants/basler/20260724/block01 \
+  --prepare /path/to/hourly_run --all-tracks
+
+# Run each of the 114 task indices. Existing matching velocity caches can
+# be copied with their JSON metadata and timestamps preserved.
+python -m analysis.postural_dynamics_extract \
+  --tasks /path/to/hourly_run/tasks.json --task-index 0 \
+  --output /path/to/pose_velocity_cache
+
+python -m pytest analysis/test_postural_dynamics.py \
+  analysis/test_postural_dynamics_hourly.py -q
+
+python -m analysis.postural_dynamics_hourly \
+  --tasks /path/to/hourly_run/tasks.json \
+  --pose-cache /path/to/pose_velocity_cache \
+  --dictionary /bucket/ReiterU/Ants/basler/20260724/block01/analysis_outputs/postural_dynamics_velocity_20260924 \
+  --block /bucket/ReiterU/Ants/basler/20260724/block01 \
+  --spatial-atoms /bucket/ReiterU/Ants/basler/20260724/block01/analysis_outputs/long_timescale_0723_0724_0729_20260915/temporal_clusters_4h/atoms/2 \
+  --output /path/to/hourly_results
+```
+
+The dictionary input is a generated data artifact, like the tracking files.
+Its hash and source run are recorded. To reproduce it from tracking data,
+use the archived velocity procedure below; its ant partitions are not used
+by the hourly pipeline.
+
+An hour requires five accepted clips; an ant requires 16 measured hours
+on day 1. This replaces the original >=240-clip daily cohort threshold and
+removes the >40% detection prescreen. Sixteen of 24 hours guarantees every
+pair has at least eight shared hours. All other quality rules are unchanged.
+The thresholds are declared before clustering; they are not adjusted for
+spatial agreement. The initial 24/28 ants came from 41/45 detection-qualified
+identities, minus 17 per colony with insufficient accepted daily clips.
+
+Square-root hourly probabilities are concatenated in clock order. Masked
+KMeans uses the mean squared discrepancy over observed hours, with equal
+weight per ant. Its center update accounts for different observed-hour
+counts. A center hour without any contributing ant falls back to the
+training colony's clock-hour mean. Missing hours are neither zero activity
+nor interpolated posture. Hourly estimates with only five clips remain noisy.
+
+Fit K=1–6. A K>=2 partition must have >=4 ants per group and median bootstrap
+ARI >=0.8 over 100 whole-ant resamples. Select the smallest K within 0.02
+of the best eligible silhouette, using distances on shared hours. Otherwise
+select K=1. The displayed grouping, next-day assignments, maps and forecasts
+all use exactly this selected partition. For K=1, retention and spatial-label
+agreement are not informative and are marked not applicable.
+
+Day 1 is July 24 10:00–July 25 10:00. Day 2 is the following 24 clock-matched
+hours and does not select training ants. Test-hour loss masks unobserved
+hours. Display/continuous-model PCA uses training clock-hour means for its
+basis, with each ant projected on observed features; this filling does not
+enter clustering. Controls include independently shuffled hourly order,
+frozen alternative feature dictionaries, hourly camera usage and observed-hour
+masks. Pairwise-distance correlations are descriptive, not significance tests
+on supposedly independent ant pairs. The original camera-centering correction
+was not fully stored and is not approximated in this revision.
+
+Outputs include figures 02–07, `0724_hourly_postural_dynamics.pdf`, an offline
+hourly explorer, `hourly_motif_frequencies.csv`, `hourly_motif_profiles.npz`,
+all-ant quality and hourly coverage tables, selected groups, K-selection tables,
+held-out validation, `HOURLY_FROZEN.json`, source/code hashes and software
+versions. Missing hourly frequencies are NaN/null; sample counts are explicit.
+The publication keeps the earlier results intact.
+
+## Archived whole-day aggregation procedure
+
+The following describes the preceding whole-day aggregation, retained to
+reproduce its frozen motif dictionary and historical figures. Its forced
+K=2 diagnostic view is superseded by the selected-K hourly workflow above.
+
 
 The figures now start at step 2: eigenpostures and a sampled-posture density
 heat map. Step 3 explains and illustrates motifs of joint posture and signed
