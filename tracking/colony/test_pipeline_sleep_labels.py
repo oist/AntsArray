@@ -4,6 +4,26 @@ import subprocess
 import sys
 
 
+def test_recording_timestamp_override_reaches_mapper_and_requires_one_block(tmp_path):
+    root = Path(__file__).resolve().parents[2]
+    block = tmp_path / "dataset/block01"
+    (block / "data").mkdir(parents=True)
+    hmats = tmp_path / "H.npz"
+    hmats.touch()
+    output = tmp_path / "output"
+    command = ["bash", str(root / "tracking/colony/submit_blocks_pipeline.sh"),
+               "--blocks_root", str(block.parent), "--hmats", str(hmats),
+               "--output_root", str(output), "--experiment_name", "20260726_104256", "--dry_run"]
+    subprocess.run(command, check=True, capture_output=True, text=True)
+    mapper = output / "jobs/block01/scripts/map_block01.sbatch"
+    assert "--experiment_name 20260726_104256" in mapper.read_text()
+    subprocess.run(["bash", "-n", str(mapper)], check=True)
+    (block.parent / "block02/data").mkdir(parents=True)
+    result = subprocess.run(command, capture_output=True, text=True)
+    assert result.returncode == 2
+    assert "requires exactly one block" in result.stderr
+
+
 def test_motion_labels_follow_motion_cache_and_gate_publication(tmp_path):
     root = Path(__file__).resolve().parents[2]
     block = tmp_path / "dataset" / "block01"

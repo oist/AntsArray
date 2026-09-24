@@ -11,7 +11,9 @@ This script is intentionally only orchestration:
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import logging
+import re
 import sys
 from pathlib import Path
 
@@ -27,6 +29,17 @@ from tracking.stitch_tracks import write_pngs_from_existing  # noqa: E402
 from detection_pipeline.lib import tracking_state  # noqa: E402
 
 
+def parse_experiment_name(value: str) -> str:
+    """Keep an existing recording timestamp when extending a tracked window."""
+    if not re.fullmatch(r"\d{8}_\d{6}", value):
+        raise argparse.ArgumentTypeError("experiment_name must be YYYYMMDD_HHMMSS")
+    try:
+        datetime.strptime(value, "%Y%m%d_%H%M%S")
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("experiment_name must be a valid recording timestamp") from exc
+    return value
+
+
 def run_mapping(
     *,
     hmats_path: Path,
@@ -38,6 +51,7 @@ def run_mapping(
     skip_existing: bool,
     chunks: set[str] | None = None,
     tracking_state_dir: Path | None = None,
+    experiment_name: str | None = None,
 ) -> None:
     from tracking.colony.map_combine import (
         infer_experiment_name,
@@ -62,7 +76,8 @@ def run_mapping(
                      tracking_state.state_path(tracking_state_dir),
                      rec["map"]["hmats_calib_id"], resolved_threshold)
     hmats = load_homographies(hmats_path)
-    exp = infer_experiment_name(data_dir)
+    exp = parse_experiment_name(experiment_name) if experiment_name is not None else infer_experiment_name(data_dir)
+    logging.info("Panorama recording name: %s", exp)
     panorama_dir.mkdir(parents=True, exist_ok=True)
 
     if map_mode in ("aruco", "both"):
@@ -209,6 +224,8 @@ def main() -> None:
     parser.add_argument("--skip_combine", action="store_true")
     parser.add_argument("--skip_stitch", action="store_true")
     parser.add_argument("--map_mode", choices=("aruco", "sleap", "both"), default="both")
+    parser.add_argument("--experiment_name", type=parse_experiment_name, default=None,
+                        help="Recording timestamp YYYYMMDD_HHMMSS. Set to the existing track prefix when extending a window.")
     parser.add_argument(
         "--min_instance_frame_frac",
         type=float,
@@ -319,6 +336,7 @@ def main() -> None:
             skip_existing=args.skip_existing,
             chunks=set(complete_chunks),
             tracking_state_dir=tracks_dir,
+            experiment_name=args.experiment_name,
         )
 
     if not args.skip_combine:

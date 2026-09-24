@@ -197,6 +197,7 @@ partition="$PARTITION"
 sbatch_bin="$SBATCH_BIN"
 slurm_setup="$SLURM_SETUP"
 map_mode="$MAP_MODE"
+experiment_name=""
 side="$SIDE"
 skip_existing="$SKIP_EXISTING"
 x_threshold="$X_THRESHOLD"
@@ -295,6 +296,7 @@ Optional:
   --sbatch_bin PATH         sbatch command/path. Default: sbatch
   --slurm_setup CMD         Command to run before sbatch, e.g. module load slurm.
   --map_mode MODE           aruco, sleap, or both. Default: both
+  --experiment_name STAMP   Preserve an existing recording's YYYYMMDD_HHMMSS prefix when extending its tracked chunks.
   --side SIDE               left, right, or both. Default: both
   --x_threshold FLOAT       Panorama left/right split X (must match the hmats
                             calibration). Empty = full-arena panorama_regions.csv from this
@@ -395,6 +397,7 @@ while [[ $# -gt 0 ]]; do
     --sbatch_bin) sbatch_bin="$2"; shift 2 ;;
     --slurm_setup) slurm_setup="$2"; shift 2 ;;
     --map_mode) map_mode="$2"; shift 2 ;;
+    --experiment_name) experiment_name="$2"; shift 2 ;;
     --side) side="$2"; shift 2 ;;
     --x_threshold) x_threshold="$2"; shift 2 ;;
     --skip_existing) skip_existing=1; shift ;;
@@ -537,6 +540,10 @@ if [[ ${#blocks[@]} -eq 0 ]]; then
   echo "ERROR: no block directories matched: $blocks_root/$block_glob" >&2
   exit 2
 fi
+if [[ -n "$experiment_name" && ${#blocks[@]} -ne 1 ]]; then
+  echo "ERROR: --experiment_name requires exactly one block; narrow --block_glob." >&2
+  exit 2
+fi
 
 submitted=0
 for block_dir in "${blocks[@]}"; do
@@ -665,6 +672,10 @@ for block_dir in "${blocks[@]}"; do
   if [[ -n "$x_threshold" ]]; then
     x_threshold_arg=" --x_threshold ${x_threshold}"
   fi
+  experiment_name_arg=""
+  if [[ -n "$experiment_name" ]]; then
+    experiment_name_arg=" --experiment_name $(printf '%q' "$experiment_name")"
+  fi
   sleep_skip_existing_arg=""
   case "$sleep_skip_existing" in
     auto|"")
@@ -714,7 +725,7 @@ mkdir -p "${panorama_dir}" "${tracks_dir}" "${logs_dir}"
   --work_dir "${work_dir}" \\
   --panorama_dir "${panorama_dir}" \\
   --tracks_dir "${tracks_dir}" \\
-  --map_mode "${map_mode}"${x_threshold_arg} \\
+  --map_mode "${map_mode}"${x_threshold_arg}${experiment_name_arg} \\
   --skip_combine \\
   --skip_stitch${skip_existing_arg}
 EOF

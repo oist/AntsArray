@@ -118,6 +118,22 @@ def test_explicit_override_can_map_without_annotations(tmp_path, monkeypatch):
     assert map_combine.X_THRESHOLD == 123.5
 
 
+def test_extending_a_window_preserves_its_existing_recording_name(tmp_path, monkeypatch):
+    # Full-block directory iteration may find a different camera's start time.
+    monkeypatch.setattr(map_combine, "infer_experiment_name", lambda _: "20260726_104312")
+    monkeypatch.setattr(map_combine, "load_homographies", lambda _: [])
+    names = []
+    def capture(hmats, data_dir, out_dir, exp, **kwargs):
+        names.append(exp)
+    monkeypatch.setattr(map_combine, "process_aruco_chunks", capture)
+    monkeypatch.setattr(map_combine, "process_sleap_chunks", capture)
+    pipeline.run_mapping(hmats_path=tmp_path / "H.npz", data_dir=tmp_path / "data",
+                         panorama_dir=tmp_path / "panorama", map_mode="both",
+                         min_instance_frame_frac=0.25, x_threshold=2477.7,
+                         skip_existing=True, experiment_name="20260726_104256")
+    assert names == ["20260726_104256", "20260726_104256"]
+
+
 @pytest.mark.parametrize("entrypoint", ["pipeline", "standalone"])
 @pytest.mark.parametrize("has_regions", [True, False])
 def test_both_mapping_entrypoints_report_boundary_source(
