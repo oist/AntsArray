@@ -1,7 +1,7 @@
 """Sample short, body-relative pose sequences without loading spatial labels.
 
-The output contains intrinsic segment directions and quality diagnostics.
-Absolute position, heading, speed, sleep and spatial cluster labels are excluded.
+The output contains intrinsic segment directions and signed body velocities.
+Absolute position, global heading, sleep and spatial cluster labels are excluded.
 """
 from __future__ import annotations
 
@@ -24,6 +24,34 @@ CLIP_FRAMES = 60
 RECORDING_START = '2026-07-24T09:31:10'
 DAY1_FRAME = (28*60+50)*FPS  # first complete clock-aligned day: July 24 10:00
 DAY_FRAMES = 86400*FPS
+MM_PER_PX = .016
+SAMPLE_ENDS = np.arange(4,59,2)
+
+
+def body_velocity(xy, position, *, fps=FPS, mm_per_px=MM_PER_PX):
+    """Causal five-frame anchor-velocity fit, projected onto the body axes.
+
+    Input [clips,60,10,2] landmarks and [clips,60,2] TrackX/TrackY.
+    Output [clips,28,2] in mm/s: positive anterior and signed lateral.
+    At raw frame t, only t-4 through t enter either velocity or orientation.
+    The lateral unit vector is (-anterior_y, anterior_x), in image coordinates.
+    """
+    xy=np.asarray(xy,dtype=float);position=np.asarray(position,dtype=float)
+    if xy.shape[1:]!=(60,10,2) or position.shape!=(len(xy),60,2):
+        raise ValueError('Expected complete 60-frame landmark and anchor clips')
+    axis=xy[:,:,0]-xy[:,:,2]
+    norm=np.linalg.norm(axis,axis=-1,keepdims=True)
+    axis=np.divide(axis,norm,out=np.full_like(axis,np.nan),where=norm>1e-9)
+    indices=SAMPLE_ENDS[:,None]+np.arange(-4,1)
+    positions=position[:,indices]*mm_per_px
+    # Center before differencing to retain precision under large translations.
+    positions=positions-positions[:,:,2:3]
+    velocity=np.sum(positions*np.arange(-2,3)[None,None,:,None],axis=2)*(fps/10.)
+    direction=np.mean(axis[:,indices],axis=2)
+    norm=np.linalg.norm(direction,axis=-1,keepdims=True)
+    direction=np.divide(direction,norm,out=np.full_like(direction,np.nan),where=norm>.1)
+    lateral=np.stack([-direction[...,1],direction[...,0]],axis=-1)
+    return np.stack([(velocity*direction).sum(axis=-1),(velocity*lateral).sum(axis=-1)],axis=-1).astype(np.float32)
 
 
 def stamp(path):
@@ -90,7 +118,7 @@ def extract(task, output):
     if stamp(source)!=task['source']:
         raise ValueError(f'Track changed: {source}')
     code_hash=hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
-    signature=dict(task=task,code_sha256=code_hash,clip_frames=CLIP_FRAMES,fps=FPS,sampling='one uniform random clip per minute for two clock-matched days')
+    signature=dict(task=task,code_sha256=code_hash,clip_frames=CLIP_FRAMES,fps=FPS,feature_version='posture_velocity_v2',sampling='one uniform random clip per minute for two clock-matched days')
     output.mkdir(parents=True,exist_ok=True)
     target=output/(task['ant'].replace(':','_')+'.npz')
     meta_path=target.with_suffix('.json')
@@ -108,9 +136,11 @@ def extract(task, output):
     sums=np.zeros((len(frames),10,2),np.float64)
     counts=np.zeros((len(frames),10),np.uint16)
     cameras=np.full(len(frames),np.nan,dtype=np.float32)
+    positions=np.full((len(frames),2),np.nan,dtype=np.float64)
+    position_cameras=np.full(len(frames),np.nan,dtype=np.float32)
     conflicting_camera=np.zeros(len(frames),bool)
     scanned=0
-    for batch in parquet.iter_batches(batch_size=262144,columns=['Frame','Bodypoint','X','Y','SleapCam'],use_threads=False):
+    for batch in parquet.iter_batches(batch_size=262144,columns=['Frame','Bodypoint','X','Y','SleapCam','TrackX','TrackY','CameraID'],use_threads=False):
         frame=batch.column(0).to_numpy(zero_copy_only=False);bp=batch.column(1).to_numpy(zero_copy_only=False)
         valid=(frame>=0)&(frame<n_frames)&(bp>=0)&(bp<10)
         selected=np.flatnonzero(valid)
@@ -127,22 +157,27 @@ def extract(task, output):
         conflict=np.isfinite(cameras[offsets0])&np.isfinite(cam)&(cameras[offsets0]!=cam)
         conflicting_camera[offsets0[conflict]]=True
         cameras[offsets0]=cam
+        for j in (0,1):positions[offsets0,j]=batch.column(5+j).to_numpy(zero_copy_only=False)[selected[anchor]]
+        position_cameras[offsets0]=batch.column(7).to_numpy(zero_copy_only=False)[selected[anchor]]
         scanned+=len(batch)
     xy=np.divide(sums,counts[...,None],out=np.full_like(sums,np.nan),where=counts[...,None]>0)
     duplicated=(counts>1).any(axis=1)
     xy[duplicated|conflicting_camera]=np.nan
     shape,lengths=intrinsic_directions(xy)
+    velocity=body_velocity(xy.reshape(len(starts),CLIP_FRAMES,10,2),positions.reshape(len(starts),CLIP_FRAMES,2))
     shape=shape.reshape(len(starts),CLIP_FRAMES,16).astype(np.float32)
-    lengths=(lengths.reshape(len(starts),CLIP_FRAMES,9)*.016).astype(np.float32)
+    lengths=(lengths.reshape(len(starts),CLIP_FRAMES,9)*MM_PER_PX).astype(np.float32)
     cameras=cameras.reshape(len(starts),CLIP_FRAMES)
     # No absolute positions or global orientations are written to this cache.
     np.savez_compressed(target,shape=shape,lengths_mm=lengths,frames=starts,cameras=cameras,
+                        velocity_mm_s=velocity,position_cameras=position_cameras.reshape(len(starts),CLIP_FRAMES),
                         duplicate_frame=duplicated.reshape(len(starts),CLIP_FRAMES))
     if stamp(source)!=task['source']:raise ValueError('Input changed during extraction')
     complete=np.isfinite(shape).all(axis=(1,2))
     result=dict(signature=signature,scanned_rows=scanned,clips=len(starts),complete_clips=int(complete.sum()),
                 complete_fraction=float(complete.mean()),duplicate_frames=int(duplicated.sum()),
                 length_percentiles=np.nanquantile(lengths,[.01,.5,.99],axis=(0,1)).tolist(),
+                velocity_percentiles_mm_s=np.nanquantile(velocity,[.001,.01,.5,.99,.999],axis=(0,1)).tolist(),
                 output=stamp(target))
     meta_path.write_text(json.dumps(result,indent=2)+'\n')
     print('EXTRACTED',task['ant'],json.dumps({k:result[k] for k in ('scanned_rows','clips','complete_clips','duplicate_frames')}),flush=True)

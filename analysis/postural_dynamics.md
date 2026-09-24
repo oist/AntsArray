@@ -1,115 +1,151 @@
-# Posture-first behavioral landscape: 20260724/block01
+# Posture and body-velocity landscape: 20260724/block01
 
-This analysis implements the order of inference suggested by the eigenworm
-work: measure intrinsic shape, learn shape modes, describe short histories,
-compare individual usage, then inspect external behavior. It does not fit
-posture to the previous spatial groups. The ten tracked nodes cover the tag
-anchor, head, petiole, gaster tip and antennae; they do not cover legs.
+The figures now start at step 2: eigenpostures and a sampled-posture density
+heat map. Step 3 explains and illustrates motifs of joint posture and signed
+body velocity. Steps 4–7 are refitted from those new motifs. Measurement QC
+remains in tables and methods; it is not an opening figure.
 
-The implementation is scoped to this recording, its 24 Hz clock, its 0.016
-mm/pixel calibration, and two matched 24-hour windows beginning July 24 at
-10:00. It rejects a different recording instead of silently reusing those
-assumptions. A general analysis of other dates should make those parameters
-explicit and repeat validation.
+This is an exploratory revision after the earlier posture-only analysis.
+Models from that version are preserved in its published output and Git
+commit `43c82c1`. New features and outcomes are labeled
+`posture_velocity_v2`; old feature caches are rejected.
 
 ## Reproduce
 
-Use the repository environment with NumPy, pandas, SciPy, scikit-learn,
-matplotlib, pyarrow and pytest. Exact versions are recorded in each completed
-run's `run_manifest.json`.
+The repository dependencies include NumPy, pandas, SciPy, scikit-learn,
+matplotlib and pyarrow; use the test extra for pytest. Each run records the
+exact software versions. The tracked `colony_behavioral_landscape.py` supplies
+whole-ant bootstrap and Hellinger helpers.
 
 ```bash
 python -m analysis.postural_dynamics_extract \
   --block /bucket/ReiterU/Ants/basler/20260724/block01 \
   --prepare /path/to/run
 
-# Run once for every index in tasks.json (the 0724 inventory selects 86).
-# Independent array tasks are safe. Write caches to a compute-writable disk.
+# Run every task index in tasks.json (86 detection-screened ants for 0724).
+# Independent array tasks are safe; use a compute-writable output disk.
 python -m analysis.postural_dynamics_extract \
   --tasks /path/to/run/tasks.json --task-index 0 \
-  --output /path/to/pose_cache
+  --output /path/to/pose_velocity_cache
 
 python -m pytest analysis/test_postural_dynamics.py -q
 
 python -m analysis.postural_dynamics \
-  --tasks /path/to/run/tasks.json --pose-cache /path/to/pose_cache \
+  --tasks /path/to/run/tasks.json \
+  --pose-cache /path/to/pose_velocity_cache \
   --block /bucket/ReiterU/Ants/basler/20260724/block01 \
   --spatial-atoms /bucket/ReiterU/Ants/basler/20260724/block01/analysis_outputs/long_timescale_0723_0724_0729_20260915/temporal_clusters_4h/atoms/2 \
   --output /path/to/results
 
-# Rebuild figures from an existing completed run without refitting models.
+# Rebuild figures from saved results without refitting numerical models.
 python -m analysis.postural_dynamics_plots \
   --block /bucket/ReiterU/Ants/basler/20260724/block01 \
   --output /path/to/results
 ```
 
-The extraction streams each long-format per-ant parquet once. Its compact
-cache stores eight body-relative unit directions, segment lengths for QC,
-camera IDs and global clip-start frames. It stores no arena positions,
-absolute headings, translation speeds, sleep labels or spatial groups.
-Sampling uses the full recording length in parquet metadata, not the
-per-ant observed span in speed metadata. A deterministic random 2.5-second
-clip is selected within each minute of the two days.
+The implementation is scoped to this recording, 24 Hz and 0.016 mm/pixel.
+Different recordings require explicit calibration/time-window parameters
+and renewed validation. New outputs should use a new directory, such as
+`analysis_outputs/postural_dynamics_velocity_20260924`, to preserve the
+previous posture-only results.
 
-The original >40% detection screen uses each ant's observed span, matching
-the existing analysis cohort. Fitting additionally requires at least 240
-fully measured day-1 clips distributed over at least 24 half-hours. This
-threshold is applied before spatial outcomes are loaded. Day-2 availability
-does not determine inclusion in training. Missing points, duplicates,
-camera switches and degenerate segment lengths invalidate the entire clip;
-there is no interpolation. Segment QC accepts a 0.1–1.25 mm body axis and
-0.05–2 mm analyzed segments. These broad bounds remove obvious failures,
-not all tracking noise. There are no finished per-node confidence scores.
+## Features and motif construction
 
-Four-frame causal filtering precedes 12 Hz sampling. Unit directions are
-renormalized after filtering. History ends at raw frame 52; its future target
-is raw frame 58. The smoothing windows therefore do not overlap. Tests
-explicitly perturb future frames to guard against leakage, and verify
-translation/rotation/scale invariance while preserving head articulation.
+1. **Intrinsic posture.** The ten landmarks cover the tag anchor, head,
+   petiole, gaster tip and antennae, with no leg landmarks. Express eight
+   segment directions relative to the petiole-to-tag anterior axis. The 16
+   direction cosines remove translation, global rotation and uniform scale.
+   Four-frame causal smoothing precedes 12 Hz sampling. Learn posture-only
+   PCA from balanced training ants and retain 95% variance.
+2. **Signed body velocity.** Estimate the slope of TrackX/TrackY over the
+   five most recent raw frames by least squares, convert to mm/s, and project
+   onto the mean unit anterior axis in that window and its perpendicular
+   `(-a_y, a_x)`. Forward velocity is positive toward the head. Lateral sign
+   follows that defined axis, without assigning anatomical left/right from
+   image coordinates. Store only the two projected velocities, not absolute
+   positions or global headings. Velocity is physical mm/s, so it is not
+   invariant to changing body size while retaining the same pixel calibration.
+3. **Balanced metric.** Center using balanced day-1 training clips. Divide
+   all retained posture coefficients by the square root of their total
+   variance, preserving relative mode weights. Divide each velocity channel
+   by its training SD times sqrt(2). Both feature blocks then contribute
+   total variance one. Save exact centers/divisors in `feature_scaling.csv`.
+4. **One-second histories.** Concatenate posture coefficients and the two
+   velocity channels at each of 13 timestamps across one second. Flatten
+   this time-by-feature matrix and divide by sqrt(13). Squared Euclidean
+   distance is then mean feature discrepancy across the sampled times.
+5. **Motif dictionary.** MiniBatchKMeans learns shared prototype histories
+   from balanced training ants in both colonies. Compare 12/24/48 centers
+   using future joint-state prediction on held-out hours; select the smallest
+   count within one standard error of the best. Refit the basis, scaling and
+   dictionary on day 1 only, then assign all histories to the nearest center.
+   Motif examples are actual measured histories nearest their centers.
+6. **Ant profiles.** Compute each ant's motif-frequency distribution. Fit
+   ant groups in square-root frequency space separately within each colony.
+   P0/P1 label order follows lower/higher postural angular motion, not space.
 
-PCA retains 95% of direction-cosine variance and balances ants. Every fourth
-hour of day 1 is withheld for short-history prediction and dictionary
-resolution selection. A fixed one-second primary history is compared with
-instantaneous posture, shuffled past times and mean-removed dynamics. The
-motif dictionary size is chosen from 12/24/48 using the smallest within one
-standard error of the best future-posture prediction. The final basis and
-dictionary are refitted on day 1 and applied unchanged to day 2.
+Motifs and prediction targets both include velocity. This changes the
+interpretation from posture alone to posture plus locomotion. Ablations
+refit motifs and groups on the same cohort with instantaneous joint state,
+posture histories only, velocity histories only, mean-removed joint
+histories, half/double velocity amplitude, and camera-centered joint
+histories. Camera-only frequency profiles provide a nuisance comparator.
+Weights are not selected by spatial recovery.
 
-Ants are represented by square-root motif frequencies and clustered
-separately within the two colonies. K=2 is a prespecified comparison;
-K=2–6, whole-ant bootstrap stability and a continuous profile alternative
-are also reported. The selection rule requires a minimum group size of four
-and median bootstrap ARI at least 0.8, then chooses the smallest K within
-0.02 of the best eligible silhouette. A result of K=1 means no candidate
-passed, rather than a formal test of unimodality. P0/P1 labels follow median
-angular motion, without consulting spatial outcomes.
+## Sampling, missing data and validation
 
-`SPACE_BLIND_FROZEN.json` records model/group hashes before any spatial
-files are opened. Only then are the exact 0724 spatial atoms, previous
-fine-grid groups, arena annotations and measured behavior loaded. The
-existing spatial groups are a descriptive comparison, not training labels.
-Spatial forecasting predicts an ant's second-day map from the first-day
-maps of *other* members of its posture group. The baseline uses all other
-ants. Both days need at least 40% position coverage. Uncertainty resamples
-whole ants and the null permutes whole-ant labels. The observed association
-does not imply that posture causes spatial occupancy.
+One independently seeded random 2.5-second clip is requested per minute
+for each ant, exactly matching the earlier sampling schedule. Day 1 begins
+July 24 at 10:00 and lasts 24 hours; day 2 is the following matched 24-hour
+period. Sampling uses the full recording clock in parquet metadata rather
+than the ant's observed span in speed metadata.
 
-## Deliverables
+The initial >40% detection rule uses each ant's first-to-last observed span,
+matching the existing cohort. Fitting additionally requires >=240 accepted
+day-1 clips in >=24 half-hours. Day-2 availability does not select training
+ants. Missing landmarks or anchor positions, duplicate detections, unknown
+or switching pose/position cameras and degenerate geometry reject clips.
+Geometry bounds are 0.1–1.25 mm for the body axis and 0.05–2 mm for analyzed
+segments. A broad jump guard rejects clips with estimated velocity magnitude
+above 20 mm/s. No interpolation or missing-as-immobile rule is used. Finished
+tracks lack per-node confidence, and residual tracking noise remains possible.
 
-- Seven figure pairs (PNG/PDF), a combined PDF and `REPORT.md`.
-- `index.html`, a linked gallery, and `explorer.html`, a self-contained
-  offline mode/motif/individual explorer with no external dependencies.
-- Quality, model selection, prediction, group assignment and post hoc
-  comparison tables; compact models, measured motif examples and maps.
-- Frozen model hashes, source fingerprints, exact software versions and
-  a completion marker written only after all deliverables succeed.
+Posture and velocity are sampled at raw frames 4,6,...,58. History ends at
+frame 52 and predicts the joint state at frame 58 (0.25 s later). Neither
+filter reaches into future data; input and target filter windows do not
+overlap. Every fourth day-1 hour is withheld for internal validation. Tests
+check velocity signs, calibration, rotation/translation invariance, missing
+anchors, future-frame exclusion, training-only scaling, balanced block
+variance and sampling boundaries.
 
-The extraction cache is reproducible from the original tracking files and
-is not a Git artifact. Publish completed results alongside the recording;
-commit the analysis source and tests. `colony_behavioral_landscape.py` is a
-tracked dependency supplying whole-ant bootstrap and Hellinger helpers.
+K=2 is a prespecified comparison, not an enforced biological conclusion.
+Compare K=2–6 with 100 whole-ant bootstraps. Candidates need smallest group
+>=4 and median bootstrap ARI >=0.8. Select the smallest K within 0.02 of the
+best eligible silhouette; K=1 means none passed, not evidence of unimodality.
+Compare discrete prototypes with continuous profile projections on day 2.
+
+`SPACE_BLIND_FROZEN.json` records joint feature definitions, normalization,
+dimension and model/group hashes before occupancy maps or prior spatial
+labels are opened. Absolute location is excluded from fitting; its local
+derivative, projected into body coordinates, is an explicitly allowed input.
+Spatial forecasts use other group members' day-1 maps to predict an ant's
+day-2 occupancy, excluding that ant from both the group and colony baseline.
+Both days require >=40% position coverage. Resample whole ants for uncertainty
+and permute whole-ant labels for the null. Camera centering can remove real
+context-dependent behavior as well as imaging bias; it is not a causal fix.
+
+## Outputs
+
+Six PNG/PDF pairs (numbered 02–07), a combined PDF,
+`0724_postural_dynamics_velocity.pdf`, `REPORT.md`, an offline gallery and an
+interactive mode/motif/ant explorer. The explorer includes signed velocity
+traces for the recalculated motifs. Tables, models, measured examples,
+normalization parameters, source/code fingerprints and software versions
+accompany the figures. A completion marker is written only after all outputs
+succeed. Extraction caches and generated results are data artifacts; commit
+the source, tests and documentation, and publish results alongside the data.
 
 Methodological inspiration: [Stephens et al., 2008](https://journals.plos.org/ploscompbiol/article?id=10.1371/journal.pcbi.1000028)
 and [Costa, Ahamed, Jordan and Stephens](https://arxiv.org/abs/2105.12811).
-This implementation does not reproduce the latter's full transfer-operator
-construction or claim to identify maximally predictive states.
+The implementation does not claim to reproduce the full transfer-operator
+method or identify maximally predictive states.

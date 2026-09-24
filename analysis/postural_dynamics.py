@@ -29,6 +29,28 @@ from analysis.postural_dynamics_extract import DAY1_FRAME, DAY_FRAMES, FPS, EDGE
 CURRENT=24  # raw frame 52, after causal filtering and 12 Hz sampling
 FUTURE=27   # raw frame 58: 0.25 seconds later
 SEED=724
+PRIMARY='posture_velocity_history'
+MAX_VELOCITY_MM_S=20.
+
+
+def joint_state(scores,velocity,training_indices,normalizer=None):
+    """Join posture and signed velocity with equal total training variance.
+
+    Preserve the relative variances of posture modes. Each velocity component
+    contributes half of the velocity block's variance. All fitting uses only
+    the supplied training clips and times through CURRENT.
+    """
+    scores=np.asarray(scores);velocity=np.asarray(velocity)
+    if scores.shape[:2]!=velocity.shape[:2] or velocity.shape[-1]!=2:
+        raise ValueError('Velocity and posture must have aligned clip times')
+    if normalizer is None:
+        p=scores[training_indices,:CURRENT+1];v=velocity[training_indices,:CURRENT+1]
+        normalizer=dict(posture_feature_mean=p.mean(axis=(0,1)),
+          posture_feature_scale=np.array(max(np.sqrt(p.var(axis=(0,1)).sum()),1e-6)),
+          velocity_feature_mean=v.mean(axis=(0,1)),velocity_feature_std=np.maximum(v.std(axis=(0,1)),1e-4))
+    posture=(scores-normalizer['posture_feature_mean'])/normalizer['posture_feature_scale']
+    motion=(velocity-normalizer['velocity_feature_mean'])/(normalizer['velocity_feature_std']*np.sqrt(2))
+    return np.concatenate([posture,motion],axis=-1).astype(np.float32),normalizer
 
 
 def causal_pose(shape, width=4):
@@ -60,7 +82,7 @@ def clip_quality(shape,lengths,cameras,duplicates):
 
 
 def history_features(scores, seconds=1., *, dynamics_only=False, shuffle=False, seed=SEED):
-    """A fixed-endpoint history; spatial variables cannot enter this interface."""
+    """A fixed-endpoint history of posture and/or body-relative velocities."""
     steps=int(round(seconds*12))
     if not np.isclose(steps,seconds*12) or not 0<=steps<=CURRENT:
         raise ValueError('History must lie on the 12 Hz grid within the observed clip')
@@ -122,6 +144,8 @@ def load_pose_cache(tasks_path,cache,output):
     for task in tasks:
         path=cache/(task['ant'].replace(':','_')+'.npz')
         saved=json.loads(path.with_suffix('.json').read_text())
+        if saved['signature'].get('feature_version')!='posture_velocity_v2':
+            raise ValueError(f'Velocity extraction is required: {path}')
         if saved['signature']['task']!=task or stamp(task['source']['path'])!=task['source']:
             raise ValueError(f'Stale or mismatched pose cache: {path}')
         actual=stamp(path)
@@ -130,6 +154,10 @@ def load_pose_cache(tasks_path,cache,output):
         with np.load(path) as z:
             raw=z['shape'];lengths=z['lengths_mm'];cameras=z['cameras'];starts=z['frames']
             keep,flags=clip_quality(raw,lengths,cameras,z['duplicate_frame'])
+            velocity=z['velocity_mm_s'];position_camera=z['position_cameras']
+            velocity_valid=np.isfinite(velocity).all(axis=(1,2))&(np.linalg.norm(velocity,axis=-1)<=MAX_VELOCITY_MM_S).all(axis=1)
+            camera_valid=np.isfinite(position_camera).all(axis=1)&(position_camera>=0).all(axis=1)&(np.ptp(np.nan_to_num(position_camera,nan=-1),axis=1)==0)
+            original_keep=keep.copy();keep&=velocity_valid&camera_valid
             accepted=causal_pose(raw[keep])
             indices=np.flatnonzero(keep)
             after=np.isfinite(accepted).all(axis=(1,2));accepted=accepted[after];indices=indices[after]
@@ -139,6 +167,7 @@ def load_pose_cache(tasks_path,cache,output):
                      detection_fraction=task['detection_fraction'],requested=len(raw),
                      complete_clips=int(flags['complete'].sum()),geometry_pass=int(flags['geometry'].sum()),
                      camera_pass=int(flags['same_camera'].sum()),duplicate_clips=int(flags['duplicate'].sum()),accepted=len(indices))
+            row.update(posture_quality_clips=int(original_keep.sum()),velocity_pass=int(velocity_valid.sum()),position_camera_pass=int(camera_valid.sum()))
             for d in (0,1):
                 valid=indices[day[indices]==d]
                 row[f'day{d+1}_clips']=len(valid)
@@ -148,6 +177,7 @@ def load_pose_cache(tasks_path,cache,output):
             if row['day1_eligible']:
                 index=len(meta);meta.append(row)
                 pieces.append(dict(shape=accepted,ant_index=np.full(len(indices),index,np.int32),
+                                   velocity=velocity[indices],
                                    day=day[indices],minute=minute[indices],frames=starts[indices],
                                    camera=cameras[indices,0].astype(int),
                                    lengths=np.nanmedian(lengths[indices[day[indices]==0]],axis=(0,1))))
@@ -156,13 +186,13 @@ def load_pose_cache(tasks_path,cache,output):
     pd.DataFrame(qc).to_csv(output/'pose_quality.csv',index=False)
     ants=pd.DataFrame(meta)
     if any((ants.side==s).sum()<12 for s in ('left','right')):raise ValueError('Fewer than 12 eligible ants in a colony')
-    bundle={key:np.concatenate([p[key] for p in pieces],axis=0) for key in ('shape','ant_index','day','minute','frames','camera')}
+    bundle={key:np.concatenate([p[key] for p in pieces],axis=0) for key in ('shape','velocity','ant_index','day','minute','frames','camera')}
     bundle['lengths']=np.median(np.stack([p['lengths'] for p in pieces]),axis=0)
     return ants,bundle,pd.DataFrame(qc),provenance
 
 
 def fit_space_blind(ants,b,output,bootstrap=100):
-    """No block path, spatial maps, occupancy labels, speed or sleep available."""
+    """Fit posture and velocity without occupancy maps, location or labels."""
     shape,ids,day=b['shape'],b['ant_index'],b['day']
     train=(day==0)&((b['minute']//60)%4!=3)
     valid=(day==0)&~train
@@ -170,24 +200,28 @@ def fit_space_blind(ants,b,output,bootstrap=100):
     pca_validation=PCA(svd_solver='full').fit(shape[balanced,::4].reshape(-1,16))
     rank=int(np.searchsorted(np.cumsum(pca_validation.explained_variance_ratio_),.95)+1)
     scores=pca_validation.transform(shape.reshape(-1,16)).reshape(len(shape),28,16)[:,:,:rank].astype(np.float32)
-    target=scores[:,FUTURE];current=scores[:,CURRENT]
+    state,validation_normalizer=joint_state(scores,b['velocity'],balanced)
+    target=state[:,FUTURE];current=state[:,CURRENT]
     target_mean=target[balanced].mean(axis=0)
     base=ant_mean(np.square(target[valid]-target_mean).sum(axis=1),ids[valid])
     persistence=ant_mean(np.square(target[valid]-current[valid]).sum(axis=1),ids[valid])
     history_rows=[];errors={}
     for h in (0.,.25,.5,1.,2.):
         for shuffled in ((False,True) if h>0 else (False,)):
-            x=history_features(scores,h,shuffle=shuffled)
+            x=history_features(state,h,shuffle=shuffled)
             ridge=Ridge(alpha=1.).fit(x[balanced],target[balanced])
-            loss=ant_mean(np.square(ridge.predict(x[valid])-target[valid]).sum(axis=1),ids[valid])
+            squared=np.square(ridge.predict(x[valid])-target[valid])
+            loss=ant_mean(squared.sum(axis=1),ids[valid])
             errors[f'{h:g}_{shuffled}']=loss
             history_rows.append(dict(history_seconds=h,shuffled=shuffled,mean_mse=loss.mean(),
                                      standard_error=loss.std(ddof=1)/np.sqrt(len(loss)),
                                      explained_vs_mean=1-loss.mean()/base.mean(),
-                                     gain_vs_persistence=1-loss.mean()/persistence.mean(),n_ants=len(loss)))
+                                     gain_vs_persistence=1-loss.mean()/persistence.mean(),n_ants=len(loss),
+                                     posture_block_mse=ant_mean(squared[:,:rank].sum(axis=1),ids[valid]).mean(),
+                                     velocity_block_mse=ant_mean(squared[:,rank:].sum(axis=1),ids[valid]).mean()))
     history_table=pd.DataFrame(history_rows)
     history_table.to_csv(output/'history_prediction_validation.csv',index=False)
-    x=history_features(scores,1.)
+    x=history_features(state,1.)
     motif_rows=[]
     for k in (12,24,48):
         model=motif_model(x[balanced],k)
@@ -202,9 +236,15 @@ def fit_space_blind(ants,b,output,bootstrap=100):
     pca=PCA(svd_solver='full').fit(shape[balanced,::4].reshape(-1,16))
     rank=int(np.searchsorted(np.cumsum(pca.explained_variance_ratio_),.95)+1)
     scores=pca.transform(shape.reshape(-1,16)).reshape(len(shape),28,16)[:,:,:rank].astype(np.float32)
-    primary=history_features(scores,1.)
-    variants={'posture_history':primary,'posture_only':history_features(scores,0.),
-              'dynamics_only':history_features(scores,1.,dynamics_only=True)}
+    state,normalizer=joint_state(scores,b['velocity'],balanced)
+    primary=history_features(state,1.)
+    variants={PRIMARY:primary,'instantaneous':history_features(state,0.),
+              'posture_history':history_features(state[:,:,:rank],1.),
+              'velocity_history':history_features(state[:,:,rank:],1.),
+              'dynamics_only':history_features(state,1.,dynamics_only=True)}
+    for weight,name in ((.5,'velocity_half'),(2.,'velocity_double')):
+        weighted=state.copy();weighted[:,:,rank:]*=weight
+        variants[name]=history_features(weighted,1.)
     centered=primary.copy();global_mean=primary[balanced].mean(axis=0)
     camera_means={}
     for camera in np.unique(b['camera']):
@@ -218,6 +258,9 @@ def fit_space_blind(ants,b,output,bootstrap=100):
     clip_motion=np.sqrt(np.square(differences).mean(axis=(1,2)))*12
     activity=np.array([clip_motion[(ids==i)&(day==0)].mean() for i in range(len(ants))])
     ants=ants.copy();ants['angular_motion_rad_s']=activity
+    for j,name in enumerate(('forward_velocity_mm_s','lateral_velocity_mm_s')):
+        ants[name]=[b['velocity'][(ids==i)&(day==0),:CURRENT+1,j].mean() for i in range(len(ants))]
+    ants['sampled_speed_mm_s']=[np.linalg.norm(b['velocity'][(ids==i)&(day==0),:CURRENT+1],axis=-1).mean() for i in range(len(ants))]
     results={};model_arrays={};profile_arrays={};motif_labels={};secondary_rows=[]
     for name,x in variants.items():
         model=motif_model(x[balanced],n_motifs)
@@ -225,7 +268,7 @@ def fit_space_blind(ants,b,output,bootstrap=100):
         prob,count=distributions(assigned,ids,day,len(ants),n_motifs)
         profile_arrays[name]=prob;motif_labels[name]=assigned
         model_arrays[name+'_centers']=model.cluster_centers_
-        if name=='posture_history':
+        if name==PRIMARY:
             examples=[]
             training=x[balanced]
             for motif in range(n_motifs):
@@ -234,6 +277,9 @@ def fit_space_blind(ants,b,output,bootstrap=100):
                 distance=np.square(training[candidates]-model.cluster_centers_[motif]).sum(axis=1)
                 examples.append(balanced[candidates[distance.argmin()]])
             model_arrays['motif_example_shape']=shape[examples]
+            model_arrays['motif_example_velocity_mm_s']=b['velocity'][examples]
+            centers=model.cluster_centers_.reshape(n_motifs,13,rank+2)*np.sqrt(13)
+            model_arrays['motif_center_velocity_mm_s']=centers[:,:,rank:]*(normalizer['velocity_feature_std']*np.sqrt(2))+normalizer['velocity_feature_mean']
             model_arrays['motif_example_ant']=ids[examples]
             model_arrays['motif_example_frames']=b['frames'][examples]
             for side in ('left','right'):
@@ -273,8 +319,10 @@ def fit_space_blind(ants,b,output,bootstrap=100):
                 table.to_csv(output/f'{side}_posture_groups.csv',index=False)
         for side in ('left','right'):
             rows=np.flatnonzero(ants.side.eq(side).to_numpy());features=np.sqrt(prob[0,rows])
-            fit=KMeans(2,n_init=40,random_state=SEED).fit(features)
-            labels,order=order_labels(fit.labels_,activity[rows])
+            if name==PRIMARY:labels=results[side]['labels']
+            else:
+                fit=KMeans(2,n_init=40,random_state=SEED).fit(features)
+                labels,order=order_labels(fit.labels_,activity[rows])
             secondary_rows.extend(dict(side=side,ant=ants.iloc[i].ant,representation=name,group=int(labels[j])) for j,i in enumerate(rows))
     # Camera-only profiles are a diagnostic comparator, never a posture input.
     cameras=np.unique(b['camera']);camera_index=np.searchsorted(cameras,b['camera'])
@@ -288,11 +336,14 @@ def fit_space_blind(ants,b,output,bootstrap=100):
     model_arrays.update(posture_mean=pca.mean_,posture_components=pca.components_,posture_variance=pca.explained_variance_,
                         posture_variance_ratio=pca.explained_variance_ratio_,rank=np.array(rank),n_motifs=np.array(n_motifs),
                         standard_lengths_mm=b['lengths'],ants=ants.ant.to_numpy(str),camera_ids=np.array(list(camera_means)),camera_feature_means=np.stack(list(camera_means.values())))
+    model_arrays.update(normalizer,feature_version=np.array('posture_velocity_v2'))
+    pd.DataFrame([dict(feature=f'posture_PC{j+1}',center=float(normalizer['posture_feature_mean'][j]),divisor=float(normalizer['posture_feature_scale']),units='direction-cosine coefficient') for j in range(rank)]+
+      [dict(feature=n,center=float(normalizer['velocity_feature_mean'][j]),divisor=float(normalizer['velocity_feature_std'][j]*np.sqrt(2)),units='mm/s') for j,n in enumerate(('forward_velocity','lateral_velocity'))]).to_csv(output/'feature_scaling.csv',index=False)
     np.savez_compressed(output/'space_blind_models.npz',**model_arrays)
     np.savez_compressed(output/'ant_motif_profiles.npz',**profile_arrays)
     # Half-hour profiles keep actual elapsed time and sample counts, never fill gaps.
     halfhour=b['minute']//30;temporal=[]
-    assigned=motif_labels['posture_history']
+    assigned=motif_labels[PRIMARY]
     for side,r in results.items():
         for row_index,i in enumerate(r['rows']):
             for slot in range(96):
@@ -317,10 +368,12 @@ def fit_space_blind(ants,b,output,bootstrap=100):
     # Small, balanced posture sample for density plots and interactive examples.
     sample=balanced_indices(day==0,ids,80)
     np.savez_compressed(output/'posture_display_samples.npz',shape=shape[sample],scores=scores[sample],ant_index=ids[sample],
-                        frames=b['frames'][sample],motion=clip_motion[sample],motif=assigned[sample],camera=b['camera'][sample])
-    frozen=dict(frozen_utc=datetime.now(timezone.utc).isoformat(),spatial_inputs_loaded=False,history_seconds=1.,
+                        frames=b['frames'][sample],motion=clip_motion[sample],motif=assigned[sample],camera=b['camera'][sample],velocity_mm_s=b['velocity'][sample])
+    frozen=dict(frozen_utc=datetime.now(timezone.utc).isoformat(),occupancy_inputs_loaded=False,history_seconds=1.,
                 prediction_horizon_seconds=.25,rank95=rank,n_motifs=n_motifs,n_ants=len(ants),n_clips=len(shape),
-                input_features='16 body-relative direction cosines; translation, orientation and scale removed',
+                feature_version='posture_velocity_v2',input_features='Posture PCA coefficients plus signed anterior/lateral velocity histories; location and global heading excluded',
+                metric='Posture block variance 1; two standardized velocity channels with combined variance 1; statistics fit on balanced day-1 data',
+                history_samples=13,feature_channels=rank+2,motif_vector_dimensions=13*(rank+2),
                 model_sha256=hashlib.sha256((output/'space_blind_models.npz').read_bytes()).hexdigest(),
                 groups_sha256={s:hashlib.sha256((output/f'{s}_posture_groups.csv').read_bytes()).hexdigest() for s in results},
                 selected_ant_k={s:r['selected_k'] for s,r in results.items()},
@@ -334,7 +387,7 @@ def fit_space_blind(ants,b,output,bootstrap=100):
 def spatial_validation(block,atom_root,output,results,ants,fit):
     """First access to spatial outcomes, after all posture fitting is frozen."""
     frozen=json.loads((output/'SPACE_BLIND_FROZEN.json').read_text())
-    assert frozen['spatial_inputs_loaded'] is False
+    assert frozen['occupancy_inputs_loaded'] is False
     assert hashlib.sha256((output/'space_blind_models.npz').read_bytes()).hexdigest()==frozen['model_sha256']
     start=pd.Timestamp('2026-07-24 10:00').value//(1800*10**9)
     spatial={};provenance=[]

@@ -2,8 +2,49 @@
 import numpy as np
 import pytest
 
-from analysis.postural_dynamics_extract import intrinsic_directions,schedule,DAY1_FRAME,DAY_FRAMES,CLIP_FRAMES,FPS
-from analysis.postural_dynamics import causal_pose,clip_quality,history_features,distributions,CURRENT,FUTURE
+from analysis.postural_dynamics_extract import intrinsic_directions,body_velocity,schedule,DAY1_FRAME,DAY_FRAMES,CLIP_FRAMES,FPS
+from analysis.postural_dynamics import causal_pose,clip_quality,history_features,distributions,joint_state,CURRENT,FUTURE
+
+
+def moving_skeleton(velocity):
+    position=np.arange(60)[None,:,None]/FPS*np.asarray(velocity)[None,None,:]
+    xy=np.zeros((1,60,10,2));xy[:,:,2,0]=-1
+    xy+=position[:,:,None,:]
+    return xy,position
+
+
+def test_velocity_recovers_signed_motion_and_is_rotation_translation_invariant():
+    xy,position=moving_skeleton([2.,-.5])
+    actual=body_velocity(xy,position,mm_per_px=1)
+    np.testing.assert_allclose(actual,np.broadcast_to([2.,-.5],(1,28,2)),atol=1e-6)
+    angle=2.1;rot=np.array([[np.cos(angle),-np.sin(angle)],[np.sin(angle),np.cos(angle)]])
+    transformed=body_velocity(xy@rot.T+[1743,-229],position@rot.T+[1743,-229],mm_per_px=1)
+    np.testing.assert_allclose(actual,transformed,atol=1e-6)
+    # Coordinates in pixels and physical calibration must give the same answer.
+    np.testing.assert_allclose(body_velocity(xy/.016,position/.016),actual,atol=1e-6)
+
+
+def test_velocity_is_causal_and_cannot_span_a_missing_anchor():
+    xy,position=moving_skeleton([-1.,.25]);base=body_velocity(xy,position,mm_per_px=1)
+    position[:,53:]+=100
+    changed=body_velocity(xy,position,mm_per_px=1)
+    np.testing.assert_allclose(changed[:,:CURRENT+1],base[:,:CURRENT+1])
+    assert not np.allclose(changed[:,25],base[:,25])
+    position[:,10]=np.nan
+    missing=body_velocity(xy,position,mm_per_px=1)
+    assert not np.isfinite(missing[:,3:6]).any()
+
+
+def test_joint_scaling_balances_blocks_and_does_not_fit_on_heldout_data():
+    rng=np.random.default_rng(721)
+    pose=rng.normal(size=(8,28,5))*np.arange(1,6);v=rng.normal(size=(8,28,2))*[2,.3]+[.2,-.1]
+    train=np.array([0,2,4,6]);state,norm=joint_state(pose,v,train)
+    var=state[train,:CURRENT+1].var(axis=(0,1))
+    np.testing.assert_allclose([var[:5].sum(),var[5:].sum()],[1,1],atol=1e-6)
+    pose[1::2]*=100;v[1::2]+=1000
+    other,other_norm=joint_state(pose,v,train)
+    for key in norm:np.testing.assert_allclose(norm[key],other_norm[key])
+    np.testing.assert_allclose(state[train],other[train])
 
 
 def test_shape_removes_translation_rotation_scale_but_keeps_head_motion():
