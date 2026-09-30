@@ -78,10 +78,28 @@ fi
 # Input-side -ss so the seek costs no decoding. Sound only because chunk
 # boundaries are keyframe boundaries: under -c copy both the seek and the
 # segmenter snap to keyframes, so a CHUNK_SEC that is not a whole number of GOPs
-# would shift every boundary in the wave. verify_first_chunk refuses that rather
+# would shift every boundary in the wave. verify_landing refuses that rather
 # than shipping silently misaligned chunks.
+#
+# Do not seek to the boundary itself. When the video has B-frames, ffmpeg backs
+# an input -ss off by 3/23 s before seeking (its dts heuristic for formats that
+# cannot seek by pts, Matroska included), so a target exactly on a keyframe lands
+# on the keyframe BEFORE it. Every lo>0 wave of 0726/0729 came out one GOP (60 s)
+# early that way. Aim SEEK_PAST_SEC after the boundary -- more than the back-off,
+# less than one GOP -- and the seek snaps back onto the boundary keyframe.
+SEEK_PAST_SEC=0.5
 ss_args=()
-(( lo > 0 )) && ss_args=(-ss "$(( lo * CHUNK_SEC ))")
+landing_args=()
+seek_sec=0
+if (( lo > 0 )); then
+	seek_sec=$(awk -v b="$(( lo * CHUNK_SEC ))" -v p="$SEEK_PAST_SEC" 'BEGIN{printf "%.3f", b+p}')
+	ss_args=(-ss "$seek_sec")
+	# Second output: the first copied packet, timestamped relative to the seek
+	# point, i.e. exactly where the seek landed. Costs no extra read.
+	landing_log=$(mktemp "${TMPDIR:-/tmp}/chunk_landing.XXXXXX")
+	trap 'rm -f "$landing_log"' EXIT
+	landing_args=(-map 0:v:0 -c copy -frames:v 1 -f framecrc "$landing_log")
+fi
 
 # -t cannot be trusted to stop the segment muxer exactly at the window's end:
 # -reset_timestamps restarts the output clock for every segment, so the duration
@@ -120,13 +138,43 @@ ffmpeg -hide_banner -nostdin -y "${ss_args[@]}" -i "$source_path" \
 	-t "$(( (hi - lo + 1) * CHUNK_SEC ))" -c copy -map 0 \
 	-f segment -segment_time "$CHUNK_SEC" -reset_timestamps 1 \
 	-segment_start_number "$lo" \
-	"$flash_dir/${vname}_%03d.${OUT_EXT}"
+	"$flash_dir/${vname}_%03d.${OUT_EXT}" \
+	"${landing_args[@]}"
 
-# A shifted seek is invisible in the output -- every chunk is a valid file of
-# roughly the right size -- so check the packet count of the wave's FIRST chunk
-# against the frame cap the worklist will hand inference. Packets, not frames:
-# -count_packets never decodes. Skipped when lo==0 (no seek happened) and when
-# the first chunk is the video's last (a legitimately short residual).
+remove_wave_output() {
+	for (( i=lo; i<=hi; i++ )); do rm -f "$(chunk_path "$i")"; done
+}
+
+# A shifted seek is invisible in the chunks themselves -- they are valid files of
+# exactly the right length -- so check where it landed: the frame the wave's
+# first chunk starts on must be the boundary frame lo*CHUNK_SEC*fps. It is not
+# when the video has no keyframe there, e.g. an NVENC scene-cut IDR moved this
+# camera's GOP grid (0928 cam19, +457 frames). Fails closed on an unreadable log.
+verify_landing() {
+	local tb pts landed want
+	tb=$(awk '/^#tb 0:/ {print $3; exit}' "$landing_log")
+	pts=$(awk -F, '!/^#/ {gsub(/ /, "", $3); print $3; exit}' "$landing_log")
+	want=$(awk -v f="$fps" -v c="$(( lo * CHUNK_SEC ))" 'BEGIN{printf "%d", f*c+0.5}')
+	if [[ -z "$tb" || -z "$pts" ]]; then
+		echo "[ERR] could not read where the -ss $seek_sec seek landed in $vname; removing the wave's output." >&2
+		remove_wave_output
+		return 1
+	fi
+	landed=$(awk -v s="$seek_sec" -v p="$pts" -v tb="$tb" -v f="$fps" \
+		'BEGIN{split(tb, r, "/"); x=(s + p*r[1]/r[2])*f; printf "%d", (x < 0 ? x-0.5 : x+0.5)}')
+	if (( landed != want )); then
+		echo "[ERR] chunk $lo of $vname would start at frame $landed, not at its boundary frame $want:" >&2
+		echo "      the video has no keyframe at the boundary (an off-grid keyframe, e.g. an" >&2
+		echo "      NVENC scene-cut IDR, moved this camera's GOP grid). Removing the wave's output." >&2
+		remove_wave_output
+		return 1
+	fi
+	echo "[OK] chunk $lo starts on its boundary keyframe (frame $want)"
+}
+
+# The first chunk's length catches a keyframe that is missing from its END
+# boundary. Packets, not frames: -count_packets never decodes. Skipped when the
+# first chunk is the video's last (a legitimately short residual).
 verify_first_chunk() {
 	local first want got
 	first=$(chunk_path "$lo")
@@ -139,16 +187,19 @@ verify_first_chunk() {
 	fi
 	if (( got != want )); then
 		echo "[ERR] chunk $lo of $vname holds $got frames, expected $want." >&2
-		echo "      The -ss seek did not land on a chunk boundary, so every chunk in" >&2
-		echo "      this wave is offset. CHUNK_SEC=$CHUNK_SEC must be a whole number" >&2
+		echo "      Its end boundary is not a keyframe, so every later chunk in this" >&2
+		echo "      wave is offset. CHUNK_SEC=$CHUNK_SEC must be a whole number" >&2
 		echo "      of GOPs for wave processing. Removing the misaligned output." >&2
-		for (( i=lo; i<=hi; i++ )); do rm -f "$(chunk_path "$i")"; done
+		remove_wave_output
 		return 1
 	fi
 	echo "[OK] chunk $lo alignment verified ($got frames)"
 }
 prune_out_of_window
 
+if (( lo > 0 )); then
+	verify_landing || exit 1
+fi
 if (( lo > 0 && lo < n_chunks - 1 )); then
 	verify_first_chunk || exit 1
 fi
