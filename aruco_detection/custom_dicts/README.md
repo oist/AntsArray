@@ -31,6 +31,13 @@ A matching `.svg` is written next to the `.png` automatically (pass `--no-svg` t
 
 Defaults: `--marker-mm 1.5 --margin-mm 0.3 --dpi 600 --cols 10`.
 
+## Re-tagging sheets (only some IDs)
+
+`--ids "3,13,57-59"` prints just those IDs, `--copies N` repeats each one N times in a row
+(columns default to ~10, a multiple of N), `--title` labels the sheet. Without these options the
+output is the full sheet above, unchanged. `aruco_detection/tag_roster/` finds which IDs a block's
+colonies are missing and writes these sheets for you.
+
 ## Rebuild the dictionaries from scratch
 
 Slow (full 2^16 search + simulated annealing). Only needed if changing `--dict-a-count`, `--dict-b-count`, or distance constraints.

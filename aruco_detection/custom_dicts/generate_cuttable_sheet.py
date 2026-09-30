@@ -4,7 +4,7 @@
 Layout:
   - 10x10 grid of markers (IDs 0-99)
   - Each marker at specified physical size (default 1.5mm)
-  - White quiet zone (margin) around each marker (default 0.5mm)
+  - White quiet zone (margin) around each marker (default 0.3mm)
   - ID labels positioned outside the margin
   - Cutting crop marks at row/column boundaries for precise cutting
 
@@ -17,6 +17,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import html
 from pathlib import Path
 
 import cv2
@@ -45,25 +46,60 @@ def mm_to_px(mm, dpi):
     return round(mm * dpi / 25.4)
 
 
+def parse_ids(spec, n_markers):
+    """Parse an ID list such as "3,13,57-59" into sorted unique IDs of the dictionary."""
+    ids = set()
+    for part in spec.split(","):
+        part = part.strip()
+        lo, sep, hi = part.partition("-")
+        if not lo.isdigit() or (sep and not hi.isdigit()):
+            raise ValueError(f"bad ID or range {part!r} in {spec!r}")
+        lo, hi = int(lo), int(hi) if sep else int(lo)
+        if lo > hi or hi >= n_markers:
+            raise ValueError(f"{part!r} is not within IDs 0-{n_markers - 1}")
+        ids.update(range(lo, hi + 1))
+    return sorted(ids)
+
+
+def tag_sequence(ids, n_markers, copies=1):
+    """Tags in print order: every ID once (full sheet) or each given ID `copies` times in a row."""
+    if copies < 1:
+        raise ValueError("copies must be at least 1")
+    base = range(n_markers) if ids is None else ids
+    bad = [mid for mid in base if not 0 <= mid < n_markers]
+    if bad:   # a negative ID would index the dictionary from the end and print the wrong marker
+        raise ValueError(f"IDs {bad} are not within 0-{n_markers - 1}")
+    return [mid for mid in base for _ in range(copies)]
+
+
+def default_cols(copies):
+    """About 10 columns, rounded down to whole IDs so an ID's copies never wrap to the next row."""
+    return copies * max(1, 10 // copies)
+
+
 def generate_cuttable_sheet(
     dictionary: aruco.Dictionary,
     n_markers: int,
     min_d: int,
     output_path: Path,
     marker_mm: float = 1.5,
-    margin_mm: float = 0.5,
+    margin_mm: float = 0.3,   # same as the CLI and the SVG: 2.1 mm tags
     label_gap_mm: float = 1.8,
     col_gap_mm: float = 1.2,
     crop_mark_mm: float = 2.0,
     page_margin_mm: float = 8.0,
     dpi: int = 600,
     cols: int = 10,
+    ids: list[int] | None = None,
+    title: str | None = None,
 ):
     """Generate a cuttable tag sheet with crop marks.
 
+    `ids` is the print order (see tag_sequence); None = every marker once, in ID order.
+
     Physical layout per tag:
         [margin][marker][margin]
-         0.5mm   1.5mm   0.5mm  = 2.5mm wide
+         0.3mm   1.5mm   0.3mm  = 2.1mm wide
 
     Between tags:
         Horizontal gap (col_gap_mm) for vertical crop marks
@@ -72,7 +108,8 @@ def generate_cuttable_sheet(
     Crop marks: short lines at every row/column cut boundary,
     extending outside the grid area.
     """
-    rows = (n_markers + cols - 1) // cols
+    seq = tag_sequence(ids, n_markers)
+    rows = (len(seq) + cols - 1) // cols
 
     # Convert dimensions to pixels
     marker_px = mm_to_px(marker_mm, dpi)
@@ -94,8 +131,24 @@ def generate_cuttable_sheet(
     grid_w = cols * cell_w - col_gap_px  # no gap after last column
     grid_h = rows * cell_h - label_gap_px  # no gap after last row... actually keep it for labels
 
+    if title is None:
+        title = f"Custom_A  {n_markers} markers  min_d={min_d}  marker={marker_mm}mm  margin={margin_mm}mm"
+    footer_text = f"DPI: {dpi}  |  Cut along crop marks  |  Each tag: {marker_mm + 2*margin_mm:.1f}mm x {marker_mm + 2*margin_mm:.1f}mm"
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = mm_to_px(2.0, dpi) / 30  # scale relative to desired text height
+
+    # A re-tagging sheet can be far narrower than its own text, so widen it to fit the
+    # title, footer and ruler. The full sheet keeps its historical (byte-identical) layout.
+    content_w = grid_w
+    if ids is not None:
+        thick = max(1, dpi // 300)
+        content_w = max(grid_w,
+                        cv2.getTextSize(title, font, font_scale, thick)[0][0],
+                        cv2.getTextSize(footer_text, font, font_scale * 0.5, thick)[0][0],
+                        mm_to_px(18, dpi))   # 10 mm ruler + its label
+
     # Total sheet with page margins and crop mark space
-    sheet_w = grid_w + 2 * page_margin_px + 2 * crop_mark_px
+    sheet_w = content_w + 2 * page_margin_px + 2 * crop_mark_px
     sheet_h = rows * cell_h + 2 * page_margin_px + 2 * crop_mark_px + mm_to_px(6, dpi)  # extra for title
 
     # Title area
@@ -109,14 +162,11 @@ def generate_cuttable_sheet(
     sheet = np.ones((sheet_h, sheet_w), dtype=np.uint8) * 255
 
     # -- Title --
-    title = f"Custom_A  {n_markers} markers  min_d={min_d}  marker={marker_mm}mm  margin={margin_mm}mm"
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    font_scale = mm_to_px(2.0, dpi) / 30  # scale relative to desired text height
     cv2.putText(sheet, title, (ox, oy - mm_to_px(2, dpi)),
                 font, font_scale, 0, max(1, dpi // 300), cv2.LINE_AA)
 
     # Scale ruler (10mm)
-    ruler_x = ox + grid_w - mm_to_px(12, dpi)
+    ruler_x = ox + content_w - mm_to_px(12, dpi)
     ruler_y = oy - mm_to_px(5, dpi)
     ruler_len = mm_to_px(10, dpi)
     cv2.line(sheet, (ruler_x, ruler_y), (ruler_x + ruler_len, ruler_y), 0, max(1, dpi // 300))
@@ -128,8 +178,8 @@ def generate_cuttable_sheet(
                 font, font_scale * 0.6, 0, max(1, dpi // 300), cv2.LINE_AA)
 
     # -- Draw markers and ID labels --
-    for mid in range(n_markers):
-        r, c = divmod(mid, cols)
+    for k, mid in enumerate(seq):
+        r, c = divmod(k, cols)
 
         # Tag cut boundary top-left
         tag_x = ox + c * cell_w
@@ -158,8 +208,8 @@ def generate_cuttable_sheet(
     arm_len = mm_to_px(0.6, dpi)  # length of each arm of the L
     corner_gap = mm_to_px(0.15, dpi)  # tiny gap between corner mark and tag edge
 
-    for mid in range(n_markers):
-        r, c = divmod(mid, cols)
+    for k in range(len(seq)):
+        r, c = divmod(k, cols)
         tag_x = ox + c * cell_w
         tag_y = oy + r * cell_h
 
@@ -194,7 +244,6 @@ def generate_cuttable_sheet(
 
     # -- Print info footer --
     footer_y = sheet_h - page_margin_px
-    footer_text = f"DPI: {dpi}  |  Cut along crop marks  |  Each tag: {marker_mm + 2*margin_mm:.1f}mm x {marker_mm + 2*margin_mm:.1f}mm"
     cv2.putText(sheet, footer_text, (ox, footer_y),
                 font, font_scale * 0.5, 120, max(1, dpi // 300), cv2.LINE_AA)
 
@@ -224,13 +273,17 @@ def generate_cuttable_svg(
     page_margin_mm: float = 8.0,
     cols: int = 10,
     name: str = "Custom_A",
+    ids: list[int] | None = None,
+    title: str | None = None,
 ):
     """Generate a cuttable tag sheet as SVG (vector format).
 
     All coordinates and sizes are in millimeters (SVG user units = mm via viewBox).
     Output is true vector — markers are rectangles, labels are text, crop marks are lines.
+    `ids` is the print order (see tag_sequence); None = every marker once, in ID order.
     """
-    rows = (n_markers + cols - 1) // cols
+    seq = tag_sequence(ids, n_markers)
+    rows = (len(seq) + cols - 1) // cols
 
     # Tag cut boundary (marker + 2 margins)
     tag_w = marker_mm + 2 * margin_mm
@@ -242,9 +295,20 @@ def generate_cuttable_svg(
 
     grid_w = cols * cell_w - col_gap_mm
 
+    if title is None:
+        title = f"{name}  {n_markers} markers  min_d={min_d}  marker={marker_mm}mm  margin={margin_mm}mm"
+    footer = (f"Vector SVG  |  Cut along corner marks  |  "
+              f"Each tag: {tag_w:.1f}mm x {tag_h:.1f}mm")
+
+    # Widen a re-tagging sheet to fit its text (Helvetica averages < 0.6 em per
+    # character); the full sheet keeps its historical layout, as in the PNG.
+    content_w = grid_w
+    if ids is not None:
+        content_w = max(grid_w, 0.6 * 2.0 * len(title), 0.6 * 1.2 * len(footer), 18.0)
+
     # Sheet dimensions in mm
     title_h = 6.0
-    sheet_w = grid_w + 2 * page_margin_mm + 2 * crop_arm_mm
+    sheet_w = content_w + 2 * page_margin_mm + 2 * crop_arm_mm
     sheet_h = rows * cell_h + 2 * page_margin_mm + 2 * crop_arm_mm + title_h + 6.0  # extra footer
 
     # Origin of grid (top-left of first tag)
@@ -266,14 +330,13 @@ def generate_cuttable_svg(
     svg.append(f'  <rect width="{sheet_w}" height="{sheet_h}" fill="white"/>')
 
     # Title
-    title = f"{name}  {n_markers} markers  min_d={min_d}  marker={marker_mm}mm  margin={margin_mm}mm"
     svg.append(
         f'  <text x="{ox}" y="{oy - 2}" font-family="Helvetica, Arial, sans-serif" '
-        f'font-size="2.0" fill="black">{title}</text>'
+        f'font-size="2.0" fill="black">{html.escape(title, quote=False)}</text>'
     )
 
     # Scale ruler (10mm) above title
-    rx = ox + grid_w - 12.0
+    rx = ox + content_w - 12.0
     ry = oy - 5.0
     svg.append(
         f'  <line x1="{rx}" y1="{ry}" x2="{rx + 10}" y2="{ry}" '
@@ -292,8 +355,8 @@ def generate_cuttable_svg(
     )
 
     # Markers, labels, and crop marks
-    for mid in range(n_markers):
-        r, c = divmod(mid, cols)
+    for k, mid in enumerate(seq):
+        r, c = divmod(k, cols)
         tag_x = ox + c * cell_w
         tag_y = oy + r * cell_h
 
@@ -351,8 +414,6 @@ def generate_cuttable_svg(
 
     # Footer
     footer_y = sheet_h - page_margin_mm
-    footer = (f"Vector SVG  |  Cut along corner marks  |  "
-              f"Each tag: {tag_w:.1f}mm x {tag_h:.1f}mm")
     svg.append(
         f'  <text x="{ox}" y="{footer_y}" font-family="Helvetica, Arial, sans-serif" '
         f'font-size="1.2" fill="#555">{footer}</text>'
@@ -375,8 +436,13 @@ def main():
     p.add_argument("--marker-mm", type=float, default=1.5, help="Marker size in mm (default: 1.5)")
     p.add_argument("--margin-mm", type=float, default=0.3, help="White margin in mm (default: 0.3)")
     p.add_argument("--dpi", type=int, default=600, help="Output DPI for PNG (default: 600)")
-    p.add_argument("--cols", type=int, default=10, help="Columns (default: 10)")
+    p.add_argument("--cols", type=int, default=None,
+                   help="Columns (default: ~10, a multiple of --copies so an ID's copies share a row)")
     p.add_argument("--name", default="Custom_A", help="Dictionary name shown in title")
+    p.add_argument("--ids", default=None,
+                   help='Print only these IDs, e.g. "3,13,57-59" (re-tagging); default: every ID')
+    p.add_argument("--copies", type=int, default=1, help="Tags per ID (default: 1)")
+    p.add_argument("--title", default=None, help="Title line (default: dictionary summary)")
     p.add_argument("--no-svg", action="store_true",
                    help="Skip SVG output when generating PNG (default: also save SVG)")
     args = p.parse_args()
@@ -387,14 +453,23 @@ def main():
     dictionary, n_markers, min_d, _patterns = load_custom_dictionary(args.npz)
     print(f"Loaded: {n_markers} markers, min_d={min_d}")
 
+    wanted = None if args.ids is None else parse_ids(args.ids, n_markers)
+    seq = None
+    if wanted is not None or args.copies != 1:
+        seq = tag_sequence(wanted, n_markers, copies=args.copies)
+        print(f"Tags: {len(seq)} ({args.copies} x IDs {' '.join(map(str, wanted or range(n_markers)))})")
+    cols = args.cols if args.cols is not None else default_cols(args.copies)
+
     ext = output_path.suffix.lower()
     if ext == ".svg":
         generate_cuttable_svg(
             dictionary, n_markers, min_d, output_path,
             marker_mm=args.marker_mm,
             margin_mm=args.margin_mm,
-            cols=args.cols,
+            cols=cols,
             name=args.name,
+            ids=seq,
+            title=args.title,
         )
     elif ext == ".png":
         generate_cuttable_sheet(
@@ -402,7 +477,9 @@ def main():
             marker_mm=args.marker_mm,
             margin_mm=args.margin_mm,
             dpi=args.dpi,
-            cols=args.cols,
+            cols=cols,
+            ids=seq,
+            title=args.title,
         )
         if not args.no_svg:
             svg_path = output_path.with_suffix(".svg")
@@ -410,8 +487,10 @@ def main():
                 dictionary, n_markers, min_d, svg_path,
                 marker_mm=args.marker_mm,
                 margin_mm=args.margin_mm,
-                cols=args.cols,
+                cols=cols,
                 name=args.name,
+                ids=seq,
+                title=args.title,
             )
     else:
         raise ValueError(f"Unsupported output extension: {ext}. Use .png or .svg")
