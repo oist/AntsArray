@@ -142,6 +142,8 @@ defaults:
 | `--skip-trt-export`    | off                | fall back to `sleap-nn track` (raw model dirs, no export)                                           |
 | `--saion-partition`    | `largegpu`       | A100 SM80                                                                                             |
 | `--sleap-module`       | `sleap-nn/0.2.0` | saion module to `module load` for predict tasks                                                     |
+| `--sleap-max-instances` | `96`            | most animals kept per frame; baked into the TRT/ONNX export and its cache key (`<centroid>__<instance>__k<N>b<B>__<partition>`), recorded in the contract. sleap-nn's own default of 20 silently truncated every colony nest camera (cam01/02/04/06/07/09) in every block until 2026-10-05. Cap sweep on 20260928 cam09 (70 ants/frame, max 82): 48 and 64 still cap 98-100 % of frames; 96 caps none and matches 128 |
+| `--sleap-batch-size`   | auto             | the engine's max batch = inference batch. Auto = min(8, 192 / cap) on the exported path: the engine runs cap x batch crops of 640x640 and TensorRT cannot build above 192 (A100: 20x8, 48x4, 64x3, 96x2, 128x1 build; 240+ fail). Speed depends on the cap, not on the batch or on how many animals are in view: ~45 / 25 / 21 / 14 / 11 fps at cap 20 / 48 / 64 / 96 / 128 |
 | `--aruco-concurrency`  | `100`            | array `%N` cap; compute cpu cap 2000 / `-c 16` ≈ 125 max                                             |
 | `--sleap-concurrency`  | `8`              | array `%N` cap                                                                                      |
 | `--datacp-concurrency` | `4`              | array `%N` cap (deigo has 4 mover nodes)                                                            |

@@ -43,6 +43,7 @@ CONTRACT = {
     "sleap_module": "sleap-nn/0.3.3",
     "sleap_runtime": "tensorrt",
     "saion_partition": "short-a100",
+    "sleap_max_instances": "128",
 }
 
 
@@ -210,6 +211,24 @@ def test_execution_setting_change_only_warns():
         b.close()
 
 
+def test_instance_cap_is_filled_into_old_contracts_and_a_raise_only_warns():
+    """The exported engine's per-frame instance cap (sleap-nn --max-instances).
+
+    Blocks processed before the cap was recorded get it filled in by the first run
+    that supplies it; re-running capped nest cameras at a higher cap warns, it does
+    not refuse -- the same treatment as the other execution settings.
+    """
+    b = Block()
+    try:
+        assert b.sync(drop=("sleap_max_instances",)) == 0
+        assert "sleap_max_instances" not in b.state()["detection"]
+        assert b.sync() == 0
+        assert b.state()["detection"]["sleap_max_instances"] == "128"
+        assert b.sync({"sleap_max_instances": "256"}) == 0
+    finally:
+        b.close()
+
+
 def test_empty_aruco_params_is_a_value_not_absence():
     """'' means detector defaults. A later run must not be free to change it."""
     b = Block()
@@ -237,7 +256,8 @@ def test_key_absent_from_contract_is_filled_not_refused():
     try:
         assert b.sync(legs="aruco",
                       drop=("sleap_model_centroid", "sleap_model_instance",
-                            "sleap_module", "sleap_runtime", "saion_partition")) == 0
+                            "sleap_module", "sleap_runtime", "saion_partition",
+                            "sleap_max_instances")) == 0
         assert "sleap_model_centroid" not in b.state()["detection"]
         assert b.sync() == 0
         assert b.state()["detection"]["sleap_model_centroid"] == "/models/x.centroid"

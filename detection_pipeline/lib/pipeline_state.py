@@ -62,7 +62,12 @@ HARD_KEYS = ("chunk_sec", "chunk_ext", "aruco_dict", "aruco_params",
 # here deliberately -- pipeline.sh auto-falls back to the pytorch path for
 # legacy model dirs, so refusing a runtime change would refuse a legitimate
 # rerun that the pipeline itself chose.
-SOFT_KEYS = ("sleap_module", "sleap_runtime", "saion_partition", "aruco_script")
+SOFT_KEYS = ("sleap_module", "sleap_runtime", "saion_partition", "aruco_script",
+             "sleap_max_instances")
+# sleap_max_instances is the per-frame instance cap baked into the exported engine
+# (sleap-nn export --max-instances). A raise does change output content, but only
+# on frames that hit the old cap, and re-running exactly those cameras at a higher
+# cap is the intended repair -- so it warns, and older contracts get it filled in.
 
 # Which contract keys belong to which leg. An --only-aruco run must not be
 # judged against sleap keys it never supplied, and vice versa.
@@ -70,7 +75,7 @@ ALWAYS_KEYS = ("chunk_sec", "chunk_ext")
 LEG_KEYS = {
     "aruco": ("aruco_dict", "aruco_params", "aruco_script"),
     "sleap": ("sleap_model_centroid", "sleap_model_instance", "sleap_module",
-              "sleap_runtime", "saion_partition"),
+              "sleap_runtime", "saion_partition", "sleap_max_instances"),
 }
 
 # Output basenames in data/. Mirrors catalog/const.py, kept local so this module

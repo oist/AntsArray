@@ -38,10 +38,28 @@ REMOTE_OUTPUT="$REMOTE_ROOT/output"
 REMOTE_JOBS="$REMOTE_ROOT/jobs${WAVE_SLUG:+/$WAVE_SLUG}"
 EXPORT_ROOT="/work/ReiterU/$USER/sleap_export"
 
-# Identify model set + GPU partition so engines for different GPU types coexist.
-# TRT engines are SM-specific (e.g. A100 SM80 vs V100 SM70); building on partition
-# X and predicting on partition Y will fail to load the engine.
-MODEL_ID="$(basename "$SLEAP_MODEL_CENTROID")__$(basename "$SLEAP_MODEL_INSTANCE")__${SAION_PARTITION}"
+# Identify model set + instance cap + batch + GPU partition so engines for different
+# GPU types coexist. TRT engines are SM-specific (e.g. A100 SM80 vs V100 SM70); building
+# on partition X and predicting on partition Y will fail to load the engine. The
+# per-frame instance cap and the max batch are baked into the export, so they are part
+# of the key too: an engine exported with another cap must never be picked up by a
+# cache hit (the pre-key engines all carry sleap-nn's default cap of 20, which
+# truncated nest cameras), and one built for a smaller batch cannot serve a larger
+# inference batch. cap x batch is limited to 192 crops (see export_sleap_trt.sh), so
+# an unset batch follows the cap. The partition stays the LAST component -- the A100
+# adoption below strips it.
+# A pipeline.env written before the cap existed exports SLEAP_BATCH_SIZE=8 but no cap:
+# that batch was chosen for sleap-nn's cap of 20, so derive both afresh rather than pair
+# cap 96 with batch 8 (768 crops, which cannot build).
+if [[ -z "${SLEAP_MAX_INSTANCES:-}" ]]; then
+	SLEAP_MAX_INSTANCES=96
+	SLEAP_BATCH_SIZE=""
+fi
+if [[ -z "${SLEAP_BATCH_SIZE:-}" ]]; then
+	SLEAP_BATCH_SIZE=$(( 192 / SLEAP_MAX_INSTANCES ))
+	(( SLEAP_BATCH_SIZE > 8 )) && SLEAP_BATCH_SIZE=8
+fi
+MODEL_ID="$(basename "$SLEAP_MODEL_CENTROID")__$(basename "$SLEAP_MODEL_INSTANCE")__k${SLEAP_MAX_INSTANCES}b${SLEAP_BATCH_SIZE}__${SAION_PARTITION}"
 MODEL_ID="${MODEL_ID//\//_}"
 EXPORT_DIR="$EXPORT_ROOT/$MODEL_ID"
 
@@ -90,12 +108,13 @@ if (( SKIP_TRT_EXPORT == 0 )) && [[ "$SLEAP_RUNTIME" != "pytorch" ]]; then
 		else
 			echo "[INFO] no sibling engine; building on $SAION_PARTITION via $SCRIPTS_DIR/export_sleap_trt.sh"
 			# export_sleap_trt.sh srun's itself onto $SAION_PARTITION and blocks until done
-			ssh_login_retry saion "SLEAP_MODULE='${SLEAP_MODULE:-sleap-nn/0.2.0}' bash '$SCRIPTS_DIR/export_sleap_trt.sh' \
+			ssh_login_retry saion "SLEAP_MODULE='${SLEAP_MODULE:-sleap-nn/0.2.0}' MAX_BATCH='${SLEAP_BATCH_SIZE}' bash '$SCRIPTS_DIR/export_sleap_trt.sh' \
 				--centroid '$SLEAP_MODEL_CENTROID' \
 				--instance '$SLEAP_MODEL_INSTANCE' \
 				--out '$EXPORT_DIR' \
 				--runtime '$SLEAP_RUNTIME' \
-				--partition '$SAION_PARTITION'" \
+				--partition '$SAION_PARTITION' \
+				--max-instances '$SLEAP_MAX_INSTANCES'" \
 				|| { echo "[ERR] TRT export failed" >&2; exit 3; }
 		fi
 	fi

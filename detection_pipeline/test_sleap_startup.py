@@ -46,7 +46,19 @@ source() {
         return 127
     fi
 }
-sleap-nn() { printf 'INFERENCE_REACHED\\n'; }
+sleap-nn() {
+    printf 'INFERENCE_REACHED\\n'
+    # Like the real export: write the metadata, carrying the cap it was given.
+    local out="" k=20
+    while [[ $# -gt 0 ]]; do
+        case "$1" in -o) out="$2"; shift 2 ;; --max-instances) k="$2"; shift 2 ;; *) shift ;; esac
+    done
+    if [[ -n "$out" ]]; then
+        mkdir -p "$out"
+        printf '{"max_instances": %s}\\n' "$k" > "$out/export_metadata.json"
+    fi
+    return 0
+}
 export -f fake_module source sleap-nn
 """
     if modules_ready:

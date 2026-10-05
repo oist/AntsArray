@@ -91,7 +91,13 @@ SLEAP runtime:
                                     Picking the partition auto-sizes the four knobs
                                     below; you only set them to hold resources back.
   --sleap-module NAME               saion module name. default: sleap-nn/0.2.0
-  --sleap-batch-size N              TRT inference batch; must be <= engine max profile batch. default: 8
+  --sleap-batch-size N              inference batch = the engine's max batch. default: auto =
+                                    min(8, 192 / cap) on the exported path (cap x batch over
+                                    192 crops cannot build), 8 on the 'sleap-nn track' path
+  --sleap-max-instances N           most animals kept per frame. Baked into the TRT/ONNX
+                                    export (and its cache key, __k<N>b<B>__), so a new value
+                                    re-exports. default: 96 (sleap-nn's own 20 truncated
+                                    every nest camera)
   --sleap-cpus N                    cpus per sleap task. default: auto = cpu_cap/concurrency
   --sleap-mem SIZE                  mem per sleap task.  default: auto = mem_cap/concurrency
   --sleap-wall D-HH                 per-task walltime.   default: auto = partition wall
@@ -236,11 +242,16 @@ SLEAP_RUNTIME=tensorrt
 SKIP_TRT_EXPORT=0
 SAION_PARTITION=largegpu
 SLEAP_MODULE="sleap-nn/0.2.0"
-# TRT per-frame inference batch. Must be <= the exported engine's max optimization
-# profile batch. Full-res Simple_skeleton engines max out at 8 (batch>=16 fails to
-# build with a Myelin int32 overflow), so 8 is the safe default; raise only if the
-# engine was exported with a larger max batch.
-SLEAP_BATCH_SIZE=8
+# TRT per-frame inference batch. Empty = auto, resolved after arg parsing: on the
+# exported path min(8, 192 / cap), because the engine runs cap x batch crops of
+# 640x640 and TensorRT cannot build above 192 (measured 2026-10-05: 20x8, 48x4,
+# 64x3, 96x2, 128x1 build; 240+ crops fail); 8 on the 'sleap-nn track' path.
+SLEAP_BATCH_SIZE=""
+# Per-frame instance cap of the exported engine (sleap-nn export --max-instances).
+# sleap-nn defaults to 20, which silently dropped ants on every colony nest camera.
+# 96 is the measured choice: on 20260928 cam09 (70 ants/frame, max 82) 48 and 64 still
+# cap 98-100 % of frames, 96 caps none and matches 128, 31 % faster.
+SLEAP_MAX_INSTANCES=96
 ARUCO_CONCURRENCY=100   # compute assoc cap=2000 cpu; at -c 16 that's ~125 concurrent max, so 100 leaves headroom for the bridge (also on compute)
 # Sleap GPU concurrency + per-task resources. Empty = auto-derived from the
 # selected --saion-partition after arg parsing (see saion_caps below):
@@ -309,6 +320,7 @@ while [[ $# -gt 0 ]]; do
 		--saion-partition) SAION_PARTITION="$2"; shift 2 ;;
 		--sleap-module) SLEAP_MODULE="$2"; shift 2 ;;
 		--sleap-batch-size) SLEAP_BATCH_SIZE="$2"; shift 2 ;;
+		--sleap-max-instances) SLEAP_MAX_INSTANCES="$2"; shift 2 ;;
 		--aruco-concurrency) ARUCO_CONCURRENCY="$2"; shift 2 ;;
 		--sleap-concurrency) SLEAP_CONCURRENCY="$2"; shift 2 ;;
 		--sleap-cpus) SLEAP_CPUS="$2"; shift 2 ;;
@@ -460,6 +472,8 @@ case "$SLEAP_RUNTIME" in
 	tensorrt|onnx|pytorch) ;;
 	*) echo "[ERR] --sleap-runtime must be tensorrt|onnx|pytorch" >&2; exit 2 ;;
 esac
+[[ "$SLEAP_MAX_INSTANCES" =~ ^[1-9][0-9]*$ ]] || {
+	echo "[ERR] --sleap-max-instances must be a positive integer, got '$SLEAP_MAX_INSTANCES'" >&2; exit 2; }
 case "$CHUNK_EXT" in
 	mkv|mp4|avi) ;;
 	*) echo "[ERR] --chunk-ext must be mkv|mp4|avi" >&2; exit 2 ;;
@@ -497,6 +511,28 @@ if (( SKIP_TRT_EXPORT == 0 )) && [[ "$SLEAP_RUNTIME" != "pytorch" ]]; then
 		SKIP_TRT_EXPORT=1
 	fi
 fi
+
+# Inference batch. On the exported path it is also the engine's max batch, and the
+# engine runs cap x batch crops at once, which TensorRT cannot build above 192.
+MAX_ENGINE_CROPS=192
+if (( SKIP_TRT_EXPORT == 0 )) && [[ "$SLEAP_RUNTIME" != "pytorch" ]]; then
+	(( SLEAP_MAX_INSTANCES <= MAX_ENGINE_CROPS )) || {
+		echo "[ERR] --sleap-max-instances $SLEAP_MAX_INSTANCES exceeds the $MAX_ENGINE_CROPS-crop engine limit even at batch 1" >&2; exit 2; }
+	if [[ -z "$SLEAP_BATCH_SIZE" ]]; then
+		SLEAP_BATCH_SIZE=$(( MAX_ENGINE_CROPS / SLEAP_MAX_INSTANCES ))
+		(( SLEAP_BATCH_SIZE > 8 )) && SLEAP_BATCH_SIZE=8
+	fi
+else
+	SLEAP_BATCH_SIZE="${SLEAP_BATCH_SIZE:-8}"
+fi
+[[ "$SLEAP_BATCH_SIZE" =~ ^[1-9][0-9]*$ ]] || {
+	echo "[ERR] --sleap-batch-size must be a positive integer, got '$SLEAP_BATCH_SIZE'" >&2; exit 2; }
+if (( SKIP_TRT_EXPORT == 0 )) && [[ "$SLEAP_RUNTIME" != "pytorch" ]]; then
+	(( SLEAP_MAX_INSTANCES * SLEAP_BATCH_SIZE <= MAX_ENGINE_CROPS )) || {
+		echo "[ERR] --sleap-max-instances $SLEAP_MAX_INSTANCES x --sleap-batch-size $SLEAP_BATCH_SIZE" \
+		     "= $(( SLEAP_MAX_INSTANCES * SLEAP_BATCH_SIZE )) crops; TensorRT cannot build above $MAX_ENGINE_CROPS" >&2; exit 2; }
+fi
+echo "[INFO] SLEAP max_instances=$SLEAP_MAX_INSTANCES batch=$SLEAP_BATCH_SIZE"
 
 # Roots. Only the jobs dir is wave-scoped -- see the WAVE_SLUG comment above.
 # An explicit --jobs-root is honoured verbatim: the caller has already chosen the
@@ -685,6 +721,7 @@ export OUTPUT_GROUP="$OUTPUT_GROUP"
 export SAION_PARTITION="$SAION_PARTITION"
 export SLEAP_MODULE="$SLEAP_MODULE"
 export SLEAP_BATCH_SIZE="$SLEAP_BATCH_SIZE"
+export SLEAP_MAX_INSTANCES="$SLEAP_MAX_INSTANCES"
 export SLEAP_MODEL_CENTROID="$SLEAP_MODEL_CENTROID"
 export SLEAP_MODEL_INSTANCE="$SLEAP_MODEL_INSTANCE"
 export SLEAP_RUNTIME="$SLEAP_RUNTIME"
@@ -759,6 +796,10 @@ if (( ONLY_BACKUP != 1 )); then
 		            --set "sleap_module=$SLEAP_MODULE"
 		            --set "sleap_runtime=$SLEAP_RUNTIME"
 		            --set "saion_partition=$SAION_PARTITION")
+		# The cap only exists on the exported path; 'sleap-nn track' does not read it.
+		if (( SKIP_TRT_EXPORT == 0 )) && [[ "$SLEAP_RUNTIME" != "pytorch" ]]; then
+			STATE_SET+=(--set "sleap_max_instances=$SLEAP_MAX_INSTANCES")
+		fi
 	fi
 	NEW_RUN_ARG=()
 	(( NEW_PROCESSING_RUN == 1 )) && NEW_RUN_ARG=(--new-run)
