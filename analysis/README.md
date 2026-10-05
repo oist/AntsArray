@@ -24,6 +24,13 @@ analysis. Its `# %%` cells form one end-to-end workflow:
 Edit `DATASET_ROOT` near the top, then run the cells in
 order. The required per-track inputs are produced by
 `compute_track_grid_occupancy.py` and `compute_track_speed_vector.py`.
+New speed vectors discard values above **20 mm/s** as `NaN`, after position
+interpolation and smoothing. The tracking pipeline exposes this as
+`--speed_max_mm_s` (or `SPEED_MAX_MM_S`); the standalone calculator uses
+`--max_speed_mm_s`. Set the value to `none` to disable rejection. The chosen
+cutoff is recorded in each speed cache's metadata; existing caches are not
+automatically regenerated. This is independent of the sleep bodypoint cutoff
+and heatmap color scaling.
 `ANTS_DATASET_ROOT` can override the dataset path without editing the script.
 To analyze combined blocks, pass the date folder with `--continuous`, or pass
 the exact `continous_stitched` / `continuous_stitched` folder directly:

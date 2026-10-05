@@ -122,6 +122,7 @@ PER_TRACK_ANALYSIS_SUBMIT_TIME="0-01:00:00"
 PER_TRACK_ANALYSIS_CPUS=4
 PER_TRACK_ANALYSIS_MEM="16G"
 PER_TRACK_ANALYSIS_TIME="0-12:00:00"
+SPEED_MAX_MM_S="${SPEED_MAX_MM_S:-20.0}"
 GRID_OCCUPANCY_GRID_SIZE_MM="${GRID_OCCUPANCY_GRID_SIZE_MM:-0.25}"
 GRID_OCCUPANCY_OUTPUT_NAME="${GRID_OCCUPANCY_OUTPUT_NAME:-grid_occupancy_histograms}"
 GRID_OCCUPANCY_BOUNDS_JSON="${GRID_OCCUPANCY_BOUNDS_JSON:-}"
@@ -226,6 +227,7 @@ per_track_analysis_submit_time="$PER_TRACK_ANALYSIS_SUBMIT_TIME"
 per_track_analysis_cpus="$PER_TRACK_ANALYSIS_CPUS"
 per_track_analysis_mem="$PER_TRACK_ANALYSIS_MEM"
 per_track_analysis_time="$PER_TRACK_ANALYSIS_TIME"
+speed_max_mm_s="$SPEED_MAX_MM_S"
 grid_occupancy_grid_size_mm="$GRID_OCCUPANCY_GRID_SIZE_MM"
 grid_occupancy_output_name="$GRID_OCCUPANCY_OUTPUT_NAME"
 grid_occupancy_bounds_json="$GRID_OCCUPANCY_BOUNDS_JSON"
@@ -329,6 +331,8 @@ Optional:
   --per_track_analysis_submit_cpus N
   --per_track_analysis_submit_mem MEM
   --per_track_analysis_submit_time TIME
+  --speed_max_mm_s FLOAT|none
+                          Discard translational speeds above this value. Default: ${SPEED_MAX_MM_S} mm/s.
   --grid_size_mm FLOAT    Occupancy histogram bin size in mm. Default: ${GRID_OCCUPANCY_GRID_SIZE_MM}
   --grid_output_name NAME Occupancy output folder. Default: ${GRID_OCCUPANCY_OUTPUT_NAME}
   --grid_bounds_json PATH Optional inferred bounds JSON for occupancy histograms.
@@ -429,6 +433,7 @@ while [[ $# -gt 0 ]]; do
     --per_track_analysis_submit_cpus) per_track_analysis_submit_cpus="$2"; shift 2 ;;
     --per_track_analysis_submit_mem) per_track_analysis_submit_mem="$2"; shift 2 ;;
     --per_track_analysis_submit_time) per_track_analysis_submit_time="$2"; shift 2 ;;
+    --speed_max_mm_s) speed_max_mm_s="$2"; shift 2 ;;
     --grid_size_mm) grid_occupancy_grid_size_mm="$2"; shift 2 ;;
     --grid_output_name) grid_occupancy_output_name="$2"; shift 2 ;;
     --grid_bounds_json) grid_occupancy_bounds_json="$2"; shift 2 ;;
@@ -696,6 +701,7 @@ for block_dir in "${blocks[@]}"; do
       ;;
   esac
   sleep_model_q="$(printf '%q' "$sleep_model")"
+  speed_max_mm_s_q="$(printf '%q' "$speed_max_mm_s")"
   grid_occupancy_grid_size_mm_q="$(printf '%q' "$grid_occupancy_grid_size_mm")"
   grid_occupancy_output_name_q="$(printf '%q' "$grid_occupancy_output_name")"
   grid_occupancy_bounds_json_q="$(printf '%q' "$grid_occupancy_bounds_json")"
@@ -989,6 +995,8 @@ export PYTHONNOUSERSITE=1
 cd "${REPO_ROOT}"
 mkdir -p "${per_track_analysis_logs_dir}"
 
+speed_max_mm_s=${speed_max_mm_s_q}
+speed_operation_args_text="\$(printf '%q %q' --max_speed_mm_s "\${speed_max_mm_s}")"
 grid_occupancy_grid_size_mm=${grid_occupancy_grid_size_mm_q}
 grid_occupancy_output_name=${grid_occupancy_output_name_q}
 grid_occupancy_bounds_json=${grid_occupancy_bounds_json_q}
@@ -1030,6 +1038,7 @@ bash "${PER_TRACK_FANOUT_SH}" \\
   --operation_script analysis/compute_track_speed_vector.py \\
   --operation_name speed_vector \\
   --output_name speed_vectors \\
+  --operation_args "\${speed_operation_args_text}" \\
   --run_workdir "${REPO_ROOT}" \\
   --conda_bin "${conda_bin}" \\
   --conda_env "${conda_env}" \\
@@ -1390,6 +1399,7 @@ EOF
     if [[ -f "$analysis_after_stitch_script" ]]; then
       mkdir -p "$logs_dir"
       analysis_grid_args=(
+        --speed_max_mm_s "$speed_max_mm_s"
         --grid_size_mm "$grid_occupancy_grid_size_mm"
         --grid_output_name "$grid_occupancy_output_name"
         --fps "$fps"

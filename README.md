@@ -338,6 +338,14 @@ analysis/compute_track_speed_vector.py
 
 This loads only track `TrackX/TrackY`, builds a dense frame vector, interpolates short gaps, smooths valid segments, converts to mm/s, and saves only the compact speed vector plus metadata.
 
+New speed caches reject values above **20 mm/s** as missing (`NaN`). Set
+`--speed_max_mm_s` on `tracking/colony/submit_blocks_pipeline.sh` or
+`scripts/analysis_after_stitch.sh` to override this cutoff; `none` disables it.
+Both wrappers also accept `SPEED_MAX_MM_S` as an environment default.
+The standalone calculator uses `--max_speed_mm_s` and the same 20 mm/s default.
+The selected cutoff is recorded in `speed_metadata.json`. Existing caches keep
+the threshold they were generated with; changing this default does not rebuild them.
+
 Per-track output:
 
 ```text

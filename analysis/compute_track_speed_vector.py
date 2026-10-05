@@ -201,7 +201,8 @@ def main() -> None:
     parser.add_argument("--bodypoint", type=int, default=0)
     parser.add_argument("--max_interp_gap_frames", type=int, default=5)
     parser.add_argument("--smooth_sigma_frames", type=float, default=2.0)
-    parser.add_argument("--max_speed_mm_s", default="5.0", help="Set to none/off to keep all speeds.")
+    parser.add_argument("--max_speed_mm_s", default="20.0",
+                        help="Discard speeds above this value (mm/s). Default: 20.0; none/off keeps all speeds.")
     args = parser.parse_args()
 
     import os

@@ -37,6 +37,7 @@ timeout_secs=172800   # 48h overall deadline
 run_sleep=0
 sleep_model=""
 fps="${FPS:-24.0}"
+speed_max_mm_s="${SPEED_MAX_MM_S:-20.0}"
 sleep_motion_mm_per_px="${SLEEP_MOTION_MM_PER_PX:-0.016}"
 sleep_motion_cache_max_gap_frames="${SLEEP_MOTION_CACHE_MAX_GAP_FRAMES:-120}"
 grid_size_mm="${GRID_OCCUPANCY_GRID_SIZE_MM:-0.25}"
@@ -65,6 +66,8 @@ Options:
   --poll_seconds N        Poll interval while waiting for the marker. Default: 120
   --timeout N             Overall wait deadline (s). Default: 172800 (48h)
   --fps FLOAT             Frame rate for all-bodypoint sleep motion. Default: $fps
+  --speed_max_mm_s FLOAT|none
+                          Discard translational speeds above this value. Default: $speed_max_mm_s mm/s.
   --sleep_motion_mm_per_px FLOAT
                           Spatial scale for all-bodypoint sleep motion. Default: $sleep_motion_mm_per_px
   --sleep_motion_cache_max_gap_frames N
@@ -95,6 +98,7 @@ while [[ $# -gt 0 ]]; do
     --poll_seconds) poll_seconds="$2"; shift 2 ;;
     --timeout) timeout_secs="$2"; shift 2 ;;
     --fps) fps="$2"; shift 2 ;;
+    --speed_max_mm_s) speed_max_mm_s="$2"; shift 2 ;;
     --sleep_motion_mm_per_px) sleep_motion_mm_per_px="$2"; shift 2 ;;
     --sleep_motion_cache_max_gap_frames) sleep_motion_cache_max_gap_frames="$2"; shift 2 ;;
     --run_sleep) run_sleep=1; shift ;;
@@ -200,7 +204,8 @@ run_routine() {  # $1 operation_script(basename)  $2 operation_name  $3 output_n
 }
 
 run_routine compute_track_colony_presence_vector.py colony_presence colony_presence_vectors
-run_routine compute_track_speed_vector.py           speed_vector    speed_vectors
+speed_args_text="$(printf '%q %q' --max_speed_mm_s "$speed_max_mm_s")"
+run_routine compute_track_speed_vector.py           speed_vector    speed_vectors "$speed_args_text"
 sleep_motion_args=(
   --fps "$fps"
   --mm_per_px "$sleep_motion_mm_per_px"
