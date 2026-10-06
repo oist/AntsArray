@@ -21,6 +21,16 @@ import sys
 SUPERSEDED = "_superseded_cap20"
 
 
+def per_frame_counts(fr, inst):
+    """Instances per frame from the Frame and Instance columns (one row per bodypoint).
+
+    One int64 key per (frame, instance) and a 1-D unique: a cap-96 chunk holds tens of millions
+    of rows, where np.unique(axis=0) on the pairs takes minutes per file."""
+    import numpy as np
+    keys = np.unique(fr.astype(np.int64) * (1 << 20) + inst.astype(np.int64))
+    return np.unique(keys >> 20, return_counts=True)[1]
+
+
 def h5_stats(path):
     """(expected_frames or None, per-frame instance counts) of a _sleap_data.h5."""
     import h5py
@@ -31,8 +41,7 @@ def h5_stats(path):
         if d.shape[0] == 0:
             return exp, np.zeros(0, dtype=int)
         fr, inst = d["Frame"][:], d["Instance"][:]
-    pairs = np.unique(np.stack([fr, inst], 1), axis=0)
-    return exp, np.unique(pairs[:, 0], return_counts=True)[1]
+    return exp, per_frame_counts(fr, inst)
 
 
 def parse_range(text):
@@ -120,15 +129,15 @@ def main(argv=None):
             status, detail = check_chunk(view_data, block_data, p["vname"], chunk, a.cap)
             if status == "pending":
                 n_pending += 1
-                print("pending  %s %03d" % (cam, chunk))
+                print("pending  %s %03d" % (cam, chunk), flush=True)
                 continue
             if status == "error":
                 n_err += 1
-                print("ERROR    %s %03d: %s; nothing moved" % (cam, chunk, detail))
+                print("ERROR    %s %03d: %s; nothing moved" % (cam, chunk, detail), flush=True)
                 continue
             capped = " -- %d frames at cap %d" % (detail["frames_at_cap"], a.cap) if detail["frames_at_cap"] else ""
             print("%s %s %03d (mean %.1f, max %d)%s" % ("promote " if a.yes else "would   ", cam, chunk,
-                  detail["mean_per_frame"], detail["max_per_frame"], capped))
+                  detail["mean_per_frame"], detail["max_per_frame"], capped), flush=True)
             if not a.yes:
                 n_ok += 1
                 continue
