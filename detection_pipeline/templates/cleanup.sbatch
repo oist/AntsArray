@@ -29,6 +29,12 @@ archive_deigo_logs() {
 	local aruco_logs=( "$JOBS_ROOT"/aruco_*.out "$JOBS_ROOT"/aruco_*.err "$JOBS_ROOT"/aruco_*.status "$JOBS_ROOT"/sacct_aruco_*.tsv )
 	(( ${#aruco_logs[@]} )) && { rsync_retry -ah --chmod=Du=rwx,Dg=rwx,Fu=rw,Fg=rw --chown=:"$OUTPUT_GROUP" "${aruco_logs[@]}" "deigo:$HPC_LOGS_DIR/aruco/" || echo "[WARN] aruco log archive failed; streamed copies remain"; }
 	local ctl_logs=( "$JOBS_ROOT"/chunk_*.out "$JOBS_ROOT"/chunk_*.err "$JOBS_ROOT"/bridge_*.out "$JOBS_ROOT"/bridge_*.err "$JOBS_ROOT"/aruco_datacp_*.out "$JOBS_ROOT"/cleanup_*.out "$JOBS_ROOT"/manifest.csv "$JOBS_ROOT"/aruco_worklist.txt "$JOBS_ROOT"/pipeline.env )
+	# Which instance cap each chunk ran with, and the nest-camera table it came from: the
+	# contract records only the table rows, and a later table edit must not rewrite history.
+	local f
+	for f in "$JOBS_ROOT/nest_cams.tsv" "$JOBS_ROOT/saion_stage/sleap_caps.tsv"; do
+		if [[ -f "$f" ]]; then ctl_logs+=( "$f" ); fi
+	done
 	(( ${#ctl_logs[@]} )) && { rsync_retry -ah --chmod=Du=rwx,Dg=rwx,Fu=rw,Fg=rw --chown=:"$OUTPUT_GROUP" "${ctl_logs[@]}" "deigo:$HPC_LOGS_DIR/pipeline/" || echo "[WARN] pipeline log archive failed"; }
 }
 archive_deigo_logs || true

@@ -65,9 +65,12 @@ if [[ -z "${SLEAP_BATCH_SIZE:-}" ]]; then
 	SLEAP_BATCH_SIZE=$(( 192 / SLEAP_MAX_INSTANCES ))
 	(( SLEAP_BATCH_SIZE > 8 )) && SLEAP_BATCH_SIZE=8
 fi
-MODEL_ID="$(basename "$SLEAP_MODEL_CENTROID")__$(basename "$SLEAP_MODEL_INSTANCE")__k${SLEAP_MAX_INSTANCES}b${SLEAP_BATCH_SIZE}__${SAION_PARTITION}"
-MODEL_ID="${MODEL_ID//\//_}"
-EXPORT_DIR="$EXPORT_ROOT/$MODEL_ID"
+engine_dir_for() {   # <cap> <batch> -> the cached export dir of that engine
+	local id
+	id="$(basename "$SLEAP_MODEL_CENTROID")__$(basename "$SLEAP_MODEL_INSTANCE")__k${1}b${2}__${SAION_PARTITION}"
+	echo "$EXPORT_ROOT/${id//\//_}"
+}
+EXPORT_DIR="$(engine_dir_for "$SLEAP_MAX_INSTANCES" "$SLEAP_BATCH_SIZE")"
 
 echo "[INFO] preparing saion-side dirs"
 ssh_retry saion "
@@ -83,48 +86,52 @@ ssh_retry saion "
 # are all SM80, so their engines are interchangeable -- adopt a sibling A100
 # partition's engine before paying for a rebuild (which is flaky on contended
 # nodes: the full-res profile can exhaust the TRT workspace).
-if (( SKIP_TRT_EXPORT == 0 )) && [[ "$SLEAP_RUNTIME" != "pytorch" ]]; then
+# ensure_engine <cap> <batch>: called once per instance cap this run needs, after the
+# bucket-skip list below has said which caps those are.
+ensure_engine() {
+	local cap="$1" batch="$2" dir base adopted _p _cand engine_file
+	local a100_parts="largegpu short-a100 gpu-a100"
+	dir="$(engine_dir_for "$cap" "$batch")"
 	case "$SLEAP_RUNTIME" in
-		onnx) ENGINE_FILE="model.onnx" ;;
-		*)    ENGINE_FILE="model.trt" ;;
+		onnx) engine_file="model.onnx" ;;
+		*)    engine_file="model.trt" ;;
 	esac
-	A100_PARTS="largegpu short-a100 gpu-a100"
 
-	if ssh_retry saion "[[ -f '$EXPORT_DIR/$ENGINE_FILE' ]]"; then
-		echo "[OK] engine already at $EXPORT_DIR/$ENGINE_FILE"
-	else
-		# Try to adopt a same-model engine from a sibling A100 partition dir.
-		MODEL_BASE="${MODEL_ID%__*}"   # strip trailing __<partition>
-		ADOPTED=""
-		if [[ " $A100_PARTS " == *" $SAION_PARTITION "* ]]; then
-			for _p in $A100_PARTS; do
-				_cand="$EXPORT_ROOT/${MODEL_BASE}__${_p}"
-				[[ "$_cand" == "$EXPORT_DIR" ]] && continue
-				if ssh_retry saion "[[ -f '$_cand/$ENGINE_FILE' ]]"; then ADOPTED="$_cand"; break; fi
-			done
-		fi
-
-		if [[ -n "$ADOPTED" ]]; then
-			echo "[OK] reusing SM80 engine from $ADOPTED (same arch as $SAION_PARTITION)"
-			ssh_retry saion "mkdir -p '$EXPORT_DIR' &&
-				for f in model.trt model.trt.metadata.json model.onnx export_metadata.json training_config_centroid.yaml training_config_centered_instance.yaml; do
-					[[ -f '$ADOPTED/'\$f ]] && ln -sf '$ADOPTED/'\$f '$EXPORT_DIR/'\$f
-				done; true" \
-				|| { echo "[ERR] engine adoption failed" >&2; exit 3; }
-		else
-			echo "[INFO] no sibling engine; building on $SAION_PARTITION via $SCRIPTS_DIR/export_sleap_trt.sh"
-			# export_sleap_trt.sh srun's itself onto $SAION_PARTITION and blocks until done
-			ssh_login_retry saion "SLEAP_MODULE='${SLEAP_MODULE:-sleap-nn/0.2.0}' MAX_BATCH='${SLEAP_BATCH_SIZE}' bash '$SCRIPTS_DIR/export_sleap_trt.sh' \
-				--centroid '$SLEAP_MODEL_CENTROID' \
-				--instance '$SLEAP_MODEL_INSTANCE' \
-				--out '$EXPORT_DIR' \
-				--runtime '$SLEAP_RUNTIME' \
-				--partition '$SAION_PARTITION' \
-				--max-instances '$SLEAP_MAX_INSTANCES'" \
-				|| { echo "[ERR] TRT export failed" >&2; exit 3; }
-		fi
+	if ssh_retry saion "[[ -f '$dir/$engine_file' ]]"; then
+		echo "[OK] engine already at $dir/$engine_file"
+		return 0
 	fi
-fi
+	# Try to adopt a same-model engine from a sibling A100 partition dir.
+	base="${dir##*/}"; base="${base%__*}"   # strip trailing __<partition>
+	adopted=""
+	if [[ " $a100_parts " == *" $SAION_PARTITION "* ]]; then
+		for _p in $a100_parts; do
+			_cand="$EXPORT_ROOT/${base}__${_p}"
+			[[ "$_cand" == "$dir" ]] && continue
+			if ssh_retry saion "[[ -f '$_cand/$engine_file' ]]"; then adopted="$_cand"; break; fi
+		done
+	fi
+
+	if [[ -n "$adopted" ]]; then
+		echo "[OK] reusing SM80 engine from $adopted (same arch as $SAION_PARTITION)"
+		ssh_retry saion "mkdir -p '$dir' &&
+			for f in model.trt model.trt.metadata.json model.onnx export_metadata.json training_config_centroid.yaml training_config_centered_instance.yaml; do
+				[[ -f '$adopted/'\$f ]] && ln -sf '$adopted/'\$f '$dir/'\$f
+			done; true" \
+			|| { echo "[ERR] engine adoption failed" >&2; exit 3; }
+	else
+		echo "[INFO] no sibling engine for cap $cap; building on $SAION_PARTITION via $SCRIPTS_DIR/export_sleap_trt.sh"
+		# export_sleap_trt.sh srun's itself onto $SAION_PARTITION and blocks until done
+		ssh_login_retry saion "SLEAP_MODULE='${SLEAP_MODULE:-sleap-nn/0.2.0}' MAX_BATCH='$batch' bash '$SCRIPTS_DIR/export_sleap_trt.sh' \
+			--centroid '$SLEAP_MODEL_CENTROID' \
+			--instance '$SLEAP_MODEL_INSTANCE' \
+			--out '$dir' \
+			--runtime '$SLEAP_RUNTIME' \
+			--partition '$SAION_PARTITION' \
+			--max-instances '$cap'" \
+			|| { echo "[ERR] TRT export failed" >&2; exit 3; }
+	fi
+}
 
 # --- Skip rsync: saion compute self-fetches via /deigo_flash cross-mount ---
 # Each saion sleap predict task does `cp /deigo_flash/.../<chunk>.mkv /work/.../input/`
@@ -178,6 +185,38 @@ if (( $(wc -l < "$WORKLIST") == 0 )); then
 	exit 0
 fi
 
+# --- Per-chunk instance caps and their engines -------------------------------
+# Inference time follows the cap, not the ants in view, and only nest cameras come near
+# the small cap. scripts/sleap_caps.py gives every chunk a cap from the nest-camera table
+# (snapshotted into JOBS_ROOT by pipeline.sh); one engine is made per cap that occurs, and
+# the saion array picks each chunk's engine from sleap_caps.tsv (lib/sleap_engines.sh). A
+# uniform run (--sleap-max-instances, or an env file from before per-camera caps) has one
+# cap and one engine, as before.
+CAPS_TSV="$SLEAP_STAGE/sleap_caps.tsv"
+ENGINES=""
+if (( SKIP_TRT_EXPORT == 0 )) && [[ "$SLEAP_RUNTIME" != "pytorch" ]]; then
+	if [[ "${SLEAP_CAP_MODE:-uniform}" == "nest" ]]; then
+		CAP_ARGS=(--nest-cams "$SLEAP_NEST_CAMS" --nest-cap "$SLEAP_NEST_CAP" --other-cap "$SLEAP_OTHER_CAP")
+	else
+		CAP_ARGS=(--uniform "$SLEAP_MAX_INSTANCES")
+	fi
+	python3 "$SCRIPTS_DIR/sleap_caps.py" table --worklist "$WORKLIST" --manifest "$JOBS_ROOT/manifest.csv" \
+			--chunk-sec "$CHUNK_SEC" "${CAP_ARGS[@]}" --out "$CAPS_TSV" \
+		|| { echo "[ERR] could not give every chunk an instance cap; nothing submitted to saion" >&2; exit 3; }
+	for cap in $(cut -f3 "$CAPS_TSV" | sort -rnu); do
+		batch="$SLEAP_BATCH_SIZE"
+		if [[ "${SLEAP_CAP_MODE:-uniform}" == "nest" ]]; then
+			batch=$(( 192 / cap ))
+			(( batch > 8 )) && batch=8
+		fi
+		ensure_engine "$cap" "$batch"
+		ENGINES+="${ENGINES:+ }$cap:$batch:$(engine_dir_for "$cap" "$batch")"
+	done
+	EXPORT_DIR="${ENGINES%% *}"
+	EXPORT_DIR="${EXPORT_DIR#*:*:}"   # largest cap's engine; per-chunk choice overrides it
+	echo "[INFO] engines (cap:batch:dir): $ENGINES"
+fi
+
 # --- Render saion-side templates locally, then upload ------------------------
 RENDERED_PREDICT="$JOBS_ROOT/sleap_predict_array.rendered.sh"
 RENDERED_DATACP="$JOBS_ROOT/sleap_datacp_array.rendered.sh"
@@ -222,6 +261,8 @@ sed -e "s#__REMOTE_JOBS__#$REMOTE_JOBS#g" \
     -e "s#__SHIP_LIB__#$LIB_DIR/ship_logs.sh#g" \
     -e "s#__HPC_LOGS_DIR__#$HPC_LOGS_DIR#g" \
     -e "s#__SCRIPTS_DIR__#$SCRIPTS_DIR#g" \
+    -e "s#__ENGINES__#$ENGINES#g" \
+    -e "s#__ENGINES_LIB__#$LIB_DIR/sleap_engines.sh#g" \
     "$TEMPLATES_DIR/sleap_predict_array.template.sh" > "$RENDERED_PREDICT"
 
 sed -e "s#__REMOTE_JOBS__#$REMOTE_JOBS#g" \
@@ -233,6 +274,9 @@ sed -e "s#__REMOTE_JOBS__#$REMOTE_JOBS#g" \
     "$TEMPLATES_DIR/sleap_datacp_array.template.sh" > "$RENDERED_DATACP"
 
 UPLOAD_SET=("$WORKLIST" "$RENDERED_PREDICT" "$RENDERED_DATACP")
+if [[ -n "$ENGINES" ]]; then
+	UPLOAD_SET+=("$CAPS_TSV")   # read per chunk by the predict array (lib/sleap_engines.sh)
+fi
 if [[ "$PREFETCH_PARTITION" != "off" ]]; then
 	sed -e "s#__REMOTE_JOBS__#$REMOTE_JOBS#g" \
 	    -e "s#__REMOTE_INPUT__#$REMOTE_INPUT#g" \

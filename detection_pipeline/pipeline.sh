@@ -93,11 +93,20 @@ SLEAP runtime:
   --sleap-module NAME               saion module name. default: sleap-nn/0.2.0
   --sleap-batch-size N              inference batch = the engine's max batch. default: auto =
                                     min(8, 192 / cap) on the exported path (cap x batch over
-                                    192 crops cannot build), 8 on the 'sleap-nn track' path
-  --sleap-max-instances N           most animals kept per frame. Baked into the TRT/ONNX
-                                    export (and its cache key, __k<N>b<B>__), so a new value
-                                    re-exports. default: 96 (sleap-nn's own 20 truncated
-                                    every nest camera)
+                                    192 crops cannot build), 8 on the 'sleap-nn track' path.
+                                    Only with --sleap-max-instances (per-camera caps set
+                                    each engine's batch from its cap)
+  Instance cap (most animals kept per frame; baked into the TRT/ONNX export and its cache
+  key __k<N>b<B>__). Inference time follows the cap, not the ants, so by default only nest
+  cameras get the large cap -- one engine per cap, chosen per chunk:
+  --nest-cams FILE                  nest-camera table: effective_from (JST) <TAB> camNN,camNN
+                                    <TAB> note; the latest row at a chunk's time applies (add a
+                                    row when nests are added or moved). default:
+                                    /bucket/ReiterU/Ants/basler/_catalog/nest_cams.tsv
+  --sleap-nest-cap N                cap for nest cameras.  default: 96
+  --sleap-other-cap N               cap for the others.    default: 20
+  --sleap-max-instances N           one cap for EVERY camera instead (no table; e.g. cap-96
+                                    re-run views). sleap-nn's own 20 truncated nest cameras
   --sleap-cpus N                    cpus per sleap task. default: auto = cpu_cap/concurrency
   --sleap-mem SIZE                  mem per sleap task.  default: auto = mem_cap/concurrency
   --sleap-wall D-HH                 per-task walltime.   default: auto = partition wall
@@ -249,9 +258,16 @@ SLEAP_MODULE="sleap-nn/0.2.0"
 SLEAP_BATCH_SIZE=""
 # Per-frame instance cap of the exported engine (sleap-nn export --max-instances).
 # sleap-nn defaults to 20, which silently dropped ants on every colony nest camera.
-# 96 is the measured choice: on 20260928 cam09 (70 ants/frame, max 82) 48 and 64 still
-# cap 98-100 % of frames, 96 caps none and matches 128, 31 % faster.
-SLEAP_MAX_INSTANCES=96
+# 96 is the measured choice for nests: on 20260928 cam09 (70 ants/frame, max 82) 48 and
+# 64 still cap 98-100 % of frames, 96 caps none and matches 128, 31 % faster. Inference
+# time follows the cap (cap 96 ~3x cap 20 even on an empty camera), and away from the
+# nests 20 is reached only in rare chunks (mostly a recording's first 30 min), so by
+# default nest cameras (NEST_CAMS_TABLE, per date) get SLEAP_NEST_CAP and the rest
+# SLEAP_OTHER_CAP. --sleap-max-instances N sets one cap for every camera instead.
+SLEAP_MAX_INSTANCES=""
+NEST_CAMS_TABLE="/bucket/ReiterU/Ants/basler/_catalog/nest_cams.tsv"
+SLEAP_NEST_CAP=96
+SLEAP_OTHER_CAP=20
 ARUCO_CONCURRENCY=100   # compute assoc cap=2000 cpu; at -c 16 that's ~125 concurrent max, so 100 leaves headroom for the bridge (also on compute)
 # Sleap GPU concurrency + per-task resources. Empty = auto-derived from the
 # selected --saion-partition after arg parsing (see saion_caps below):
@@ -321,6 +337,9 @@ while [[ $# -gt 0 ]]; do
 		--sleap-module) SLEAP_MODULE="$2"; shift 2 ;;
 		--sleap-batch-size) SLEAP_BATCH_SIZE="$2"; shift 2 ;;
 		--sleap-max-instances) SLEAP_MAX_INSTANCES="$2"; shift 2 ;;
+		--nest-cams) NEST_CAMS_TABLE="$2"; shift 2 ;;
+		--sleap-nest-cap) SLEAP_NEST_CAP="$2"; shift 2 ;;
+		--sleap-other-cap) SLEAP_OTHER_CAP="$2"; shift 2 ;;
 		--aruco-concurrency) ARUCO_CONCURRENCY="$2"; shift 2 ;;
 		--sleap-concurrency) SLEAP_CONCURRENCY="$2"; shift 2 ;;
 		--sleap-cpus) SLEAP_CPUS="$2"; shift 2 ;;
@@ -472,8 +491,10 @@ case "$SLEAP_RUNTIME" in
 	tensorrt|onnx|pytorch) ;;
 	*) echo "[ERR] --sleap-runtime must be tensorrt|onnx|pytorch" >&2; exit 2 ;;
 esac
-[[ "$SLEAP_MAX_INSTANCES" =~ ^[1-9][0-9]*$ ]] || {
-	echo "[ERR] --sleap-max-instances must be a positive integer, got '$SLEAP_MAX_INSTANCES'" >&2; exit 2; }
+for _cap in "$SLEAP_NEST_CAP" "$SLEAP_OTHER_CAP" ${SLEAP_MAX_INSTANCES:+"$SLEAP_MAX_INSTANCES"}; do
+	[[ "$_cap" =~ ^[1-9][0-9]*$ ]] || {
+		echo "[ERR] instance caps must be positive integers, got '$_cap'" >&2; exit 2; }
+done
 case "$CHUNK_EXT" in
 	mkv|mp4|avi) ;;
 	*) echo "[ERR] --chunk-ext must be mkv|mp4|avi" >&2; exit 2 ;;
@@ -512,10 +533,30 @@ if (( SKIP_TRT_EXPORT == 0 )) && [[ "$SLEAP_RUNTIME" != "pytorch" ]]; then
 	fi
 fi
 
+# Instance caps: per camera from the nest-camera table, unless --sleap-max-instances gave
+# one cap for all. The cap only exists on the exported path ('sleap-nn track' does not
+# read it), and runs without a SLEAP leg never read it, so those stay uniform and never
+# need the table. In nest mode SLEAP_MAX_INSTANCES names the nest engine (the largest);
+# the bridge adds one engine per other cap that occurs.
+MAX_ENGINE_CROPS=192
+EXPORTED_PATH=0
+if (( SKIP_TRT_EXPORT == 0 )) && [[ "$SLEAP_RUNTIME" != "pytorch" ]]; then EXPORTED_PATH=1; fi
+if [[ -n "$SLEAP_MAX_INSTANCES" ]] || (( EXPORTED_PATH == 0 || ONLY_ARUCO == 1 || ONLY_BACKUP == 1 )); then
+	SLEAP_CAP_MODE=uniform
+	SLEAP_MAX_INSTANCES="${SLEAP_MAX_INSTANCES:-$SLEAP_NEST_CAP}"
+else
+	SLEAP_CAP_MODE=nest
+	[[ -z "$SLEAP_BATCH_SIZE" ]] || {
+		echo "[ERR] --sleap-batch-size needs --sleap-max-instances: with per-camera caps each engine's batch follows its cap" >&2; exit 2; }
+	[[ -r "$NEST_CAMS_TABLE" ]] || {
+		echo "[ERR] nest-camera table not readable: $NEST_CAMS_TABLE (--nest-cams FILE, or --sleap-max-instances N for one cap)" >&2; exit 2; }
+	(( SLEAP_OTHER_CAP <= MAX_ENGINE_CROPS )) || {
+		echo "[ERR] --sleap-other-cap $SLEAP_OTHER_CAP exceeds the $MAX_ENGINE_CROPS-crop engine limit even at batch 1" >&2; exit 2; }
+	SLEAP_MAX_INSTANCES="$SLEAP_NEST_CAP"
+fi
 # Inference batch. On the exported path it is also the engine's max batch, and the
 # engine runs cap x batch crops at once, which TensorRT cannot build above 192.
-MAX_ENGINE_CROPS=192
-if (( SKIP_TRT_EXPORT == 0 )) && [[ "$SLEAP_RUNTIME" != "pytorch" ]]; then
+if (( EXPORTED_PATH == 1 )); then
 	(( SLEAP_MAX_INSTANCES <= MAX_ENGINE_CROPS )) || {
 		echo "[ERR] --sleap-max-instances $SLEAP_MAX_INSTANCES exceeds the $MAX_ENGINE_CROPS-crop engine limit even at batch 1" >&2; exit 2; }
 	if [[ -z "$SLEAP_BATCH_SIZE" ]]; then
@@ -532,7 +573,14 @@ if (( SKIP_TRT_EXPORT == 0 )) && [[ "$SLEAP_RUNTIME" != "pytorch" ]]; then
 		echo "[ERR] --sleap-max-instances $SLEAP_MAX_INSTANCES x --sleap-batch-size $SLEAP_BATCH_SIZE" \
 		     "= $(( SLEAP_MAX_INSTANCES * SLEAP_BATCH_SIZE )) crops; TensorRT cannot build above $MAX_ENGINE_CROPS" >&2; exit 2; }
 fi
-echo "[INFO] SLEAP max_instances=$SLEAP_MAX_INSTANCES batch=$SLEAP_BATCH_SIZE"
+if [[ "$SLEAP_CAP_MODE" == nest ]]; then
+	_other_batch=$(( MAX_ENGINE_CROPS / SLEAP_OTHER_CAP ))
+	(( _other_batch > 8 )) && _other_batch=8
+	echo "[INFO] SLEAP instance caps: nest cameras $SLEAP_NEST_CAP (batch $SLEAP_BATCH_SIZE)," \
+	     "others $SLEAP_OTHER_CAP (batch $_other_batch); nest-camera table $NEST_CAMS_TABLE"
+else
+	echo "[INFO] SLEAP max_instances=$SLEAP_MAX_INSTANCES batch=$SLEAP_BATCH_SIZE (every camera)"
+fi
 
 # Roots. Only the jobs dir is wave-scoped -- see the WAVE_SLUG comment above.
 # An explicit --jobs-root is honoured verbatim: the caller has already chosen the
@@ -722,6 +770,10 @@ export SAION_PARTITION="$SAION_PARTITION"
 export SLEAP_MODULE="$SLEAP_MODULE"
 export SLEAP_BATCH_SIZE="$SLEAP_BATCH_SIZE"
 export SLEAP_MAX_INSTANCES="$SLEAP_MAX_INSTANCES"
+export SLEAP_CAP_MODE="$SLEAP_CAP_MODE"
+export SLEAP_NEST_CAMS="$JOBS_ROOT/nest_cams.tsv"
+export SLEAP_NEST_CAP="$SLEAP_NEST_CAP"
+export SLEAP_OTHER_CAP="$SLEAP_OTHER_CAP"
 export SLEAP_MODEL_CENTROID="$SLEAP_MODEL_CENTROID"
 export SLEAP_MODEL_INSTANCE="$SLEAP_MODEL_INSTANCE"
 export SLEAP_RUNTIME="$SLEAP_RUNTIME"
@@ -769,6 +821,20 @@ if (( N_VIDEOS <= 0 )); then
 fi
 echo "[INFO] $N_VIDEOS grid videos discovered"
 
+# Per-camera caps: snapshot the nest-camera table (an edit must not change a queued wave)
+# and check now that it covers the whole block -- the bridge would otherwise stop only
+# after chunking. The rows in force are what the processing contract records.
+SLEAP_CAPS_DESC="$SLEAP_MAX_INSTANCES"
+if [[ "$SLEAP_CAP_MODE" == nest ]]; then
+	cp "$NEST_CAMS_TABLE" "$JOBS_ROOT/nest_cams.tsv"
+	SLEAP_CAPS_DESC=$(python3 "$SCRIPTS_DIR/sleap_caps.py" describe --manifest "$MANIFEST" --chunk-sec "$CHUNK_SEC" \
+		--nest-cams "$JOBS_ROOT/nest_cams.tsv" --nest-cap "$SLEAP_NEST_CAP" --other-cap "$SLEAP_OTHER_CAP") || {
+		echo "[ERR] could not give this block per-camera caps (reason above: a table row missing for its" \
+		     "dates -> add one to $NEST_CAMS_TABLE; a video without a readable sidecar or camNN name ->" \
+		     "pass --sleap-max-instances N for one cap). Nothing was submitted." >&2; exit 2; }
+	echo "[INFO] SLEAP caps for this block: $SLEAP_CAPS_DESC"
+fi
+
 # --- Processing contract ------------------------------------------------------
 # Declare (first run) or verify (every later run) how this block is processed.
 # A chunk's filename encodes its INDEX, not its settings, so re-running a block
@@ -798,7 +864,7 @@ if (( ONLY_BACKUP != 1 )); then
 		            --set "saion_partition=$SAION_PARTITION")
 		# The cap only exists on the exported path; 'sleap-nn track' does not read it.
 		if (( SKIP_TRT_EXPORT == 0 )) && [[ "$SLEAP_RUNTIME" != "pytorch" ]]; then
-			STATE_SET+=(--set "sleap_max_instances=$SLEAP_MAX_INSTANCES")
+			STATE_SET+=(--set "sleap_max_instances=$SLEAP_CAPS_DESC")
 		fi
 	fi
 	NEW_RUN_ARG=()

@@ -150,7 +150,14 @@ def _bridge_key_block():
     bridge = (ROOT / "templates/bridge.sbatch").read_text()
     start = bridge.index("SLEAP_MAX_INSTANCES=") if "if [[ -z \"${SLEAP_MAX_INSTANCES" not in bridge \
         else bridge.index("if [[ -z \"${SLEAP_MAX_INSTANCES")
-    return bridge[start:bridge.index("MODEL_ID=")]
+    return bridge[start:bridge.index("engine_dir_for()")]
+
+
+def _bridge_function(name):
+    """The text of one shell function defined in bridge.sbatch (top-level, tab-indented body)."""
+    bridge = (ROOT / "templates/bridge.sbatch").read_text()
+    start = bridge.index(name + "() {")
+    return bridge[start:bridge.index("\n}\n", start) + 3]
 
 
 def test_bridge_derives_the_batch_for_an_env_without_a_cap():
@@ -166,7 +173,13 @@ def test_bridge_derives_the_batch_for_an_env_without_a_cap():
 
 
 def test_bridge_engine_cache_key_carries_cap_and_batch():
-    bridge = (ROOT / "templates/bridge.sbatch").read_text()
-    assert '__k${SLEAP_MAX_INSTANCES}b${SLEAP_BATCH_SIZE}__${SAION_PARTITION}' in bridge
-    assert "--max-instances '$SLEAP_MAX_INSTANCES'" in bridge
-    assert "MAX_BATCH='${SLEAP_BATCH_SIZE}'" in bridge
+    sh = ("EXPORT_ROOT=/work/x; SAION_PARTITION=largegpu; SLEAP_MODEL_CENTROID=/m/a.centroid;"
+          " SLEAP_MODEL_INSTANCE=/m/a.centered_instance\n%s\nengine_dir_for 96 2; engine_dir_for 20 8"
+          % _bridge_function("engine_dir_for"))
+    r = subprocess.run(["bash", "-c", sh], text=True, capture_output=True, timeout=10)
+    assert r.stdout.split() == ["/work/x/a.centroid__a.centered_instance__k96b2__largegpu",
+                                "/work/x/a.centroid__a.centered_instance__k20b8__largegpu"], r.stderr
+    # The export of a missing engine is asked for that engine's own cap and batch.
+    ensure = _bridge_function("ensure_engine")
+    assert "--max-instances '$cap'" in ensure
+    assert "MAX_BATCH='$batch'" in ensure

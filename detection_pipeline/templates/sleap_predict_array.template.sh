@@ -30,6 +30,7 @@ module load __SLEAP_MODULE__
 # Home is shared deigo<->saion, so the rendered deigo repo path also works on saion.
 source "__HOSTS_LIB__"
 source "__SHIP_LIB__"
+source "__ENGINES_LIB__"
 
 # UV_TOOL_DIR is not a reliable handle on the sleap-nn interpreter: 0.2.0's
 # modulefile exports it, but 0.3.3's deliberately does not -- it only prepends
@@ -85,6 +86,11 @@ REMOTE_JOBS="__REMOTE_JOBS__"
 REMOTE_INPUT="__REMOTE_INPUT__"
 REMOTE_OUTPUT="__REMOTE_OUTPUT__"
 EXPORT_DIR="__EXPORT_DIR__"
+# Per-chunk engines: "cap:batch:export_dir ..." for every instance cap in this run's
+# sleap_caps.tsv (vname<TAB>chunk<TAB>cap). Nest cameras run the large-cap engine and
+# the rest the small one; empty = no exported engine (the 'sleap-nn track' path).
+ENGINES="__ENGINES__"
+CAPS_TSV="$REMOTE_JOBS/sleap_caps.tsv"
 SLEAP_RUNTIME="__SLEAP_RUNTIME__"
 CHUNK_EXT="__CHUNK_EXT__"
 SLEAP_MODEL_CENTROID="__SLEAP_MODEL_CENTROID__"
@@ -302,6 +308,17 @@ for (( row_idx=start_idx; row_idx<end_idx; row_idx++ )); do
 		rm -f "$out_slp"
 	fi
 
+	# This chunk's engine. No row or no engine for its cap -> skip it, visibly missing,
+	# rather than run it on some other engine (a wrong cap silently truncates nests).
+	row_cap=""; row_batch="$SLEAP_BATCH_SIZE"; row_dir="$EXPORT_DIR"
+	if [[ -n "$ENGINES" ]]; then
+		if ! read -r row_cap row_batch row_dir < <(engine_for_chunk "$CAPS_TSV" "$ENGINES" "$vname" "$chunk"); then
+			echo "[ERR] ${vname}_${chunk}: no instance cap or engine for it in $CAPS_TSV; skipped" >&2
+			n_unassigned=$(( ${n_unassigned:-0} + 1 ))
+			continue
+		fi
+	fi
+
 	# Self-fetch if not already on /work
 	if [[ ! -s "$input" ]]; then
 		if [[ ! -s "$src_remote" ]]; then
@@ -315,7 +332,7 @@ for (( row_idx=start_idx; row_idx<end_idx; row_idx++ )); do
 		fi
 	fi
 
-	echo "[$(date)] sleap on ${vname}_${chunk} (runtime=$SLEAP_RUNTIME, skip_trt=$SKIP_TRT_EXPORT)"
+	echo "[$(date)] sleap on ${vname}_${chunk} (runtime=$SLEAP_RUNTIME, skip_trt=$SKIP_TRT_EXPORT, cap=${row_cap:-n/a}, batch=$row_batch)"
 
 	_t0=$SECONDS
 	if (( SKIP_TRT_EXPORT == 0 )) && [[ "$SLEAP_RUNTIME" != "pytorch" ]]; then
@@ -326,18 +343,18 @@ for (( row_idx=start_idx; row_idx<end_idx; row_idx++ )); do
 			# chunks carry inflated container metadata, and without a bound the
 			# reader runs off the end of the real stream with an IndexError.
 			sleap-nn predict \
-				-m "$EXPORT_DIR" \
+				-m "$row_dir" \
 				-i "$input" \
 				-o "$out_slp" \
 				--runtime "$SLEAP_RUNTIME" \
-				--batch_size "$SLEAP_BATCH_SIZE" \
+				--batch_size "$row_batch" \
 				${n_frames:+--frames "0-$(( n_frames - 1 ))"} \
 				--device cuda
 		else
-			sleap-nn predict "$EXPORT_DIR" "$input" \
+			sleap-nn predict "$row_dir" "$input" \
 				-o "$out_slp" \
 				--runtime "$SLEAP_RUNTIME" \
-				--batch-size "$SLEAP_BATCH_SIZE" \
+				--batch-size "$row_batch" \
 				${n_frames:+--n-frames "$n_frames"} \
 				--device cuda
 		fi
@@ -380,3 +397,8 @@ done
 # Wait for any backgrounded post-processing (slp2h5 + rsync) before exiting.
 wait
 echo "[$(date)] all background uploads finished; task done"
+# A chunk with no engine was never run: fail the task so sacct and the FAIL mail show it.
+if (( ${n_unassigned:-0} > 0 )); then
+	echo "[ERR] ${n_unassigned} chunk(s) of this task had no instance cap/engine and were not run" >&2
+	exit 1
+fi
