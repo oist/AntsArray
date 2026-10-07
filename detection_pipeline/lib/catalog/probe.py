@@ -60,6 +60,13 @@ def probe_video(vn, allow_ffprobe=False, ffprobe_timeout=120, max_probe_sec=180)
             info.clean_close = (cc if isinstance(cc, bool)
                                 else str(ctx.get("status", "")).lower() == "closed")
             info.start_epoch_ms = _num(ctx, "startEpochMs", int)
+            # A split tail (split_block_at_drop.py) is a stream copy of the recording from
+            # frame derived.frameOffset on, but keeps the original sidecar, so startEpochMs
+            # is the RECORDING's start: without the offset the timeline drew 20260916/block02
+            # on top of block01.
+            offset = _num(sc.get("derived") or {}, "frameOffset", int)
+            if info.start_epoch_ms is not None and offset and fps:
+                info.start_epoch_ms += int(round(offset * 1000.0 / fps))
             info.frames_emitted = _num(cap, "framesEmitted", int)
             info.frames_encoded = _num(rec, "framesEncoded", int)
             info.missed_frames = _num(sdk, "Statistic_Missed_Frame_Count", int)
