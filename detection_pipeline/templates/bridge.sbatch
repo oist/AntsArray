@@ -13,6 +13,12 @@ JOBS_ROOT="__JOBS_ROOT__"
 source "$JOBS_ROOT/pipeline.env"
 source "$LIB_DIR/hosts.sh"
 
+# The deigo cleanup waits for the chunks in the bucket-skip list written below. A
+# re-submitted wave reuses JOBS_ROOT, so drop the previous run's list before anything
+# can fail: if this bridge dies before writing its own, cleanup must wait for the whole
+# wave rather than trust a stale (possibly empty) list and free /flash early.
+rm -f "$JOBS_ROOT/saion_stage/aruco_worklist.txt"
+
 # Slurm mail for the saion-side jobs, embedded as plain strings in the ssh'd
 # sbatch command lines (email addresses contain no whitespace; empty = off).
 # saion_cleanup gets END too: its exit 0 means the verify-before-delete gate
@@ -142,20 +148,24 @@ echo "[INFO] saion will self-fetch chunks from $DEIGO_FLASH_SAION_PREFIX (cross-
 SLEAP_STAGE="$JOBS_ROOT/saion_stage"
 mkdir -p "$SLEAP_STAGE"
 SLEAP_WORKLIST="$SLEAP_STAGE/aruco_worklist.txt"   # basename must match saion-side reader
+# Built under a temporary name and renamed when complete: the deigo cleanup reads this
+# list, and a bridge killed mid-filter must not leave a truncated one behind.
+STAGE_TMP="$SLEAP_WORKLIST.tmp"
 if [[ "${SLEAP_FORCE_RECOMPUTE:-0}" == "1" ]]; then
 	echo "[INFO] --sleap-force-recompute: bucket skip disabled; recomputing all chunks"
-	cp "$WORKLIST" "$SLEAP_WORKLIST"
+	cp "$WORKLIST" "$STAGE_TMP"
 else
 	module use /apps/unit/ReiterU/.modulefiles
 	module load opencv/4.9.0 2>/dev/null || true   # provides h5py on deigo
 	if python3 "$SCRIPTS_DIR/filter_done_chunks.py" \
-			--worklist "$WORKLIST" --data-dir "$DATA_DIR" --out "$SLEAP_WORKLIST"; then
+			--worklist "$WORKLIST" --data-dir "$DATA_DIR" --out "$STAGE_TMP"; then
 		:
 	else
 		echo "[WARN] bucket-skip filter failed; recomputing all chunks (full worklist)" >&2
-		cp "$WORKLIST" "$SLEAP_WORKLIST"
+		cp "$WORKLIST" "$STAGE_TMP"
 	fi
 fi
+mv -f "$STAGE_TMP" "$SLEAP_WORKLIST"
 WORKLIST="$SLEAP_WORKLIST"   # everything below (upload, array size, gate) uses the filtered list
 
 # Nothing left to do -> don't submit an empty array or a datacp/cleanup that

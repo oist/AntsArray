@@ -37,25 +37,48 @@ archive_deigo_logs || true
 # inference. Saion holds its own /work copies once self-fetch (or bridge rsync)
 # has happened, so /flash is safe to free as soon as all expected chunks are
 # visible on the /saion_work read-only mount.
+# "Expected" = the chunks saion fetches: the bridge's bucket-skip-filtered list. A
+# re-run whose other chunks already have SLEAP on the bucket never sends those, so
+# waiting for the whole wave timed out (20260928 block01-k96: 320 / 611). The list
+# counts only if THIS run's bridge wrote it, i.e. it is newer than the bridge's
+# submission record: a re-submitted wave reuses JOBS_ROOT, and a previous run's
+# (smaller, maybe empty) list left by a bridge that died early or never ran would
+# free chunks saion has not fetched. Otherwise wait for the whole wave as before.
+# Freeing below still covers every chunk of the wave.
 WORKLIST="$JOBS_ROOT/aruco_worklist.txt"
-SAION_INPUT_DIR="/saion_work/ReiterU/$USER/$EXP_NAME/input"
+WAIT_LIST="$JOBS_ROOT/saion_stage/aruco_worklist.txt"
+JID_BRIDGE="$JOBS_ROOT/jid_bridge.txt"
+if [[ ! -f "$WAIT_LIST" ]] || [[ -f "$JID_BRIDGE" && ! "$WAIT_LIST" -nt "$JID_BRIDGE" ]]; then
+	WAIT_LIST="$WORKLIST"
+fi
+SAION_INPUT_DIR="${CLEANUP_SAION_INPUT_DIR:-/saion_work/ReiterU/$USER/$EXP_NAME/input}"
 CHUNK_COPY_TIMEOUT="${CHUNK_COPY_TIMEOUT:-${SLEAP_TIMEOUT:-5400}}"   # 1.5h: stays within the short 2h walltime (leaves margin for archive+rm)
 POLL_SECS="${CLEANUP_POLL_SECS:-300}"     # check every 5 min
 
-if [[ ! -f "$WORKLIST" ]]; then
+if [[ ! -f "$WAIT_LIST" ]]; then
 	echo "[WARN] no worklist; treating as nothing to wait for"
 	expected=0
 else
-	expected=$(wc -l < "$WORKLIST")
+	expected=$(wc -l < "$WAIT_LIST")
+	echo "[INFO] chunks saion fetches: $WAIT_LIST ($expected)"
 fi
 
+# A chunk counts once saion's copy matches the /flash source in size: input/ is
+# shared across runs, so the name alone also matches a stale copy of a chunk that
+# has been re-cut since (or one still being copied).
 count_chunks_on_saion() {
-	local n=0
+	local n=0 name
 	[[ -d "$SAION_INPUT_DIR" ]] || { echo 0; return; }
 	while IFS=$'\t' read -r vname chunk _; do
 		[[ -n "$vname" ]] || continue
-		[[ -f "$SAION_INPUT_DIR/${vname}_${chunk}.${CHUNK_EXT}" ]] && n=$((n+1))
-	done < "$WORKLIST"
+		name="${vname}_${chunk}.${CHUNK_EXT}"
+		[[ -f "$SAION_INPUT_DIR/$name" ]] || continue
+		if [[ -f "$FLASH_ROOT/$vname/$name" ]] &&
+			[[ "$(stat -c %s "$SAION_INPUT_DIR/$name")" != "$(stat -c %s "$FLASH_ROOT/$vname/$name")" ]]; then
+			continue
+		fi
+		n=$((n+1))
+	done < "$WAIT_LIST"
 	echo "$n"
 }
 

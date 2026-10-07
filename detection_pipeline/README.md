@@ -24,7 +24,7 @@ deigo-login (detection_pipeline/pipeline.sh)
               │     │     │     ↳ each chunk: inline rsync .slp → bucket (via ssh saion login)
               │     │     └── saion sleap_datacp (single safety-net job)
               │     └── saion cleanup (rm -rf /work)
-              └── cleanup (polls bucket for all SLP files → rm -rf /flash)
+              └── cleanup (waits until saion holds every chunk it fetches → frees the wave's /flash chunks)
 ```
 
 Key design choices:
@@ -46,8 +46,10 @@ rsync -ah --chmod=Du=rwx,Dg=rwx,Fu=rw,Fg=rw \
   catch any uploads that hit a transient SSH failure.
 - **Single-job datacps** (one per leg) — keeps total queued jobs under the
   `AssocGrpSubmitJobsLimit` cap on both deigo and saion `datacp`.
-- **Bucket is the cleanup sentinel.** Deigo cleanup polls `$DATA_DIR/*.slp` until
-  every chunk has a result, then frees `/flash`. No cross-cluster Slurm deps needed.
+- **Saion's input dir is the cleanup sentinel.** Deigo cleanup polls the read-only
+  `/saion_work` mount until every chunk saion fetches (the bridge's bucket-skip-filtered
+  `saion_stage/aruco_worklist.txt`) is there, then frees the wave's chunks on `/flash`.
+  No cross-cluster Slurm deps needed.
 - All cross-cluster SSH (TRT export trigger, saion sbatch, inline uploads) uses
   `ssh_retry` with 5 attempts + 10·n backoff — the lesson from block01's
   `kex_exchange_identification` reset wedging the whole pipeline.
@@ -700,8 +702,11 @@ ls /saion_work/ReiterU/$USER/sleap_export/<model_id>__largegpu/  # TRT engine
 
 Mounts are **read-only**. Saion predict tasks read chunks from `/deigo_flash`
 and copy them into local `/work` at task start; no bulk deigo→saion rsync is
-needed. `cleanup.sbatch` polls bucket for final SLEAP outputs before deleting
-`/flash` — if outputs are missing, it exits non-zero and preserves the data.
+needed. `cleanup.sbatch` waits until every chunk saion fetches is in its `/work`
+input (the bridge's bucket-skip-filtered list, so a re-run whose other chunks already
+have SLEAP on the bucket does not wait for them; without that list it waits for the whole
+wave) before deleting the wave's chunks on `/flash` — on timeout it exits non-zero and
+preserves the data.
 
 ## Run logs (`hpc_logs/`) — survive mid-run failures
 
