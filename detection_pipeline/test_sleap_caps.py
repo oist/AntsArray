@@ -111,14 +111,16 @@ def test_a_split_tail_starts_at_its_frame_offset(tmp_path):
     assert got == {("cam01", "000"): 20, ("cam11", "000"): 96}
 
 
-def test_a_table_saved_on_windows_with_a_japanese_note_loads(tmp_path):
+def test_a_table_saved_on_windows_with_a_non_ascii_note_loads(tmp_path):
+    # BOM + CRLF + a non-ASCII note: deigo's Python 3.6 decodes by locale (ASCII under C).
+    note = "new nest – Fluon-coated, µ-film"
     path = tmp_path / "t.tsv"
     path.write_bytes(("﻿effective_from\tnest_cams\tnote\r\n"
-                      "2026-07-01 00:00\tcam01,cam09\t新しい巣\r\n").encode("utf-8"))
+                      "2026-07-01 00:00\tcam01,cam09\t%s\r\n" % note).encode("utf-8"))
 
     rows = sleap_caps.load_table(path)
 
-    assert rows == [(JST_0701, frozenset({"cam01", "cam09"}), "新しい巣")]
+    assert rows == [(JST_0701, frozenset({"cam01", "cam09"}), note)]
 
 
 def test_a_video_not_named_camNN_is_refused(tmp_path):
