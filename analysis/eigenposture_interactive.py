@@ -1,15 +1,15 @@
 # %% 1. Settings — run cells in VS Code/Spyder, or: python -i analysis/eigenposture_interactive.py
-"""Inspect the selected July 24 analysis, one calculation at a time.
+"""Inspect the July 24 posture/velocity analysis, one calculation at a time.
 
 Requires numpy, pandas, matplotlib, scipy and scikit-learn. No repo imports.
-Change SIDE/BIN_MINUTES/etc. and rerun from cell 4. All arrays remain available.
+Change settings and rerun cells in order. All arrays remain available.
 
-Input boundary: tracking, body alignment and clip QC have already been done.
-One measurement/minute summarizes a sampled 2.5-second clip, NOT a full minute.
-The landmark PCA is rebuilt below from exact saved coordinate moments; per-clip
-PC means/rates and velocities are loaded from the corresponding measurement cache.
-See eigenposture_features.py for the upstream coordinate reconstruction and QC.
-This runs the chosen analysis, not the previous 152-configuration search.
+Tracking, body alignment and clip QC have already been done. One observation per
+minute summarizes a sampled 2.5-second clip, NOT a full minute. Five-minute bins
+summarize these observations. No explicit posture-PC derivatives are used.
+The landmark PCA uses both recorded days. Coordinate means are recovered from
+all 12 archived modes (up to cache rounding) and projected onto this new basis.
+Clustering uses the entire balanced profile, with no second PCA/projection.
 """
 
 from pathlib import Path
@@ -20,7 +20,6 @@ from matplotlib.colors import PowerNorm
 import numpy as np
 import pandas as pd
 from scipy.optimize import linear_sum_assignment
-from sklearn.decomposition import PCA
 from sklearn.metrics import adjusted_rand_score
 from sklearn.mixture import GaussianMixture
 from threadpoolctl import threadpool_limits
@@ -30,41 +29,56 @@ DATA = Path(
 )
 SIDE = "right"  # 'left' or 'right'; fits are independent by colony
 BIN_MINUTES = 5  # try 1, 15, 30, 60, 120, 240 (must divide 1440)
-POSTURE_PCS = 4  # 1–4; four modes are available in this cache
+POSTURE_PCS = 4  # 1–12; all coordinate modes are available
 SCALING = "family"  # 'family' or 'standard'
-COVARIANCE = "tied"  # 'tied' = shared variance; try 'full' for separate
-BOOTSTRAPS = 500  # use 30 for a quick preview; 500 reproduces the report
+COVARIANCE = "tied"  # shared full covariance in balanced feature space
+BOOTSTRAPS = 500  # use 30 for a quick preview
 SEED = 7241010
 COLORS = np.array(["#237b9c", "#e18132", "#8867ab", "#a34d52"])
 
 plt.ion()  # figures stay interactive; no files are overwritten
 threadpool_limits(limits=1)  # avoid slow BLAS oversubscription on these tiny fits
 assert SIDE in ("left", "right") and 1440 % BIN_MINUTES == 0
-assert 1 <= POSTURE_PCS <= 4 and SCALING in ("family", "standard")
+assert 1 <= POSTURE_PCS <= 12 and SCALING in ("family", "standard")
 
-# %% 2. Load measurements and inspect which ants have enough observations
+# %% 2. Load coordinate means/velocities; inspect observation coverage
 coverage = pd.read_csv(DATA / "all_ant_coverage.csv")
-with np.load(DATA / "eigenposture_measurements.npz") as cache:
-    all_minutes = cache["minute"]  # [114 ants, 2880 minutes, 12 channels]
-    all_names, all_families = cache["feature_names"], cache["families"]
+# The old four-mode cache is insufficient for changing the landmark PCA basis.
+# All 12 modes are an invertible coordinate representation, not a truncation.
+with np.load(DATA / "full_rank" / "eigenposture_measurements.npz") as cache:
     np.testing.assert_array_equal(cache["ants"], coverage.ant)
+    cached = cache["minute"]
+    all_velocity = cached[:, :, :4]
+    old_posture_scores = cached[:, :, 4:16]
+with np.load(DATA / "full_rank" / "landmark_pca.npz") as old_basis:
+    coordinate_means = old_posture_scores @ old_basis["components"] + old_basis["mean"]
+del cached, old_posture_scores
+# Eligibility no longer depends on the discarded PC-rate channels.
+for day in (1, 2):
+    coverage[f"day{day}_eligible"] = (coverage[f"day{day}_posture_hours"] >= 12) & (
+        coverage[f"day{day}_velocity_hours"] >= 12
+    )
 print(coverage.groupby("side")[["day1_eligible", "day2_eligible"]].sum())
-print(pd.DataFrame({"channel": all_names, "family": all_families}))
 
-# %% 3. Rebuild the raw-landmark PCA (this is NOT the later ant-profile PCA)
-# Coordinates: six antennal landmarks × (forward, lateral), relative to the head,
-# normalized by each ant's fixed day1 body-axis length. No straightness feature.
-# Saved moments already weight observed hours/minutes/windows equally within ants.
+# %% 3. Landmark PCA over the FULL 48 hours, with equal colony and ant weights
+# Six antennal landmarks × (forward, lateral), relative to the head, normalized
+# by a fixed per-ant body-axis length. Use exact saved moments of valid windows,
+# not covariance of minute means (which would discard within-clip variation).
 with np.load(DATA / "ant_coordinate_moments.npz") as moments:
     np.testing.assert_array_equal(moments["ants"], coverage.ant)
-    day1_version = list(moments["versions"]).index("day1")
-    first, second = (
-        moments["means"][:, day1_version],
-        moments["seconds"][:, day1_version],
-    )
+    day_indices = [list(moments["versions"]).index(day) for day in ("day1", "day2")]
+    daily_first = moments["means"][:, day_indices]
+    daily_second = moments["seconds"][:, day_indices]
+hours = coverage[["day1_posture_hours", "day2_posture_hours"]].to_numpy(float)
+hours[~np.isfinite(daily_first).all(axis=2)] = 0
+# Day moments already weight observed hours/minutes/windows equally. Weight each
+# day by its observed hours, so one recorded hour has the same weight on either day.
+weights = hours / np.maximum(hours.sum(axis=1, keepdims=True), 1)
+first = np.sum(np.nan_to_num(daily_first) * weights[:, :, None], axis=1)
+second = np.sum(np.nan_to_num(daily_second) * weights[:, :, None, None], axis=1)
+pca_eligible = hours.sum(axis=1) >= 24  # at least half of the full recording
 colony_indices = [
-    np.flatnonzero(coverage.side.eq(s) & coverage.day1_eligible)
-    for s in ("left", "right")
+    np.flatnonzero(coverage.side.eq(side) & pca_eligible) for side in ("left", "right")
 ]
 coordinate_center = np.mean([first[i].mean(axis=0) for i in colony_indices], axis=0)
 coordinate_second = np.mean([second[i].mean(axis=0) for i in colony_indices], axis=0)
@@ -81,8 +95,8 @@ coordinate_modes *= np.sign(
     coordinate_modes[np.arange(12), np.abs(coordinate_modes).argmax(axis=1)]
 )[:, None]
 posture_variance = coordinate_values / coordinate_values.sum()
-with np.load(DATA / "landmark_pca.npz") as saved:
-    np.testing.assert_allclose(coordinate_modes, saved["components"], atol=1e-9)
+all_posture = (coordinate_means - coordinate_center) @ coordinate_modes[:POSTURE_PCS].T
+print("Full-recording PCA ants per colony:", [len(i) for i in colony_indices])
 fig, axes = plt.subplots(1, 2, figsize=(10, 3.5), layout="constrained")
 axes[0].plot(np.arange(1, 13), posture_variance.cumsum(), "o-")
 axes[0].set(
@@ -106,12 +120,13 @@ print(
 # %% 4. Select one colony and channels; inspect an individual ant's time series
 ant_indices = np.flatnonzero(coverage.side.eq(SIDE) & coverage.day1_eligible)
 ants = coverage.iloc[ant_indices].reset_index(drop=True)
-channels = np.r_[np.arange(4), 4 + np.arange(POSTURE_PCS), 8 + np.arange(POSTURE_PCS)]
-minute = all_minutes[ant_indices][:, :, channels]
-names, families = all_names[channels], all_families[channels]
-# Cache construction: PC mean = (mean coordinates - center) @ mode.T;
-# PC rate = sqrt(mean((12 * difference of adjacent smoothed PC samples)**2)).
-# Velocity is projected along the anterior/lateral axes before clip mean/RMS.
+minute = np.concatenate([all_velocity[ant_indices], all_posture[ant_indices]], axis=2)
+names = np.array(
+    ["forward_mean", "lateral_mean", "forward_rms", "lateral_rms"]
+    + [f"posture_pc{i+1}_mean" for i in range(POSTURE_PCS)]
+)
+families = np.array(["velocity"] * 4 + ["posture"] * POSTURE_PCS)
+print(pd.DataFrame({"channel": names, "family": families}))
 ANT = 0  # row in 'ants'; change to inspect another identity
 fig, axes = plt.subplots(2, 1, figsize=(10, 4), sharex=True, layout="constrained")
 axes[0].plot(np.arange(1440) / 60, minute[ANT, :1440, 2], lw=0.6)
@@ -147,8 +162,6 @@ def make_profiles(data, mask=None):
             )
         elif name in ("forward_rms", "lateral_rms"):
             transformed[:, j] = np.log1p(np.maximum(raw[:, j], 0) / 0.1)
-        elif name.endswith("_rate"):
-            transformed[:, j] = np.log1p(np.maximum(raw[:, j], 0))
     return binned, raw, transformed
 
 
@@ -160,9 +173,9 @@ print("minute:", minute.shape, "binned:", binned.shape, "profiles:", profiles.sh
 print(profile_table.head())
 
 
-# %% 6. Balance feature families, then learn ONE axis describing differences among ants
+# %% 6. Balance velocity/posture families; keep EVERY retained feature dimension
 # Every intermediate is returned so you can inspect it in the variable explorer.
-def fit_axis(x):
+def balance_profiles(x):
     keep = np.isfinite(x).sum(axis=0) >= max(4, int(0.5 * len(x)))
     fill = np.nanmedian(x[:, keep], axis=0)
     imputed = np.where(np.isfinite(x[:, keep]), x[:, keep], fill)
@@ -173,9 +186,6 @@ def fit_axis(x):
             columns = profile_families[keep] == family
             scale[columns] = max(np.sqrt(np.sum(std[columns] ** 2)), 1e-6)
     balanced = (imputed - center) / scale
-    pca = PCA(1, svd_solver="full").fit(balanced)
-    score_scale = np.sqrt(pca.explained_variance_[0])
-    scores = pca.transform(balanced) / score_scale
     return dict(
         keep=keep,
         fill=fill,
@@ -183,77 +193,69 @@ def fit_axis(x):
         center=center,
         scale=scale,
         balanced=balanced,
-        pca=pca,
-        score_scale=score_scale,
-        scores=scores,
     )
 
 
-def project_profiles(x, state):
+def apply_balance(x, state):
     x = x[:, state["keep"]]
     x = np.where(np.isfinite(x), x, state["fill"])
-    return (
-        state["pca"].transform((x - state["center"]) / state["scale"])
-        / state["score_scale"]
-    )
+    return (x - state["center"]) / state["scale"]
 
 
-state = fit_axis(profiles)
-balanced, profile_pca, scores = state["balanced"], state["pca"], state["scores"]
+state = balance_profiles(profiles)
+balanced = state["balanced"]
+feature_names = np.array(profile_names)[state["keep"]]
+balanced_table = pd.DataFrame(balanced, index=ants.ant, columns=feature_names)
+# Ordering is for display only; no fitted axis is used for ordering or clustering.
+ant_order = np.argsort(profiles_raw[:, 2])
 fig, axes = plt.subplots(1, 2, figsize=(12, 5), layout="constrained")
-im = axes[0].imshow(
-    balanced[np.argsort(scores[:, 0])], aspect="auto", cmap="RdBu_r", vmin=-1, vmax=1
-)
+im = axes[0].imshow(balanced[ant_order], aspect="auto", cmap="RdBu_r", vmin=-1, vmax=1)
 axes[0].set(
     xlabel="Profile feature",
-    ylabel="Ant (ordered by profile PC1)",
-    title="Balanced profiles",
+    ylabel="Ant (ordered by forward RMS)",
+    title="All balanced features",
 )
 fig.colorbar(im, ax=axes[0])
-axes[1].barh(np.arange(state["keep"].sum()), profile_pca.components_[0])
-axes[1].set_yticks(
-    np.arange(state["keep"].sum()), np.array(profile_names)[state["keep"]], fontsize=7
-)
+axes[1].barh(np.arange(len(feature_names)), balanced.std(axis=0))
+axes[1].set_yticks(np.arange(len(feature_names)), feature_names, fontsize=7)
 axes[1].set(
-    xlabel="Loading on ant-profile PC1",
-    title=f"{profile_pca.explained_variance_ratio_[0]:.1%} of profile variance",
+    xlabel="SD after family balancing",
+    title=f"Clustering input: {balanced.shape[1]} dimensions",
+)
+print(
+    "Balanced family variance:",
+    {
+        family: float(
+            balanced[:, profile_families[state["keep"]] == family].var(axis=0).sum()
+        )
+        for family in np.unique(families)
+    },
 )
 
 
 # %% 7. Fit K=1–4 mixtures without looking at spatial labels
-# Both random and sorted-score initializations are tried, as in the full analysis.
-def fit_mixture(z, k, seed=SEED, n_init=5):
-    initial_means = [None]
-    if k > 1:
-        initial_means += [
-            np.stack(
-                [z[g].mean(axis=0) for g in np.array_split(np.argsort(z[:, 0]), k)]
-            )
-        ]
-    fits = [
-        GaussianMixture(
-            k,
-            covariance_type=COVARIANCE,
-            reg_covar=0.001,
-            n_init=n_init if means is None else 1,
-            means_init=means,
-            max_iter=500,
-            random_state=seed,
-        ).fit(z)
-        for means in initial_means
-    ]
-    return max(
-        (fit for fit in fits if fit.converged_), key=lambda fit: fit.lower_bound_
-    )
+# K-means initializations and mixture fitting both use all balanced dimensions.
+def fit_mixture(z, k, seed=SEED, n_init=20):
+    model = GaussianMixture(
+        k,
+        covariance_type=COVARIANCE,
+        reg_covar=0.001,
+        n_init=n_init,
+        max_iter=500,
+        random_state=seed,
+    ).fit(z)
+    if not model.converged_:
+        raise RuntimeError("Mixture did not converge")
+    return model
 
 
-mixtures = {k: fit_mixture(scores, k, n_init=5 if k == 2 else 20) for k in range(1, 5)}
+mixtures = {k: fit_mixture(balanced, k) for k in range(1, 5)}
 k_table = pd.DataFrame(
     [
         dict(
             k=k,
-            bic=m.bic(scores),
-            smallest_group=np.bincount(m.predict(scores), minlength=k).min(),
+            bic=m.bic(balanced),
+            smallest_group=np.bincount(m.predict(balanced), minlength=k).min(),
         )
         for k, m in mixtures.items()
     ]
@@ -261,17 +263,17 @@ k_table = pd.DataFrame(
 print(k_table)
 
 # %% 8. Refit on resampled ants and disjoint time samples; then choose K
-# Every bootstrap refits imputation, family scaling, profile PCA AND mixture.
+# Every bootstrap refits imputation, family scaling and the full-space mixture.
 bootstrap_ari, temporal_ari = {}, {}
 for k in (2, 3, 4):
-    labels = mixtures[k].predict(scores)
+    labels = mixtures[k].predict(balanced)
     rng = np.random.default_rng(SEED + 60000)
     bootstrap_ari[k] = []
     for repeat in range(BOOTSTRAPS if k == 2 else min(BOOTSTRAPS, 100)):
         sample = rng.integers(len(ants), size=len(ants))
-        boot_state = fit_axis(profiles[sample])
-        boot_model = fit_mixture(boot_state["scores"], k, SEED + 60000 + repeat)
-        prediction = boot_model.predict(project_profiles(profiles, boot_state))
+        boot_state = balance_profiles(profiles[sample])
+        boot_model = fit_mixture(boot_state["balanced"], k, SEED + 60000 + repeat)
+        prediction = boot_model.predict(apply_balance(profiles, boot_state))
         bootstrap_ari[k].append(adjusted_rand_score(labels, prediction))
     temporal_ari[k] = []
     for block_minutes in (1, 5, 15, 30, 60, 120):
@@ -279,9 +281,9 @@ for k in (2, 3, 4):
         for half in (0, 1):
             mask = (np.arange(1440) // block_minutes) % 2 == half
             _, _, split_profiles = make_profiles(minute[:, :1440], mask)
-            split_state = fit_axis(split_profiles)
+            split_state = balance_profiles(split_profiles)
             halves.append(
-                fit_mixture(split_state["scores"], k).predict(split_state["scores"])
+                fit_mixture(split_state["balanced"], k).predict(split_state["balanced"])
             )
         temporal_ari[k].append(adjusted_rand_score(*halves))
     k_table.loc[k, ["bootstrap_median", "bootstrap_p10", "temporal_median"]] = [
@@ -302,7 +304,7 @@ selected_k = (
     else int(eligible[eligible.bic <= eligible.bic.min() + 2].index.min())
 )
 model = mixtures[selected_k]
-labels = model.predict(scores)
+labels = model.predict(balanced)
 # Name groups from low to high forward RMS velocity; this does not affect fitting.
 remap = np.argsort(
     np.argsort([np.nanmedian(minute[labels == g, :1440, 2]) for g in range(selected_k)])
@@ -311,37 +313,67 @@ groups = remap[labels]
 print("Selected K:", selected_k, "| Group sizes:", np.bincount(groups))
 fig, axes = plt.subplots(1, 3, figsize=(12, 3.5), layout="constrained")
 axes[0].plot(k_table.index, k_table.bic - k_table.bic.min(), "o-")
-axes[0].set(xlabel="K", ylabel="BIC − minimum", xticks=[1, 2, 3, 4])
+too_small = k_table[k_table.smallest_group < 5]
+axes[0].scatter(
+    too_small.index,
+    too_small.bic - k_table.bic.min(),
+    marker="x",
+    color="red",
+    s=70,
+    label="Group smaller than 5",
+)
+axes[0].set(
+    xlabel="K",
+    ylabel="BIC − minimum",
+    xticks=[1, 2, 3, 4],
+    title=f"Selected K={selected_k}",
+)
+axes[0].legend(fontsize=8)
 axes[1].boxplot(
     [bootstrap_ari[k] for k in (2, 3, 4)], tick_labels=["2", "3", "4"], showfliers=False
 )
 axes[1].set(xlabel="K", ylabel="Ant-bootstrap ARI", ylim=(-0.1, 1.05))
-grid = np.linspace(scores.min() - 0.3, scores.max() + 0.3, 500)
-axes[2].hist(scores[:, 0], bins=12, density=True, color=".8")
-axes[2].plot(grid, np.exp(model.score_samples(grid[:, None])), color="black")
-axes[2].scatter(scores[:, 0], np.zeros(len(ants)), c=COLORS[groups], s=20)
-axes[2].set(xlabel="Ant-profile PC1", ylabel="Density", title=f"{SIDE}: K={selected_k}")
+# Show two physical feature coordinates, purely for display. The fitted model
+# above uses every balanced column, not this 2D view and not a learned projection.
+plot_columns = [
+    list(feature_names).index(name)
+    for name in ("mean: forward_rms", "mean: posture_pc1_mean")
+]
+axes[2].scatter(
+    balanced[:, plot_columns[0]], balanced[:, plot_columns[1]], c=COLORS[groups]
+)
+axes[2].set(
+    xlabel="Balanced forward RMS mean",
+    ylabel="Balanced posture PC1 mean",
+    title=f"{SIDE}: K={selected_k} (two-feature view)",
+)
 
-# %% 9. Apply the frozen day1 transform/model to day2
+# %% 9. Apply day1 balancing/clustering to day2 in the same full-recording basis
 _, day2_raw, day2_profiles = make_profiles(minute[:, 1440:])
 ok = ants.day2_eligible.to_numpy(bool)
-day2_scores = project_profiles(day2_profiles[ok], state)
-day2_groups = remap[model.predict(day2_scores)]
-print(f"Next-day retention: {(groups[ok] == day2_groups).sum()}/{ok.sum()}")
-fig, ax = plt.subplots(figsize=(5, 4), layout="constrained")
-ax.scatter(scores[ok, 0], day2_scores[:, 0], c=COLORS[groups[ok]])
-ax.axline((0, 0), slope=1, color=".7", linestyle="--")
-ax.set(
-    xlabel="Day1 profile score",
-    ylabel="Day2 score (frozen model)",
-    title="Each point is one ant",
-)
-# Day2 was examined previously; this is a repeatability check, not a fresh holdout.
+day2_balanced = apply_balance(day2_profiles[ok], state)
+day2_groups = remap[model.predict(day2_balanced)]
+if selected_k > 1:
+    print(f"Day-to-day retention: {(groups[ok] == day2_groups).sum()}/{ok.sum()}")
+else:
+    print("K=1: no supported separation; single-group retention is trivial.")
+fig, axes = plt.subplots(1, 2, figsize=(9, 4), layout="constrained")
+for ax, column in zip(axes, plot_columns):
+    ax.scatter(balanced[ok, column], day2_balanced[:, column], c=COLORS[groups[ok]])
+    ax.axline((0, 0), slope=1, color=".7", linestyle="--")
+    ax.set(
+        xlabel="Day1 balanced feature",
+        ylabel="Day2 balanced feature",
+        title=feature_names[column],
+    )
+# The landmark PCA includes BOTH days. This is a repeatability check in a shared
+# basis, not held-out validation of the complete pipeline. Day1 fitted only the
+# balancing and mixture; day2 does not change those two fitted stages.
 
 # %% 10. Only now load the spatial classes and compare ant identities
 reference = pd.read_csv(DATA / "spatial_reference.csv")
 assignments = ants[["ant", "side", "track_id", "track_name"]].copy()
-assignments["activity_group"], assignments["score"] = groups, scores[:, 0]
+assignments["activity_group"] = groups
 assignments = assignments.merge(
     reference[["side", "track_id", "spatial_cluster"]],
     on=["side", "track_id"],
@@ -351,11 +383,13 @@ contingency = pd.crosstab(assignments.activity_group, assignments.spatial_cluste
 rows, columns = linear_sum_assignment(-contingency.to_numpy())
 matched = contingency.to_numpy()[rows, columns].sum()
 print(contingency)
-print(
-    f"Spatial agreement after matching names: {matched}/{len(ants)}; ARI =",
-    adjusted_rand_score(assignments.spatial_cluster, assignments.activity_group),
-)
-# K=1 is not recovery of two classes, even though its majority-match fraction is nonzero.
+if selected_k > 1:
+    print(
+        f"Spatial agreement after matching names: {matched}/{len(ants)}; ARI =",
+        adjusted_rand_score(assignments.spatial_cluster, assignments.activity_group),
+    )
+else:
+    print("K=1: activity features did not recover the two spatial classes.")
 
 # %% 11. Plot where each fitted group actually spends time (equal weight per ant)
 occupancy = DATA / "reproduction" / "occupancy" / "per_track"
@@ -386,7 +420,7 @@ for ax, data, title in zip(axes, mean_maps, map_titles):
     ax.set(title=title, xlabel="x (mm)", ylabel="y (mm)")
 fig.colorbar(im, ax=axes, label="Mean fraction of observations / bin", shrink=0.7)
 plt.show()
-# Inspect: coordinate_modes, minute, binned, profile_table, state, scores,
+# Inspect: coordinate_modes, minute, binned, profile_table, state, balanced_table,
 # k_table, bootstrap_ari, temporal_ari, assignments, day2_groups, mean_maps.
 # For parameter exploration, change BIN_MINUTES/SCALING/COVARIANCE at the top
-# and rerun cells 4 onward. Keep spatial agreement out of parameter selection.
+# and rerun the cells. Keep spatial agreement out of parameter selection.

@@ -22,23 +22,52 @@ python -i analysis/eigenposture_interactive.py
 
 Edit `DATA`, `SIDE`, `BIN_MINUTES`, `POSTURE_PCS`, `SCALING`, `COVARIANCE`, and
 `BOOTSTRAPS` at the top. The default fits the right colony; set `SIDE = "left"`
-for the other colony. Use 30 bootstraps for a preview or the default 500 to
-reproduce the final audit. After changing the analysis settings, rerun the
-settings cell and cells 4 onward (also cell 3 to update the landmark-PC plot).
+for the other colony. Use 30 bootstraps for a preview or the default 500 for the
+full stability calculation. Rerun the cells in order after changing parameters.
 
-This is a single file with ordinary NumPy/scikit-learn calculations, no imports
-from the analysis pipeline, and no automatic output-file writes. It rebuilds the
-landmark PCA from saved coordinate moments, then exposes bin means, physical and
-transformed profiles, family scaling, profile PCA, K selection, resampling,
-next-day predictions, and spatial comparisons. Useful variables include
-`coordinate_modes`, `minute`, `binned`, `profile_table`, `state`, `scores`,
-`k_table`, and `assignments`. The `state` dictionary contains the imputed data,
-centering, scales, balanced data, and fitted PCA.
+**The interactive version was revised on 2026-10-10:**
 
-It starts after tracking/body alignment/clip QC, using the saved measurement
-cache, and reproduces the selected analysis rather than rerunning all 152 search
-configurations. Upstream coordinate extraction remains in
+- Section 3 fits landmark PCA over the full 48 hours in both colonies. Daily
+  coordinate moments are weighted by observed hours before averaging ants and
+  colonies equally. PCA eligibility requires at least 24 observed posture hours
+  across the full recording (41 left, 45 right ants for these inputs).
+- Minute coordinate means are recovered from all 12 modes in the archived
+  `full_rank` cache and projected onto the new basis. This reconstruction is
+  complete up to cache rounding; the previous four-mode truncation is not used.
+- PC-rate features are removed, including their influence on ant eligibility.
+  Five-minute bins retain posture/velocity summaries. These bins contain sampled
+  observations, not continuous five-minute clips; mean/SD across bin means does
+  not measure a derivative or retain the order of those bins.
+- Clustering directly uses every balanced feature. With four posture modes this
+  is 16 dimensions: mean and SD of four velocity and four posture channels.
+  There is no additional ant-profile PCA, whitening, or one-dimensional score.
+  Gaussian-mixture initialization, fitting, BIC and stability checks all use the
+  same full feature space. Two-feature plots are display views only.
+- Day1 still fits feature balancing and the mixture. Day2 is a repeatability
+  comparison using those fixed stages and the shared, full-recording posture
+  basis; it is not held-out validation of the complete analysis.
+
+With the revised defaults, the existing BIC/stability/minimum-group rule selects
+K=1 in both colonies. All K=1–4 fits and their diagnostics remain in `mixtures`
+and `k_table`; this is a changed analysis, not a reproduction of the earlier
+one-axis separation. The script labels single-group retention as trivial and
+does not present majority-class spatial matching as recovery of two classes.
+
+The file contains ordinary NumPy/scikit-learn calculations, no imports from the
+analysis pipeline, and no automatic output-file writes. Inspect
+`coordinate_modes`, `coordinate_means`, `minute`, `binned`, `profile_table`,
+`state`, `balanced_table`, `k_table`, and `assignments`. The `state` dictionary
+contains imputed data, centering, scales, and the full balanced matrix.
+
+Inputs additionally include `full_rank/eigenposture_measurements.npz` and
+`full_rank/landmark_pca.npz`, both present in the published original analysis.
+The starting point remains the saved tracking/body-alignment/clip-QC cache;
+upstream coordinate extraction is in
 [`eigenposture_features.py`](eigenposture_features.py).
+
+The batch commands and numerical results below describe the **earlier
+2026-10-09 parameter audit**. They are retained as a record of that analysis and
+are not the expected output of the revised interactive script.
 
 ## Result
 
