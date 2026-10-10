@@ -10,6 +10,36 @@ Published results:
 under the basler bucket. Six figures are also available as
 `parameter_audit_figures.pdf`. Earlier analyses remain intact.
 
+## Inspect the analysis interactively
+
+Open [`eigenposture_interactive.py`](eigenposture_interactive.py) in VS Code or
+Spyder and run its numbered `# %%` cells in order. Alternatively, from the
+repository root:
+
+```bash
+python -i analysis/eigenposture_interactive.py
+```
+
+Edit `DATA`, `SIDE`, `BIN_MINUTES`, `POSTURE_PCS`, `SCALING`, `COVARIANCE`, and
+`BOOTSTRAPS` at the top. The default fits the right colony; set `SIDE = "left"`
+for the other colony. Use 30 bootstraps for a preview or the default 500 to
+reproduce the final audit. After changing the analysis settings, rerun the
+settings cell and cells 4 onward (also cell 3 to update the landmark-PC plot).
+
+This is a single file with ordinary NumPy/scikit-learn calculations, no imports
+from the analysis pipeline, and no automatic output-file writes. It rebuilds the
+landmark PCA from saved coordinate moments, then exposes bin means, physical and
+transformed profiles, family scaling, profile PCA, K selection, resampling,
+next-day predictions, and spatial comparisons. Useful variables include
+`coordinate_modes`, `minute`, `binned`, `profile_table`, `state`, `scores`,
+`k_table`, and `assignments`. The `state` dictionary contains the imputed data,
+centering, scales, balanced data, and fitted PCA.
+
+It starts after tracking/body alignment/clip QC, using the saved measurement
+cache, and reproduces the selected analysis rather than rerunning all 152 search
+configurations. Upstream coordinate extraction remains in
+[`eigenposture_features.py`](eigenposture_features.py).
+
 ## Result
 
 The principal instability is the separate-variance mixture, not hourly binning
