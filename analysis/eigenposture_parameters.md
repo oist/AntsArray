@@ -10,93 +10,17 @@ Published results:
 under the basler bucket. Six figures are also available as
 `parameter_audit_figures.pdf`. Earlier analyses remain intact.
 
-## Inspect the analysis interactively
+## Current interactive analysis
 
-Open [`eigenposture_interactive.py`](eigenposture_interactive.py) in VS Code or
-Spyder and run its numbered `# %%` cells in order. Alternatively, from the
-repository root:
+The interactive script has been rebuilt to cluster five-minute behavioral states,
+then cluster ants by their state proportions. See
+[`eigenposture_interactive.md`](eigenposture_interactive.md) for the current steps,
+unsigned velocity definition, inputs, and results. The older daily mean/max
+velocity profiles and one-axis analysis are no longer in that script.
 
-```bash
-python -i analysis/eigenposture_interactive.py
-```
-
-Edit `DATA`, `SIDE`, `BIN_MINUTES`, `POSTURE_PCS`, `SCALING`, `COVARIANCE`, and
-`BOOTSTRAPS` at the top. The default fits the right colony; set `SIDE = "left"`
-for the other colony. Use 30 bootstraps for a preview or the default 500 for the
-full stability calculation. Rerun the cells in order after changing parameters.
-
-**The interactive version was revised on 2026-10-10:**
-
-- Section 3 fits landmark PCA over the full 48 hours in both colonies. Daily
-  coordinate moments are weighted by observed hours before averaging ants and
-  colonies equally. PCA eligibility requires at least 24 observed posture hours
-  across the full recording (41 left, 45 right ants for these inputs).
-- Minute coordinate means are recovered from all 12 modes in the archived
-  `full_rank` cache and projected onto the new basis. This reconstruction is
-  complete up to cache rounding; the previous four-mode truncation is not used.
-- PC-rate and RMS-velocity features are removed. Eligibility depends only on
-  posture and velocity coverage. Bins contain sampled observations, not
-  continuous clips. One clustering row is one ant, with six features and no
-  extra SD features or concatenated time-bin dimensions.
-- The six features are four posture-PC means and the **maximum signed forward
-  and lateral velocities**. Posture retains mean within bins, then mean across
-  observed bins. Velocity now uses maximum within valid bins, then maximum
-  across bins: each ant's largest valid sampled-clip mean over the day. The cache
-  stores clip means, so this is not an instantaneous or frame-by-frame maximum,
-  nor a maximum of time-bin averages. Velocities retain the existing invertible
-  `asinh(v / 0.1)` transform; posture scores remain linear. The velocity and
-  posture families are scaled to equal total variance. This scaling preserves
-  all six dimensions and the relative amplitudes of the posture PCs.
-- Clustering directly uses all six balanced features with the default four PCs.
-  There is no additional ant-profile PCA, whitening, or one-dimensional score.
-  Gaussian-mixture initialization, fitting, BIC and stability checks all use the
-  same full feature space. Two-feature plots are display views only.
-- Day1 still fits feature balancing and the mixture. Day2 is a repeatability
-  comparison using those fixed stages and the shared, full-recording posture
-  basis; it is not held-out validation of the complete analysis.
-
-This is a small **ant-level profile**, not a clustering of individual time bins
-or a model of postural dynamics. Maximum means the largest **signed** value,
-not the largest magnitude: a large negative lateral excursion does not become
-a large positive peak. Maxima capture an observed peak, not its frequency, and
-are sensitive to outliers and the number of observed clips. Posture means still
-average over excursions. Increasing bin size uses the same sampled observations
-and only affects velocity maxima through bin-coverage filtering. `binned`
-contains velocity maxima and posture means for inspecting the time course.
-
-With five-minute bins and the unchanged shared-covariance/BIC/stability rule,
-the maximum-velocity version selects **K=1 in both colonies**. K=2 worsens BIC
-relative to K=1 by 4.82 left and 9.46 right. Its median ant-bootstrap ARI is
-0.809 left and 0.417 right (500 resamples; tenth percentiles -0.014 and 0.053).
-The left K=3 fit improves BIC but fails temporal stability (median ARI 0.464);
-left K=4 and right K=3/4 each contain a singleton. Maximum velocity therefore
-does not improve the two-class result with the other choices held fixed.
-
-The preceding mean-velocity version selected K=2 left and K=1 right at both
-5- and 240-minute bins. Its left split agreed with 39/41 spatial assignments,
-with median bootstrap ARI 0.902; the right five-minute K=2 fit had median ARI
-0.668. Those figures describe the mean-velocity version, not the maximum version.
-
-All K=1–4 fits and their diagnostics remain in `mixtures` and `k_table`; this
-is a changed analysis, not a reproduction of the earlier one-axis separation.
-The script labels single-group retention as trivial and does not present
-majority-class spatial matching as recovery of two classes.
-
-The file contains ordinary NumPy/scikit-learn calculations, no imports from the
-analysis pipeline, and no automatic output-file writes. Inspect
-`coordinate_modes`, `coordinate_means`, `minute`, `binned`, `profile_table`,
-`state`, `balanced_table`, `k_table`, and `assignments`. The `state` dictionary
-contains imputed data, centering, scales, and the full balanced matrix.
-
-Inputs additionally include `full_rank/eigenposture_measurements.npz` and
-`full_rank/landmark_pca.npz`, both present in the published original analysis.
-The starting point remains the saved tracking/body-alignment/clip-QC cache;
-upstream coordinate extraction is in
-[`eigenposture_features.py`](eigenposture_features.py).
-
-The batch commands and numerical results below describe the **earlier
-2026-10-09 parameter audit**. They are retained as a record of that analysis and
-are not the expected output of the revised interactive script.
+The batch commands and numerical results below describe the **2026-10-09
+parameter audit**, retained as a historical record. They are not the expected
+output of the current interactive script.
 
 ## Result
 
