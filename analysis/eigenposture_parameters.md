@@ -34,12 +34,17 @@ full stability calculation. Rerun the cells in order after changing parameters.
 - Minute coordinate means are recovered from all 12 modes in the archived
   `full_rank` cache and projected onto the new basis. This reconstruction is
   complete up to cache rounding; the previous four-mode truncation is not used.
-- PC-rate features are removed, including their influence on ant eligibility.
-  Five-minute bins retain posture/velocity summaries. These bins contain sampled
-  observations, not continuous five-minute clips; mean/SD across bin means does
-  not measure a derivative or retain the order of those bins.
-- Clustering directly uses every balanced feature. With four posture modes this
-  is 16 dimensions: mean and SD of four velocity and four posture channels.
+- PC-rate and RMS-velocity features are removed. Eligibility depends only on
+  posture and velocity coverage. Bins contain sampled observations, not
+  continuous clips. One clustering row is one ant: its mean across observed
+  bin means, for each of the six channels. There are no extra SD features or
+  concatenated time-bin dimensions.
+- The six features are four posture-PC means, signed forward velocity and
+  signed lateral velocity. Velocities retain the existing invertible
+  `asinh(v / 0.1)` transform; posture scores remain linear. The velocity and
+  posture families are scaled to equal total variance. This scaling preserves
+  all six dimensions and the relative amplitudes of the posture PCs.
+- Clustering directly uses all six balanced features with the default four PCs.
   There is no additional ant-profile PCA, whitening, or one-dimensional score.
   Gaussian-mixture initialization, fitting, BIC and stability checks all use the
   same full feature space. Two-feature plots are display views only.
@@ -47,11 +52,27 @@ full stability calculation. Rerun the cells in order after changing parameters.
   comparison using those fixed stages and the shared, full-recording posture
   basis; it is not held-out validation of the complete analysis.
 
-With the revised defaults, the existing BIC/stability/minimum-group rule selects
-K=1 in both colonies. All K=1–4 fits and their diagnostics remain in `mixtures`
-and `k_table`; this is a changed analysis, not a reproduction of the earlier
-one-axis separation. The script labels single-group retention as trivial and
-does not present majority-class spatial matching as recovery of two classes.
+This is intentionally a small **ant-level mean profile**, not a clustering of
+individual time bins or a model of postural dynamics. It does not retain bin
+order or variability, or distinguish excursion frequency from intensity; signed
+lateral motion in opposite directions can cancel. Increasing bin size averages
+the same sampled observations, so it need not improve separation. `binned` remains
+available for inspecting the time course before averaging.
+
+With the six-feature defaults (five-minute bins, shared full covariance), the
+existing BIC/stability/minimum-group rule selects K=2 left and K=1 right. The
+left split has 25/16 ants, agrees with 39/41 spatial assignments, and has median
+ant-bootstrap ARI 0.902 (500 resamples). K=2 improves left BIC by 16.51; right
+K=2 worsens BIC by 3.99 and has median bootstrap ARI 0.668. The right K=3/4 fits
+each contain a singleton and fail the minimum-group rule. This does not support
+a robust two-class result in both colonies. Repeating the full checks with
+240-minute bins also selects K=2 left and K=1 right; the left assignments are
+unchanged. All four runs were verified to use exactly six input dimensions.
+
+All K=1–4 fits and their diagnostics remain in `mixtures` and `k_table`; this
+is a changed analysis, not a reproduction of the earlier one-axis separation.
+The script labels single-group retention as trivial and does not present
+majority-class spatial matching as recovery of two classes.
 
 The file contains ordinary NumPy/scikit-learn calculations, no imports from the
 analysis pipeline, and no automatic output-file writes. Inspect

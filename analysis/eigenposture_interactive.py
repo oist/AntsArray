@@ -9,7 +9,9 @@ minute summarizes a sampled 2.5-second clip, NOT a full minute. Five-minute bins
 summarize these observations. No explicit posture-PC derivatives are used.
 The landmark PCA uses both recorded days. Coordinate means are recovered from
 all 12 archived modes (up to cache rounding) and projected onto this new basis.
-Clustering uses the entire balanced profile, with no second PCA/projection.
+Each clustering row is one ant's mean posture and signed velocity across bins.
+Four posture PCs plus forward/lateral velocity give exactly six features.
+Clustering uses all six balanced features, with no second PCA/projection.
 """
 
 from pathlib import Path
@@ -48,7 +50,7 @@ coverage = pd.read_csv(DATA / "all_ant_coverage.csv")
 with np.load(DATA / "full_rank" / "eigenposture_measurements.npz") as cache:
     np.testing.assert_array_equal(cache["ants"], coverage.ant)
     cached = cache["minute"]
-    all_velocity = cached[:, :, :4]
+    all_velocity = cached[:, :, :2]  # signed forward/lateral means; no RMS
     old_posture_scores = cached[:, :, 4:16]
 with np.load(DATA / "full_rank" / "landmark_pca.npz") as old_basis:
     coordinate_means = old_posture_scores @ old_basis["components"] + old_basis["mean"]
@@ -122,20 +124,24 @@ ant_indices = np.flatnonzero(coverage.side.eq(SIDE) & coverage.day1_eligible)
 ants = coverage.iloc[ant_indices].reset_index(drop=True)
 minute = np.concatenate([all_velocity[ant_indices], all_posture[ant_indices]], axis=2)
 names = np.array(
-    ["forward_mean", "lateral_mean", "forward_rms", "lateral_rms"]
-    + [f"posture_pc{i+1}_mean" for i in range(POSTURE_PCS)]
+    ["forward_velocity", "lateral_velocity"]
+    + [f"posture_pc{i+1}" for i in range(POSTURE_PCS)]
 )
-families = np.array(["velocity"] * 4 + ["posture"] * POSTURE_PCS)
+families = np.array(["velocity"] * 2 + ["posture"] * POSTURE_PCS)
 print(pd.DataFrame({"channel": names, "family": families}))
 ANT = 0  # row in 'ants'; change to inspect another identity
 fig, axes = plt.subplots(2, 1, figsize=(10, 4), sharex=True, layout="constrained")
-axes[0].plot(np.arange(1440) / 60, minute[ANT, :1440, 2], lw=0.6)
-axes[0].set(ylabel="Forward RMS (mm/s)", title=ants.ant.iloc[ANT])
-axes[1].plot(np.arange(1440) / 60, minute[ANT, :1440, 4], lw=0.6)
+axes[0].plot(np.arange(1440) / 60, minute[ANT, :1440, 0], lw=0.6)
+axes[0].set(ylabel="Forward velocity (mm/s)", title=ants.ant.iloc[ANT])
+axes[1].plot(np.arange(1440) / 60, minute[ANT, :1440, 2], lw=0.6)
 axes[1].set(xlabel="Hours from July 24, 10:00 JST", ylabel="Posture PC1")
 
 
-# %% 5. Minute clips → bin means → each ant's mean and SD across bins
+# %% 5. Minute clips → bin means → each ant's SIX means across bins
+# One row per ant: no SD, RMS, rates, or concatenated time-bin features.
+# These means do not retain temporal order or excursion variability. Signed
+# lateral motion in opposite directions can cancel. Larger bins use the same
+# sampled clips; they do not add observations or preserve more dynamics.
 # A small helper makes exactly the same calculation reusable for time splits/day2.
 def make_profiles(data, mask=None):
     data = data.copy()
@@ -149,25 +155,16 @@ def make_profiles(data, mask=None):
         warnings.simplefilter("ignore", RuntimeWarning)  # unobserved bins stay NaN
         binned = np.nanmean(bins, axis=2)
         binned[np.isfinite(bins).sum(axis=2) < minimum_clips] = np.nan
-        raw = np.concatenate(
-            [np.nanmean(binned, axis=1), np.nanstd(binned, axis=1)], axis=1
-        )
+        raw = np.nanmean(binned, axis=1)
     transformed = raw.copy()
-    for j, name in enumerate(np.tile(names, 2)):
-        if name in ("forward_mean", "lateral_mean"):
-            transformed[:, j] = (
-                np.arcsinh(raw[:, j] / 0.1)
-                if j < len(names)
-                else np.log1p(np.maximum(raw[:, j], 0) / 0.1)
-            )
-        elif name in ("forward_rms", "lateral_rms"):
-            transformed[:, j] = np.log1p(np.maximum(raw[:, j], 0) / 0.1)
+    # Keep the existing signed, invertible velocity transform; no new channels.
+    transformed[:, :2] = np.arcsinh(raw[:, :2] / 0.1)
     return binned, raw, transformed
 
 
 binned, profiles_raw, profiles = make_profiles(minute[:, :1440])
-profile_names = [f"{stat}: {name}" for stat in ("mean", "sd") for name in names]
-profile_families = np.tile(families, 2)
+profile_names = [f"mean: {name}" for name in names]
+profile_families = families.copy()
 profile_table = pd.DataFrame(profiles_raw, index=ants.ant, columns=profile_names)
 print("minute:", minute.shape, "binned:", binned.shape, "profiles:", profiles.shape)
 print(profile_table.head())
@@ -207,12 +204,12 @@ balanced = state["balanced"]
 feature_names = np.array(profile_names)[state["keep"]]
 balanced_table = pd.DataFrame(balanced, index=ants.ant, columns=feature_names)
 # Ordering is for display only; no fitted axis is used for ordering or clustering.
-ant_order = np.argsort(profiles_raw[:, 2])
+ant_order = np.argsort(profiles_raw[:, 0])
 fig, axes = plt.subplots(1, 2, figsize=(12, 5), layout="constrained")
 im = axes[0].imshow(balanced[ant_order], aspect="auto", cmap="RdBu_r", vmin=-1, vmax=1)
 axes[0].set(
     xlabel="Profile feature",
-    ylabel="Ant (ordered by forward RMS)",
+    ylabel="Ant (ordered by mean forward velocity)",
     title="All balanced features",
 )
 fig.colorbar(im, ax=axes[0])
@@ -305,9 +302,9 @@ selected_k = (
 )
 model = mixtures[selected_k]
 labels = model.predict(balanced)
-# Name groups from low to high forward RMS velocity; this does not affect fitting.
+# Name groups from low to high mean forward velocity; this does not affect fitting.
 remap = np.argsort(
-    np.argsort([np.nanmedian(minute[labels == g, :1440, 2]) for g in range(selected_k)])
+    np.argsort([np.nanmedian(profiles_raw[labels == g, 0]) for g in range(selected_k)])
 )
 groups = remap[labels]
 print("Selected K:", selected_k, "| Group sizes:", np.bincount(groups))
@@ -337,13 +334,13 @@ axes[1].set(xlabel="K", ylabel="Ant-bootstrap ARI", ylim=(-0.1, 1.05))
 # above uses every balanced column, not this 2D view and not a learned projection.
 plot_columns = [
     list(feature_names).index(name)
-    for name in ("mean: forward_rms", "mean: posture_pc1_mean")
+    for name in ("mean: forward_velocity", "mean: posture_pc1")
 ]
 axes[2].scatter(
     balanced[:, plot_columns[0]], balanced[:, plot_columns[1]], c=COLORS[groups]
 )
 axes[2].set(
-    xlabel="Balanced forward RMS mean",
+    xlabel="Balanced mean forward velocity",
     ylabel="Balanced posture PC1 mean",
     title=f"{SIDE}: K={selected_k} (two-feature view)",
 )
