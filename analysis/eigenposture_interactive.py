@@ -233,11 +233,35 @@ axes[0].legend(fontsize=8);fig.suptitle(f"5. Selected {role_choice['model']}: K=
 show('05_ant_methods')
 
 # %% 6. Inspect the ant classes, and the coverage available to each ant
+class_colors=plt.get_cmap('tab10')(np.arange(k_roles))
+# Each dot is an ANT represented by its eight state proportions. The selected
+# clustering above uses all sqrt(proportion) coordinates; UMAP is only a view.
+role_view=UMAP(n_neighbors=min(8,len(ants)-1),min_dist=.15,n_epochs=400,
+    random_state=SEED,n_jobs=1).fit_transform(role_x)
+class_profiles=np.array([proportions[ants.ant_class.eq(c)].mean(axis=0) for c in range(k_roles)])
+pd.DataFrame(class_profiles,index=[f'C{c}' for c in range(k_roles)],columns=state_names).to_csv(OUTPUT/'class_state_profiles.csv',index_label='ant_class')
+ants[['ant','ant_class']].assign(umap_1=role_view[:,0],umap_2=role_view[:,1]).to_csv(OUTPUT/'ant_class_umap.csv',index=False)
+fig,axes=plt.subplots(1,2,figsize=(13,5))
+for c in range(k_roles):
+    keep=ants.ant_class.eq(c).to_numpy()
+    axes[0].scatter(*role_view[keep].T,s=55,color=class_colors[c],label=f'C{c}: {keep.sum()} ants')
+for i,row in enumerate(ants.itertuples()):axes[0].annotate(f'{row.track_id:02d}',role_view[i],xytext=(4,3),textcoords='offset points',fontsize=7)
+axes[0].set(xlabel='UMAP 1',ylabel='UMAP 2',title='Ants grouped by their state proportions');axes[0].legend(fontsize=8)
+image=axes[1].imshow(class_profiles*100,aspect='auto',cmap='viridis',vmin=0,vmax=max(1,class_profiles.max()*100))
+for c in range(k_roles):
+    for s in range(n_states):axes[1].text(s,c,f'{class_profiles[c,s]:.0%}',ha='center',va='center',fontsize=9,
+        color='black' if class_profiles[c,s]>.5*class_profiles.max() else 'white')
+axes[1].set(xticks=np.arange(n_states),xticklabels=state_names,yticks=np.arange(k_roles),
+    yticklabels=[f'C{c} (n={ants.ant_class.eq(c).sum()})' for c in range(k_roles)],title='Mean state proportions within each ant class')
+fig.colorbar(image,ax=axes[1],label='Class mean of ant state proportions (%)')
+fig.suptitle(f'6a. {n_states} behavioral states → ant state proportions → {k_roles} behavioral ant classes')
+fig.text(.08,.02,f"Fit: {role_choice['model']} in all {n_states} square-root proportion dimensions. UMAP: n=8, min_dist=0.15; display only. Each ant has equal weight.",fontsize=9)
+fig.tight_layout(rect=(0,.055,1,.95));show('06_state_to_ant_classes')
 ordered=ants.sort_values(['ant_class','track_id']).index.to_numpy()
 fig,axes=plt.subplots(1,2,figsize=(14,9),layout='constrained')
 im=axes[0].imshow(proportions[ordered],aspect='auto',cmap='viridis',vmin=0)
 axes[0].set(xticks=np.arange(n_states),xticklabels=state_names,yticks=np.arange(len(ants)),
-    yticklabels=[f"C{ants.loc[a,'ant_class']} / {ants.loc[a,'track_id']:03d}" for a in ordered],title='6. Ant state proportions')
+    yticklabels=[f"C{ants.loc[a,'ant_class']} / {ants.loc[a,'track_id']:03d}" for a in ordered],title='6b. Ant state proportions')
 axes[0].tick_params(axis='y',labelsize=7);axes[0].tick_params(axis='x',rotation=90)
 fig.colorbar(im,ax=axes[0],label='Fraction of classified observations')
 axes[1].barh(np.arange(len(ants)),ants.loc[ordered,'detection_fraction'],label='Detection coverage',alpha=.5)
@@ -249,6 +273,32 @@ for boundary in np.flatnonzero(np.diff(ants.loc[ordered,'ant_class']))+.5:
 axes[1].legend();show('06_ant_classes')
 ants.to_csv(OUTPUT/'ant_classes.csv',index=False)
 pd.DataFrame(proportions,index=ants.ant,columns=state_names).to_csv(OUTPUT/'ant_state_proportions.csv')
+# Audit successive support requirements, with each count divided by its own
+# frame grid. 12-Hz sampling therefore does NOT artificially halve coverage.
+extraction=pd.DataFrame([dict(ant=row['ant'],**{k:row['extraction'][k] for k in
+    ['total_samples','valid_pose_samples','valid_motion_samples']}) for row in mean_metadata['inputs']])
+coverage=cohort[['ant','side','n_frames','detection_fraction']].merge(extraction,on='ant',validate='one_to_one').merge(
+    pd.read_csv(SOURCE/'feature_coverage.csv'),on='ant',validate='one_to_one')
+assert len(coverage)==len(cohort)
+stages=['detection_fraction','posture_fraction','motion_fraction','contact_fraction','assigned_fraction']
+for target,column in zip(stages[1:],['valid_pose_samples','valid_motion_samples','n_observed_samples','n_assigned_samples']):
+    coverage[target]=coverage[column]/coverage.total_samples
+assert (np.diff(coverage[stages[1:]].to_numpy(),axis=1)<=0).all()
+np.testing.assert_array_equal(coverage.set_index('ant').loc[ants.ant,'n_assigned_samples'],counts.sum(axis=1))
+coverage.to_csv(OUTPUT/'state_coverage_stages.csv',index=False)
+coverage_summary=coverage.groupby('side')[stages].mean()
+coverage_summary.to_csv(OUTPUT/'state_coverage_summary.csv')
+fig,ax=plt.subplots(figsize=(11,5))
+for i,(side,values) in enumerate(coverage_summary.iterrows()):
+    bars=ax.bar(np.arange(len(stages))+(i-.5)*.36,values*100,width=.36,label=f'{side}: {cohort.side.eq(side).sum()} ants')
+    ax.bar_label(bars,fmt='%.1f%%',fontsize=9)
+ax.set(xticks=np.arange(len(stages)),xticklabels=['Detected position','Valid full-body\nposture','+ Valid motion','+ Contacts\navailable','State assigned\n(≥250 ms segments)'],
+    ylabel='Mean ant coverage (% of full recording)',ylim=(0,100),title='6c. Where coverage is lost before state assignment')
+ax.legend()
+fig.text(.08,.025,'Posture: all 10 landmarks, geometry checks, five valid 24-Hz frames, one camera.\n'
+    'Motion: finite derivatives, matching position/pose camera, speed ≤20 mm/s. Short segments are removed last.\n'
+    'All stages are normalized to full recording time; missing observations never count as a behavioral state.',fontsize=9)
+fig.tight_layout(rect=(0,.16,1,1));show('06_state_coverage')
 # Compatibility with the downstream utilities: every >60% right ant is eligible.
 eligible=np.ones(len(ants),bool);ids=np.arange(len(ants))
 
@@ -351,7 +401,49 @@ show('05_quiet_bouts')
 sleep_tracks = sma.load_sleep_label_tracks(sleep_root, cluster_ids)
 sleep, ant_sleep = sma.cluster_sleep_timeseries(sleep_tracks, bin_seconds=600,
     min_classified_fraction=.5, recording_start_frame=start, recording_stop_frame=stop)
-sma.plot_cluster_sleep_timeseries(sleep, start_clock_seconds=clock).suptitle("11. Putative sleep from behavioral states, by ant class")
+# Direct full-recording ant summaries: count all classified samples for sleep,
+# all finite trajectory-cache samples for speed, then give each ant equal weight.
+# Never average hourly fractions to estimate an ant's overall sleep fraction.
+ant_summary=ants[['ant','side','track_id','track_name','ant_class']].merge(
+    pd.read_csv(sleep_root/'ant_quiet_summary.csv')[['side','track_id','classified_seconds','quiet_seconds']],
+    on=['side','track_id'],validate='one_to_one')
+ant_summary['sleep_fraction']=ant_summary.quiet_seconds/ant_summary.classified_seconds
+if MIN_SLEEP_SECONDS==0:np.testing.assert_allclose(ant_summary.sleep_fraction,proportions[:,quiet_states].sum(axis=1))
+speed_means=[]
+for row in ant_summary.itertuples():
+    folder=stitched/'speed_vectors/per_track'/Path(row.track_name).stem
+    vector=np.load(folder/'speed_mm_s.npy',mmap_mode='r');finite=np.isfinite(vector)
+    speed_means.append(dict(ant=row.ant,mean_speed_mm_s=float(np.mean(vector[finite],dtype=np.float64)),
+        valid_speed_seconds=int(finite.sum())/FPS))
+ant_summary=ant_summary.merge(pd.DataFrame(speed_means),on='ant',validate='one_to_one')
+ant_summary.to_csv(OUTPUT/'ant_sleep_speed_summary.csv',index=False)
+class_summary=ant_summary.groupby('ant_class').agg(n_ants=('ant','size'),
+    sleep_fraction=('sleep_fraction','mean'),mean_speed_mm_s=('mean_speed_mm_s','mean'))
+class_summary.to_csv(OUTPUT/'class_sleep_speed_summary.csv')
+fig,axes=plt.subplots(2,2,figsize=(13,8));rng=np.random.default_rng(SEED)
+for c in range(k_roles):
+    group=ant_summary[ant_summary.ant_class.eq(c)];color=class_colors[c]
+    for ax,column,factor in [(axes[0,0],'sleep_fraction',100),(axes[0,1],'mean_speed_mm_s',1)]:
+        value=group[column].to_numpy()*factor
+        ax.scatter(c+rng.uniform(-.13,.13,len(value)),value,color=color,s=28,alpha=.8)
+        ax.plot([c-.23,c+.23],[value.mean()]*2,color='black',lw=2)
+    curve=sleep[sleep.cluster_id.eq(f'right_behavior_{c}')]
+    axes[1,0].plot(curve.time_h,curve.mean_sleep_fraction*100,color=color,label=f'C{c}')
+    curve=speed[speed.leiden_cluster.eq(c)]
+    axes[1,1].plot(curve.time_h,curve.mean_speed_mm_s,color=color,label=f'C{c}')
+for ax in axes[0]:ax.set(xticks=np.arange(k_roles),xticklabels=[f'C{c}\nn={len(ant_summary[ant_summary.ant_class.eq(c)])}' for c in range(k_roles)])
+axes[0,0].set(ylabel='Putative sleep (% of classified time)',ylim=(0,100),title='Each point is one ant; bars are equal-ant means')
+axes[0,1].set(ylabel='Mean trajectory speed (mm/s)',ylim=(0,None),title='Full-recording speed by behavioral ant class')
+axes[1,0].set(ylabel='Putative sleep (%)',ylim=(0,100));axes[1,1].set(ylabel='Mean trajectory speed (mm/s)',ylim=(0,None))
+for ax in axes[1]:
+    go.add_light_shading(ax,clock,stop/FPS/3600,light_on_hour=LIGHT_ON,light_off_hour=LIGHT_OFF)
+    ax.set(xlabel=f'Elapsed hours from {go.format_clock_time(clock)}');ax.legend(ncol=k_roles,fontsize=8)
+fig.suptitle('11a. Putative sleep and speed by behavioral ant class')
+fig.text(.08,.025,f"Sleep = states {quiet_states.tolist()}; unknown time is excluded. This describes classes fitted from the same state proportions.\n"
+    'Curves: 10-min equal-ant means; sleep bins require ≥50% classified coverage. Points pool all valid samples for each ant.\n'
+    'Speed uses the existing trajectory cache (not within-window peaks); dark intervals are shaded.',fontsize=9)
+fig.tight_layout(rect=(0,.13,1,.96));show('05_class_sleep_speed')
+sma.plot_cluster_sleep_timeseries(sleep, start_clock_seconds=clock).suptitle("11b. Putative sleep from behavioral states, by ant class")
 sma.plot_ant_sleep_heatmap(ant_sleep, start_clock_seconds=clock).suptitle("12. Individual state-derived putative sleep")
 speed.to_csv(OUTPUT / "class_speed.csv", index=False)
 sleep.to_csv(OUTPUT / "class_sleep.csv", index=False)

@@ -44,7 +44,11 @@ downstream readers also require PyArrow and Shapely.
 5. **Ant classes:** compare K-means, Ward, tied/diagonal GMM, Leiden, and HDBSCAN
    in square-root state proportions (Hellinger geometry). Refit the selected
    method visibly and assert agreement with the saved classes.
-6. **Inspect:** per-ant state proportions and detection versus classified coverage.
+6. **Inspect:** show how ant state proportions form the behavioral ant classes:
+   one UMAP point per ant, colored by its fitted class, alongside the class mean
+   state proportions. UMAP is a view only (8 neighbors, min_dist 0.15); class
+   fitting retains all eight square-root proportion coordinates. Also plot
+   individual state proportions and a stage-by-stage coverage audit.
 7. **Space:** hand the fixed classes to existing grid utilities; require an exact
    side/ID/filename match for every classified ant. Spatial labels are read for
    the first time here, solely for post hoc comparison. Plot mean/individual
@@ -55,7 +59,15 @@ downstream readers also require PyArrow and Shapely.
     current file instead. Neither reference affects any model fit.
 8. **Speed and putative sleep:** interpret quiet clusters from their measured
    body and antennal motion, then derive frame labels from those state assignments.
-   Plot quiet-run durations, class curves, and individual heatmaps.
+   Plot quiet-run durations, class curves, and individual heatmaps. A combined
+   sleep/speed figure shows individual ant values, equal-ant class means, and
+   ten-minute time courses. Whole-recording sleep is quiet samples / classified
+   samples for each ant; it uses every classified observation. Whole-recording
+   speed averages all finite samples in the existing trajectory cache for each
+   ant. Classes then give each ant equal weight. Unknown observations never count
+   as awake or zero speed. Time-course sleep bins retain the established 50%
+   classified-coverage threshold; their contributing ant counts are shown in
+   the detailed sleep figure. The whole-recording points have no extra bin filter.
 9. **Clock profiles:** activity and state-derived quietness by time of day,
    using complete light-dark cycles when available.
 10. **Returns and contacts:** retain the same ant classes and use state-derived
@@ -129,6 +141,29 @@ for right ants, despite their higher detection coverage. Complete skeletons,
 valid motion support, and the 250-ms minimum are needed for these features.
 Short-tail exclusion removes 3.60% of otherwise feature-valid samples. Missing
 posture can be behavior dependent; pooled proportions describe observed behavior.
+
+The coverage audit explains the gap between detection and state assignment.
+For right-colony ants, **mean** coverage of the full recording is 82.7% for
+detected positions, 53.3% after full-body posture checks, 50.4% after motion
+checks, 50.4% after requiring contact-output availability, and 48.5% after
+discarding segments shorter than 250 ms. The corresponding left-colony values
+are 82.8%, 56.8%, 54.7%, 54.7%, and 52.9%. These are equal-ant means; the median
+classified coverages above differ slightly. Detection needs a tracked position;
+posture needs all ten landmarks, valid body geometry, and five consecutive
+24-Hz frames from one camera. Motion additionally needs finite derivatives,
+matching pose/position cameras, and body speed at most 20 mm/s. Cached counters
+identify the total loss at each stage, not the separate contributions of each
+check inside the posture stage. Contact availability causes no further loss in
+this run. Sampling at 12 Hz does **not** halve coverage: posture-stage counts
+use the 12-Hz denominator. `state_coverage_stages.csv` and
+`state_coverage_summary.csv` save the audit.
+
+The speed summary reuses the grid-occupancy trajectory cache: short gaps up to
+five frames are interpolated, positions have Gaussian smoothing with sigma two
+frames, and speeds above 5 mm/s are rejected in this dataset's cache. These
+mean trajectory speeds therefore differ from the unsigned within-window peak
+features used to learn states. `ant_sleep_speed_summary.csv` and
+`class_sleep_speed_summary.csv` save the individual values and equal-ant means.
 
 ## Rebuild from pipeline outputs
 
