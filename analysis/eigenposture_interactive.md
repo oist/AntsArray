@@ -167,8 +167,11 @@ of biological roles. Against the frozen two-group spatial reference, C0/C1 are
 entirely in group 0, C3 entirely in group 1, and C2 contains two group-0 and six
 group-1 ants. Thus 42/44 match their behavioral class's predominant spatial group;
 this is a post hoc description, not held-out prediction accuracy.
-The most temporally stable passing two-class fit (tied-covariance GMM) matches
-the frozen spatial groups exactly: 26 versus 18 ants, ARI=1.00. The report shows
-this broad grouping beside the selected four-class solution. The broad fit is
-chosen by behavioral stability, not by spatial agreement; the spatial comparison
-remains descriptive and does not change the four classes used downstream.
+The most temporally stable passing two-class fit (diagonal-covariance GMM)
+contains 24 versus 20 ants and matches 42/44 frozen spatial labels after mapping
+group identities. Its median temporal and ant-removal ARIs are both 1.00. The
+report shows this broad grouping beside the selected four-class solution. The
+tied-covariance two-class GMM matches all 44 spatial labels, but has slightly
+lower temporal stability (ARI 0.955). The broad fit is chosen by behavioral
+stability; spatial agreement does not select it or change the four downstream
+classes. All these spatial comparisons remain descriptive.
