@@ -10,6 +10,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.colors import ListedColormap, BoundaryNorm
+from matplotlib.patches import Patch
 import numpy as np
 import pandas as pd
 from scipy.cluster.hierarchy import linkage, leaves_list
@@ -277,10 +278,38 @@ def make_report(block,source,sequences,features,models,output,comparison=None):
             for y,ai in enumerate(ids):
                 spatial=external.spatial_cluster.iloc[ai]
                 if np.isfinite(spatial):ax.scatter(1.025,y,c=['#333333' if spatial==0 else '#c5c5c5'],s=9,marker='s',clip_on=False)
-            ax.set(yticks=np.arange(len(ids)),yticklabels=[ants.ant.iloc[i] for i in ids],xlabel='Mean proportion across observed hours',title=f'{side}: {len(ids)} ants with hourly estimates; role K={roles[side]["k"]}')
+            ax.set(yticks=np.arange(len(ids)),yticklabels=[ants.ant.iloc[i] for i in ids],xlabel='Mean proportion across observed hours',title=f'{side}: {len(ids)} shown; {roles[side]["n"]} eligible for roles; K={roles[side]["k"]}')
             ax.tick_params(axis='y',labelsize=6)
-        fig.suptitle('6. Proportion-based repertoires | right-edge squares: spatial class, post hoc only')
+            for label,ai in zip(ax.get_yticklabels(),ids):
+                if not ants.eligible_role.iloc[ai]:label.set_color('.65')
+        fig.legend(handles=[Patch(color=colors[s],label=state_names[s]) for s in range(k)],loc='outside lower center',ncol=min(k,10),fontsize=9)
+        fig.suptitle('6. Ant repertoires | gray names: insufficient role coverage | squares: spatial class')
         save(fig,'06_ant_repertoires')
+
+        fig,axes=plt.subplots(1,3,figsize=(14,4.5),layout='constrained')
+        for side in ('left','right'):
+            path=output/(side+'_role_k.csv')
+            if path.exists():
+                table=pd.read_csv(path);axes[0].plot(table.k,table.bic-table.bic.iloc[0],'-o',label=side)
+        axes[0].axhline(0,color='.7',ls='--');axes[0].set(xticks=range(1,5),xlabel='Number of roles',ylabel='BIC minus K=1 BIC',title='Lower BIC favors the proposed split');axes[0].legend()
+        group_labels=[];group_means=[]
+        for side in ('left','right'):
+            for role in sorted(ants.loc[ants.side.eq(side)&(ants.role>=0),'role'].unique()):
+                ids=np.flatnonzero(ants.side.eq(side)&ants.role.eq(role))
+                group_labels.append(f'{side} R{role}\nn={len(ids)}');group_means.append(proportions[ids].mean(axis=0))
+        if group_means:
+            group_means=np.asarray(group_means);bottom=np.zeros(len(group_means))
+            for s in range(k):axes[1].bar(range(len(group_means)),group_means[:,s],bottom=bottom,color=colors[s]);bottom+=group_means[:,s]
+            axes[1].set(xticks=range(len(group_means)),xticklabels=group_labels,ylim=(0,1),ylabel='Mean state proportion',title='Role profiles from behavior alone')
+        selected=external[external.side.eq('right')&external.eligible_role&external.spatial_cluster.notna()&(external.role>=0)]
+        if len(selected):
+            table=pd.crosstab(selected.role,selected.spatial_cluster.astype(int));table.to_csv(output/'right_role_spatial_table.csv')
+            axes[2].imshow(table,cmap='Blues',aspect='auto')
+            for i in range(len(table)):
+                for j in range(len(table.columns)):axes[2].text(j,i,str(table.iloc[i,j]),ha='center',va='center')
+            axes[2].set(xticks=range(len(table.columns)),xticklabels=table.columns,yticks=range(len(table)),yticklabels=table.index,xlabel='Independent spatial class',ylabel='Behavioral role',title=f'Right colony, post hoc ARI={spatial_scores[1]["ari"]:.2f}')
+        fig.suptitle('Role selection additionally requires bootstrap and temporal stability')
+        save(fig,'06b_roles_spatial')
 
         fig,axes=plt.subplots(1,3,figsize=(14,4.5),layout='constrained')
         cams=np.unique(data['camera']);table=np.array([[np.mean(data['camera'][state==s]==c) for c in cams] for s in range(k)])
