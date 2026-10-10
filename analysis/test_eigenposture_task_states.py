@@ -6,8 +6,10 @@ import unittest
 import warnings
 
 import numpy as np
+import pandas as pd
 
 from analysis.eigenposture_unsigned_velocity import unsigned_peaks
+from analysis.eigenposture_interactions import count_onsets
 
 
 def interactive_helper(name, **settings):
@@ -62,6 +64,28 @@ class TaskStateTests(unittest.TestCase):
         )
         np.testing.assert_allclose(result[:2], [[1 / 3, 2 / 3, 0], [0, 0, 1]])
         self.assertTrue(np.isnan(result[2]).all())
+
+    def test_transitions_preserve_order_without_crossing_gaps(self):
+        transitions = interactive_helper("transition_counts", task_k=2)
+        # Equal state fractions, different time organization.
+        labels = np.array([[0, 0, 1, 1, -1, 0], [0, 1, 0, 1, -1, 0]])
+        counts = transitions(labels)
+        np.testing.assert_array_equal(counts[0], [[1, 1], [0, 1]])
+        np.testing.assert_array_equal(counts[1], [[0, 2], [1, 0]])
+        self.assertEqual(counts.sum(), 6)
+        self.assertEqual(transitions(np.full((1, 6), -1)).sum(), 0)
+
+    def test_interactions_count_both_ants_and_preserve_missing_coverage(self):
+        ants = pd.DataFrame(dict(side=["left", "left", "right"], track_id=[0, 1, 0]))
+        bouts = pd.DataFrame(dict(side=["left"] * 6, ant_a=[0] * 6, ant_b=[1] * 6,
+                                  start_frame=[9, 10, 19, 20, 25, 30],
+                                  is_new_onset=[True, True, True, True, False, True]))
+        coverage = {"left": np.ones(40, bool), "right": np.ones(40, bool)}
+        coverage["right"][21] = False
+        counts = count_onsets(bouts, ants, coverage, 10, 2, 10, 1)
+        np.testing.assert_array_equal(counts[:2], [[2, 1], [2, 1]])
+        self.assertEqual(counts[2, 0], 0)
+        self.assertTrue(np.isnan(counts[2, 1]))
 
 
 if __name__ == "__main__":

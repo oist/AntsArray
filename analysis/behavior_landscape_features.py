@@ -132,11 +132,19 @@ def load_contacts(block, info):
         path = block / "stitched/analysis_cache/return_sleep" / f"pair_contact_bouts_{key}.parquet"
         if path.is_file():
             candidates.add(path)
-    if len(candidates) != 1:
-        raise FileNotFoundError(f"Need exactly one current, source-validated pair-contact cache; found {candidates}")
-    path = candidates.pop()
-    sources.append(path)
+    if not candidates:
+        raise FileNotFoundError("No current, source-validated pair-contact cache")
+    path, *duplicates = sorted(candidates)
     bouts = pd.read_parquet(path)
+    # Copies keyed by staging and published paths may use different Parquet
+    # encodings. Accept multiple caches only if every value agrees.
+    keys = ["side", "ant_a", "ant_b", "start_frame"]
+    canonical = bouts.sort_values(keys).reset_index(drop=True)
+    for duplicate in duplicates:
+        other = pd.read_parquet(duplicate).sort_values(keys).reset_index(drop=True)
+        pd.testing.assert_frame_equal(canonical, other, check_exact=True)
+    sources.extend(duplicates)
+    sources.append(path)
     n = int(np.ceil(info["frame_stop"] / settings.fps))
     coverage = {side: np.zeros(n, bool) for side in ("left", "right")}
     for c in chunks:

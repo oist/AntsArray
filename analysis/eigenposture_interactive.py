@@ -1,10 +1,11 @@
 # %% 1. Settings — run these cells in order in VS Code/Spyder
 """Five-minute behavior states, their time courses, and ant task distributions.
 
-Six features per bin: max unsigned forward/lateral sample velocity + four mean
-posture PCs. First cluster BINS pooled across all ants, then cluster each ANT's
-state proportions. No ant identity, position, time, or extra PCA enters either
-clustering. State labels are candidate behaviors, not verified biological tasks.
+Seven features per bin: max unsigned forward/lateral sample velocity + four mean
+posture PCs + new interaction bouts. First cluster BINS pooled across all ants;
+then compare ANT groups from state proportions alone versus proportions plus
+adjacent-bin transitions. Identity and position never enter either clustering.
+UMAP is a visualization only. States are not verified biological tasks.
 One sampled 2.5-second clip/minute is available, not continuous five-minute video.
 """
 
@@ -20,11 +21,13 @@ from sklearn.cluster import KMeans
 from sklearn.metrics import adjusted_rand_score, silhouette_score
 from sklearn.mixture import GaussianMixture
 from threadpoolctl import threadpool_limits
+from umap import UMAP
 
 DATA = Path(
     "/home/sam-reiter/bucket/ReiterU/Ants/basler/20260724/block01/analysis_outputs/eigenposture_20261009"
 )
 VELOCITY_DATA = DATA.parent / "task_states_20261010" / "unsigned_velocity.npz"
+INTERACTION_DATA = DATA.parent / "task_states_interactions_20261010" / "interaction_counts.npz"
 BIN_MINUTES = 5
 MIN_CLIPS = 3  # jointly observed clips per bin; missing bins remain unassigned
 POSTURE_PCS = 4
@@ -33,6 +36,7 @@ ANT_KS = range(1, 5)  # includes one ant group
 MIN_ANT_HOURS = 12  # observed five-minute bins across the full 48 hours
 BOOTSTRAPS = 200  # ant resamples per candidate K; try 20 for a preview
 SEED = 7241010
+UMAP_POINTS = 10000  # random pooled bins for a quick static visualization
 
 plt.ion()
 threadpool_limits(limits=1)
@@ -111,7 +115,7 @@ print(
 )
 
 
-# %% 4. Make a six-dimensional observation for EACH ant × five-minute bin
+# %% 4. Make a seven-dimensional observation for EACH ant × five-minute bin
 names = ["Forward peak (mm/s)", "Lateral peak (mm/s)"] + [
     f"Posture PC{i}" for i in range(1, 5)
 ]
@@ -133,6 +137,14 @@ def bin_features(data):
 
 
 binned, clip_counts = bin_features(minute)
+with np.load(INTERACTION_DATA) as cache:
+    np.testing.assert_array_equal(cache["ants"], coverage.ant)
+    assert cache["start_frame"] == 41520 and cache["bin_frames"] == 7200
+    interaction_counts = cache["counts"]
+assert interaction_counts.shape == binned.shape[:2]
+assert np.nanmin(interaction_counts) >= 0
+binned = np.concatenate([binned, interaction_counts[:, :, None]], axis=2)
+names.append("Interaction onsets / 5 min")
 valid = np.isfinite(binned).all(axis=2)
 ants = coverage.copy()
 ants["observed_bin_hours"] = valid.sum(axis=1) * BIN_MINUTES / 60
@@ -142,19 +154,20 @@ print(
 )
 print("All five-minute vectors:", binned.shape, "| valid:", valid.sum())
 
-# %% 5. Pool bins irrespective of ant; balance velocity and posture in SIX dimensions
+# %% 5. Pool bins; balance velocity, posture and interaction families
 raw = binned[valid]  # no ant-level summary, identity, time, or space in this matrix
 transformed = raw.copy()
 transformed[:, :2] = np.log1p(transformed[:, :2] / 0.1)
+transformed[:, 6] = np.log1p(transformed[:, 6])
 feature_center = transformed.mean(axis=0)
-feature_scale = np.ones(6)
-for columns in (slice(0, 2), slice(2, 6)):
+feature_scale = np.ones(7)
+for columns in (slice(0, 2), slice(2, 6), slice(6, 7)):
     feature_scale[columns] = max(
         np.sqrt(transformed[:, columns].var(axis=0).sum()), 1e-6
     )
 task_input = (transformed - feature_center) / feature_scale
 
-# %% 6. Choose a task-state resolution in the full six-dimensional space
+# %% 6. Choose a task-state resolution in the full seven-dimensional space
 # K-means discretizes behavior; silhouette chooses separation among K=2..10.
 # This does not prove a number of biological tasks or test continuous vs discrete.
 sample = np.random.default_rng(SEED).choice(
@@ -195,23 +208,49 @@ axes[0].plot(task_k_table.index, task_k_table.silhouette, "o-")
 axes[0].axvline(task_k, color=".5", ls="--")
 axes[0].set(
     xlabel="Task-state K",
-    ylabel="Silhouette (six dimensions)",
+    ylabel="Silhouette (seven dimensions)",
     title="Choose a behavioral resolution",
 )
 centroids = np.stack(
     [task_input[tasks[valid] == k].mean(axis=0) for k in range(task_k)]
 )
 im = axes[1].imshow(centroids, aspect="auto", cmap="RdBu_r", vmin=-2, vmax=2)
-axes[1].set_xticks(range(6), ["Forward", "Lateral", "PC1", "PC2", "PC3", "PC4"])
+axes[1].set_xticks(range(7), ["Forward", "Lateral", "PC1", "PC2", "PC3", "PC4", "Contacts"], rotation=25)
 axes[1].set_yticks(range(task_k), [f"T{k}" for k in range(task_k)])
 axes[1].set(title="What distinguishes the task states?", xlabel="Balanced feature")
 fig.colorbar(im, ax=axes[1], label="Mean balanced value")
 
-# %% 7. Each ant's task assignments across the complete 48 hours
+# %% 7. Static UMAP of the fitted states; it never determines cluster assignments
 state_colors = plt.get_cmap("tab10")(np.arange(task_k))
 state_cmap = ListedColormap(state_colors)
 state_cmap.set_bad("#dddddd")
 state_norm = BoundaryNorm(np.arange(task_k + 1) - 0.5, task_k)
+umap_sample = np.random.default_rng(SEED).choice(len(raw), min(UMAP_POINTS, len(raw)), replace=False)
+umap_coordinates = UMAP(n_neighbors=20, min_dist=0.05, metric="euclidean",
+                        n_epochs=300, random_state=SEED, n_jobs=1).fit_transform(task_input[umap_sample])
+umap_labels = tasks[valid][umap_sample]
+fig, axes = plt.subplots(1, 3, figsize=(14, 4), layout="constrained")
+axes[0].scatter(*umap_coordinates.T, c=umap_labels, cmap=state_cmap,
+                norm=state_norm, s=3, alpha=0.65, rasterized=True)
+for state in range(task_k):
+    axes[0].scatter([], [], color=state_colors[state], label=f"T{state}")
+axes[0].legend(markerscale=0.8)
+axes[0].set_title(f"States fitted in 7D (K={task_k})")
+for ax, column, label in zip(axes[1:], (6, 0), ("Interaction onsets / 5 min", "Forward peak (mm/s)")):
+    values = raw[umap_sample, column]
+    im = ax.scatter(*umap_coordinates.T, c=np.log1p(values), cmap="viridis", s=3,
+                    alpha=0.65, rasterized=True)
+    fig.colorbar(im, ax=ax, label=f"log(1 + {label})")
+    ax.set_title(label)
+for ax in axes:
+    ax.set(xlabel="UMAP 1", ylabel="UMAP 2", xticks=[], yticks=[])
+fig.suptitle(f"Random sample of {len(umap_sample):,} bins; visualization only")
+bin_rows, bin_columns = np.where(valid)
+umap_table = pd.DataFrame(dict(ant=ants.ant.to_numpy()[bin_rows[umap_sample]],
+                               bin=bin_columns[umap_sample], state=umap_labels,
+                               umap1=umap_coordinates[:, 0], umap2=umap_coordinates[:, 1]))
+
+# %% 8. Each ant's task assignments across the complete 48 hours
 clock_ticks = np.arange(0, 49, 12)
 clock_labels = [
     "Jul24 10:00",
@@ -222,7 +261,8 @@ clock_labels = [
 ]
 
 
-def plot_timelines(orderings, title, show_groups=False):
+def plot_timelines(orderings, title, show_groups=False, groups=None):
+    groups = ant_groups if groups is None and show_groups else groups
     fig, axes = plt.subplots(2, 1, figsize=(15, 15), sharex=True, layout="constrained")
     for ax, side in zip(axes, ("left", "right")):
         rows = orderings[side]
@@ -237,8 +277,8 @@ def plot_timelines(orderings, title, show_groups=False):
         row_labels = (
             [
                 (
-                    f"{ants.ant.iloc[i]} G{ant_groups[i]}"
-                    if ant_groups[i] >= 0
+                    f"{ants.ant.iloc[i]} G{groups[i]}"
+                    if groups[i] >= 0
                     else f"{ants.ant.iloc[i]} (low coverage)"
                 )
                 for i in rows
@@ -248,7 +288,7 @@ def plot_timelines(orderings, title, show_groups=False):
         )
         ax.set_yticks(np.arange(len(rows)), row_labels, fontsize=6)
         if show_groups:
-            for boundary in np.flatnonzero(np.diff(ant_groups[rows])):
+            for boundary in np.flatnonzero(np.diff(groups[rows])):
                 ax.axhline(boundary + 0.5, color="black", lw=1)
         ax.axvline(24, color="black", ls="--", lw=0.8)
         ax.set(title=f"{side}: {title}", ylabel="Ant; gray = insufficient observations")
@@ -276,7 +316,7 @@ bin_table = pd.DataFrame(
 for column, name in enumerate(names):
     bin_table[name] = binned[:, :, column].ravel()
 
-# %% 8. Task distributions for each ant, using ONLY its observed bins
+# %% 9. State proportions and transitions between adjacent observed bins
 
 
 def task_proportions(labels):
@@ -289,127 +329,163 @@ proportions = task_proportions(tasks)
 proportion_table = pd.DataFrame(
     proportions, index=ants.ant, columns=[f"T{k}" for k in range(task_k)]
 )
-# Square-root proportions give Hellinger geometry, retaining every task column.
-# No extra PCA or individual-column standardization is applied.
-ant_input = np.sqrt(proportions)
+def transition_counts(labels):
+    """Counts of ordered state pairs, never spanning a missing bin or split gap."""
+    result = np.zeros((len(labels), task_k, task_k), dtype=int)
+    for ant, row in enumerate(labels):
+        valid_pair = (row[:-1] >= 0) & (row[1:] >= 0)
+        np.add.at(result[ant], (row[:-1][valid_pair], row[1:][valid_pair]), 1)
+    return result
+
+
+def ant_features(labels, with_transitions=False, transition_scale=1.0):
+    # Square roots retain all proportion/transition coordinates; no further PCA.
+    fractions = np.sqrt(task_proportions(labels))
+    if not with_transitions:
+        return fractions
+    pairs = transition_counts(labels).reshape(len(labels), -1)
+    total = pairs.sum(axis=1, keepdims=True)
+    joint = np.divide(pairs, total, out=np.full(pairs.shape, np.nan), where=total > 0)
+    return np.column_stack([fractions, np.sqrt(joint) * transition_scale])
+
+
+pairs = transition_counts(tasks)
+next_counts = pairs.sum(axis=2)
+stay_probabilities = np.divide(
+    np.diagonal(pairs, axis1=1, axis2=2), next_counts,
+    out=np.full(next_counts.shape, np.nan), where=next_counts > 0,
+)
+transition_table = pd.DataFrame(pairs.reshape(len(ants), -1), index=ants.ant,
+                               columns=[f"T{i}->T{j}" for i in range(task_k) for j in range(task_k)])
 print(proportion_table.head())
 
 
-# %% 9. Cluster task distributions into ant groups, independently by colony
-# K=1 is allowed. Stability checks condition on the already fitted task dictionary.
+# %% 10. Compare groups from proportions alone vs proportions + state transitions
+# K=1 is allowed. Stability checks condition on the already fitted state dictionary.
 def fit_ant_model(x, k, seed=SEED):
-    model = GaussianMixture(
-        k,
-        covariance_type="tied",
-        reg_covar=0.001,
-        n_init=10,
-        max_iter=500,
-        random_state=seed,
-    ).fit(x)
+    model = GaussianMixture(k, covariance_type="tied", reg_covar=0.001,
+                            n_init=10, max_iter=500, random_state=seed).fit(x)
     if not model.converged_:
         raise RuntimeError("Ant mixture did not converge")
     return model
 
 
-ant_groups = np.full(len(ants), -1, dtype=int)
-ant_models, ant_k_tables, ant_bootstrap = {}, {}, {}
-for side in ("left", "right"):
-    indices = np.flatnonzero(ants.side.eq(side) & ants.eligible)
-    x = ant_input[indices]
-    models = {k: fit_ant_model(x, k) for k in ANT_KS}
-    table = pd.DataFrame(
-        [
-            dict(
-                k=k,
-                bic=m.bic(x),
-                smallest_group=np.bincount(m.predict(x), minlength=k).min(),
-            )
+def cluster_ants(with_transitions):
+    groups = np.full(len(ants), -1, dtype=int)
+    selected_models, tables, scales = {}, {}, {}
+    for side in ("left", "right"):
+        indices = np.flatnonzero(ants.side.eq(side) & ants.eligible)
+        labels_by_ant = tasks[indices]
+        base = ant_features(labels_by_ant)
+        scale = 1.0
+        if with_transitions:
+            joint = ant_features(labels_by_ant, True)[:, task_k:]
+            # Equal total between-ant variance for proportions and transitions.
+            scale = np.sqrt(base.var(axis=0).sum() / max(joint.var(axis=0).sum(), 1e-12))
+        scales[side] = scale
+        x = ant_features(labels_by_ant, with_transitions, scale)
+        assert np.isfinite(x).all()
+        models = {k: fit_ant_model(x, k) for k in ANT_KS}
+        table = pd.DataFrame([
+            dict(k=k, bic=m.bic(x), smallest_group=np.bincount(m.predict(x), minlength=k).min())
             for k, m in models.items()
-        ]
-    ).set_index("k")
-    for k in list(ANT_KS)[1:]:
-        labels = models[k].predict(x)
-        rng = np.random.default_rng(SEED)
-        bootstrap, temporal = [], []
-        for repeat in range(BOOTSTRAPS):
-            sample = rng.integers(len(x), size=len(x))
-            m = fit_ant_model(x[sample], k, SEED + repeat)
-            bootstrap.append(adjusted_rand_score(labels, m.predict(x)))
-        for block_minutes in (30, 60, 120):
-            halves = []
-            for half in (0, 1):
-                mask = (
-                    np.arange(tasks.shape[1]) * BIN_MINUTES // block_minutes
-                ) % 2 == half
-                half_x = np.sqrt(task_proportions(tasks[indices][:, mask]))
-                assert np.isfinite(half_x).all()
-                halves.append(fit_ant_model(half_x, k).predict(half_x))
-            temporal.append(adjusted_rand_score(*halves))
-        ant_bootstrap[side, k] = np.array(bootstrap)
-        table.loc[k, ["bootstrap_median", "bootstrap_p10", "temporal_median"]] = [
-            np.median(bootstrap),
-            np.quantile(bootstrap, 0.1),
-            np.median(temporal),
-        ]
-    admissible = table[
-        (table.bic < table.loc[1, "bic"])
-        & (table.smallest_group >= 5)
-        & (table.bootstrap_median >= 0.8)
-        & (table.temporal_median >= 0.6)
-    ]
-    table["admissible"] = table.index.isin(admissible.index)
-    k = (
-        1
-        if admissible.empty
-        else int(admissible[admissible.bic <= admissible.bic.min() + 2].index.min())
-    )
-    model = models[k]
-    labels = model.predict(x)
-    expected_speed = proportions[indices] @ task_means[:, 0]
-    remap = np.argsort(
-        np.argsort([expected_speed[labels == g].mean() for g in range(k)])
-    )
-    ant_groups[indices] = remap[labels]
-    ant_models[side] = model
-    ant_k_tables[side] = table
-    print(
-        f"{side}: ant-group K={k}, n={len(indices)}, sizes={np.bincount(ant_groups[indices])}"
-    )
-    print(table)
-ants["ant_group"] = ant_groups
-fig, axes = plt.subplots(1, 2, figsize=(10, 4), layout="constrained")
-for ax, side in zip(axes, ("left", "right")):
-    table = ant_k_tables[side]
-    ax.plot(table.index, table.bic - table.bic.min(), "o-")
-    rejected = table[(table.index > 1) & ~table.admissible]
-    ax.scatter(
-        rejected.index,
-        rejected.bic - table.bic.min(),
-        marker="x",
-        s=80,
-        color="red",
-        label="Fails size/stability rule",
-    )
-    ax.legend(fontsize=8)
-    ax.set(
-        xlabel="Ant-group K",
-        ylabel="BIC − minimum",
-        xticks=list(ANT_KS),
-        title=f"{side}: selected K={ant_models[side].n_components}",
-    )
+        ]).set_index("k")
+        for k in list(ANT_KS)[1:]:
+            labels = models[k].predict(x)
+            rng = np.random.default_rng(SEED)
+            bootstrap, temporal = [], []
+            for repeat in range(BOOTSTRAPS):
+                sample = rng.integers(len(x), size=len(x))
+                m = fit_ant_model(x[sample], k, SEED + repeat)
+                bootstrap.append(adjusted_rand_score(labels, m.predict(x)))
+            for block_minutes in (30, 60, 120):
+                halves = []
+                for half in (0, 1):
+                    mask = (np.arange(tasks.shape[1]) * BIN_MINUTES // block_minutes) % 2 == half
+                    half_labels = labels_by_ant.copy()
+                    half_labels[:, ~mask] = -1  # keep time gaps: NEVER concatenate halves
+                    half_x = ant_features(half_labels, with_transitions, scale)
+                    assert np.isfinite(half_x).all()
+                    halves.append(fit_ant_model(half_x, k).predict(half_x))
+                temporal.append(adjusted_rand_score(*halves))
+            table.loc[k, ["bootstrap_median", "bootstrap_p10", "temporal_median"]] = [
+                np.median(bootstrap), np.quantile(bootstrap, 0.1), np.median(temporal)]
+        admissible = table[(table.bic < table.loc[1, "bic"]) & (table.smallest_group >= 5)
+                           & (table.bootstrap_median >= 0.8) & (table.temporal_median >= 0.6)]
+        table["admissible"] = table.index.isin(admissible.index)
+        k = 1 if admissible.empty else int(admissible[admissible.bic <= admissible.bic.min() + 2].index.min())
+        model = models[k]
+        labels = model.predict(x)
+        expected_speed = proportions[indices] @ task_means[:, 0]
+        remap = np.argsort(np.argsort([expected_speed[labels == g].mean() for g in range(k)]))
+        groups[indices] = remap[labels]
+        selected_models[side], tables[side] = model, table
+        print(f"{side}, transitions={with_transitions}: K={k}, n={len(indices)}, sizes={np.bincount(groups[indices])}", flush=True)
+        print(table, flush=True)
+    return groups, selected_models, tables, scales
 
-# %% 10. Compare task distributions and timelines after grouping ants
+
+baseline_groups, baseline_models, baseline_k_tables, _ = cluster_ants(False)
+ant_groups, ant_models, ant_k_tables, transition_scales = cluster_ants(True)
+ants["proportion_group"] = baseline_groups
+ants["ant_group"] = ant_groups
+comparison_rows = []
+fig, axes = plt.subplots(2, 2, figsize=(11, 7), layout="constrained")
+for row, (method, models, tables) in enumerate([
+    ("Proportions", baseline_models, baseline_k_tables),
+    ("Proportions + transitions", ant_models, ant_k_tables),
+]):
+    for ax, side in zip(axes[row], ("left", "right")):
+        table = tables[side]
+        selected_k = models[side].n_components
+        ax.plot(table.index, table.bic - table.bic.min(), "o-")
+        rejected = table[(table.index > 1) & ~table.admissible]
+        ax.scatter(rejected.index, rejected.bic - table.bic.min(), marker="x", s=70,
+                   color="red", label="Fails BIC/size/stability rule")
+        ax.axvline(selected_k, ls="--", color=".5")
+        ax.set(xlabel="Ant-group K", ylabel="BIC − minimum", xticks=list(ANT_KS),
+               title=f"{side}: {method}; selected K={selected_k}")
+        ax.legend(fontsize=7)
+        comparison_rows.append(dict(side=side, method=method, k=selected_k,
+                                    **table.loc[selected_k].drop("admissible").to_dict()))
+comparison_table = pd.DataFrame(comparison_rows)
+
+# Show persistence conditional on the current state, alongside the group overlap.
+fig, axes = plt.subplots(2, 3, figsize=(14, 8), layout="constrained")
+for row, side in enumerate(("left", "right")):
+    indices = np.flatnonzero(ants.side.eq(side) & ants.eligible)
+    cross = pd.crosstab(baseline_groups[indices], ant_groups[indices])
+    axes[row, 0].imshow(cross, cmap="Blues", vmin=0)
+    for (i, j), value in np.ndenumerate(cross.to_numpy()):
+        axes[row, 0].text(j, i, str(value), ha="center", va="center",
+                          color="white" if value > cross.to_numpy().max() / 2 else "black")
+    axes[row, 0].set(xlabel="Group: proportions + transitions", ylabel="Group: proportions only",
+                     xticks=range(cross.shape[1]), yticks=range(cross.shape[0]), title=f"{side}: same ants")
+    for ax, values, ylabel in zip(axes[row, 1:], (proportions, stay_probabilities),
+                                  ("Fraction of observed bins", "P(stay in next 5-minute bin)")):
+        for g in range(baseline_models[side].n_components):
+            group = indices[baseline_groups[indices] == g]
+            means = np.nanmean(values[group], axis=0)
+            line, = ax.plot(range(task_k), means, "o-", label=f"G{g}, n={len(group)}")
+            for state in range(task_k):
+                ax.scatter(np.full(len(group), state) + (g - 1) * .04,
+                           values[group, state], s=10, alpha=.2, color=line.get_color())
+        ax.set(xticks=range(task_k), xticklabels=[f"T{s}" for s in range(task_k)],
+               ylabel=ylabel, ylim=(0, 1), title=f"{side}: proportion groups")
+        ax.legend(fontsize=7)
+
+# %% 11. Compare task distributions and timelines after grouping ants
 ordered = {}
 for side, rows in by_identity.items():
-    # Low-coverage ants remain visible at the bottom, with ant_group=-1.
+    # Low-coverage ants remain visible at the bottom, with proportion_group=-1.
     order = np.lexsort(
         (
             np.nan_to_num(proportions[rows] @ task_means[:, 0]),
-            np.where(ant_groups[rows] < 0, 99, ant_groups[rows]),
+            np.where(baseline_groups[rows] < 0, 99, baseline_groups[rows]),
         )
     )
     ordered[side] = rows[order]
-plot_timelines(ordered, "ordered by ant task-distribution group", show_groups=True)
+plot_timelines(ordered, "ordered by ant proportion group", show_groups=True, groups=baseline_groups)
 fig, axes = plt.subplots(2, 1, figsize=(15, 8), layout="constrained")
 for ax, side in zip(axes, ("left", "right")):
     rows = ordered[side]
@@ -428,8 +504,8 @@ for ax, side in zip(axes, ("left", "right")):
         np.arange(len(rows)),
         [
             (
-                f"{ants.ant.iloc[i]}\nG{ant_groups[i]}"
-                if ant_groups[i] >= 0
+                f"{ants.ant.iloc[i]}\nG{baseline_groups[i]}"
+                if baseline_groups[i] >= 0
                 else f"{ants.ant.iloc[i]}\nlow coverage"
             )
             for i in rows
@@ -444,7 +520,7 @@ for ax, side in zip(axes, ("left", "right")):
     )
 axes[0].legend(ncols=task_k, fontsize=8)
 
-# %% 11. Only NOW compare with spatial classes; they did not choose either clustering
+# %% 12. Only NOW compare with spatial classes; they did not choose either clustering
 reference = pd.read_csv(DATA / "spatial_reference.csv")
 assignments = ants.merge(
     reference[["side", "track_id", "spatial_cluster"]],
@@ -457,29 +533,25 @@ assert assignments.loc[assignments.eligible, "spatial_cluster"].notna().all()
 spatial_results = []
 for side in ("left", "right"):
     subset = assignments[assignments.side.eq(side) & assignments.eligible]
-    contingency = pd.crosstab(subset.ant_group, subset.spatial_cluster)
-    print(side, "spatial comparison:\n", contingency)
-    if ant_models[side].n_components == 1:
-        print(
-            "K=1: no supported ant division; majority matching is not two-class recovery."
-        )
-        continue
-    ari = adjusted_rand_score(subset.spatial_cluster, subset.ant_group)
-    matched = None
-    if ant_models[side].n_components == 2:
-        rows, columns = linear_sum_assignment(-contingency.to_numpy())
-        matched = int(contingency.to_numpy()[rows, columns].sum())
-        print(f"Two-class spatial agreement: {matched}/{len(subset)}, ARI={ari:.3f}")
-    else:
-        print(f"Different numbers of groups: inspect contingency; ARI={ari:.3f}")
-    spatial_results.append(dict(side=side, matched=matched, n=len(subset), ari=ari))
+    for method, column, models in [("Proportions", "proportion_group", baseline_models),
+                                    ("Proportions + transitions", "ant_group", ant_models)]:
+        contingency = pd.crosstab(subset[column], subset.spatial_cluster)
+        ari = adjusted_rand_score(subset.spatial_cluster, subset[column])
+        matched = None
+        if models[side].n_components == 2:
+            rows, columns = linear_sum_assignment(-contingency.to_numpy())
+            matched = int(contingency.to_numpy()[rows, columns].sum())
+        print(side, method, "spatial comparison:\n", contingency)
+        print(f"ARI={ari:.3f}; K={models[side].n_components}")
+        spatial_results.append(dict(side=side, method=method, matched=matched,
+                                    n=len(subset), ari=ari))
 
-# %% 12. Where do the ant groups spend time? Equal weight per ant, same cohort
+# %% 13. Where do the ant groups spend time? Equal weight per ant, same cohort
 occupancy = DATA / "reproduction" / "occupancy" / "per_track"
 for side in ("left", "right"):
     subset = assignments[assignments.side.eq(side) & assignments.eligible]
     maps, titles = [], []
-    for column, prefix in [("spatial_cluster", "Spatial"), ("ant_group", "Activity")]:
+    for column, prefix in [("spatial_cluster", "Spatial"), ("proportion_group", "Proportions")]:
         for group, group_ants in subset.groupby(column):
             histograms = []
             for ant in group_ants.itertuples():
@@ -506,4 +578,5 @@ for side in ("left", "right"):
     fig.colorbar(im, ax=axes, label="Mean fraction of observations / bin", shrink=0.7)
 plt.show()
 # Inspect: coordinate_modes, binned, clip_counts, task_input, task_k_table,
-# task_summary, tasks, bin_table, proportion_table, ant_k_tables, assignments.
+# task_summary, umap_table, tasks, bin_table, proportion_table, transition_table,
+# baseline_k_tables, ant_k_tables, comparison_table, assignments.

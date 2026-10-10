@@ -1,140 +1,155 @@
-# Five-minute task states and ant division of labor
+# Five-minute behavior states and ant groups
 
-Open [`eigenposture_interactive.py`](eigenposture_interactive.py) and run its
-numbered `# %%` cells in order. It uses ordinary NumPy, pandas, SciPy,
-scikit-learn and Matplotlib, with no analysis-pipeline imports. It leaves arrays
-and figures available for inspection and does not automatically write outputs.
+Run the numbered cells in `eigenposture_interactive.py` to inspect each step.
+For static PNGs, a PDF, and CSV/NPZ tables:
 
-## What each step does
+```bash
+python -m analysis.eigenposture_task_report --output /path/to/results
+```
 
-1. Load all 114 tracked identities, aligned antennal coordinates, and unsigned
-   forward/lateral motion measurements. Refit the four posture PCs over the
-   full 48 hours, using the same equal-colony/equal-ant moment calculation.
-2. Form one six-dimensional vector for each ant's five-minute bin: four mean
-   posture-PC scores and maximum unsigned forward/lateral speed. Absolute value
-   is taken on the original short-window velocity components **before** any
-   averaging. These are maxima of sampled, smoothed velocities, not continuous
-   five-minute observations. Each minute contributes one 2.5-second clip.
-3. Require at least three clips jointly observed in all six channels per bin.
-   Missing bins remain missing. Pool valid bins from all ants, both colonies,
-   and both days. Identity, time and spatial position are not input features.
-4. Apply `log1p(v/0.1)` to unsigned speeds and balance the velocity/posture
-   families to equal total variance. Fit K-means in all six dimensions. Select
-   among K=2–10 using silhouette on a fixed sample of up to 3,000 pooled bins.
-   This chooses a descriptive behavioral resolution; it does not infer the
-   number of biological tasks or test whether behavior is intrinsically discrete.
-5. Assign every valid bin to a state. Display all ants across 48 hours, with
-   five-minute columns and gray for missing bins. State labels T0, T1, etc. are
-   ordered by unsigned forward speed for display, not named as biological tasks.
-6. Count each ant's fraction of observed bins in each state. Fit shared-covariance
-   Gaussian mixtures to the square-root proportions, separately by colony,
-   retaining every task coordinate without another PCA. Require 12 observed
-   bin-hours across the 48-hour recording for this ant-level fit. Lower-coverage
-   ants remain visible in the task timelines and proportion plots.
-7. Choose ant-group K=1–4 using BIC, minimum group size five, median ant-bootstrap
-   ARI at least 0.8, and median temporal-split ARI at least 0.6. Select the smaller
-   qualifying K within two BIC units of the best, or K=1 if none qualifies.
-   Bootstrap refits resample ants; time splits alternate 30-, 60-, and 120-minute
-   blocks. These checks condition on the pooled task dictionary. Both days enter
-   that dictionary and the posture PCA, so this is not an independent holdout.
-8. Reorder the timelines by ant group and plot each ant's task proportions.
-   Only then load spatial classes and compare occupancy on the same eligible
-   ants. Neither stage is chosen for spatial agreement; two ant groups are not
-   forced. State categories and ant groups describe this recording, not proven
-   biological task identities or lifelong castes.
+No HTML is generated. The script uses NumPy, pandas, SciPy, scikit-learn,
+Matplotlib, threadpoolctl and umap-learn. Extraction of the interaction cache
+also needs the existing pipeline dependencies, including PyArrow and Shapely.
 
-## Current result
+## State clustering
 
-The current run has **33,736 valid bins and two behavioral states**. Mean
-forward/lateral peak speeds are 0.55/0.45 mm/s in T0 and 4.53/2.02 mm/s in T1;
-their posture-PC profiles also differ. K=2 has silhouette 0.378, versus 0.261
-for K=3. This is the lowest candidate resolution, not evidence for exactly two
-biological tasks.
+1. Fit landmark PCA over the full 48 hours, with equal colony and ant weights.
+   Retain four posture PCs. No additional PCA follows.
+2. For each ant and five-minute interval, take mean posture scores and maximum
+   **unsigned** forward/lateral velocity. Absolute values are taken before
+   averaging, from the original short-window motion samples. Require three
+   jointly valid clips out of five. Each minute has one sampled 2.5-second clip;
+   these are not continuous five-minute posture measurements.
+3. Add a seventh feature: the number of **new undirected pair-contact bouts**
+   starting in that five-minute interval. Each bout counts for both ants;
+   repeated contact with the same partner can count again. Contacts use all
+   skeleton segments/nodes within 0.1 mm, joining detections separated by at
+   most two seconds. Left-censored onsets are excluded. These counts use the
+   continuous interaction output, including times outside sampled posture
+   clips. Missing interaction coverage stays missing. They are detection
+   counts, not rates corrected for each ant's tracking exposure.
+4. Pool bins across all ants, without identity, time or position as features.
+   Apply `log1p(v/0.1)` to velocities and `log1p(count)` to interactions.
+   Scale the velocity, posture and interaction families to equal total variance.
+   Fit K-means in **all seven dimensions**. Select K=2–10 by silhouette on a
+   fixed random sample of at most 3,000 bins. This selects a descriptive
+   resolution, not proof of a particular number of biological tasks.
+5. Display the states using a UMAP of 10,000 randomly sampled bins:
+   `n_neighbors=20`, `min_dist=0.05`, Euclidean distance, 300 epochs, fixed seed.
+   UMAP does not determine any cluster assignment or K. Its apparent gaps and
+   densities are not additional evidence for discrete classes. See the
+   [UMAP parameter documentation](https://umap-learn.readthedocs.io/en/latest/parameters.html).
+6. Assign every valid bin, display all 114 identities through time, and leave
+   missing bins gray. State IDs are ordered by mean forward peak speed.
 
-Ant task proportions select **three groups in each colony**: 24/8/9 ants on the
-left and 25/7/13 on the right. Their mean fractions of T1 bins are 32/65/79% and
-24/47/77%, respectively. The BIC advantage of three versus two groups is small
-(2.35 left, 2.12 right). K=2 is also stable; do not treat the third group as an
-established biological caste. For the selected K=3, median ant-bootstrap ARI is
-1.000 left and 0.824 right; tenth percentiles are 1.000 and 0.648. Temporal-split
-medians are 0.960 and 0.668. The right division is less stable.
+## Does temporal organization reveal additional ant groups?
 
-The spatial contingency is consistent with the lowest-activity group occupying
-one spatial class and both higher-activity groups mainly occupying the other:
+Compare two explicitly defined ant representations, separately by colony:
 
-| Colony / activity group | Spatial 0 | Spatial 1 |
-|---|---:|---:|
-| Left G0 | 23 | 1 |
-| Left G1 | 0 | 8 |
-| Left G2 | 0 | 9 |
-| Right G0 | 25 | 0 |
-| Right G1 | 2 | 5 |
-| Right G2 | 0 | 13 |
+- **Proportions:** square roots of each ant's state fractions.
+- **Proportions + transitions:** the same fractions plus square roots of the
+  normalized joint counts of ordered adjacent-bin state pairs. Diagonal pairs
+  describe persistence; off-diagonal pairs describe switching. Proportions and
+  transitions receive equal total between-ant variance, using one scale per
+  family. Every coordinate is retained without PCA.
 
-Spatial ARI is 0.726 left and 0.748 right. These are three-to-two comparisons;
-the script does not force a one-to-one class match or merge groups using space.
+Only consecutive, observed five-minute bins contribute a pair. Missing bins,
+including time blocks removed during validation, break the sequence. Two bins
+on opposite sides of a gap are never joined. The transition representation
+measures organization at five-minute resolution; it is not an explicit model
+of long dwell-time distributions or transitions inside individual bins.
 
-All 114 identities appear in the timelines. Forty-one left and 45 right ants
-have at least 12 observed bin-hours and enter the ant-level fit; the remaining
-16/12 identities have under one observed bin-hour. An initial 24-hour cutoff
-excluded substantially observed ants (only 25 left and 43 right remained), so
-the final cutoff follows this coverage gap. That earlier run is archived in
-`strict_24h/`; its outcomes were not used to select the better spatial match.
+Both representations use the same shared-covariance Gaussian mixture and K=1–4
+selection: BIC below K=1, minimum group size five, median ant-bootstrap ARI at
+least 0.8, and median temporal-split ARI at least 0.6. Choose the smaller eligible
+K within two BIC units of the best, or K=1. There are 200 ant bootstraps; temporal
+splits alternate 30-, 60- and 120-minute blocks. BIC is compared **within each
+representation**, not between representations of different dimensions.
 
-## Inspectable arrays
+The ant fit requires at least 12 observed bin-hours over the full 48 hours;
+this retains 41 left and 45 right ants in the previous run. All identities
+remain visible in timelines. Stability checks condition on the pooled state
+labels and the full-recording posture basis; these are not independent holdouts.
 
-| Variable | Meaning |
-|---|---|
-| `coordinate_modes` | Full-recording posture basis |
-| `binned` | Ant × 576 five-minute bins × six features |
-| `clip_counts` | Jointly observed clips per bin |
-| `task_input` | Pooled valid bins, balanced in six dimensions |
-| `task_k_table`, `task_summary` | State-resolution scores and physical feature means |
-| `tasks` | Ant × time state labels; -1 is missing |
-| `bin_table` | Every ant/bin, timestamp, task, coverage, and six measurements |
-| `proportion_table` | Each ant's distribution of observed task states |
-| `ant_k_tables`, `ant_bootstrap` | Ant-group selection and stability diagnostics |
-| `assignments` | Coverage, ant groups, and subsequent spatial comparison |
+The summary plots compare selected K and stability, group overlap, state
+fractions, and conditional stay probabilities. A stay probability is the chance
+of the same state in the immediately following bin, using only adjacent observed
+pairs. Spatial classes and occupancy are loaded only after both fits and are
+never used to select them. Groups describe this recording; extra groups alone
+would not establish biological roles.
 
-`MIN_CLIPS`, `MIN_ANT_HOURS`, `TASK_KS`, and `BOOTSTRAPS` are near the top.
-The defaults use 200 ant-bootstrap refits per candidate K; 20 is a quick preview.
-Rerun cells in order after changing a setting. Keep spatial labels out of choices.
+## Inputs and outputs
 
-## Inputs and reproduction
-
-`DATA` points to the published `eigenposture_20261009` folder. The new small
-`unsigned_velocity.npz` sits in the neighboring `task_states_20261010` folder.
-It was rebuilt from the original motion samples because taking the absolute
-value of a signed clip mean would lose reversals within a clip.
-
-To regenerate that cache from the existing unfitted pose cache:
+`DATA` is the published `eigenposture_20261009` folder. `VELOCITY_DATA` is the
+previous `task_states_20261010/unsigned_velocity.npz`. `INTERACTION_DATA` is
+`task_states_interactions_20261010/interaction_counts.npz`. Regenerate caches:
 
 ```bash
 python -m analysis.eigenposture_unsigned_velocity \
   --pose-cache /path/to/pose_cache \
   --source /path/to/eigenposture_20261009 \
   --output /path/to/task_states_20261010/unsigned_velocity.npz
+python -m analysis.eigenposture_interactions \
+  --block /path/to/20260724/block01 \
+  --source /path/to/eigenposture_20261009 \
+  --output /path/to/task_states_interactions_20261010/interaction_counts.npz
 python -m unittest analysis.test_eigenposture_task_states -v
-python -i analysis/eigenposture_interactive.py
 ```
 
-To export the timelines, feature tables, plots, PDF and a standalone hoverable
-HTML report, run:
+The contact loader checks the published run, current tracking sources, contact
+metadata, and cache keys before reuse. If staging/published path keys both
+exist, their entire bout tables must agree exactly. The extractor records its
+source fingerprints, cache hash, geometry, time origin and counting definition.
 
-```bash
-python -m analysis.eigenposture_task_report --output /path/to/new/results
-```
+Useful arrays are `coordinate_modes`, `binned` (ant × 576 bins × 7), `task_input`,
+`task_summary`, `umap_table`, `tasks`, `proportion_table`, `transition_table`,
+`stay_probabilities`, `baseline_k_tables`, `ant_k_tables`, `comparison_table`,
+and `assignments`. The exporter saves the same quantities and the clean script,
+with CSV group-selection diagnostics for both representations. The original
+six-feature results remain in `task_states_20261010`.
 
-The current report is in
-`20260724/block01/analysis_outputs/task_states_20261010/index.html` under the
-basler bucket. It includes all 114 identities, colony/coverage/ant filters, and
-bin-level hover details. `five_minute_tasks.csv.gz` includes every bin, with
-`task=-1` for insufficient observations. Use `--from-results` to rebuild just
-the HTML from an already exported run.
+## July 24 result (interaction-expanded run, 2026-10-10)
 
-The extractor reuses the original body-axis, camera-continuity, and speed QC;
-requires at least eight valid velocity samples per clip; validates the current
-tracking source sizes/timestamps; and checks recomputed signed clip means against
-the original published cache before saving unsigned peaks. Its companion JSON
-records source hashes and the statistic. Peaks are sensitive to extreme values
-and sampling; unobserved motion cannot be recovered from this sampled recording.
+The 33,736 valid bins select **three states**, with silhouette 0.293 versus
+0.287 for two states: a small preference, not strong evidence for a unique K.
+Their mean unsigned forward/lateral peaks and interaction counts are:
+
+| State | Forward (mm/s) | Lateral (mm/s) | New contacts / 5 min | Bins |
+|---|---:|---:|---:|---:|
+| T0 | 0.646 | 0.515 | 50.40 | 14,538 |
+| T1 | 1.340 | 0.699 | 10.66 | 5,749 |
+| T2 | 4.919 | 2.169 | 46.20 | 13,449 |
+
+The posture profiles also differ. T1 is relatively low in contacts; interaction
+counts do not increase monotonically with speed. The labels remain descriptive.
+
+| Ant representation | Left (41 ants) | Right (45 ants) |
+|---|---|---|
+| State proportions | K=2; sizes 24/17 | K=3; sizes 25/7/13 |
+| Proportions + transitions | K=1 | K=1 |
+
+Proportion groups have median bootstrap ARI 1.000 in both colonies, with tenth
+percentiles 1.000/0.814; temporal-split medians are 1.000/0.773. Spatial ARI is
+0.902 left and 0.748 right. The left two-group matching is 40/41; the right
+comparison has three activity groups versus two spatial classes.
+
+Adding transitions **does not support additional groups under this rule**.
+For the transition representation, K=2 is worse than K=1 by 6.55 BIC units on
+the left and 15.67 on the right. K=3 is worse by 35.35/17.41. Its 12 coordinates
+(three fractions plus nine transitions) include related information and increase
+the mixture's complexity penalty with only 41/45 ants. Thus K=1 here is not
+evidence that biological roles are absent, and it does not establish that dwell
+history could never help with a different temporal model.
+
+The main timelines and spatial maps retain **proportion groups**. The comparison
+figure shows the transition result separately, and the persistence profiles show
+how the proportion groups differ in remaining in each state. In exports,
+`baseline_groups` / `proportion_group` denote proportions, while `ant_groups` /
+`ant_group` denote the transition comparison. All identities remain in timelines;
+only the 86 adequately observed ants enter either ant-group fit.
+
+Static figures are numbered: 1 PCA, 2 state K/centroids, 3 UMAP, 4 identity
+raster, 5 ant K comparison, 6 group overlap/fractions/persistence, 7 grouped
+raster, 8 ant state proportions, 9–10 spatial comparison. Results are in
+`20260724/block01/analysis_outputs/task_states_interactions_20261010`.
+The Python 3.12 environment is pinned in `eigenposture_task_requirements.txt`.
