@@ -36,11 +36,14 @@ full stability calculation. Rerun the cells in order after changing parameters.
   complete up to cache rounding; the previous four-mode truncation is not used.
 - PC-rate and RMS-velocity features are removed. Eligibility depends only on
   posture and velocity coverage. Bins contain sampled observations, not
-  continuous clips. One clustering row is one ant: its mean across observed
-  bin means, for each of the six channels. There are no extra SD features or
-  concatenated time-bin dimensions.
-- The six features are four posture-PC means, signed forward velocity and
-  signed lateral velocity. Velocities retain the existing invertible
+  continuous clips. One clustering row is one ant, with six features and no
+  extra SD features or concatenated time-bin dimensions.
+- The six features are four posture-PC means and the **maximum signed forward
+  and lateral velocities**. Posture retains mean within bins, then mean across
+  observed bins. Velocity now uses maximum within valid bins, then maximum
+  across bins: each ant's largest valid sampled-clip mean over the day. The cache
+  stores clip means, so this is not an instantaneous or frame-by-frame maximum,
+  nor a maximum of time-bin averages. Velocities retain the existing invertible
   `asinh(v / 0.1)` transform; posture scores remain linear. The velocity and
   posture families are scaled to equal total variance. This scaling preserves
   all six dimensions and the relative amplitudes of the posture PCs.
@@ -52,22 +55,27 @@ full stability calculation. Rerun the cells in order after changing parameters.
   comparison using those fixed stages and the shared, full-recording posture
   basis; it is not held-out validation of the complete analysis.
 
-This is intentionally a small **ant-level mean profile**, not a clustering of
-individual time bins or a model of postural dynamics. It does not retain bin
-order or variability, or distinguish excursion frequency from intensity; signed
-lateral motion in opposite directions can cancel. Increasing bin size averages
-the same sampled observations, so it need not improve separation. `binned` remains
-available for inspecting the time course before averaging.
+This is a small **ant-level profile**, not a clustering of individual time bins
+or a model of postural dynamics. Maximum means the largest **signed** value,
+not the largest magnitude: a large negative lateral excursion does not become
+a large positive peak. Maxima capture an observed peak, not its frequency, and
+are sensitive to outliers and the number of observed clips. Posture means still
+average over excursions. Increasing bin size uses the same sampled observations
+and only affects velocity maxima through bin-coverage filtering. `binned`
+contains velocity maxima and posture means for inspecting the time course.
 
-With the six-feature defaults (five-minute bins, shared full covariance), the
-existing BIC/stability/minimum-group rule selects K=2 left and K=1 right. The
-left split has 25/16 ants, agrees with 39/41 spatial assignments, and has median
-ant-bootstrap ARI 0.902 (500 resamples). K=2 improves left BIC by 16.51; right
-K=2 worsens BIC by 3.99 and has median bootstrap ARI 0.668. The right K=3/4 fits
-each contain a singleton and fail the minimum-group rule. This does not support
-a robust two-class result in both colonies. Repeating the full checks with
-240-minute bins also selects K=2 left and K=1 right; the left assignments are
-unchanged. All four runs were verified to use exactly six input dimensions.
+With five-minute bins and the unchanged shared-covariance/BIC/stability rule,
+the maximum-velocity version selects **K=1 in both colonies**. K=2 worsens BIC
+relative to K=1 by 4.82 left and 9.46 right. Its median ant-bootstrap ARI is
+0.809 left and 0.417 right (500 resamples; tenth percentiles -0.014 and 0.053).
+The left K=3 fit improves BIC but fails temporal stability (median ARI 0.464);
+left K=4 and right K=3/4 each contain a singleton. Maximum velocity therefore
+does not improve the two-class result with the other choices held fixed.
+
+The preceding mean-velocity version selected K=2 left and K=1 right at both
+5- and 240-minute bins. Its left split agreed with 39/41 spatial assignments,
+with median bootstrap ARI 0.902; the right five-minute K=2 fit had median ARI
+0.668. Those figures describe the mean-velocity version, not the maximum version.
 
 All K=1–4 fits and their diagnostics remain in `mixtures` and `k_table`; this
 is a changed analysis, not a reproduction of the earlier one-axis separation.

@@ -5,11 +5,12 @@ Requires numpy, pandas, matplotlib, scipy and scikit-learn. No repo imports.
 Change settings and rerun cells in order. All arrays remain available.
 
 Tracking, body alignment and clip QC have already been done. One observation per
-minute summarizes a sampled 2.5-second clip, NOT a full minute. Five-minute bins
-summarize these observations. No explicit posture-PC derivatives are used.
+minute summarizes a sampled 2.5-second clip, NOT a full minute. Time bins retain
+maximum signed clip-mean velocities and mean posture. No PC derivatives are used.
 The landmark PCA uses both recorded days. Coordinate means are recovered from
 all 12 archived modes (up to cache rounding) and projected onto this new basis.
-Each clustering row is one ant's mean posture and signed velocity across bins.
+Each clustering row is one ant's mean posture and maximum signed velocities.
+These velocity peaks are maxima of clip means, not frame-by-frame maxima.
 Four posture PCs plus forward/lateral velocity give exactly six features.
 Clustering uses all six balanced features, with no second PCA/projection.
 """
@@ -132,16 +133,19 @@ print(pd.DataFrame({"channel": names, "family": families}))
 ANT = 0  # row in 'ants'; change to inspect another identity
 fig, axes = plt.subplots(2, 1, figsize=(10, 4), sharex=True, layout="constrained")
 axes[0].plot(np.arange(1440) / 60, minute[ANT, :1440, 0], lw=0.6)
-axes[0].set(ylabel="Forward velocity (mm/s)", title=ants.ant.iloc[ANT])
+axes[0].set(ylabel="Clip-mean forward velocity (mm/s)", title=ants.ant.iloc[ANT])
 axes[1].plot(np.arange(1440) / 60, minute[ANT, :1440, 2], lw=0.6)
 axes[1].set(xlabel="Hours from July 24, 10:00 JST", ylabel="Posture PC1")
 
 
-# %% 5. Minute clips → bin means → each ant's SIX means across bins
+# %% 5. Each ant's SIX features: two velocity maxima + four posture means
 # One row per ant: no SD, RMS, rates, or concatenated time-bin features.
-# These means do not retain temporal order or excursion variability. Signed
-# lateral motion in opposite directions can cancel. Larger bins use the same
-# sampled clips; they do not add observations or preserve more dynamics.
+# Velocity: max within valid bins, then max across bins. This is the daily max
+# of valid signed clip means, NOT max of bin averages or instantaneous velocity.
+# Posture: mean within bins, then mean across observed bins, as before.
+# Signed max is the largest value, NOT the largest magnitude; negative lateral
+# excursions do not contribute by magnitude. Maxima describe a peak, not how
+# often it occurs, and are sensitive to outliers and the number of valid clips.
 # A small helper makes exactly the same calculation reusable for time splits/day2.
 def make_profiles(data, mask=None):
     data = data.copy()
@@ -154,8 +158,10 @@ def make_profiles(data, mask=None):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)  # unobserved bins stay NaN
         binned = np.nanmean(bins, axis=2)
+        binned[:, :, :2] = np.nanmax(bins[:, :, :, :2], axis=2)
         binned[np.isfinite(bins).sum(axis=2) < minimum_clips] = np.nan
         raw = np.nanmean(binned, axis=1)
+        raw[:, :2] = np.nanmax(binned[:, :, :2], axis=1)
     transformed = raw.copy()
     # Keep the existing signed, invertible velocity transform; no new channels.
     transformed[:, :2] = np.arcsinh(raw[:, :2] / 0.1)
@@ -163,7 +169,9 @@ def make_profiles(data, mask=None):
 
 
 binned, profiles_raw, profiles = make_profiles(minute[:, :1440])
-profile_names = [f"mean: {name}" for name in names]
+profile_names = [f"max: {name}" for name in names[:2]] + [
+    f"mean: {name}" for name in names[2:]
+]
 profile_families = families.copy()
 profile_table = pd.DataFrame(profiles_raw, index=ants.ant, columns=profile_names)
 print("minute:", minute.shape, "binned:", binned.shape, "profiles:", profiles.shape)
@@ -209,7 +217,7 @@ fig, axes = plt.subplots(1, 2, figsize=(12, 5), layout="constrained")
 im = axes[0].imshow(balanced[ant_order], aspect="auto", cmap="RdBu_r", vmin=-1, vmax=1)
 axes[0].set(
     xlabel="Profile feature",
-    ylabel="Ant (ordered by mean forward velocity)",
+    ylabel="Ant (ordered by max forward velocity)",
     title="All balanced features",
 )
 fig.colorbar(im, ax=axes[0])
@@ -302,7 +310,7 @@ selected_k = (
 )
 model = mixtures[selected_k]
 labels = model.predict(balanced)
-# Name groups from low to high mean forward velocity; this does not affect fitting.
+# Name groups from low to high max forward velocity; this does not affect fitting.
 remap = np.argsort(
     np.argsort([np.nanmedian(profiles_raw[labels == g, 0]) for g in range(selected_k)])
 )
@@ -334,13 +342,13 @@ axes[1].set(xlabel="K", ylabel="Ant-bootstrap ARI", ylim=(-0.1, 1.05))
 # above uses every balanced column, not this 2D view and not a learned projection.
 plot_columns = [
     list(feature_names).index(name)
-    for name in ("mean: forward_velocity", "mean: posture_pc1")
+    for name in ("max: forward_velocity", "mean: posture_pc1")
 ]
 axes[2].scatter(
     balanced[:, plot_columns[0]], balanced[:, plot_columns[1]], c=COLORS[groups]
 )
 axes[2].set(
-    xlabel="Balanced mean forward velocity",
+    xlabel="Balanced max forward velocity",
     ylabel="Balanced posture PC1 mean",
     title=f"{SIDE}: K={selected_k} (two-feature view)",
 )
