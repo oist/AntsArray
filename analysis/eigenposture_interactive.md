@@ -1,5 +1,10 @@
 # Five-minute behavior states and ant groups
 
+For the newer Leiden analysis with posture rates, wavelets, unsigned antennal
+speed, feature reduction and a sleep comparison, use
+[eigenposture_leiden.md](eigenposture_leiden.md). It uses proportions only for
+ant roles. The workflow below documents the earlier K-means comparison.
+
 Run the numbered cells in `eigenposture_interactive.py` to inspect each step.
 For static PNGs, a PDF, and CSV/NPZ tables:
 
