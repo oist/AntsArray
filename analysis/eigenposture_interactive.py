@@ -233,15 +233,32 @@ print(f"Post hoc spatial agreement: ARI={spatial_ari:.3f}, {len(observed)}/{len(
 comparison.to_csv(OUTPUT / "posthoc_spatial_comparison.csv", index=False)
 overlap=pd.crosstab(observed.ant_class,observed.spatial_cluster)
 overlap.to_csv(OUTPUT/'class_spatial_counts.csv')
-fig,ax=plt.subplots(figsize=(5,4),layout='constrained')
-image=ax.imshow(overlap.div(overlap.sum(axis=1),axis=0),vmin=0,vmax=1,cmap='Blues',aspect='auto')
-for i in range(len(overlap)):
-    for j in range(len(overlap.columns)):
-        ax.text(j,i,str(overlap.iloc[i,j]),ha='center',va='center',color='red')
-ax.set(xticks=np.arange(len(overlap.columns)),xticklabels=overlap.columns,
-    yticks=np.arange(len(overlap)),yticklabels=[f'C{s}' for s in overlap.index],
-    xlabel='Independent spatial group',ylabel='Behavioral ant class',title='Post hoc overlap: numbers are ants')
-fig.colorbar(image,ax=ax,label='Fraction within behavioral class')
+overlaps=[(f'Selected {k_roles} classes',overlap,'C')]
+# Also describe the broad two-way fit. Select it by temporal/ant stability,
+# using the SAME behavior-only ordering as above, never by spatial agreement.
+coarse=role_search[(role_search.k==2)&role_search.qualifies].sort_values(
+    ['temporal_ari','ant_removal_ari'],ascending=False)
+coarse_choice=None;coarse_spatial_ari=None
+if len(coarse):
+    coarse_choice=coarse.iloc[0].to_dict()
+    with np.load(SOURCE/'roles/candidate_labels.npz') as z:broad_labels=z[coarse_choice['model']]
+    broad=comparison.assign(broad_ant_class=broad_labels)
+    broad.to_csv(OUTPUT/'broad_class_spatial_comparison.csv',index=False)
+    coarse_spatial_ari=adjusted_rand_score(broad_labels[observed.index],observed.spatial_cluster)
+    table=pd.crosstab(broad.loc[observed.index,'broad_ant_class'],observed.spatial_cluster)
+    overlaps.append((f"Broad grouping: {coarse_choice['model']}",table,'B'))
+    print(f'Broad two-class spatial ARI={coarse_spatial_ari:.3f}',flush=True)
+fig,axes=plt.subplots(1,len(overlaps),figsize=(5*len(overlaps),4),squeeze=False,layout='constrained')
+for ax,(title,table,prefix) in zip(axes.flat,overlaps):
+    image=ax.imshow(table.div(table.sum(axis=1),axis=0),vmin=0,vmax=1,cmap='Blues',aspect='auto')
+    for i in range(len(table)):
+        for j in range(len(table.columns)):
+            ax.text(j,i,str(table.iloc[i,j]),ha='center',va='center',color='red')
+    ax.set(xticks=np.arange(len(table.columns)),xticklabels=table.columns,
+        yticks=np.arange(len(table)),yticklabels=[f'{prefix}{s}' for s in table.index],
+        xlabel='Independent spatial group',ylabel='Behavioral group',title=title)
+fig.colorbar(image,ax=axes.ravel().tolist(),label='Fraction within behavioral group')
+fig.suptitle('Post hoc spatial overlap: numbers are ants')
 # A finer behavior partition can refine a spatial group, lowering ARI without
 # mixing spatial identities; inspect this count table alongside the occupancy.
 go.plot_cluster_mean_histograms(grid, cluster_table, title="7. Occupancy emerging from behavioral ant classes")
@@ -348,6 +365,7 @@ show("07_return_response")
     n_right_ants=len(ants), n_states=n_states, n_classes=k_roles,
     class_sizes=ants.ant_class.value_counts().sort_index().to_dict(), spatial_ari=spatial_ari,
     spatial_homogeneity=spatial_homogeneity,
+    broad_ant_model=coarse_choice, broad_spatial_ari=coarse_spatial_ari,
     state_model=selection, ant_model=role_choice, quiet_states=quiet_states.tolist(),
     minimum_sleep_seconds=MIN_SLEEP_SECONDS, sleep_source="discovered state membership; no cached sleep labels",
     complete_clock_cycles=complete_cycles),indent=2)+"\n")
