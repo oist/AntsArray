@@ -5,6 +5,12 @@ This analysis compares **0.5, 1 and 2 second windows**, with assignments every
 using state proportions. Spatial occupancy and existing sleep labels do not
 choose features, clusters, Leiden resolution, or ant roles.
 
+For the minimal right-colony continuation, run the numbered cells in
+[`eigenposture_interactive.py`](eigenposture_interactive.py); see its
+[short guide](eigenposture_interactive.md). It reuses this validated dictionary,
+derives ant classes from state proportions, and carries those classes into the
+occupancy, speed, sleep, clock-profile and return/recipient analyses.
+
 ## What the literature changes
 
 Recent methods support analyzing movement sequences, accounting for observation

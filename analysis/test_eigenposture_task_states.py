@@ -1,4 +1,4 @@
-"""Tests for missing-bin handling and unsigned motion before aggregation."""
+"""Tests for hourly state weighting, missing coverage and unsigned motion."""
 
 import ast
 from pathlib import Path
@@ -43,37 +43,23 @@ class TaskStateTests(unittest.TestCase):
         self.assertTrue(np.isnan(peaks[1:]).all())
         np.testing.assert_array_equal(velocity, before)
 
-    def test_bins_use_common_clips_and_never_fill_missing_with_zero(self):
-        make_bins = interactive_helper("bin_features", BIN_MINUTES=5, MIN_CLIPS=3)
-        data = np.full((2, 10, 6), np.nan)
-        data[0, :3] = [[1, 2, 1, 2, 3, 4], [3, 1, 3, 4, 5, 6], [2, 4, 5, 6, 7, 8]]
-        data[0, 3] = [999, 999, np.nan, 1, 1, 1]
-        data[0, 5:7] = 2
-        before = data.copy()
-        binned, counts = make_bins(data)
-        np.testing.assert_allclose(binned[0, 0], [3, 4, 3, 4, 5, 6])
-        np.testing.assert_array_equal(counts, [[3, 2], [0, 0]])
-        self.assertTrue(np.isnan(binned[0, 1]).all())
-        self.assertTrue(np.isnan(binned[1]).all())
-        np.testing.assert_array_equal(data, before)
+    def test_hourly_proportions_keep_missing_hours_unknown(self):
+        proportions = interactive_helper("hourly_proportions")
+        result = proportions(np.array([0, 0, 0, 0, 1]),
+                             np.array([0, 0, 1, 1, 0]),
+                             np.array([0, 1, 1, 1, 0]), 3, 2, minimum=2)
+        np.testing.assert_allclose(result[0, :2], [[.5, .5], [0, 1]])
+        self.assertTrue(np.isnan(result[0, 2:]).all())
+        self.assertTrue(np.isnan(result[1:]).all())
 
-    def test_task_fractions_exclude_missing_bins(self):
-        proportions = interactive_helper("task_proportions", task_k=3)
-        result = proportions(
-            np.array([[0, 1, -1, 1], [2, 2, -1, -1], [-1, -1, -1, -1]])
-        )
-        np.testing.assert_allclose(result[:2], [[1 / 3, 2 / 3, 0], [0, 0, 1]])
-        self.assertTrue(np.isnan(result[2]).all())
-
-    def test_transitions_preserve_order_without_crossing_gaps(self):
-        transitions = interactive_helper("transition_counts", task_k=2)
-        # Equal state fractions, different time organization.
-        labels = np.array([[0, 0, 1, 1, -1, 0], [0, 1, 0, 1, -1, 0]])
-        counts = transitions(labels)
-        np.testing.assert_array_equal(counts[0], [[1, 1], [0, 1]])
-        np.testing.assert_array_equal(counts[1], [[0, 2], [1, 0]])
-        self.assertEqual(counts.sum(), 6)
-        self.assertEqual(transitions(np.full((1, 6), -1)).sum(), 0)
+    def test_each_observed_hour_has_equal_weight(self):
+        proportions = interactive_helper("hourly_proportions")
+        # Ten state-0 observations in one hour and two state-1 observations in
+        # another must yield 50:50, not the tracking-weighted 10:2 split.
+        labels = np.r_[np.zeros(10, int), np.ones(2, int)]
+        result = proportions(np.zeros(12, int), labels, labels, 1, 2, minimum=2)
+        np.testing.assert_allclose(np.nanmean(result, axis=1), [[.5, .5]])
+        np.testing.assert_array_equal(np.isfinite(result).all(axis=2).sum(axis=1), [2])
 
     def test_interactions_count_both_ants_and_preserve_missing_coverage(self):
         ants = pd.DataFrame(dict(side=["left", "left", "right"], track_id=[0, 1, 0]))
