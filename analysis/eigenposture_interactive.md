@@ -4,7 +4,7 @@ Open `analysis/eigenposture_interactive.py` and run its ten `# %%` cells in
 VS Code/Jupyter from the repository root. It uses the new full-recording model
 packet and continues through the established grid-occupancy analyses. Plots are
 ordinary Matplotlib figures, saved as PNGs; the batch runner also writes a PDF.
-The costly extraction and model comparisons are in four small companion modules.
+Companion modules handle the costly extraction, model comparisons, and summaries.
 
 ```bash
 OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 NUMBA_NUM_THREADS=4 \
@@ -36,6 +36,8 @@ downstream readers also require PyArrow and Shapely.
    retaining tails of at least 250 ms. Gaps and camera changes break segments.
    Three UMAP settings show the same labels; clustering uses the balanced feature
    space, never the 2-D coordinates. Inspect feature profiles and quiet candidates.
+   Figure 4b adds each state's mean full-body skeleton and a heatmap of its
+   unsigned body/antennal velocity, turning, and exact concurrent contacts.
 4. **Ant representation:** count each ant's assigned state observations directly,
    then normalize. Counts weight variable-length windows by their observed
    duration. No equal-hour averaging, additional eligibility filter, or final PCA.
@@ -74,6 +76,22 @@ Nonnegative variation, rate, motion and contact measurements receive log1p
 transforms. Each feature family has equal total variance, preserving every
 coordinate. Exact contacts are unique simultaneous partners per raw frame,
 summarized by mean and maximum; persistent contact counts on every observed frame.
+
+The mean-posture figure averages **actual aligned coordinates**, without PCA
+reconstruction, across all assigned observations from both colonies. The same
+body-normalized scale is used in every panel; body points are teal and antennae
+orange. These are average skeletons, not representative frames; averaging can
+hide posture variation. Every observed 12-Hz sample receives equal weight, so
+longer observed windows and ants with more classified time contribute more.
+The accompanying feature means use the same duration weights. Forward/lateral
+velocity and peak contacts remain **within-window maxima**, averaged across
+windows; antennal/turning speeds and mean contacts are within-window means.
+Printed heatmap values retain mm/s, rad/s, or partner-count units. Colors span
+the lowest to highest state mean separately in each feature, allowing comparison
+without mixing units. These pooled means differ from the ant-balanced dictionary
+medians used for quiet-state interpretation; labels and sleep definitions are
+unchanged. Numerical values are in `state_mean_features.csv` and
+`state_mean_postures.csv` beside the plots.
 
 State comparisons use Leiden resolutions 0.4, 0.8, 1.2, and 1.6. Prefer the finest
 partition with seed ARI >=0.8, ant-removal ARI >=0.65, at least five ants per state,
@@ -126,6 +144,7 @@ python -m analysis.full_behavior_extract --block "$BLOCK" --output "$RUN" --work
 python -m analysis.full_behavior_states features --root "$RUN" --workers 4
 python -m analysis.full_behavior_states learn --root "$RUN"
 python -m analysis.full_behavior_states assign --root "$RUN"
+python -m analysis.full_behavior_profiles --root "$RUN"
 python -m analysis.full_behavior_roles --root "$RUN"
 ANTS_DATASET_ROOT="$BLOCK" python -m analysis.eigenposture_task_report \
   --source "$RUN" --output "$RUN/report"
@@ -133,7 +152,10 @@ ANTS_DATASET_ROOT="$BLOCK" python -m analysis.eigenposture_task_report \
 
 The published packet retains features, model comparisons, assignments, PCA,
 coverage/provenance, classes, derived quiet labels, and the report. Large dense
-pose/motion arrays are reproducible local intermediates. The preceding eight-state
+pose/motion arrays are reproducible local intermediates. `models/state_means.*`
+retains the small all-observation summary; plots reuse it without the dense
+arrays. Rebuild that summary after changing assignments or features. The preceding
+eight-state
 sampled-clip analysis remains documented in `fine_behavior.md` as a historical
 result; its state numbers are not interchangeable with this rebuilt dictionary.
 

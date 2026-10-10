@@ -9,6 +9,7 @@ from pathlib import Path
 import os
 import sys
 import json
+import hashlib
 repo=Path(__file__).resolve().parents[1] if '__file__' in globals() else Path.cwd()
 if str(repo) not in sys.path:sys.path.insert(0,str(repo))
 if os.environ.get('MPLBACKEND','').lower()!='agg':
@@ -27,6 +28,7 @@ from analysis.full_behavior_extract import SEED,HZ,FPS
 from analysis.full_behavior_states import NAMES,encode
 from analysis.full_behavior_roles import fit_labels
 from analysis.full_behavior_sleep import build as build_state_sleep,select_quiet_states
+from analysis.full_behavior_profiles import build as build_state_means
 
 BLOCK=Path(os.environ.get('ANTS_DATASET_ROOT','/home/sam-reiter/bucket/ReiterU/Ants/basler/20260724/block01'))
 SOURCE=Path(os.environ.get('ANTS_BEHAVIOR_SOURCE',str(BLOCK/'analysis_outputs/full_body_behavior_20261011')))
@@ -126,9 +128,59 @@ fig,ax=plt.subplots(figsize=(13,max(4,n_states*.26)),layout='constrained')
 image=ax.imshow(encode(profiles,normalizer),aspect='auto',cmap='coolwarm',vmin=-2,vmax=2)
 feature_columns=[j for group in normalizer for j in group['columns']]
 ax.set(xticks=np.arange(len(feature_columns)),xticklabels=[NAMES[j] for j in feature_columns],
-    yticks=np.arange(n_states),yticklabels=state_names,title='4. State feature profiles; * = uncertain ant-removal match')
+    yticks=np.arange(n_states),yticklabels=state_names,title='4a. State feature profiles; * = uncertain ant-removal match')
 ax.tick_params(axis='x',rotation=90);fig.colorbar(image,ax=ax,label='Median feature / family scale')
 show('04_state_profiles')
+# Actual observed mean skeletons, not a reconstruction from retained PCs. The
+# compact summary pools ALL assigned observations from both colonies. Each 12-Hz
+# sample has equal weight: a short tail contributes only its observed duration.
+# Build once on local extraction output; published packets carry this summary.
+if not (SOURCE/'models/state_means.npz').exists():build_state_means(SOURCE)
+mean_metadata=json.loads((SOURCE/'models/state_means.json').read_text())
+assert mean_metadata['dictionary_sha256']==hashlib.sha256((SOURCE/'models/dictionary.npz').read_bytes()).hexdigest()
+with np.load(SOURCE/'models/state_means.npz') as archive:state_means=dict(archive)
+mean_pose,mean_features=state_means['mean_pose'],state_means['mean_features']
+assert mean_pose.shape==(n_states,10,2) and mean_features.shape==(n_states,7)
+np.testing.assert_array_equal(state_means['ants'],cohort.ant.to_numpy(str))
+mean_table=pd.DataFrame(mean_features,columns=state_means['feature_names'])
+mean_table.insert(0,'observed_hours',state_means['sample_count']/HZ/3600)
+mean_table.insert(0,'state',np.arange(n_states));mean_table.to_csv(OUTPUT/'state_mean_features.csv',index=False)
+pd.DataFrame(mean_pose.reshape(n_states,20),index=state_names,
+    columns=[f'{node}_{axis}' for node in landmarks for axis in ('anterior','lateral')]).to_csv(OUTPUT/'state_mean_postures.csv',index_label='state')
+columns=min(4,n_states);rows=int(np.ceil(n_states/columns))
+fig=plt.figure(figsize=(14,2.2*rows+6))
+grid=fig.add_gridspec(rows+1,columns,height_ratios=[1]*rows+[2.6],
+    left=.08,right=.95,bottom=.18,top=.92,hspace=.35,wspace=.3)
+xlim=(mean_pose[:,:,0].min()-.35,mean_pose[:,:,0].max()+.35)
+ylim=(mean_pose[:,:,1].min()-.45,mean_pose[:,:,1].max()+.35)
+for s in range(n_states):
+    ax=fig.add_subplot(grid[s//columns,s%columns]);shape=mean_pose[s]
+    for chain,color in [([3,2,0,1],'#176b78'),([1,4,5,6],'#d87b16'),([1,7,8,9],'#d87b16')]:
+        ax.plot(*shape[chain].T,'o-',color=color,lw=2,markersize=3)
+    fraction=state_means['sample_count'][s]/state_means['sample_count'].sum()
+    ax.set(title=f'{state_names[s]}  |  {fraction:.1%} of observed time',xlim=xlim,ylim=ylim,aspect='equal')
+    ax.axis('off')
+    if s==0:
+        x,y=xlim[0]+.15,ylim[0]+.18
+        ax.plot([x,x+1],[y,y],color='black',lw=2)
+        ax.text(x+.5,y-.12,'1 body-axis length',ha='center',va='top',fontsize=7)
+# A common raw color scale would mix mm/s, rad/s and partner counts. Normalize
+# each column between its smallest/largest state mean, printing the raw values.
+# These are pooled means, unlike the ant-balanced dictionary medians above.
+scaled=(mean_features-mean_features.min(axis=0))/np.maximum(np.ptp(mean_features,axis=0),1e-12)
+ax=fig.add_subplot(grid[-1,:]);image=ax.imshow(scaled,aspect='auto',cmap='viridis',vmin=0,vmax=1)
+feature_labels=['Forward peak\n(mm/s)','Lateral peak\n(mm/s)','Antenna A mean\n(mm/s)',
+    'Antenna B mean\n(mm/s)','Turning mean\n(rad/s)','Contact mean\n(partners)','Contact peak\n(partners)']
+ax.set(xticks=np.arange(7),xticklabels=feature_labels,yticks=np.arange(n_states),yticklabels=state_names)
+for s in range(n_states):
+    for j in range(7):ax.text(j,s,f'{mean_features[s,j]:.3g}',ha='center',va='center',color='black' if scaled[s,j]>.5 else 'white')
+ax.axvline(4.5,color='white',lw=2)
+fig.colorbar(image,ax=ax,pad=.02,label='Within-feature scale: lowest → highest state mean')
+fig.suptitle('4b. Mean posture and velocity / interaction features by behavioral state',fontsize=14)
+fig.text(.08,.065,'Postures: body in teal, antennae in orange; anterior points right. All panels use the same body-normalized scale.\n'
+    'Heatmap numbers: observed-duration-weighted means. Forward/lateral speeds and peak contacts are maxima within ≤1 s windows.\n'
+    f"Both colonies: {len(cohort)} ants; {state_means['sample_count'].sum():,} assigned posture observations. Color is scaled separately for each feature.",fontsize=9,linespacing=1.6)
+show('04_mean_posture_motion')
 quiet_states,motion_profiles=select_quiet_states(SOURCE)
 motion_profiles.to_csv(OUTPUT/'state_motion_profiles.csv',index=False)
 if SLEEP_STATES is not None:quiet_states=np.asarray(SLEEP_STATES,int)

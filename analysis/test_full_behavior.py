@@ -8,9 +8,25 @@ import pandas as pd
 from analysis.full_behavior_extract import align_body, count_contacts, MM_PER_PX
 from analysis.full_behavior_states import segment_windows
 from analysis.full_behavior_sleep import sleep_from_windows, build
+from analysis.full_behavior_profiles import state_sums
 
 
 class FullBehaviorTests(unittest.TestCase):
+    def test_state_means_use_observed_samples_and_duration_not_window_count(self):
+        # The long and short S0 windows have unequal weight. A huge unassigned
+        # observation and missing gap must not contaminate the mean skeleton.
+        pose=np.full((12,20),np.nan)
+        pose[:4]=np.arange(4)[:,None];pose[4]=1e9
+        pose[6:8]=10;pose[9:12]=-2
+        raw=np.zeros((3,31));raw[:,24:]=np.array([2,8,5])[:,None]
+        count,shape,motion=state_sums(pose,np.array([0,6,9]),np.array([4,2,3]),
+                                    np.array([0,0,1]),raw,2,batch_size=1)
+        np.testing.assert_array_equal(count,[6,3])
+        np.testing.assert_allclose(shape[0]/count[0],26/6)
+        np.testing.assert_allclose(shape[1]/count[1],-2)
+        np.testing.assert_allclose(motion[0]/count[0],4)
+        np.testing.assert_allclose(motion[1]/count[1],5)
+
     def test_body_alignment_removes_rigid_motion_preserves_gaster(self):
         skeleton=np.array([[0,0],[12,0],[-20,0],[-45,4],[16,5],[24,12],[33,12],
                            [16,-5],[24,-12],[33,-12]],float)[None]
