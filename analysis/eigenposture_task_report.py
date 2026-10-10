@@ -29,5 +29,8 @@ def run_analysis(output):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--source", type=Path, help="Full-body model packet; defaults to the block's published packet")
     args = parser.parse_args()
+    if args.source is not None:
+        os.environ["ANTS_BEHAVIOR_SOURCE"] = str(args.source)
     run_analysis(args.output)

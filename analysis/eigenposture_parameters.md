@@ -12,8 +12,9 @@ under the basler bucket. Six figures are also available as
 
 ## Current interactive analysis
 
-The interactive script now reuses the validated two-second behavioral dictionary,
-classifies right-colony ants by state proportions, then runs occupancy/sleep/return analyses. See
+The interactive script now uses full-body states learned from all usable segments
+of >60%-detected ants in both colonies, classifies right-colony ants by pooled
+state proportions, and runs occupancy and state-derived sleep/return analyses. See
 [`eigenposture_interactive.md`](eigenposture_interactive.md) for the current steps,
 unsigned velocity definition, inputs, and results. The older daily mean/max
 velocity profiles and one-axis analysis are no longer in that script.

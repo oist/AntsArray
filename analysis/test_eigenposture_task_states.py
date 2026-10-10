@@ -1,4 +1,4 @@
-"""Tests for hourly state weighting, missing coverage and unsigned motion."""
+"""Tests for pooled state counts, missing coverage and unsigned motion."""
 
 import ast
 from pathlib import Path
@@ -14,7 +14,7 @@ from analysis.eigenposture_interactions import count_onsets
 
 def interactive_helper(name, **settings):
     # Import just the tested function: never run data loading, plotting or fitting.
-    source = Path(__file__).with_name("eigenposture_interactive.py").read_text()
+    source = Path(__file__).with_name("full_behavior_roles.py").read_text()
     source = "\n".join(line for line in source.splitlines() if not line.startswith("%"))
     function = next(
         node
@@ -43,23 +43,18 @@ class TaskStateTests(unittest.TestCase):
         self.assertTrue(np.isnan(peaks[1:]).all())
         np.testing.assert_array_equal(velocity, before)
 
-    def test_hourly_proportions_keep_missing_hours_unknown(self):
-        proportions = interactive_helper("hourly_proportions")
-        result = proportions(np.array([0, 0, 0, 0, 1]),
-                             np.array([0, 0, 1, 1, 0]),
-                             np.array([0, 1, 1, 1, 0]), 3, 2, minimum=2)
-        np.testing.assert_allclose(result[0, :2], [[.5, .5], [0, 1]])
-        self.assertTrue(np.isnan(result[0, 2:]).all())
-        self.assertTrue(np.isnan(result[1:]).all())
+    def test_pooled_proportions_keep_missing_observations_unknown(self):
+        proportions = interactive_helper("proportions")
+        result = proportions(np.array([[2, 6], [0, 0], [3, 0]]))
+        np.testing.assert_allclose(result[[0, 2]], [[.25, .75], [1, 0]])
+        self.assertTrue(np.isnan(result[1]).all())
 
-    def test_each_observed_hour_has_equal_weight(self):
-        proportions = interactive_helper("hourly_proportions")
-        # Ten state-0 observations in one hour and two state-1 observations in
-        # another must yield 50:50, not the tracking-weighted 10:2 split.
-        labels = np.r_[np.zeros(10, int), np.ones(2, int)]
-        result = proportions(np.zeros(12, int), labels, labels, 1, 2, minimum=2)
-        np.testing.assert_allclose(np.nanmean(result, axis=1), [[.5, .5]])
-        np.testing.assert_array_equal(np.isfinite(result).all(axis=2).sum(axis=1), [2])
+    def test_observed_time_counts_replace_equal_hour_weighting(self):
+        proportions = interactive_helper("proportions")
+        # Ten observed samples of state 0 and two of state 1 count directly,
+        # even when they came from hours with different tracking coverage.
+        result = proportions(np.array([[10, 2]]))
+        np.testing.assert_allclose(result, [[10 / 12, 2 / 12]])
 
     def test_interactions_count_both_ants_and_preserve_missing_coverage(self):
         ants = pd.DataFrame(dict(side=["left", "left", "right"], track_id=[0, 1, 0]))

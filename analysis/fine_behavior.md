@@ -7,9 +7,11 @@ choose features, clusters, Leiden resolution, or ant roles.
 
 For the minimal right-colony continuation, run the numbered cells in
 [`eigenposture_interactive.py`](eigenposture_interactive.py); see its
-[short guide](eigenposture_interactive.md). It reuses this validated dictionary,
-derives ant classes from state proportions, and carries those classes into the
-occupancy, speed, sleep, clock-profile and return/recipient analyses.
+[short guide](eigenposture_interactive.md). The current continuation rebuilds
+full-body states from all usable segments of >60%-detected ants in both colonies,
+derives right-colony classes from pooled state proportions, and carries them into
+occupancy and state-derived sleep/return analyses. The eight-state dictionary and
+numbers below document the preceding sampled-clip analysis.
 
 ## What the literature changes
 
