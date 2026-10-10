@@ -75,7 +75,7 @@ summary does not make this a purely subsecond measurement.
 
 The initial comparison uses identical centers for all representations and widths.
 The follow-up removes the slow-wavelet gate and compares kinematics/trajectories
-on common two-second support. The audit also records how many independent
+on common two-second support. The audit also records how many individually supported
 0.5/1/2-second windows are available. It is essential to inspect the resulting
 speed and coverage differences before interpreting state proportions.
 
@@ -102,6 +102,13 @@ agreement is plotted explicitly as **provisional**. These thresholds are
 analysis choices, not a statistical estimate of the number of natural behaviors.
 Test ants are evaluated only after freezing that choice within each experiment.
 Comparisons between experiments remain exploratory.
+
+After selection, five additional random omissions of training ants check the
+same frozen dictionary on the test cohort. They do not reselect the model.
+The role sensitivity check removes the weakly matched state's proportion,
+renormalizes the remaining proportions, and refits the chosen role count on
+the unchanged eligible cohort. This is a sensitivity check, not another search
+for a better spatial match.
 
 Five-neighbor weighted votes assign supported windows to the dictionary. Vote
 agreement is not a calibrated probability of a biological behavior. Original
@@ -157,6 +164,9 @@ python -m analysis.fine_behavior_short_support run --wavelet --features "$run/fe
 python -m analysis.fine_behavior_report --block "$block" --source "$source" \
   --sequences "$run/sequences" --features "$run/short_features" \
   --models "$run/short_models" --output "$run/report_short"
+python -m analysis.fine_behavior_audit --features "$run/short_features" \
+  --models "$run/short_models" --report "$run/report_short" \
+  --wavelet-features "$run/features"
 python -m unittest analysis.test_fine_behavior -v
 ```
 
