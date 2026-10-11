@@ -63,6 +63,16 @@ S1 and other states may satisfy this motion rule: it is a broader readout calibr
 from S0, not a claim of exact S0 recovery. The overlap/threshold plot makes this
 visible. S0 remains the sole putative sleep **state** in the learned dictionary.
 
+The completed fanout labels all 114 tracks. For the 44 right-colony ants, mean
+full-recording label coverage is 82.43%; 87.65% of focal contact onsets have a
+fully classified preceding ten seconds. There are 704 eligible recent-return
+contacts and **484 matched contacts in 43 recipients**, versus 11 matches in
+eight recipients with direct S0 labels. C0/C1/C2/C3 contribute 134/164/123/63
+matched events in 10/14/8/11 ants. Precise returns remain 1,827. The stricter
+S0-derived body threshold retains fewer contacts than the historical 726-match
+motion result, while restoring support in every behavioral class. Matching and
+return-event rules are unchanged.
+
 The standalone sleep time course matches the speed plot's clock, light shading,
 ten-minute bins and class colors. It uses the fresh motion labels. Existing
 state occupancy, bout, class-summary and clock-profile plots retain direct S0
@@ -254,7 +264,9 @@ features used to learn states. `ant_sleep_speed_summary.csv` and
 Choose a new output directory when changing measurement or modeling choices.
 Use local disk for roughly 20 GB of intermediate arrays, not a quota-limited
 remote home. Existing stitched tracks, speed metadata, published skeleton
-interaction outputs, and downstream grid/motion caches are required.
+interaction outputs, and downstream grid/motion caches are required. The motion fanout must finish
+before the report runs; if its output is elsewhere, publish it under the model
+packet or set `ANTS_MOTION_SLEEP` to the completed labels directory.
 
 ```bash
 BLOCK=/path/to/20260724/block01
@@ -265,6 +277,10 @@ python -m analysis.full_behavior_states learn --root "$RUN"
 python -m analysis.full_behavior_states assign --root "$RUN"
 python -m analysis.full_behavior_profiles --root "$RUN"
 python -m analysis.full_behavior_roles --root "$RUN"
+# Run on the cluster, with paths visible to workers and writable scratch output.
+python -m analysis.s0_motion_sleep submit --source "$RUN" --block "$BLOCK" \
+  --work /flash/path/s0_motion --output "$RUN/sleep_from_s0_motion_20261011"
+# Continue after the final Slurm job succeeds and the output complete.json exists.
 ANTS_DATASET_ROOT="$BLOCK" python -m analysis.eigenposture_task_report \
   --source "$RUN" --output "$RUN/report"
 ```
