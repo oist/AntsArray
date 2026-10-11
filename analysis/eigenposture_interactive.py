@@ -432,7 +432,8 @@ for state,group in sample.groupby('state'):
         ax.plot(np.interp(quantiles,cdf,values),quantiles,color=colors[state],label=f'S{state}',lw=2 if state==0 else 1)
 for ax,column in zip(axes[:2],['body','antenna']):
     threshold=motion_parameters[column+'_speed_threshold_mm_s'];ax.axvline(threshold,color='black',ls='--')
-    ax.set(xscale='log',xlabel=f'{column.capitalize()} motion (mm/s)',ylabel='Equal-ant cumulative fraction',
+    ax.set_xscale('symlog',linthresh=.05)
+    ax.set(xlim=(0,None),xlabel=f'{column.capitalize()} motion (mm/s)',ylabel='Equal-ant cumulative fraction',
         title=f'S0 95th percentile: {threshold:.3g} mm/s',ylim=(0,1))
 axes[0].legend(ncol=2,fontsize=7)
 for i,(split,group) in enumerate(calibration_summary.groupby('split',sort=True)):
