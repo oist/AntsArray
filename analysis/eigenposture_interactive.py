@@ -30,6 +30,9 @@ from analysis.full_behavior_states import NAMES,encode
 from analysis.full_behavior_roles import fit_labels,compare_ant_umaps
 from analysis.full_behavior_sleep import build as build_state_sleep,select_quiet_states,contact_history_audit
 from analysis.full_behavior_profiles import build as build_state_means
+from analysis.behavior_report_figures import overview,label_figure
+from analysis.s0_motion_sleep import refresh_return_contexts
+from matplotlib.colors import ListedColormap
 
 BLOCK=Path(os.environ.get('ANTS_DATASET_ROOT','/home/sam-reiter/bucket/ReiterU/Ants/basler/20260724/block01'))
 SOURCE=Path(os.environ.get('ANTS_BEHAVIOR_SOURCE',str(BLOCK/'analysis_outputs/full_body_behavior_20261011')))
@@ -39,14 +42,17 @@ LIGHT_ON,LIGHT_OFF=5.5,19.5
 # separate non-sleep state. None opts into motion-profile candidates instead.
 SLEEP_STATES=[0]
 MIN_SLEEP_SECONDS=0  # Primary result: cluster membership; inspect bout durations separately.
+MOTION_SLEEP=Path(os.environ.get('ANTS_MOTION_SLEEP',str(SOURCE/'sleep_from_s0_motion_20261011')))
 threadpool_limits(limits=4);OUTPUT.mkdir(parents=True,exist_ok=True)
 plt.rcParams.update({'font.size':10,'axes.spines.top':False,'axes.spines.right':False})
 
 
 def show(name):
+    index=0
     for number in plt.get_fignums():
         figure=plt.figure(number)
         if not getattr(figure,'_right_saved',False):
+            label_figure(figure,name,index);index+=1
             figure.savefig(OUTPUT/f'{name}_{number:02d}.png',dpi=160,bbox_inches='tight')
             figure._right_saved=True
     plt.show(block=False)
@@ -57,6 +63,7 @@ cohort=inventory[inventory.selected].reset_index(drop=True)
 assert (cohort.detection_fraction>.6).all()
 ants=cohort[cohort.side.eq('right')].reset_index(drop=True)
 print('State cohort:',cohort.groupby('side').size().to_dict(),'right ant classes:',len(ants),flush=True)
+overview();show('00_workflow')
 
 # %% 2. PCA of all ten landmarks after body alignment, throughout the recording
 # Tag at origin, petiole->tag is anterior. Divide by each ant's median body-axis
@@ -404,8 +411,51 @@ clock = context["start_clock_seconds"]
 start, stop = context["frame_min"], context["frame_stop"]
 speed, ant_speed = go.plot_cluster_speed_timeseries(cluster_table, stitched / "speed_vectors",
     bin_seconds=600, smooth_seconds=600, start_clock_seconds=clock,
-    light_off_hour=LIGHT_OFF, light_on_hour=LIGHT_ON, title="10. Speed by behavioral ant class")
+    light_off_hour=LIGHT_OFF, light_on_hour=LIGHT_ON, title="10. Speed by behavioral ant class",cmap=ListedColormap(class_colors))
 show('05_speed')
+# Fresh motion labels use partial-pose observations; thresholds come from S0
+# in the SAME motion coordinates as return analysis. No old sleep labels enter.
+motion_definition=json.loads((MOTION_SLEEP/'definition.json').read_text())
+motion_complete=json.loads((MOTION_SLEEP/'complete.json').read_text())
+assert motion_complete['definition_sha256']==hashlib.sha256((MOTION_SLEEP/'definition.json').read_bytes()).hexdigest()
+assert motion_definition['dictionary_sha256']==hashlib.sha256((SOURCE/'models/dictionary.npz').read_bytes()).hexdigest()
+motion_parameters=motion_definition['classifier_parameters']
+sample=pd.read_parquet(MOTION_SLEEP/'calibration_samples.parquet')
+calibration_summary=pd.read_csv(MOTION_SLEEP/'calibration_state_summary.csv')
+fig,axes=plt.subplots(1,3,figsize=(15,4.5),layout='constrained')
+for state,group in sample.groupby('state'):
+    weights=1/group.groupby('ant').ant.transform('size').to_numpy()
+    for ax,column in zip(axes[:2],['body','antenna']):
+        quantiles=np.linspace(.001,.999,200)
+        order=np.argsort(group[column].to_numpy());values=group[column].to_numpy()[order]
+        cdf=np.cumsum(weights[order]);cdf/=cdf[-1]
+        ax.plot(np.interp(quantiles,cdf,values),quantiles,color=colors[state],label=f'S{state}',lw=2 if state==0 else 1)
+for ax,column in zip(axes[:2],['body','antenna']):
+    threshold=motion_parameters[column+'_speed_threshold_mm_s'];ax.axvline(threshold,color='black',ls='--')
+    ax.set(xscale='log',xlabel=f'{column.capitalize()} motion (mm/s)',ylabel='Equal-ant cumulative fraction',
+        title=f'S0 95th percentile: {threshold:.3g} mm/s',ylim=(0,1))
+axes[0].legend(ncol=2,fontsize=7)
+for i,(split,group) in enumerate(calibration_summary.groupby('split',sort=True)):
+    axes[2].bar(group.state+(i-.5)*.35,group.joint_below_fraction,width=.35,label=split.replace('_',' '))
+axes[2].set(xticks=np.arange(n_states),xticklabels=state_names,ylim=(0,1),ylabel='Fraction below both motion limits',title='Overlap with learned states')
+axes[2].legend(fontsize=8);fig.suptitle('S0 calibrates the motion-only sleep readout')
+calibration_summary.to_csv(OUTPUT/'motion_sleep_calibration.csv',index=False)
+(OUTPUT/'motion_sleep_definition.json').write_text(json.dumps(motion_definition,indent=2)+'\n')
+show('05_motion_calibration')
+motion_tracks=sma.load_sleep_label_tracks(MOTION_SLEEP,cluster_ids)
+motion_sleep,motion_ant_sleep=sma.cluster_sleep_timeseries(motion_tracks,bin_seconds=600,
+    min_classified_fraction=.5,recording_start_frame=start,recording_stop_frame=stop)
+fig,ax=plt.subplots(figsize=(12,5),layout='constrained')
+for c in range(k_roles):
+    curve=motion_sleep[motion_sleep.cluster_id.eq(f'right_behavior_{c}')]
+    ax.plot(curve.time_h,curve.mean_sleep_fraction*100,color=class_colors[c],lw=1.8,
+        label=f'C{c}: {ants.ant_class.eq(c).sum()} ants')
+sma.clock_axis(ax,clock,stop/FPS/3600,LIGHT_OFF,LIGHT_ON)
+ax.set(ylabel='Putative sleep (% of classified time)',ylim=(0,100),title='Sleep by behavioral ant class — S0-calibrated motion')
+ax.legend();ax.grid(alpha=.25)
+motion_sleep.to_csv(OUTPUT/'class_motion_sleep.csv',index=False)
+motion_ant_sleep.to_parquet(OUTPUT/'ant_motion_sleep_bins.parquet',index=False)
+show('05_motion_sleep')
 sleep_root = build_state_sleep(SOURCE, BLOCK, quiet_states, MIN_SLEEP_SECONDS)
 bouts=pd.read_parquet(sleep_root/'quiet_bouts.parquet').merge(
     cluster_ids[['side','track_id','cluster_id']],on=['side','track_id'],how='inner',validate='many_to_one')
@@ -534,27 +584,28 @@ fig.tight_layout(rect=(0,.17,1,.95));show('07_trip_investment')
 # observed entry crossing within 5 frames; new skeleton contacts <=0.1 mm.
 # Retain ALL right ants as social context, including ants without a role. Their
 # returns can expose classified recipients, without calling those ants a class.
-# Contacts are themselves state features, so contact-triggered changes in quiet
-# labels are partly definition dependent. One-second windows also blur event
-# timing. Inspect physical motion responses; this is not an independent arousal test.
+# Motion-only trailing labels use S0-calibrated thresholds, without contact
+# counts. Direct S0 occupancy remains the state interpretation in earlier plots.
 settings = rs.ReturnSettings()
-all_sleep = sma.load_sleep_label_tracks(sleep_root)
+return_sleep_tracks=motion_tracks
+all_sleep = sma.load_sleep_label_tracks(MOTION_SLEEP)
 all_sleep = all_sleep[all_sleep.side.eq("right")].copy()
-cache = SOURCE / "return_context_cache"
+cache = SOURCE / "return_context_motion_s0_20261011"
 chunks, interaction_run = rs.load_published_interaction_chunks(rs.resolve_interaction_root(BLOCK),
     BLOCK / "tracks", fps=settings.fps, start_clock_seconds=clock)
+refresh_return_contexts(SOURCE,BLOCK,all_sleep,regions,settings,cache)
 contexts = rs.load_contexts(all_sleep, BLOCK, regions, settings, cache, force=False)
 bouts, coverage = rs.load_contact_bouts(chunks, settings, cache, force=False)
-contact_history_audit(sleep_tracks,bouts,settings.fps,settings.prior_sleep_seconds).to_csv(OUTPUT/'recipient_sleep_support.csv',index=False)
+contact_history_audit(return_sleep_tracks,bouts,settings.fps,settings.prior_sleep_seconds).to_csv(OUTPUT/'recipient_sleep_support.csv',index=False)
 rs.attach_contact_context(contexts, bouts, coverage, settings)
 all_classes = all_sleep[["side", "track_id"]].merge(cluster_ids[["side", "track_id", "cluster_id"]],
     on=["side", "track_id"], how="left", validate="one_to_one").fillna({"cluster_id": "unclassified_context"})
 all_returns = rs.extract_returns(contexts, all_classes, settings)
 returns = all_returns[all_returns.cluster_id.isin(cluster_ids.cluster_id)].copy()
 return_curves, latency = rs.return_activity_curves(returns, contexts, settings)
-contacts = rs.eligible_sleeping_contacts(sleep_tracks, contexts, bouts, all_returns, settings)
+contacts = rs.eligible_sleeping_contacts(return_sleep_tracks, contexts, bouts, all_returns, settings)
 triggers, matching = rs.match_sleeping_controls(contacts, contexts, settings)
-recipient_curves = rs.trigger_state_curves(triggers, sleep_tracks, contexts, settings)
+recipient_curves = rs.trigger_state_curves(triggers, return_sleep_tracks, contexts, settings)
 # Retain the pooled return view so class splitting can be distinguished from
 # losses caused by recipient eligibility. Return events do not depend on sleep.
 fig,summary=rs.plot_return_curves(return_curves,side='right')
@@ -566,7 +617,7 @@ summary.to_csv(OUTPUT/'pooled_return_summary.csv',index=False)
 exposed=triggers[triggers.condition.eq('Recent return contact')]
 fig,summary=rs.plot_recipient_curves(recipient_curves,side='right',xlim=(-30,30))
 fig.suptitle(f'All classified right ants: {len(exposed)} matched return contacts in {exposed.track_id.nunique()} recipients\n'
-    f'Putative sleep = {quiet_states.tolist()}; contact features contribute to labels; 95% intervals require ≥5 contributing ants')
+    'S0-calibrated motion sleep; 95% intervals require ≥5 contributing ants')
 summary.to_csv(OUTPUT/'pooled_recipient_summary.csv',index=False)
 # The canonical plots pool classes; explicitly subset here so class membership
 # survives all the way to the return and recipient comparisons.
@@ -577,8 +628,8 @@ for label in sorted(cluster_ids.cluster_id.unique()):
     summary.to_csv(OUTPUT / f"{label}_return_summary.csv", index=False)
     fig, summary = rs.plot_recipient_curves(recipient_curves[recipient_curves.cluster_id.eq(label)], side="right", xlim=(-30, 30))
     events=exposed[exposed.cluster_id.eq(label)]
-    fig.suptitle(f"Quiet-state recipients: {label} — {len(events)} matched contacts, {events.track_id.nunique()} ants\n"
-        "Contacts contribute to state labels; 95% intervals require ≥5 contributing ants")
+    fig.suptitle(f"Motion-sleep recipients: {label} — {len(events)} matched contacts, {events.track_id.nunique()} ants\n"
+        "S0-calibrated motion thresholds; 95% intervals require ≥5 contributing ants")
     summary.to_csv(OUTPUT / f"{label}_recipient_summary.csv", index=False)
 returns.to_csv(OUTPUT / "returns.csv", index=False)
 triggers.to_csv(OUTPUT / "matched_triggers.csv", index=False)
@@ -596,5 +647,7 @@ show("07_return_response")
     ant_umap_view=selected_view, n_completed_trips=len(completed_trips),
     state_model=selection, ant_model=role_choice, quiet_states=quiet_states.tolist(),
     minimum_sleep_seconds=MIN_SLEEP_SECONDS, sleep_source="discovered state membership; no cached sleep labels",
+    return_sleep_source=str(MOTION_SLEEP),return_sleep_definition=motion_definition,
+    n_matched_return_contacts=len(exposed),n_matched_recipients=exposed.track_id.nunique(),
     complete_clock_cycles=complete_cycles),indent=2)+"\n")
 print(f"Finished. Figures and tables: {OUTPUT}",flush=True)

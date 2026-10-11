@@ -4,6 +4,8 @@ import os
 from pathlib import Path
 import runpy
 import shutil
+import json
+from analysis.behavior_report_figures import add_pdf_description
 
 
 def run_analysis(output):
@@ -19,9 +21,15 @@ def run_analysis(output):
     namespace = runpy.run_path(str(source))
     shutil.copy2(source, output / "eigenposture_interactive.py")
     shutil.copy2(source.with_suffix(".md"), output / "README.md")
+    descriptions=[]
     with PdfPages(output / "right_behavior_classes.pdf") as pdf:
         for number in plt.get_fignums():
-            pdf.savefig(plt.figure(number), bbox_inches="tight")
+            figure=plt.figure(number)
+            text=add_pdf_description(figure)
+            pdf.savefig(figure, bbox_inches="tight")
+            text.remove()
+            descriptions.append(dict(figure=number,title=figure._report_title,description=figure._report_caption))
+    (output/'figure_descriptions.json').write_text(json.dumps(descriptions,indent=2)+'\n')
     plt.close("all")
     return namespace
 

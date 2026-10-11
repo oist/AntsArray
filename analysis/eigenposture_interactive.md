@@ -1,9 +1,12 @@
-# Full-body states, right-colony ant classes, and state-derived sleep
+# Full-body states, ant classes, and S0-calibrated motion sleep
 
 Open `analysis/eigenposture_interactive.py` and run its eleven `# %%` cells in
 VS Code/Jupyter from the repository root. It uses the new full-recording model
 packet and continues through the established grid-occupancy analyses. Plots are
-ordinary Matplotlib figures, saved as PNGs; the batch runner also writes a PDF.
+ordinary Matplotlib figures, saved as PNGs; the batch runner writes a PDF with a
+text description beneath every figure and an opening workflow schematic. Figure
+numbers in the PDF are sequential; the original speed plot is identified by its
+title rather than its former section number 10.
 Companion modules handle the costly extraction, model comparisons, and summaries.
 
 ```bash
@@ -18,6 +21,60 @@ packet, and `ANTS_ROLE_OUTPUT` to change the interactive output. The default
 output is the packet's `report` directory. Install
 `analysis/eigenposture_leiden_requirements.txt` in the pipeline environment;
 downstream readers also require PyArrow and Shapely.
+
+
+## Fresh motion sleep calibrated from S0
+
+`analysis.s0_motion_sleep` runs four dependent Slurm stages: per-track motion
+aggregation, S0 threshold calibration, per-track labeling, and validation. Write
+worker outputs to **flash/scratch**; compute nodes may mount bucket read-only.
+Publish the completed `labels` directory as `sleep_from_s0_motion_20261011` in the
+model packet. `ANTS_MOTION_SLEEP` overrides that path.
+
+```bash
+python -m analysis.s0_motion_sleep submit \
+  --source "$RUN" --block "$BLOCK" --work /flash/path/s0_motion \
+  --output /flash/path/s0_motion/labels --concurrency 24
+```
+
+This reuses calibrated bodypoint **motion measurements**, never old sleep labels.
+Body motion is the 75th percentile across four body points with at least three
+valid points; antenna motion is the 75th percentile across six antennal points
+with at least three valid points. Displacements may span at most five frames;
+individual point speeds above 20 mm/s are excluded. Both metrics are lab-frame
+motion, unlike the head-relative antennal features of the state model.
+
+Calibration samples up to 10,000 valid 12-Hz observations per ant/state throughout
+the recording and gives each ant equal total weight within a state. Separate
+95th percentiles in S0 set body and antenna limits, **0.160509 and 0.793659 mm/s**.
+The joint envelope contains 90.77% of S0 calibration observations and 90.71%
+in held-out time blocks. It also contains 85.88% of S1 observations; S0 and S1
+are not cleanly separated by these motion variables.
+Alternating 30-minute blocks assess temporal transfer using thresholds fitted
+only on the other blocks; the final thresholds then use all calibration blocks.
+Neither contact yield, spatial groups nor behavioral ant classes select limits.
+These choices are explicit modeling assumptions, not physiological validation.
+
+Fresh frame labels require a complete trailing ten-second window, at least 50%
+jointly valid body/antenna observations, and at least 90% of the valid observations
+below both limits. Windows without sufficient evidence stay unknown. The same
+rule applies to all 114 tracks, including observations without complete posture.
+S1 and other states may satisfy this motion rule: it is a broader readout calibrated
+from S0, not a claim of exact S0 recovery. The overlap/threshold plot makes this
+visible. S0 remains the sole putative sleep **state** in the learned dictionary.
+
+The standalone sleep time course matches the speed plot's clock, light shading,
+ten-minute bins and class colors. It uses the fresh motion labels. Existing
+state occupancy, bout, class-summary and clock-profile plots retain direct S0
+membership and say so in their captions. Every PDF figure now has an explanatory
+paragraph; `figure_descriptions.json` contains the same text.
+
+Return-context caching can reuse fingerprint-matched physical position, speed,
+and crossing arrays. Both sleep-dependent arrays (state and sleep age) are always
+recomputed from the fresh labels; `physical_reuse.json` records this optimization.
+If the physical cache is absent or incompatible, the ordinary raw-input reader
+reconstructs it. Eligibility still requires ten continuously sleeping seconds
+before contact, with the same matching criteria as before.
 
 ## What each cell does
 
@@ -36,7 +93,7 @@ downstream readers also require PyArrow and Shapely.
    retaining tails of at least 250 ms. Gaps and camera changes break segments.
    Three UMAP settings show the same labels; clustering uses the balanced feature
    space, never the 2-D coordinates. Inspect feature profiles and quiet candidates.
-   Figure 4b adds each state's mean full-body skeleton and a heatmap of its
+   The mean-posture figure adds each state's mean full-body skeleton and a heatmap of its
    unsigned body/antennal velocity, turning, and exact concurrent contacts.
 4. **Ant representation:** count each ant's assigned state observations directly,
    then normalize. Counts weight variable-length windows by their observed
@@ -83,9 +140,10 @@ downstream readers also require PyArrow and Shapely.
     minimum trips, and 20% observed trip coverage. Rates use the full recording
     duration. Bridged position gaps can contribute to trip duration; these rules
     do not fill gaps in sleep labels. Trip summaries and uncertainty are saved.
-11. **Returns and contacts:** retain the same ant classes and use state-derived
-    quietness for recipient selection, matched controls, and response curves.
-    Other right ants remain social context, with unknown sleep where ineligible.
+11. **Returns and contacts:** retain the same ant classes and use fresh
+    **S0-calibrated motion labels** for recipient selection, matched controls,
+    and response curves. All 57 right ants have motion labels and remain social
+    context; only the 44 behavior-classified ants enter recipient class comparisons.
     Show pooled returns and recipients before individual class panels, with event/ant counts
     in titles. The precise return-response rules are stricter than trip investment
     (no long position-gap bridging; observed crossing within five frames).
@@ -144,15 +202,16 @@ S0 is used for sleep. `SLEEP_STATES=None` explicitly opts into all candidates.
 These choices do not train states. `MIN_SLEEP_SECONDS=0` shows membership directly; the
 bout plot separately assesses persistence. Unknown intervals remain unknown and
 censor bouts. They never count as awakenings. This is putative sleep without an
-arousal assay. **No pre-existing cached sleep labels enter these analyses.**
-The old motion cache metadata supplies only frame alignment for downstream readers.
+arousal assay. **No historical motion-sleep label arrays enter these analyses.**
+Direct S0 membership is retained for state occupancy and quiet-run plots. The new
+motion readout below is used for return figures and the standalone sleep time course.
 Ant classes were fitted to these same state proportions: differences in total
 quiet time describe the classes and do not independently validate them.
-Contacts also enter the state features. A quiet-state label changing after a
-contact is therefore partly definition dependent, and a one-second feature
-window can include measurements on both sides of the contact time. The recipient
-comparison is descriptive; inspect the body/antennal motion traces and do not
-treat it as an independent demonstration of contact-induced awakening.
+Contacts enter state discovery but do not enter the new motion sleep classifier.
+Its calibration observations come from S0, which was learned using contacts as
+one feature family. Labels use only past and current motion; the trailing window
+can delay detected transitions. The recipient comparison remains descriptive: its
+awake fraction is defined through motion, so also inspect the physical traces.
 The recipient analysis still requires ten continuously classified sleeping
 seconds before contact. `recipient_sleep_support.csv` separates unknown history
 from known non-sleep history. It also reports a diagnostic interval ending one
@@ -273,7 +332,7 @@ The precise response-event rules retain 1,827 returns. These counts differ
 because the trip-investment rules allow longer position gaps and less observed
 support. They are separately named and should not be interchanged.
 
-## Why the contact-response plots became sparse
+## Historical diagnosis: why state-only return-contact plots became sparse
 
 The comparison below holds the 44 right-ant identities fixed. The earlier
 motion-label analysis and the state-label analysis both retain 1,827 return
@@ -294,9 +353,9 @@ of label support, not a decrease in detected returns.
 | --- | ---: | ---: |
 | Historical motion labels, same 44 ants | 1,036 | 726 |
 | Previous S0 + S1 | 36 | 29 |
-| Current S0 only | 17 | 11 |
+| Previous direct S0 only | 17 | 11 |
 
-The current eleven matched contacts involve eight recipients: C0 has one event
+The preceding direct-S0 report had eleven matched contacts in eight recipients: C0 has one event
 in one ant, C1 three in three, C2 seven in four, and C3 none. No class has five
 contributing recipients, the minimum for the bootstrap intervals. Sparse curves
 here do not establish class-specific contact responses.
@@ -307,8 +366,9 @@ earlier raises all-onset sleep-history support from 1,071 to 8,522 for S0+S1,
 and from 541 to 5,065 for S0. These are counts **before** other eligibility and
 matching filters, not extra matched events. The change is consistent with
 onset-straddling feature windows; ordinary state changes can also contribute.
-The guard is diagnostic only. Primary eligibility, matching rules and S0 sleep
-membership are not relaxed to make plots denser.
+The guard was diagnostic only. Current return figures now use fresh motion labels
+calibrated from S0, while keeping the original event eligibility and matching rules.
+S0 membership remains unchanged for state and ant classification.
 
 `contact_label_history_totals.csv`, `contact_label_history_audit.csv`, and
 `contact_label_coverage_comparison.csv` retain the historical comparison. It is
