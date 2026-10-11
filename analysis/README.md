@@ -7,7 +7,10 @@ interactive analysis. Run its `# %%` cells in order in VS Code/Jupyter. It uses
 both colonies to discover behavioral states, then classifies right-colony ants
 from their state proportions. The same script compares classes in space,
 speed, sleep, trips, and return contacts. S0 alone is the putative sleep state;
-return figures can use fresh motion labels calibrated from S0.
+return figures can use fresh motion labels calibrated from S0. The current audit
+retains eight provisional state labels, flags weak states, and selects two ant
+classes (26/18) for better stability. State-merging and class-count evidence is
+in `state_class_reduction_summary.pdf` alongside the full report.
 
 [`eigenposture_interactive.md`](eigenposture_interactive.md) documents inputs,
 feature definitions, model selection, parameters, and the current results.

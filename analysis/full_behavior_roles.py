@@ -94,6 +94,120 @@ def proportions(counts):
     return np.divide(counts,total,out=np.full(counts.shape,np.nan,dtype=float),where=total>0)
 
 
+def select_model(table):
+    """Prefer the model reproducible under the weakest tested perturbation.
+
+    Higher K no longer wins just by passing a permissive threshold. A one-class
+    fallback is used only if no nontrivial candidate meets the existing checks.
+    All comparisons use behavior alone; no spatial agreement enters selection.
+    """
+    passing=table[table.qualifies]
+    if not len(passing):return dict(model='one_class',k=1,qualifies=False)
+    return passing.sort_values(['stability_score','k','silhouette'],
+                               ascending=[False,True,False]).iloc[0].to_dict()
+
+
+def evaluate_models(x, hourly, candidates=None, repeats=30):
+    """Return candidate scores, labels, and each ant-removal/time-split result."""
+    if candidates is None:
+        candidates=[(method,k) for method in ('kmeans','ward','gmm_tied','gmm_diag') for k in range(2,9)]
+        candidates += [('leiden',r) for r in (.3,.5,.8,1.,1.5,2.)]+[('hdbscan',n) for n in (3,4,5)]
+    rows=[];assignments={};details=[]
+    for method,param in candidates:
+        name=f'{method}_{param:g}';labels=fit_labels(x,method,param)
+        assigned=labels>=0;classes=np.unique(labels[assigned]);sizes=[int(np.sum(labels==s)) for s in classes]
+        ari=[];jac=[];temporal=[];tjac=[]
+        if len(classes)>1:
+            rng=np.random.default_rng(SEED)
+            for repeat in range(repeats):
+                sample=np.sort(rng.choice(len(x),round(.8*len(x)),replace=False))
+                alternative=fit_labels(x[sample],method,param,SEED+repeat)
+                ari.append(adjusted_rand_score(labels[sample],alternative));jac.append(min_jaccard(labels[sample],alternative))
+                details.append(dict(model=name,kind='ant_removal',repeat=repeat,width_hours=np.nan,
+                                    ari=ari[-1],minimum_jaccard=jac[-1]))
+            for width in (1,3,6,24):
+                groups=[]
+                for parity in (0,1):
+                    selected=(np.arange(hourly.shape[1])//width)%2==parity
+                    representation=np.sqrt(proportions(hourly[:,selected].sum(axis=1)))
+                    if not np.isfinite(representation).all():groups=[];break
+                    groups.append(fit_labels(representation,method,param))
+                if len(groups)==2:
+                    temporal.append(adjusted_rand_score(*groups));tjac.append(min_jaccard(*groups))
+                    details.append(dict(model=name,kind='temporal',repeat=0,width_hours=width,
+                                        ari=temporal[-1],minimum_jaccard=tjac[-1]))
+        row=dict(model=name,method=method,parameter=param,k=len(classes),minimum_ants=min(sizes,default=0),
+            noise_fraction=float(np.mean(~assigned)),ant_removal_ari=float(np.median(ari)) if ari else 0,
+            smallest_class_jaccard=float(np.median(jac)) if jac else 0,
+            temporal_ari=float(np.median(temporal)) if temporal else 0,
+            temporal_smallest_jaccard=float(np.median(tjac)) if tjac else 0,
+            ant_removal_ari_p10=float(np.quantile(ari,.1)) if ari else 0,
+            ant_removal_jaccard_p10=float(np.quantile(jac,.1)) if jac else 0,
+            temporal_min_ari=float(np.min(temporal)) if temporal else 0,
+            temporal_min_jaccard=float(np.min(tjac)) if tjac else 0,
+            temporal_splits=len(temporal),
+            silhouette=float(silhouette_score(x[assigned],labels[assigned])) if 1<len(classes)<assigned.sum() else np.nan)
+        row['qualifies']=(row['k']>1 and row['minimum_ants']>=3 and row['noise_fraction']==0
+            and row['ant_removal_ari']>=.8 and row['smallest_class_jaccard']>=.6
+            and row['temporal_ari']>=.65 and row['temporal_smallest_jaccard']>=.6)
+        # A median across timescales can hide a failed day-scale split. The
+        # primary score is the worst of lower-tail ant-removal agreement and
+        # the least reproducible time split, including the weakest class.
+        row['stability_score']=min(row[key] for key in ('ant_removal_ari_p10',
+            'ant_removal_jaccard_p10','temporal_min_ari','temporal_min_jaccard'))
+        rows.append(row);assignments[name]=labels
+        print('ANT MODEL',json.dumps(row),flush=True)
+    return pd.DataFrame(rows),assignments,pd.DataFrame(details)
+
+
+def merge_counts(counts, mapping):
+    """Pool the last state axis while preserving ant/time axes and duration."""
+    counts=np.asarray(counts);mapping=np.asarray(mapping,int)
+    if counts.shape[-1]!=len(mapping) or not np.array_equal(np.unique(mapping),np.arange(mapping.max()+1)):
+        raise ValueError('Expected one contiguous merged ID per input state')
+    merged=np.zeros(counts.shape[:-1]+(int(mapping.max()+1),),dtype=counts.dtype)
+    for old,new in enumerate(mapping):merged[...,new]+=counts[...,old]
+    np.testing.assert_allclose(merged.sum(axis=-1),counts.sum(axis=-1))
+    return merged
+
+
+def compare_reductions(root, output, weighting='state'):
+    """Audit fewer ant classes for each state merge, reusing observed counts."""
+    from analysis.full_behavior_states import merge_map
+    root=Path(root);output=Path(output);output.mkdir(parents=True,exist_ok=True)
+    import hashlib
+    signature=dict(dictionary_sha256=hashlib.sha256((root/'models/dictionary.npz').read_bytes()).hexdigest(),
+        counts_sha256=hashlib.sha256((root/'roles/state_counts.npz').read_bytes()).hexdigest(),
+        weighting=weighting,repeats=30,methods=['kmeans','ward','gmm_tied','gmm_diag'],class_counts=[2,3,4])
+    path=output/'role_reduction_inputs.json'
+    if path.exists() and json.loads(path.read_text())!=signature:
+        raise ValueError('Role audit belongs to different state counts or settings')
+    path.write_text(json.dumps(signature,indent=2)+'\n')
+    with np.load(root/'models/dictionary.npz') as z:dictionary=dict(z)
+    with np.load(root/'roles/state_counts.npz') as z:source=dict(z)
+    inventory=pd.read_csv(root/'inventory.csv').query('selected').reset_index(drop=True)
+    np.testing.assert_array_equal(source['ants'],inventory.ant)
+    right=inventory.side.eq('right').to_numpy();all_rows=[];all_details=[]
+    candidates=[(method,k) for method in ('kmeans','ward','gmm_tied','gmm_diag') for k in (2,3,4)]
+    for k in range(2,int(dictionary['state'].max())+2):
+        destination=output/f'roles_{k}_states';destination.mkdir(exist_ok=True)
+        mapping=merge_map(dictionary['x'],dictionary['state'],k,weighting)
+        counts=merge_counts(source['counts'][right],mapping)
+        hourly=merge_counts(source['hourly'][right],mapping)
+        if all((destination/name).exists() for name in ('comparison.csv','validation_repeats.csv','labels.npz')):
+            table=pd.read_csv(destination/'comparison.csv');detail=pd.read_csv(destination/'validation_repeats.csv')
+        else:
+            print('ANT CLASSES AFTER MERGING TO',k,'STATES',mapping.tolist(),flush=True)
+            table,labels,detail=evaluate_models(np.sqrt(proportions(counts)),hourly,candidates)
+            table.to_csv(destination/'comparison.csv',index=False)
+            detail.to_csv(destination/'validation_repeats.csv',index=False)
+            np.savez_compressed(destination/'labels.npz',**labels)
+        all_rows.append(table.assign(n_states=k));all_details.append(detail.assign(n_states=k))
+    table=pd.concat(all_rows,ignore_index=True);table.to_csv(output/'role_reduction_search.csv',index=False)
+    pd.concat(all_details,ignore_index=True).to_csv(output/'role_repeats.csv',index=False)
+    return table
+
+
 def run(root):
     output=root/'roles';output.mkdir(exist_ok=True)
     inventory=pd.read_csv(root/'inventory.csv');ants=inventory[inventory.selected].reset_index(drop=True)
@@ -104,48 +218,12 @@ def run(root):
     np.savez_compressed(output/'state_counts.npz',counts=counts,hourly=hourly,ants=ants.ant.to_numpy(str))
     right=ants.side.eq('right').to_numpy();ants=ants[right].reset_index(drop=True);p=p[right];hourly=hourly[right]
     x=np.sqrt(p);np.testing.assert_allclose((x*x).sum(axis=1),1)
-    candidates=[(method,k) for method in ('kmeans','ward','gmm_tied','gmm_diag') for k in range(2,9)]
-    candidates += [('leiden',r) for r in (.3,.5,.8,1.,1.5,2.)]+[('hdbscan',n) for n in (3,4,5)]
-    rows=[];assignments={}
-    for method,param in candidates:
-        name=f'{method}_{param:g}';labels=fit_labels(x,method,param)
-        assigned=labels>=0;classes=np.unique(labels[assigned]);sizes=[int(np.sum(labels==s)) for s in classes]
-        ari=[];jac=[];temporal=[];tjac=[]
-        if len(classes)>1:
-            rng=np.random.default_rng(SEED)
-            for repeat in range(30):
-                sample=np.sort(rng.choice(len(x),round(.8*len(x)),replace=False))
-                alternative=fit_labels(x[sample],method,param,SEED+repeat)
-                ari.append(adjusted_rand_score(labels[sample],alternative));jac.append(min_jaccard(labels[sample],alternative))
-            for width in (1,3,6,24):
-                groups=[]
-                for parity in (0,1):
-                    selected=(np.arange(hourly.shape[1])//width)%2==parity
-                    representation=np.sqrt(proportions(hourly[:,selected].sum(axis=1)))
-                    if not np.isfinite(representation).all():groups=[];break
-                    groups.append(fit_labels(representation,method,param))
-                if len(groups)==2:
-                    temporal.append(adjusted_rand_score(*groups));tjac.append(min_jaccard(*groups))
-        row=dict(model=name,method=method,parameter=param,k=len(classes),minimum_ants=min(sizes,default=0),
-            noise_fraction=float(np.mean(~assigned)),ant_removal_ari=float(np.median(ari)) if ari else 0,
-            smallest_class_jaccard=float(np.median(jac)) if jac else 0,
-            temporal_ari=float(np.median(temporal)) if temporal else 0,
-            temporal_smallest_jaccard=float(np.median(tjac)) if tjac else 0,
-            silhouette=float(silhouette_score(x[assigned],labels[assigned])) if 1<len(classes)<assigned.sum() else np.nan)
-        row['qualifies']=(row['k']>1 and row['minimum_ants']>=3 and row['noise_fraction']==0
-            and row['ant_removal_ari']>=.8 and row['smallest_class_jaccard']>=.6
-            and row['temporal_ari']>=.65 and row['temporal_smallest_jaccard']>=.6)
-        rows.append(row);assignments[name]=labels
-        print('ANT MODEL',json.dumps(row),flush=True)
-    table=pd.DataFrame(rows);table.to_csv(output/'method_comparison.csv',index=False)
+    table,assignments,details=evaluate_models(x,hourly)
+    table.to_csv(output/'method_comparison.csv',index=False)
+    details.to_csv(output/'validation_repeats.csv',index=False)
     np.savez_compressed(output/'candidate_labels.npz',**assignments)
-    passing=table[table.qualifies]
-    if len(passing):
-        selected=passing.sort_values(['k','temporal_ari','ant_removal_ari'],ascending=False).iloc[0].to_dict()
-        labels=assignments[selected['model']]
-    else:
-        selected=dict(model='one_class',k=1,qualifies=False);labels=np.zeros(len(ants),int)
-    # Numerical IDs ordered by average state-ID rank; no spatial comparison yet.
+    selected=select_model(table)
+    labels=assignments[selected['model']] if selected['k']>1 else np.zeros(len(ants),int)
     original=np.unique(labels)
     ranking=np.argsort([np.mean(p[labels==s]@np.arange(k)) for s in original])
     remap={int(original[i]):rank for rank,i in enumerate(ranking)}
@@ -153,11 +231,15 @@ def run(root):
     ants['ant_class']=labels;ants['classified_seconds']=counts[right].sum(axis=1)/HZ
     ants.to_csv(output/'ant_classes.csv',index=False)
     pd.DataFrame(p,index=ants.ant,columns=[f'S{s}' for s in range(k)]).to_csv(output/'ant_state_proportions.csv')
-    selected['rule']='Finest partition with >=3 ants/class, no noise, ant-removal ARI>=.8/min-Jaccard>=.6, temporal ARI>=.65/min-Jaccard>=.6; all state axes, no spatial inputs.'
+    selected['rule']='Among passing nontrivial models, maximize the minimum of ant-removal ARI/Jaccard 10th percentiles and worst temporal ARI/Jaccard over 1/3/6/24-hour splits. Break ties by fewer classes, then silhouette. All state proportions, no spatial inputs.'
     (output/'selection.json').write_text(json.dumps(selected,indent=2)+'\n')
     print('SELECTED ANT CLASSES',json.dumps(selected), 'sizes',np.bincount(labels).tolist(),flush=True)
 
 
 if __name__=='__main__':
-    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--root',type=Path,required=True);args=parser.parse_args()
-    with threadpool_limits(limits=4):run(args.root)
+    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--root',type=Path,required=True)
+    parser.add_argument('--compare-reductions',type=Path,help='Audit smaller state/class models in a separate directory')
+    parser.add_argument('--merge-weighting',choices=['state','observation'],default='observation');args=parser.parse_args()
+    with threadpool_limits(limits=4):
+        if args.compare_reductions:compare_reductions(args.root,args.compare_reductions,args.merge_weighting)
+        else:run(args.root)

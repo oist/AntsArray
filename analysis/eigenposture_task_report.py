@@ -28,8 +28,18 @@ def run_analysis(output):
             text=add_pdf_description(figure)
             pdf.savefig(figure, bbox_inches="tight")
             text.remove()
-            descriptions.append(dict(figure=number,title=figure._report_title,description=figure._report_caption))
+            descriptions.append(dict(figure=number,title=figure._report_title,description=figure._report_caption,
+                                     section=figure._report_section))
     (output/'figure_descriptions.json').write_text(json.dumps(descriptions,indent=2)+'\n')
+    if any(row['section']=='02_state_reduction' for row in descriptions):
+        sections={'02_state_reduction','02_state_repeat_support','05_ant_methods',
+                  '05_class_reduction','05_class_state_sensitivity'}
+        with PdfPages(output/'state_class_reduction_summary.pdf') as pdf:
+            for number in plt.get_fignums():
+                figure=plt.figure(number)
+                if (figure._report_section in sections or
+                    (figure._report_section=='04_occupancy' and figure._report_index==0)):
+                    text=add_pdf_description(figure);pdf.savefig(figure,bbox_inches='tight');text.remove()
     plt.close("all")
     return namespace
 

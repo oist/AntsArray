@@ -67,8 +67,8 @@ The completed fanout labels all 114 tracks. For the 44 right-colony ants, mean
 full-recording label coverage is 82.43%; 87.65% of focal contact onsets have a
 fully classified preceding ten seconds. There are 704 eligible recent-return
 contacts and **484 matched contacts in 43 recipients**, versus 11 matches in
-eight recipients with direct S0 labels. C0/C1/C2/C3 contribute 134/164/123/63
-matched events in 10/14/8/11 ants. Precise returns remain 1,827. The stricter
+eight recipients with direct S0 labels. These pooled event counts are independent
+of the subsequent ant-class reduction. Precise returns remain 1,827. The stricter
 S0-derived body threshold retains fewer contacts than the historical 726-match
 motion result, while restoring support in every behavioral class. Matching and
 return-event rules are unchanged.
@@ -110,7 +110,9 @@ before contact, with the same matching criteria as before.
    duration. No equal-hour averaging, additional eligibility filter, or final PCA.
 5. **Ant classes:** compare K-means, Ward, tied/diagonal GMM, Leiden, and HDBSCAN
    in square-root state proportions (Hellinger geometry). Refit the selected
-   method visibly and assert agreement with the saved classes.
+   method visibly and assert agreement with the saved classes. Prefer the most
+   reproducible partition, with fewer classes breaking ties. The current result
+   is two classes, containing 26 and 18 ants.
 6. **Inspect:** show how ant state proportions form the behavioral ant classes:
    one UMAP point per ant, colored by its fitted class, alongside the class mean
    state proportions. Compare UMAP neighbors 4/8/20 and min_dist 0.02/0.15/0.5,
@@ -189,18 +191,24 @@ medians used for quiet-state interpretation; plotting these means does not alter
 labels. Numerical values are in `state_mean_features.csv` and
 `state_mean_postures.csv` beside the plots.
 
-State comparisons use Leiden resolutions 0.4, 0.8, 1.2, and 1.6. Prefer the finest
-partition with seed ARI >=0.8, ant-removal ARI >=0.65, at least five ants per state,
-and minimum dictionary fraction 0.002. Stars flag individual states with matched
-Jaccard below 0.5. If none passes, report the most reproducible option as
-unsupported. These checks condition on the full-cohort PCA/scaling and constitute
-perturbation stability, not independent held-out biological validation.
+The original feature screen compared Leiden resolutions 0.4, 0.8, 1.2, and 1.6,
+selecting the finest partition passing seed ARI >=0.8, ant-removal ARI >=0.65,
+at least five ants per state and minimum dictionary fraction 0.002. This used
+only one alternative partition seed and one ant-removal fit. The expanded audit
+below supersedes that limited evidence: eight is now a **provisional reference**.
+Stars use median matched-state Jaccard below 0.5 across five ant removals.
+These checks hold full-cohort PCA/scaling fixed and measure perturbation
+stability, not independent held-out biological validation.
 
-Ant comparisons allow K=2–8, plus variable-K graph/density methods. Prefer the
-finest partition with at least three ants per class, no unassigned ants, median
+Ant comparisons allow K=2–8, plus variable-K graph/density methods. Candidates
+must have at least three ants per class, no unassigned ants, median
 ant-removal ARI >=0.8 and weakest-class Jaccard >=0.6, and median temporal ARI
 >=0.65 and weakest-class Jaccard >=0.6. Use 30 ant-removal repetitions and
-alternating 1-, 3-, 6-, and 24-hour blocks. Hours are validation blocks only;
+alternating 1-, 3-, 6-, and 24-hour blocks. Among passing candidates, maximize
+the minimum of the 10th-percentile ant-removal ARI/Jaccard and the worst temporal
+ARI/Jaccard across the four split widths. Ties prefer fewer classes, then higher
+silhouette. This replaces the previous finest-passing rule and prevents a median
+from hiding failure at a particular timescale. Hours are validation blocks only;
 class fitting always pools observations directly. Fall back to one class if
 none passes. A reproducible partition is not proof of discrete biological castes.
 
@@ -293,59 +301,102 @@ arrays. Rebuild that summary after changing assignments or features. Earlier
 sampled-clip scripts have been removed; their committed versions remain in Git
 history. Their state numbers are not interchangeable with this dictionary.
 
-## Full-recording state result
+## Current state and ant-class reduction audit
 
-The new fit selects eight states at Leiden resolution 0.4 in 11 dimensions:
-four full-body posture PCs (89.79% of posture variance), five motion measurements,
-and mean/peak concurrent contacts. Repeat-fit ARI is 0.813; ant-removal ARI is
-0.753, with minimum matched-state Jaccard 0.559. Each state occurs in at least
-64 dictionary ants. Expanded representations and finer resolutions produced
-9–24 states, but none passed all stability checks. This supports a compact
-vocabulary at the tested scale, not a claim that ants perform only eight actions.
+The reference dictionary has eight states at Leiden resolution 0.4 in 11
+dimensions: four full-body posture PCs (89.79% of posture variance), five motion
+measurements, and mean/peak concurrent contacts. Expanded representations and
+finer resolutions in the original screen produced 9–24 states but failed its
+checks. The original single-repeat seed/ant-removal ARIs were 0.813/0.753.
 
-S0 and S1 are low-motion candidates. Their median body motion is about
-0.012 mm/s and median antennal motion about 0.084 and 0.090 mm/s, respectively.
-Only S0 enters the current putative-sleep plots and contact-response analysis;
-both remain separate states in the ant-proportion analysis. S1 is not merged
-into sleep. Ant classes and state assignments are unchanged by this interpretation.
-They are quiet-enriched rather than pure immobility states: 62.6% and 57.5% of
-their dictionary windows jointly satisfy the displayed motion limits. State
-membership is the downstream label, without adding another motion threshold.
-Missing observations censor quiet runs, so observed run lengths can substantially
-underestimate uninterrupted quietness. Do not interpret
-those missing-data boundaries as awakenings or claim physiological sleep validation.
+The stronger audit uses **three new seeds, excluding the reference seed**, and
+five separate removals of 20% of the ants. Median reference ARIs fall to
+**0.726 / 0.706**. State S3 has median held-out matched Jaccard zero; S6 has
+0.426. These uncertain fine states are marked with asterisks in the report.
+Retaining the dictionary does not validate eight distinct biological actions.
 
-The ant comparison selects four classes (10, 14, 8, and 12 ants). K-means and
-Leiden at resolution 1 recover identical full-data assignments. K-means median
-ant-removal ARI is 1.00; temporal ARI is 0.692 and weakest-class temporal Jaccard
-0.727. The three-class solution is more consistent across time (ARI 0.935).
-Four is the finest partition passing the stated rule, not an unequivocal count
-of biological roles. Against the frozen two-group spatial reference, C0/C1 are
-entirely in group 0, C3 entirely in group 1, and C2 contains two group-0 and six
-group-1 ants. Thus 42/44 match their behavioral class's predominant spatial group;
-this is a post hoc description, not held-out prediction accuracy.
-The most temporally stable passing two-class fit (diagonal-covariance GMM)
-contains 24 versus 20 ants and matches 42/44 frozen spatial labels after mapping
-group identities. Its median temporal and ant-removal ARIs are both 1.00. The
-report shows this broad grouping beside the selected four-class solution. The
-tied-covariance two-class GMM matches all 44 spatial labels, but has slightly
-lower temporal stability (ARI 0.955). The broad fit is chosen by behavioral
-stability; spatial agreement does not select it or change the four downstream
-classes. All these spatial comparisons remain descriptive.
+We allowed every state, including S0, to merge. Ward hierarchies either weight
+each original state equally or weight it by its observation count in the
+ant-balanced dictionary. Each stability repeat refits Leiden before merging,
+then tests withheld ants by fine-state nearest-neighbor voting followed by the
+merge. Fixed-dictionary relabeling alone would overstate stability.
 
-## Current display and trip results
+The conservative selection rule requires >=90% of the original between-state
+feature variation, seed ARI >=0.8, ant-removal ARI >=0.65, and no decrease from
+the reference median seed/ant-removal ARI or weakest-state Jaccard. Sensitivity
+at 85% and 95% retained variation gives the same decision: **no supported
+reduction**. For example, equal-state six-way merging combines S0/S1 and S4/S5,
+retains 91.6% of the variation, but has seed ARI 0.653 versus 0.726 for the
+reference. Observation-weighted six-way merging retains 94.5%, with seed/ant
+ARIs 0.724/0.696, also without improvement. Direct lower-resolution Leiden
+(0.01–0.4) gives stable coarse alternatives, but these mainly distinguish
+contact intensity and discard substantial quiet/movement differences. This
+screen uses two alternative seeds and has no separate ant-removal validation.
 
-The UMAP comparison selects 8 neighbors and min_dist 0.5 by neighborhood
-preservation (median trustworthiness 0.966; five-neighbor overlap 72.7% across
-three seeds). All nine parameter settings show the same four fitted classes.
-This display choice does not select the class partition.
+S0 and S1 remain separate low-motion candidates. Their median body motion is
+about 0.012 mm/s and median antennal motion about 0.084/0.090 mm/s. **S0 alone
+remains the putative sleep state**, so its existing motion calibration remains
+valid. This is an outcome of the merge audit, not a constraint that protected S0.
+Missing observations censor quiet runs; physiological sleep requires more than
+low motion alone.
 
-The grid-occupancy trip rules identify 5,923 completed trips across the 44 ants.
-Equal-ant means for C0/C1/C2/C3 are 16.2/17.2/68.2/162.1 completed returns per
-recording day, and 34.5/31.0/382.5/679.2 minutes on completed trips per day.
-The precise response-event rules retain 1,827 returns. These counts differ
-because the trip-investment rules allow longer position gaps and less observed
-support. They are separately named and should not be interchanged.
+For ant classes, the new rule selects a **tied-covariance two-component GMM**
+on all eight square-root state proportions: **C0 = 26 ants, C1 = 18 ants**.
+Median ant-removal ARI is 1.00; its 10th percentile is 0.886. Median temporal ARI
+is 0.955 and its worst value across the four split widths is 0.909. The primary
+weakest-perturbation scores for the best two-, three-, and four-class candidates
+are **0.886, 0.800, and 0.575**, respectively. Comparing state counts 2–8 under
+both merge hierarchies also favors two ant classes across detailed vocabularies.
+
+Every former C0 ant (10) and C1 ant (14) enters the new C0, together with two
+former C2 ants. The other six former C2 ants and all twelve former C3 ants enter
+new C1. This is a new behavioral fit, not a manual forced merge. The prior
+four-class labels are retained in the audit for this comparison only. Spatial
+labels are examined after fixing this result and never select a candidate.
+The two behavioral classes match the frozen two-group spatial reference for all
+44 ants (ARI 1.00). This agreement describes this recording; it is not an
+independent experiment or held-out prediction test.
+
+`state_class_reduction_summary.pdf` collects the state-count audit, weak-state
+support, ant-class selection, old/new class mapping, sensitivity to state count,
+and post hoc spatial comparison. The full report carries the two classes
+through sleep, speed, trip and contact analyses.
+
+To reproduce the audit on an existing packet (save old classes before refitting):
+
+```bash
+AUDIT="$RUN/reduction_20261011"
+mkdir -p "$AUDIT"
+cp "$RUN/roles/ant_classes.csv" "$AUDIT/original_ant_classes.csv"
+python -m analysis.full_behavior_states resolutions --root "$RUN" --output "$AUDIT"
+python -m analysis.full_behavior_states reduce --root "$RUN" --output "$AUDIT" --merge-weighting state
+python -m analysis.full_behavior_states reduce --root "$RUN" --output "$AUDIT/weighted" --merge-weighting observation
+python -m analysis.full_behavior_roles --root "$RUN" --compare-reductions "$AUDIT" --merge-weighting state
+python -m analysis.full_behavior_roles --root "$RUN" --compare-reductions "$AUDIT/weighted" --merge-weighting observation
+python -m analysis.full_behavior_roles --root "$RUN"
+ANTS_REDUCTION_AUDIT="$AUDIT" ANTS_DATASET_ROOT="$BLOCK" \
+  python -m analysis.eigenposture_task_report --source "$RUN" --output "$RUN/report"
+```
+
+`ANTS_ROLE_MODELS` can point to a separate rebuilt `roles` directory while
+reviewing results before replacing a packet. The state audit saves exact mappings,
+repeat-level agreement, per-state Jaccards and retention-threshold sensitivity.
+The ant audit saves every candidate and perturbation result. No state dictionary,
+assignment or S0 motion label was altered by this class-only update.
+
+## Display and trip results
+
+The UMAP view is selected by neighborhood preservation, independently of class
+labels. All nine settings show the same two fitted classes; apparent separation
+does not determine their membership. The recording contains 5,923 completed
+trips across the 44 ants and 1,827 precise response returns. These differ because
+the trip-investment rules allow longer position gaps and less observed support.
+Current per-class values are saved in `class_trip_investment.csv`. C0/C1 average
+18.6/133.7 completed returns per recording day and 36.8/612.9 minutes on completed
+trips per day. Their mean trajectory speeds are 0.193/0.639 mm/s; direct S0
+occupancy averages 29.8%/16.2% of classified observations. These summaries give
+each ant equal weight. S0 occupancy is distinct from the motion-defined sleep
+time course used alongside return analysis.
 
 ## Historical diagnosis: why state-only return-contact plots became sparse
 
@@ -387,7 +438,8 @@ S0 membership remains unchanged for state and ant classification.
 
 `contact_label_history_totals.csv`, `contact_label_history_audit.csv`, and
 `contact_label_coverage_comparison.csv` retain the historical comparison in the
-published dataset. Source metadata is recorded in `contact_label_audit_inputs.json`.
+published dataset. Source metadata is recorded in `contact_label_audit_inputs.json` in
+`reduction_20261011/historical_return_labels/`.
 The standalone historical-label diagnostic has been removed; its committed
 version remains in Git history. The supported report uses the current S0 and
 S0-calibrated motion definitions described above.

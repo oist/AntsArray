@@ -27,7 +27,7 @@ from analysis import return_sleep_utils as rs
 from analysis import trip_phenotyping_utils as trip_go
 from analysis.full_behavior_extract import SEED,HZ,FPS
 from analysis.full_behavior_states import NAMES,encode
-from analysis.full_behavior_roles import fit_labels,compare_ant_umaps
+from analysis.full_behavior_roles import fit_labels,compare_ant_umaps,select_model
 from analysis.full_behavior_sleep import build as build_state_sleep,select_quiet_states,contact_history_audit
 from analysis.full_behavior_profiles import build as build_state_means
 from analysis.behavior_report_figures import overview,label_figure
@@ -37,6 +37,8 @@ from matplotlib.colors import ListedColormap
 BLOCK=Path(os.environ.get('ANTS_DATASET_ROOT','/home/sam-reiter/bucket/ReiterU/Ants/basler/20260724/block01'))
 SOURCE=Path(os.environ.get('ANTS_BEHAVIOR_SOURCE',str(BLOCK/'analysis_outputs/full_body_behavior_20261011')))
 OUTPUT=Path(os.environ.get('ANTS_ROLE_OUTPUT',str(SOURCE/'report')))
+ROLE_MODELS=Path(os.environ.get('ANTS_ROLE_MODELS',str(SOURCE/'roles')))
+REDUCTION=Path(os.environ.get('ANTS_REDUCTION_AUDIT',str(SOURCE/'reduction_20261011')))
 LIGHT_ON,LIGHT_OFF=5.5,19.5
 # Explicit POST HOC interpretation: S0 alone is putative sleep. S1 stays a
 # separate non-sleep state. None opts into motion-profile candidates instead.
@@ -63,7 +65,8 @@ cohort=inventory[inventory.selected].reset_index(drop=True)
 assert (cohort.detection_fraction>.6).all()
 ants=cohort[cohort.side.eq('right')].reset_index(drop=True)
 print('State cohort:',cohort.groupby('side').size().to_dict(),'right ant classes:',len(ants),flush=True)
-overview();show('00_workflow')
+overview(n_states=json.loads((SOURCE/'models/selection.json').read_text())['n_states'],
+         n_classes=json.loads((ROLE_MODELS/'selection.json').read_text())['k']);show('00_workflow')
 
 # %% 2. PCA of all ten landmarks after body alignment, throughout the recording
 # Tag at origin, petiole->tag is anterior. Divide by each ant's median body-axis
@@ -99,6 +102,11 @@ normalizer=json.loads((SOURCE/'models'/(selection['representation']+'_normalizer
 np.testing.assert_allclose(encode(dictionary['raw'],normalizer),dictionary['x'],atol=2e-6)
 state_stability=pd.read_csv(SOURCE/'models'/f"{selection['representation']}_{selection['resolution']:g}_state_stability.csv")
 jaccard=state_stability.matched_jaccard.to_numpy()[dictionary['order']]
+state_audit=None
+if (REDUCTION/'state_repeat_jaccards.csv').exists():
+    state_audit=pd.read_csv(REDUCTION/'state_repeat_jaccards.csv')
+    subset=state_audit[state_audit.kind.eq('ant_removal')&state_audit.n_states.eq(n_states)]
+    jaccard=subset.groupby('state').jaccard.median().reindex(np.arange(n_states)).to_numpy()
 state_names=[f'S{s}'+('*' if jaccard[s]<.5 else '') for s in range(n_states)]
 colors=plt.get_cmap('tab20')(np.arange(n_states)) if n_states<=20 else plt.get_cmap('turbo')(np.linspace(0,1,n_states))
 fig,axes=plt.subplots(1,2,figsize=(13,4),layout='constrained')
@@ -111,8 +119,35 @@ for ax,metric,threshold in zip(axes,['seed_ari','ant_removal_ari'],[.8,.65]):
     ax.axhline(threshold,color='.5',ls=':')
     ax.scatter(n_states,selection[metric],marker='*',s=170,color='black',zorder=5)
     ax.set(xlabel='Number of states',ylabel=metric.replace('_',' '))
-axes[0].legend();fig.suptitle(f"2. Selected {selection['representation']}: {n_states} states; circles pass all checks")
+axes[0].legend();fig.suptitle(f"2. Original feature screen: {selection['representation']}, {n_states} reference states")
 show('02_feature_expansion')
+# Fewer states are an explicit audit, not a forced simplification. Refit Leiden
+# before merging each repeat; fixed-state relabeling alone cannot test stability.
+if state_audit is not None:
+    fig,axes=plt.subplots(1,3,figsize=(15,4.5),layout='constrained')
+    for folder,label in [(REDUCTION,'Equal-state merges'),(REDUCTION/'weighted','Observation-weighted merges')]:
+        table=pd.read_csv(folder/'state_reduction_search.csv')
+        for ax,column in zip(axes,['retained_between_state_variance','seed_ari','ant_removal_ari']):
+            ax.plot(table.n_states,table[column],'o-',label=label)
+    if (REDUCTION/'resolution_search.csv').exists():
+        lower=pd.read_csv(REDUCTION/'resolution_search.csv')
+        for ax,column in zip(axes[:2],['retained_between_state_variance','seed_ari']):
+            ax.scatter(lower.n_states,lower[column],marker='x',s=50,color='.4',label='Lower-resolution Leiden')
+    for ax,ylabel in zip(axes,['Retained between-state feature variation','Repeat-seed ARI','Held-out-ant ARI']):
+        ax.set(xlabel='Number of states',ylabel=ylabel,ylim=(0,1.03),xticks=np.arange(2,n_states+1))
+    axes[0].axhline(.9,color='.5',ls=':');axes[1].axhline(.8,color='.5',ls=':');axes[2].axhline(.65,color='.5',ls=':')
+    axes[0].legend(fontsize=7)
+    fig.suptitle('State count: refit stability versus retained feature variation')
+    show('02_state_reduction')
+    fig,ax=plt.subplots(figsize=(10,4),layout='constrained')
+    for state,group in subset.groupby('state'):
+        ax.scatter(np.full(len(group),state)+np.linspace(-.12,.12,len(group)),group.jaccard,
+                   color=colors[state],alpha=.7,s=22)
+        ax.plot([state-.22,state+.22],[group.jaccard.median()]*2,color='black',lw=2)
+    ax.axhline(.5,color='.5',ls=':')
+    ax.set(xticks=np.arange(n_states),xticklabels=state_names,ylim=(-.03,1.03),ylabel='Matched-state Jaccard',
+           title='Eight-state reference: some states fail to recur when ants are withheld')
+    show('02_state_repeat_support')
 # Only display parameters change below. Apparent island separation is not
 # evidence for extra states. All panels show exactly the same state labels.
 rng=np.random.default_rng(SEED);sample=np.sort(rng.choice(len(dictionary['x']),min(12000,len(dictionary['x'])),replace=False))
@@ -217,30 +252,72 @@ proportions=counts/counts.sum(axis=1,keepdims=True)
 np.testing.assert_allclose(proportions.sum(axis=1),1)
 role_x=np.sqrt(proportions)  # Hellinger geometry; ALL state dimensions, no PCA.
 
-# %% 5. Compare ant clustering methods, allowing finer roles when reproducible
-# K-means, Ward, tied/diagonal GMM, Leiden, and HDBSCAN; K up to 8. Selection is
-# the finest stable partition with >=3 ants/class. Ant-removal and time-split
-# checks include the least reproducible class (Jaccard), so two stable big groups
-# cannot conceal an unstable tiny group. Hour bins are ONLY validation blocks.
-role_search=pd.read_csv(SOURCE/'roles/method_comparison.csv')
-role_choice=json.loads((SOURCE/'roles/selection.json').read_text())
+# %% 5. Prefer reproducible ant classes over the finest passing partition
+# All state proportions enter clustering. Require the existing minimum size and
+# stability checks, then maximize the WORST tested agreement: ant-removal lower
+# tails and weakest time split (1/3/6/24 h). Smaller K breaks ties. Hour bins are
+# only validation blocks, never the features defining an ant's class.
+role_search=pd.read_csv(ROLE_MODELS/'method_comparison.csv')
+role_choice=json.loads((ROLE_MODELS/'selection.json').read_text())
 k_roles=int(role_choice['k'])
 labels=(np.zeros(len(ants),int) if k_roles==1 else fit_labels(role_x,role_choice['method'],role_choice['parameter']))
 original=np.unique(labels)
 order=np.argsort([np.mean(proportions[labels==s]@np.arange(n_states)) for s in original])
 remap={int(original[i]):rank for rank,i in enumerate(order)}
 ants['ant_class']=[remap[int(s)] for s in labels]
-reference_roles=pd.read_csv(SOURCE/'roles/ant_classes.csv')
+reference_roles=pd.read_csv(ROLE_MODELS/'ant_classes.csv')
 np.testing.assert_array_equal(ants.ant,reference_roles.ant)
 np.testing.assert_array_equal(ants.ant_class,reference_roles.ant_class)
-fig,axes=plt.subplots(1,2,figsize=(13,4),layout='constrained')
-for method,group in role_search.groupby('method'):
-    axes[0].scatter(group.k,group.ant_removal_ari,label=method)
-    axes[1].scatter(group.k,group.temporal_smallest_jaccard,label=method)
-axes[0].axhline(.8,color='.5',ls=':');axes[1].axhline(.6,color='.5',ls=':')
-axes[0].set(xlabel='Ant classes',ylabel='Ant-removal ARI');axes[1].set(xlabel='Ant classes',ylabel='Weakest-class temporal Jaccard')
-axes[0].legend(fontsize=8);fig.suptitle(f"5. Selected {role_choice['model']}: K={k_roles}")
+fig,axes=plt.subplots(1,2,figsize=(13,4.5),layout='constrained')
+if 'stability_score' in role_search:
+    best=role_search.sort_values('stability_score',ascending=False).drop_duplicates('k').sort_values('k')
+    axes[0].plot(best.k,best.stability_score,'o-',color='black')
+    axes[0].scatter(k_roles,role_choice.get('stability_score',0),marker='*',s=180,color='#d87b16',zorder=5)
+    axes[0].set(xlabel='Ant classes',ylabel='Weakest tested agreement',xticks=best.k,ylim=(-.02,1.02))
+    for row in best.itertuples():
+        if row.k<=4:axes[0].annotate(row.model,(row.k,row.stability_score),xytext=(3,7),textcoords='offset points',fontsize=8)
+    validation=pd.read_csv(ROLE_MODELS/'validation_repeats.csv')
+    for k in (2,3,4):
+        options=best[best.k.eq(k)]
+        if options.empty:continue
+        model=options.iloc[0].model
+        test=validation[validation.model.eq(model)&validation.kind.eq('temporal')]
+        axes[1].plot(test.width_hours,test.ari,'o-',label=f'K={k}: {model}')
+    axes[1].set(xlabel='Alternating time-block width (h)',ylabel='Time-split ARI',xticks=[1,3,6,24],ylim=(-.02,1.02))
+    axes[1].legend(fontsize=8)
+else:
+    for method,group in role_search.groupby('method'):
+        axes[0].scatter(group.k,group.ant_removal_ari,label=method)
+        axes[1].scatter(group.k,group.temporal_smallest_jaccard,label=method)
+    axes[0].set(xlabel='Ant classes',ylabel='Ant-removal ARI');axes[1].set(xlabel='Ant classes',ylabel='Weakest-class temporal Jaccard')
+fig.suptitle(f"Selected {role_choice['model']}: K={k_roles}")
 show('05_ant_methods')
+
+if (REDUCTION/'original_ant_classes.csv').exists():
+    previous=pd.read_csv(REDUCTION/'original_ant_classes.csv')[['ant','ant_class']].rename(columns={'ant_class':'previous_class'})
+    transition=ants[['ant','ant_class']].merge(previous,on='ant',validate='one_to_one')
+    overlap=pd.crosstab(transition.previous_class,transition.ant_class)
+    transition.to_csv(OUTPUT/'previous_to_current_ant_classes.csv',index=False)
+    fig,ax=plt.subplots(figsize=(7,4.5),layout='constrained')
+    image=ax.imshow(overlap.div(overlap.sum(axis=1),axis=0),vmin=0,vmax=1,cmap='Blues',aspect='auto')
+    for i in range(len(overlap)):
+        for j in range(len(overlap.columns)):ax.text(j,i,str(overlap.iloc[i,j]),ha='center',va='center',color='red',fontsize=13)
+    ax.set(xticks=np.arange(len(overlap.columns)),xticklabels=[f'Current C{c}' for c in overlap.columns],
+           yticks=np.arange(len(overlap)),yticklabels=[f'Previous C{c}' for c in overlap.index],
+           title='Where the former four ant classes go; numbers are ants')
+    fig.colorbar(image,ax=ax,label='Fraction of previous class');show('05_class_reduction')
+
+if (REDUCTION/'role_reduction_search.csv').exists():
+    fig,axes=plt.subplots(1,2,figsize=(12,4.5),layout='constrained')
+    for ax,(folder,title) in zip(axes,[(REDUCTION,'Equal-state merges'),(REDUCTION/'weighted','Observation-weighted merges')]):
+        table=pd.read_csv(folder/'role_reduction_search.csv')
+        for k,group in table.groupby('k'):
+            best=group.sort_values('stability_score',ascending=False).drop_duplicates('n_states').sort_values('n_states')
+            ax.plot(best.n_states,best.stability_score,'o-',label=f'{k} ant classes')
+        ax.set(title=title,xlabel='Behavioral states used for ant proportions',ylabel='Weakest tested agreement',ylim=(-.02,1.02))
+        ax.legend(fontsize=8)
+    fig.suptitle('Ant-class stability across behavioral state counts')
+    show('05_class_state_sensitivity')
 
 # %% 6. Inspect the ant classes, and the coverage available to each ant
 class_colors=plt.get_cmap('tab10')(np.arange(k_roles))
@@ -364,12 +441,12 @@ overlap.to_csv(OUTPUT/'class_spatial_counts.csv')
 overlaps=[(f'Selected {k_roles} classes',overlap,'C')]
 # Also describe the broad two-way fit. Select it by temporal/ant stability,
 # using the SAME behavior-only ordering as above, never by spatial agreement.
-coarse=role_search[(role_search.k==2)&role_search.qualifies].sort_values(
-    ['temporal_ari','ant_removal_ari'],ascending=False)
+coarse=role_search[(role_search.k==2)&role_search.qualifies]
 coarse_choice=None;coarse_spatial_ari=None
-if len(coarse):
-    coarse_choice=coarse.iloc[0].to_dict()
-    with np.load(SOURCE/'roles/candidate_labels.npz') as z:broad_labels=z[coarse_choice['model']]
+if len(coarse) and k_roles>2:
+    coarse_choice=(select_model(coarse) if 'stability_score' in coarse else coarse.sort_values(
+        ['temporal_ari','ant_removal_ari'],ascending=False).iloc[0].to_dict())
+    with np.load(ROLE_MODELS/'candidate_labels.npz') as z:broad_labels=z[coarse_choice['model']]
     broad=comparison.assign(broad_ant_class=broad_labels)
     broad.to_csv(OUTPUT/'broad_class_spatial_comparison.csv',index=False)
     coarse_spatial_ari=adjusted_rand_score(broad_labels[observed.index],observed.spatial_cluster)
@@ -647,6 +724,8 @@ show("07_return_response")
     broad_ant_model=coarse_choice, broad_spatial_ari=coarse_spatial_ari,
     ant_umap_view=selected_view, n_completed_trips=len(completed_trips),
     state_model=selection, ant_model=role_choice, quiet_states=quiet_states.tolist(),
+    state_reduction=(json.loads((REDUCTION/'state_reduction_selection.json').read_text())
+                     if (REDUCTION/'state_reduction_selection.json').exists() else None),
     minimum_sleep_seconds=MIN_SLEEP_SECONDS, sleep_source="discovered state membership; no cached sleep labels",
     return_sleep_source=str(MOTION_SLEEP),return_sleep_definition=motion_definition,
     n_matched_return_contacts=len(exposed),n_matched_recipients=exposed.track_id.nunique(),

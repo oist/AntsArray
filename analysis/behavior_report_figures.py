@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import FancyBboxPatch, FancyArrowPatch
 
 
-def overview():
+def overview(n_states=8,n_classes=2):
     fig,ax=plt.subplots(figsize=(15,7));ax.set(xlim=(0,1),ylim=(0,1));ax.axis('off')
     def box(x,y,w,h,title,body,color):
         ax.add_patch(FancyBboxPatch((x,y),w,h,boxstyle='round,pad=0.009',fc=color,ec='#34495e',lw=1.2))
@@ -14,8 +14,8 @@ def overview():
     def arrow(a,b):ax.add_patch(FancyArrowPatch(a,b,arrowstyle='-|>',mutation_scale=17,lw=1.5,color='#34495e'))
     box(.015,.61,.215,.29,'TRACKING','ArUco identity + SLEAP\nBody and antenna landmarks\nPosition and exact contacts','#edf2f7')
     box(.265,.61,.215,.29,'STATE DEFINITION','Both colonies; >60% detected\nBody-aligned posture PCs\nUnsigned motion + contacts\nShort windows; Leiden','#e4f3ed')
-    box(.515,.61,.215,.29,'BEHAVIORAL STATES','S0  ·  S1  ·  S2  ·  S3\nS4  ·  S5  ·  S6  ·  S7\nS0 = putative sleep state','#fff0d7')
-    box(.765,.61,.215,.29,'ANT CLASSES','Right colony\nEach ant’s state proportions\nAll eight dimensions\nFour reproducible classes','#e9e5f6')
+    box(.515,.61,.215,.29,'BEHAVIORAL STATES',f'{n_states}-state reference dictionary\nCheck fewer states and refits\nFlag weak states\nS0 = putative sleep state','#fff0d7')
+    box(.765,.61,.215,.29,'ANT CLASSES',f'Right colony\nEach ant’s state proportions\nAll {n_states} dimensions\n{n_classes} classes; prioritize stability','#e9e5f6')
     for x in [.23,.48,.73]:arrow((x,.75),(x+.034,.75))
     box(.015,.13,.285,.29,'S0 → MOTION ENVELOPE','Body + antenna speeds during S0\nEqual-ant 95th percentiles\nFresh trailing-window motion labels','#fff0d7')
     box(.355,.13,.285,.29,'SLEEP AND RETURNS','S0 occupancy and quiet runs\nMotion-defined sleep over time\nReturn-contact responses by class','#e5f1fa')
@@ -34,7 +34,7 @@ NOTES={
 '00_workflow':('Analysis overview',
     'Identity tracking links each ant across time, while SLEAP provides body and antennal landmarks. '
     'Both colonies contribute posture, motion and exact contact features to the behavioral-state model. '
-    'S0 is interpreted as the putative sleep state. Right-colony ants are grouped by their proportions of all eight states; '
+    'S0 is interpreted as the putative sleep state. Right-colony ants are grouped by their proportions of all reference states; '
     'spatial occupancy is examined only afterward. A separate branch calibrates a motion envelope from S0 and applies it '
     'to every track, retaining partial-pose observations for return-contact analyses. This broader motion label is not identical to S0 membership.'),
 '01_full_body_pca':('Full-body posture coordinates',
@@ -42,11 +42,23 @@ NOTES={
     'The left panel shows cumulative explained variance; the right shows coordinate loadings for the first eight modes. '
     'Four PCs retain about 89.8% of the measured posture variance. The fit includes both colonies and excludes invalid full-body observations. '
     'This describes joint articulation without selecting antenna straightness as a starting feature.'),
-'02_feature_expansion':('Choosing a reproducible behavioral vocabulary',
+'02_feature_expansion':('Original feature and state-resolution audit',
     'Each point is a feature representation and Leiden resolution. Seed agreement and agreement after removing ants measure reproducibility; '
-    'outlined points pass all stated size and stability requirements. The selected eight-state solution uses four posture PCs, five motion features '
+    'outlined points passed the original single-perturbation size and stability requirements. The reference eight-state solution uses four posture PCs, five motion features '
     'and two concurrent-contact features. More features or higher resolution produced finer partitions that failed one or more checks. '
-    'Eight is the supported resolution under these tests, not an assertion that ants perform only eight actions.'),
+    'The expanded repeat audit in the next figures weakens the evidence for eight reproducible states. The dictionary is retained as a provisional reference, '
+    'not a validated count of biological behaviors.'),
+'02_state_reduction':('Testing smaller state vocabularies',
+    'Curves test Ward merges of the existing state centroids, either weighting each state equally or using its observation count in the ant-balanced dictionary. '
+    'The first panel measures the original between-state feature variation retained by a merge. The other panels show median repeat-seed and held-out-ant ARI. '
+    'Each repeat refits Leiden before merging: three new seeds and five independently chosen 20% ant removals, with the PCA and feature scaling held fixed. '
+    'Crosses show lower-resolution Leiden fits with two alternate seeds; these have no held-out-ant values in this figure. '
+    'The 90% fidelity requirement is an explicit conservative choice; 85% and 95% sensitivity is recorded in the audit. No faithful reduction passed the stability checks. '
+    'Very coarse stable solutions mainly separate contact from noncontact and pool quiet with moving observations.'),
+'02_state_repeat_support':('Which reference states survive refitting?',
+    'Each point is one of five fits omitting 20% of the dictionary ants, evaluated on the withheld ants. Bars mark median matched-state Jaccard. '
+    'An unmatched reference state receives zero. Asterisks mark medians below 0.5. These tests expose weak states that the original one-repeat audit missed. '
+    'The reference labels remain useful coordinates for ant proportions, but uncertain fine states should not be treated as independently validated biological categories.'),
 '03_state_umaps':('Views of the same eight states',
     'Dots are sampled short behavioral windows, colored by their fixed Leiden state. Each panel changes only UMAP display settings. '
     'Leiden was fitted in the balanced feature space, not in these two-dimensional coordinates. Gaps and camera changes delimit windows. '
@@ -65,18 +77,26 @@ NOTES={
     'sleep interpretation. Dotted reference limits are descriptive and were not used to learn the states. S1 is also quiet but remains a separate '
     'behavioral state. Low motion supports a putative sleep interpretation; state membership alone does not establish physiological sleep.'),
 '05_ant_methods':('Selecting ant classes from state proportions',
-    'Each ant is represented by square roots of its eight pooled state proportions, retaining every state dimension. Clustering methods and '
-    'class counts are compared using ant-removal and temporal stability. Four classes are the finest partition passing the specified criteria, '
-    'including a minimum class size and stability of the smallest class. A three-class partition is more temporally stable; the four-class result '
-    'should be read as a supported refinement rather than a unique biological taxonomy.'),
+    'Each ant is represented by square roots of its pooled state proportions, retaining every state dimension. The primary score is the minimum of '
+    'ant-removal ARI and weakest-class Jaccard 10th percentiles, and the worst temporal ARI and Jaccard across alternating 1, 3, 6, and 24 hour blocks. '
+    'This prevents a median across timescales from hiding a failed long-block comparison. The left panel shows the best score per class count; '
+    'the right exposes the individual time-split ARIs for the best two-, three-, and four-class candidates. The most stable passing model is selected, '
+    'with fewer classes breaking ties. Spatial information never enters this choice.'),
+'05_class_reduction':('How the previous classes map to the current grouping',
+    'Rows are the previous four behavioral classes and columns are the newly selected classes. Numbers are ants; color is the fraction within each previous class. '
+    'The current grouping is independently fitted from behavioral state proportions. C0 and C1 were not manually forced together; their shared assignment is an outcome of the simpler fit.'),
+'05_class_state_sensitivity':('Does changing the state vocabulary change support for ant classes?',
+    'For each tested state count and merge method, the curves show the highest weakest-perturbation score among K-means, Ward, and tied/diagonal Gaussian mixtures '
+    'at each ant-class count. All methods use full state proportions, without spatial inputs or a final one-dimensional projection. '
+    'Two classes are the more reproducible summary across the detailed state vocabularies. Stable ant grouping does not by itself validate every constituent behavioral state.'),
 '06_state_to_ant_classes':('From states to ant behavioral classes',
     'Each UMAP point is one ant, labeled by identity and colored by the fixed behavioral class. The heatmap gives the equal-ant mean state '
-    'proportions within each class. The four classes contain 10, 14, 8 and 12 ants. Clustering used all eight square-root proportion dimensions; '
+    'proportions within each class. Class sizes are printed in the figure. Clustering used every square-root proportion dimension; '
     'UMAP is a display only. Class differences in S0 occupancy are partly inherent in this construction, rather than independent validation.'),
 '06_ant_umap_comparison':('Sensitivity of the ant-class display',
     'Nine neighborhood/minimum-distance settings display the same ant classes. Three random seeds were tested for each setting; panels show '
-    'one fixed seed and report median trustworthiness and five-neighbor overlap. The selected setting, eight neighbors and minimum distance '
-    '0.5, best preserves neighborhoods under this rule. Neither the class labels nor spatial groups enter the display-selection criterion. '
+    'one fixed seed and report median trustworthiness and five-neighbor overlap. The marked setting best preserves neighborhoods under this rule. '
+    'Neither the class labels nor spatial groups enter the display-selection criterion. '
     'Embedding appearance does not change ant membership or select the number of classes.'),
 '06_ant_classes':('Individual state proportions and observed coverage',
     'Rows are right-colony ants ordered by behavioral class and identity. The heatmap gives the fraction of each ant’s classified observations '
@@ -90,8 +110,8 @@ NOTES={
     'for downstream return responses while retaining the complete-posture requirement for state discovery.'),
 '04_occupancy':[
     ('Behavioral classes and independent spatial groups','Cells show numbers of ants and color shows row-normalized overlap with frozen spatial groups. '
-     'The selected four-class behavior partition is shown alongside the most stable passing two-class behavioral fit. Spatial labels enter only '
-     'this comparison. Fine classes can subdivide a spatial group, reducing adjusted Rand agreement while preserving its broad organization. '
+     'The selected behavioral partition is compared with the frozen spatial groups; a broader two-class fit is also shown if the selected partition has more than two classes. '
+     'Spatial labels enter only this comparison. Fine classes can subdivide a spatial group, reducing adjusted Rand agreement while preserving its broad organization. '
      'Agreement is descriptive because these comparisons use the same recording, rather than a held-out experiment.'),
     ('Spatial occupancy emerging from behavioral classes','Each map averages spatial occupancy for ants already assigned to a behavioral class. '
      'Behavioral classes were learned from state proportions without coordinates, nest occupancy or spatial group labels. The maps therefore '
@@ -173,6 +193,7 @@ def description(name,index):
 def label_figure(figure,name,index):
     title,caption=description(name,index)
     figure._report_title=title;figure._report_caption=caption
+    figure._report_section=name;figure._report_index=index
     # Sequential PDF/PNG figure numbers replace legacy section-number prefixes.
     for artist in [*(ax.title for ax in figure.axes),figure._suptitle]:
         if artist is not None:artist.set_text(re.sub(r'^\d+[a-z]?\.\s*','',artist.get_text()))

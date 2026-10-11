@@ -15,6 +15,7 @@ import numpy as np
 import pandas as pd
 from scipy import sparse
 from scipy.optimize import linear_sum_assignment
+from scipy.cluster.hierarchy import linkage, cut_tree
 from sklearn.metrics import adjusted_rand_score
 from sklearn.neighbors import NearestNeighbors
 from threadpoolctl import threadpool_limits
@@ -141,6 +142,165 @@ def matched_jaccard(a,b):
     return matches
 
 
+def merge_map(x, labels, n_states, weighting='state'):
+    """Ward merges of state centroids in the fitted, balanced feature space.
+
+    ``state`` gives each existing centroid equal mass. ``observation`` uses
+    dictionary sample counts and minimizes the increase in within-state squared
+    error at each merge. No ant classes or spatial labels enter either hierarchy.
+    """
+    labels=np.asarray(labels,int);ids=np.unique(labels)
+    if not np.array_equal(ids,np.arange(len(ids))):
+        raise ValueError('State IDs must be contiguous and nonnegative')
+    if not 1 <= n_states <= len(ids):raise ValueError('Invalid merged state count')
+    if n_states==len(ids):return ids
+    centers=np.array([x[labels==s].mean(axis=0) for s in ids],float)
+    if weighting=='state':
+        return cut_tree(linkage(centers,method='ward'),n_clusters=n_states).ravel()
+    if weighting!='observation':raise ValueError('Unknown merge weighting')
+    mass=np.bincount(labels).astype(float);mapping=ids.copy()
+    while len(mass)>n_states:
+        cost=((centers[:,None]-centers[None,:])**2).sum(axis=2)
+        cost*=mass[:,None]*mass[None,:]/(mass[:,None]+mass[None,:])
+        cost[np.tril_indices(len(mass))]=np.inf
+        a,b=np.unravel_index(cost.argmin(),cost.shape)
+        centers[a]=(centers[a]*mass[a]+centers[b]*mass[b])/(mass[a]+mass[b])
+        mass[a]+=mass[b];centers=np.delete(centers,b,axis=0);mass=np.delete(mass,b)
+        mapping[mapping==b]=a;mapping[mapping>b]-=1
+    return mapping
+
+
+def between_state_variance(x, labels):
+    """Dictionary-mass-weighted feature variation explained by state means."""
+    center=x.mean(axis=0)
+    return float(sum(np.sum(labels==s)*np.sum((x[labels==s].mean(axis=0)-center)**2)
+                     for s in np.unique(labels)))
+
+
+def resolution_scan(root, output):
+    """Check lower Leiden resolutions in the unchanged feature space.
+
+    This exploratory screen compares two new partition seeds to seed zero.
+    It does not claim held-out-ant validation of these alternative dictionaries.
+    """
+    root=Path(root);output=Path(output);output.mkdir(parents=True,exist_ok=True)
+    with np.load(root/'models/dictionary.npz') as z:
+        x,original=z['x'],z['state']
+    g=graph(x);denominator=between_state_variance(x,original)
+    rows=[];labels={}
+    for resolution in (.01,.025,.05,.075,.1,.15,.2,.25,.3,.35,.4):
+        fits=[partition(g,resolution,SEED+s) for s in range(3)]
+        row=dict(resolution=resolution,n_states=int(fits[0].max()+1),
+                 seed_ari=float(np.median([adjusted_rand_score(fits[0],v) for v in fits[1:]])),
+                 retained_between_state_variance=between_state_variance(x,fits[0])/denominator)
+        rows.append(row)
+        for repeat,fit in enumerate(fits):labels[f'r{resolution:g}_seed{repeat}']=fit
+        print('RESOLUTION',row,flush=True)
+    pd.DataFrame(rows).to_csv(output/'resolution_search.csv',index=False)
+    np.savez_compressed(output/'resolution_labels.npz',**labels)
+
+
+def reduction_scan(root, output, repeats=5, seed_repeats=3, weighting='state'):
+    """Audit exact state merges against fresh Leiden fits, then select a scale.
+
+    Refit the original Leiden model before merging each perturbation: comparing
+    a fixed dictionary with itself would exaggerate the stability of a merge.
+    Preserve >=90% of the original between-state feature variation, and require
+    seed/ant-removal stability at least as high as the original dictionary.
+    The 85%, 90%, and 95% retention sensitivity is saved rather than concealed.
+    """
+    import hashlib
+    root=Path(root);output=Path(output);output.mkdir(parents=True,exist_ok=True)
+    digest=hashlib.sha256((root/'models/dictionary.npz').read_bytes()).hexdigest()
+    signature=dict(dictionary_sha256=digest,repeats=repeats,seed_repeats=seed_repeats,weighting=weighting)
+    manifest=output/'reduction_inputs.json'
+    if manifest.exists() and json.loads(manifest.read_text())!=signature:
+        raise ValueError('Reduction output belongs to a different dictionary or repeat count')
+    manifest.write_text(json.dumps(signature,indent=2)+'\n')
+    with np.load(root/'models/dictionary.npz') as z:data=dict(z)
+    choice=json.loads((root/'models/selection.json').read_text())
+    x,original,ant=data['x'],data['state'],data['ant'];fine_k=int(original.max()+1)
+    maps={k:merge_map(x,original,k,weighting) for k in range(2,fine_k+1)}
+    references={k:m[original] for k,m in maps.items()}
+    denominator=between_state_variance(x,original)
+    records=[];state_records=[]
+    def evaluate(kind,repeat,fit_x,fitted,test,neighbors=None,distance=None):
+        fine_prediction=fitted if neighbors is None else vote(fitted,neighbors,distance)[0]
+        for k in maps:
+            # The unmerged baseline keeps the native count of the repeat fit.
+            if k==fine_k:m=np.arange(int(fitted.max()+1))
+            else:m=merge_map(fit_x,fitted,min(k,int(fitted.max()+1)),weighting)
+            prediction=m[fine_prediction];reference=references[k][test]
+            jac=matched_jaccard(reference,prediction)
+            records.append(dict(kind=kind,repeat=repeat,n_states=k,
+                native_repeat_states=int(fitted.max()+1),predicted_states=int(prediction.max()+1),
+                ari=adjusted_rand_score(reference,prediction),minimum_jaccard=float(jac.min())))
+            state_records.extend(dict(kind=kind,repeat=repeat,n_states=k,state=s,jaccard=float(v))
+                                 for s,v in enumerate(jac))
+    graph_path=output/'graph.pickle'
+    if graph_path.exists():g=ig.Graph.Read_Pickle(str(graph_path))
+    else:g=graph(x);g.write_pickle(str(graph_path))
+    # Exclude seed zero: it is the reference fit, not independent evidence.
+    for repeat in range(1,seed_repeats+1):
+        path=output/f'seed_fit_{repeat}.npz'
+        if path.exists():
+            with np.load(path) as z:fitted=z['labels']
+        else:
+            fitted=partition(g,choice['resolution'],SEED+repeat)
+            np.savez_compressed(path,labels=fitted)
+        evaluate('seed',repeat,x,fitted,np.ones(len(x),bool))
+        print('REDUCTION seed repeat',repeat,flush=True)
+    for repeat in range(repeats):
+        path=output/f'ant_removal_fit_{repeat}.npz'
+        if path.exists():
+            with np.load(path) as z:part=dict(z)
+        else:
+            rng=np.random.default_rng(SEED+100+repeat)
+            removed=rng.choice(np.unique(ant),round(.2*len(np.unique(ant))),replace=False)
+            keep=~np.isin(ant,removed)
+            small=graph(x[keep],SEED+100+repeat)
+            fitted=partition(small,choice['resolution'],SEED+repeat)
+            distance,neighbors=NearestNeighbors(n_neighbors=5,n_jobs=4).fit(x[keep]).kneighbors(x[~keep])
+            part=dict(keep=keep,labels=fitted,distance=distance,neighbors=neighbors)
+            np.savez_compressed(path,**part)
+        evaluate('ant_removal',repeat,x[part['keep']],part['labels'],~part['keep'],part['neighbors'],part['distance'])
+        print('REDUCTION ant-removal repeat',repeat,flush=True)
+    detail=pd.DataFrame(records);detail.to_csv(output/'state_repeats.csv',index=False)
+    state_detail=pd.DataFrame(state_records);state_detail.to_csv(output/'state_repeat_jaccards.csv',index=False)
+    rows=[]
+    for k,mapping in maps.items():
+        sub=detail[detail.n_states.eq(k)];seed=sub[sub.kind.eq('seed')];removed=sub[sub.kind.eq('ant_removal')]
+        rows.append(dict(n_states=k,state_mapping=json.dumps(mapping.tolist()),
+            retained_between_state_variance=between_state_variance(x,references[k])/denominator,
+            seed_ari=float(seed.ari.median()),ant_removal_ari=float(removed.ari.median()),
+            ant_removal_min_ari=float(removed.ari.min()),
+            minimum_state_jaccard=float(removed.minimum_jaccard.median()),
+            minimum_fraction=float(np.bincount(references[k]).min()/len(x))))
+    table=pd.DataFrame(rows);baseline=table[table.n_states.eq(fine_k)].iloc[0]
+    table['stable']=(table.seed_ari>=max(.8,baseline.seed_ari)-1e-9)&(
+        table.ant_removal_ari>=max(.65,baseline.ant_removal_ari)-1e-9)&(
+        table.minimum_state_jaccard>=baseline.minimum_state_jaccard-1e-9)
+    table['qualifies']=table.stable & table.retained_between_state_variance.ge(.9)
+    table.to_csv(output/'state_reduction_search.csv',index=False)
+    sensitivity=[]
+    for retention in (.85,.9,.95):
+        passed=table[table.stable & table.retained_between_state_variance.ge(retention)]
+        selected=int(passed.n_states.min()) if len(passed) else fine_k
+        sensitivity.append(dict(retention_requirement=retention,n_states=selected))
+    selected=sensitivity[1]['n_states'];result=table[table.n_states.eq(selected)].iloc[0].to_dict()
+    result['state_mapping']=maps[selected].tolist();result['original_n_states']=fine_k
+    result['parent_dictionary_sha256']=digest;result['retention_sensitivity']=sensitivity;result['merge_weighting']=weighting
+    result['supported']=bool(result['qualifies'])
+    result['decision']=('supported_reduction' if selected<fine_k else
+                        'retain_reference_no_supported_reduction')
+    result['reference_seed_ari']=float(baseline.seed_ari)
+    result['reference_ant_removal_ari']=float(baseline.ant_removal_ari)
+    result['rule']='Coarsest Ward merge retaining >=90% of between-state feature variation, with seed ARI>=.8 and ant-removal ARI>=.65 and no decrease from the original in median seed ARI, ant-removal ARI, or weakest-state Jaccard; refit Leiden before merging every repeat. No ant-class or spatial target.'
+    (output/'state_reduction_selection.json').write_text(json.dumps(result,indent=2)+'\n')
+    print('SELECTED STATE REDUCTION',json.dumps(result),flush=True)
+    return result
+
+
 def learn(root):
     ants=pd.read_csv(root/'inventory.csv');ants=ants[ants.selected].reset_index(drop=True)
     output=root/'models';output.mkdir(exist_ok=True)
@@ -224,8 +384,10 @@ def assign(root):
 
 
 def main():
-    p=argparse.ArgumentParser(description=__doc__);p.add_argument('action',choices=['features','learn','assign'])
-    p.add_argument('--root',type=Path,required=True);p.add_argument('--workers',type=int,default=4);a=p.parse_args()
+    p=argparse.ArgumentParser(description=__doc__);p.add_argument('action',choices=['features','learn','assign','reduce','resolutions'])
+    p.add_argument('--root',type=Path,required=True);p.add_argument('--workers',type=int,default=4)
+    p.add_argument('--output',type=Path,help='Separate audit directory for reduce')
+    p.add_argument('--merge-weighting',choices=['state','observation'],default='observation');a=p.parse_args()
     with threadpool_limits(limits=4):
         if a.action=='features':
             ants=pd.read_csv(a.root/'inventory.csv');ants=ants[ants.selected]
@@ -233,6 +395,8 @@ def main():
                 results=list(pool.map(make_features,[(a.root,ant) for ant in ants.ant]))
             pd.DataFrame(results).to_csv(a.root/'feature_coverage.csv',index=False)
         elif a.action=='learn':learn(a.root)
+        elif a.action=='resolutions':resolution_scan(a.root,a.output or a.root/'reduction')
+        elif a.action=='reduce':reduction_scan(a.root,a.output or a.root/'reduction',weighting=a.merge_weighting)
         else:assign(a.root)
 
 
