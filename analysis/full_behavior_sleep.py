@@ -1,7 +1,8 @@
 """Derive putative sleep exclusively from discovered state membership.
 
-No existing sleep labels are read. Quiet states are interpreted AFTER state
-clustering from their body/antenna motion profiles. Unknown intervals stay
+No existing sleep labels are read. S0 is the default putative-sleep state;
+motion-profile candidates are available for explicit sensitivity analyses.
+Unknown intervals stay
 unknown and censor bouts rather than becoming apparent awakenings.
 """
 import argparse
@@ -11,6 +12,29 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from analysis.full_behavior_extract import FPS,HZ
+
+
+def contact_history_audit(tracks,bouts,fps=FPS,prior_seconds=10):
+    """Audit sleep support before contact, without changing event eligibility.
+
+    A one-second guard is a diagnostic for short feature windows straddling
+    contact onset; it is not a replacement sleep definition or matching rule.
+    """
+    from analysis.sleep_motion_analysis_utils import interval_counts
+    rows=[];prior=round(prior_seconds*fps);guard=round(fps)
+    for row in tracks.itertuples():
+        state=np.load(row.state_path,mmap_mode='r')
+        hits=bouts[bouts.side.eq(row.side)&(bouts.ant_a.eq(row.track_id)|bouts.ant_b.eq(row.track_id))&bouts.is_new_onset]
+        frames=hits.start_frame.to_numpy(np.int64)
+        known=interval_counts(state>=0,row.frame_min,frames-prior,frames)==prior
+        immediate=interval_counts(state==1,row.frame_min,frames-prior,frames)==prior
+        earlier=interval_counts(state==1,row.frame_min,frames-prior-guard,frames-guard)==prior
+        rows.append(dict(side=row.side,track_id=row.track_id,cluster_id=row.cluster_id,
+            new_contact_onsets=len(frames),full_prior_labels=int(known.sum()),
+            prior_contains_unknown=int((~known).sum()),known_prior_contains_non_sleep=int((known&~immediate).sum()),
+            full_prior_sleep=int(immediate.sum()),guarded_prior_sleep=int(earlier.sum()),
+            guarded_only=int((earlier&~immediate).sum())))
+    return pd.DataFrame(rows)
 
 
 def quiet_bouts(state,fps=FPS):
@@ -56,11 +80,15 @@ def select_quiet_states(root,body_limit=.05,antenna_limit=.15):
     return quiet,table
 
 
-def build(root,block,quiet_states=None,minimum_seconds=0):
+def build(root,block,quiet_states=(0,),minimum_seconds=0):
     output=root/'sleep_from_states';output.mkdir(exist_ok=True)
     auto,profiles=select_quiet_states(root)
     if quiet_states is None:quiet_states=auto
-    quiet_states=list(map(int,quiet_states));profiles.to_csv(output/'state_motion_profiles.csv',index=False)
+    quiet_states=list(map(int,quiet_states))
+    if not quiet_states or not set(quiet_states).issubset(set(profiles.state)):
+        raise ValueError('Putative-sleep states must be nonempty IDs in the fitted dictionary')
+    profiles['putative_sleep']=profiles.state.isin(quiet_states)
+    profiles.to_csv(output/'state_motion_profiles.csv',index=False)
     inventory=pd.read_csv(root/'inventory.csv');summaries=[];all_bouts=[]
     # Motion aggregation options are only for downstream response measurements,
     # not a sleep classifier. Sleep membership uses the state IDs above.
@@ -117,4 +145,5 @@ def build(root,block,quiet_states=None,minimum_seconds=0):
 if __name__=='__main__':
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('--root',type=Path,required=True)
     p.add_argument('--block',type=Path,required=True);p.add_argument('--minimum-seconds',type=float,default=0)
-    a=p.parse_args();build(a.root,a.block,minimum_seconds=a.minimum_seconds)
+    p.add_argument('--quiet-states',nargs='+',type=int,default=[0],help='Putative-sleep state IDs (default: S0 only)')
+    a=p.parse_args();build(a.root,a.block,quiet_states=a.quiet_states,minimum_seconds=a.minimum_seconds)

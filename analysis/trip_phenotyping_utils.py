@@ -707,7 +707,7 @@ def compute_trip_investment_confidence(
                     "completed_trips_per_day": trips_per_day,
                     "completed_trips_per_day_ci_low": trips_per_day_low,
                     "completed_trips_per_day_ci_high": trips_per_day_high,
-                    "median_trip_minutes": float(np.median(durations)),
+                    "median_trip_minutes": float(np.median(durations)) if n_trips else np.nan,
                     "median_trip_minutes_ci_low": duration_low,
                     "median_trip_minutes_ci_high": duration_high,
                 }

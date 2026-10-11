@@ -7,11 +7,31 @@ import numpy as np
 import pandas as pd
 from analysis.full_behavior_extract import align_body, count_contacts, MM_PER_PX
 from analysis.full_behavior_states import segment_windows
-from analysis.full_behavior_sleep import sleep_from_windows, build
+from analysis.full_behavior_sleep import sleep_from_windows, build, contact_history_audit
 from analysis.full_behavior_profiles import state_sums
 
 
 class FullBehaviorTests(unittest.TestCase):
+    def test_zero_trip_ant_keeps_zero_rate_and_missing_duration(self):
+        from analysis.trip_phenotyping_utils import compute_trip_investment_confidence
+        ants=pd.DataFrame(dict(side=['right']*2,track_id=[1,2],track_name=['one','two'],frame_min=[0,0],frame_max=[86399,86399]))
+        trips=pd.DataFrame(dict(track_name=['one'],duration_minutes=[2.]))
+        result=compute_trip_investment_confidence(ants,trips,fps=1,n_bootstrap=10).set_index('track_id')
+        self.assertEqual(result.loc[2,'completed_trips_per_day'],0)
+        self.assertGreater(result.loc[2,'completed_trips_per_day_ci_high'],0)
+        self.assertTrue(np.isnan(result.loc[2,'median_trip_minutes']))
+        self.assertEqual(result.loc[1,'median_trip_minutes'],2)
+
+    def test_contact_audit_separates_missing_history_and_pre_onset_state_changes(self):
+        with TemporaryDirectory() as directory:
+            path=Path(directory)/'state.npy';np.save(path,[1,1,1,1,1,1,0,0,-1,1])
+            tracks=pd.DataFrame(dict(side=['right'],track_id=[1],cluster_id=['C0'],state_path=[path],frame_min=[0]))
+            bouts=pd.DataFrame(dict(side=['right']*3,ant_a=[1]*3,ant_b=[2]*3,is_new_onset=[True]*3,start_frame=[6,8,10]))
+            row=contact_history_audit(tracks,bouts,fps=2,prior_seconds=2).iloc[0]
+            self.assertEqual(row.new_contact_onsets,3);self.assertEqual(row.full_prior_labels,2)
+            self.assertEqual(row.prior_contains_unknown,1);self.assertEqual(row.full_prior_sleep,1)
+            self.assertEqual(row.guarded_prior_sleep,2);self.assertEqual(row.guarded_only,1)
+
     def test_state_means_use_observed_samples_and_duration_not_window_count(self):
         # The long and short S0 windows have unequal weight. A huge unassigned
         # observation and missing gap must not contaminate the mean skeleton.
@@ -82,7 +102,9 @@ class FullBehaviorTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             root=Path(directory)/'run';block=Path(directory)/'block'
             (root/'models').mkdir(parents=True)
-            raw=np.zeros((2,31));raw[0,24:28]=[.01,.01,.07,.07];raw[1,24:28]=[1,1,1,1]
+            # Both states meet the motion-based candidate rule, but the default
+            # sleep definition is explicitly S0. S1 must remain non-sleep.
+            raw=np.zeros((2,31));raw[:,24:28]=[.01,.01,.07,.07]
             np.savez(root/'models/dictionary.npz',raw=raw,state=[0,1])
             pd.DataFrame(dict(ant=['right:001','right:002'],side=['right']*2,
                 track_id=[1,2],track_name=['one.parquet','two.parquet'],n_frames=[24]*2,
@@ -98,6 +120,8 @@ class FullBehaviorTests(unittest.TestCase):
             self.assertEqual(tracks.frame_min.tolist(),[2,2])
             a=np.load(tracks.state_path.iloc[0]);b=np.load(tracks.state_path.iloc[1])
             self.assertEqual(len(a),20);self.assertEqual(int((a==1).sum()),10)
+            np.testing.assert_array_equal(a[14:20],0)
+            self.assertEqual(json.loads((output/'definition.json').read_text())['quiet_states'],[0])
             self.assertTrue((b==-1).all())
             timestamp=Path(tracks.metadata_path.iloc[0]).stat().st_mtime_ns
             build(root,block)

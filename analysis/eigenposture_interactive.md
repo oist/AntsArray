@@ -1,6 +1,6 @@
 # Full-body states, right-colony ant classes, and state-derived sleep
 
-Open `analysis/eigenposture_interactive.py` and run its ten `# %%` cells in
+Open `analysis/eigenposture_interactive.py` and run its eleven `# %%` cells in
 VS Code/Jupyter from the repository root. It uses the new full-recording model
 packet and continues through the established grid-occupancy analyses. Plots are
 ordinary Matplotlib figures, saved as PNGs; the batch runner also writes a PDF.
@@ -46,8 +46,12 @@ downstream readers also require PyArrow and Shapely.
    method visibly and assert agreement with the saved classes.
 6. **Inspect:** show how ant state proportions form the behavioral ant classes:
    one UMAP point per ant, colored by its fitted class, alongside the class mean
-   state proportions. UMAP is a view only (8 neighbors, min_dist 0.15); class
-   fitting retains all eight square-root proportion coordinates. Also plot
+   state proportions. Compare UMAP neighbors 4/8/20 and min_dist 0.02/0.15/0.5,
+   with three seeds per setting. Select the view by median five-neighbor
+   trustworthiness, then neighborhood overlap, without class or spatial labels.
+   The nine panels show the fixed primary seed; all 27 fits and scores are saved.
+   UMAP is a view only; class fitting retains all eight square-root proportion
+   coordinates. Apparent island spacing is not evidence for discrete classes. Also plot
    individual state proportions and a stage-by-stage coverage audit.
 7. **Space:** hand the fixed classes to existing grid utilities; require an exact
    side/ID/filename match for every classified ant. Spatial labels are read for
@@ -57,8 +61,9 @@ downstream readers also require PyArrow and Shapely.
     The current grid-label file has three right-colony groups; this is a different
     spatial partition. A new packet without a saved reference snapshots that
     current file instead. Neither reference affects any model fit.
-8. **Speed and putative sleep:** interpret quiet clusters from their measured
-   body and antennal motion, then derive frame labels from those state assignments.
+8. **Speed and putative sleep:** use **S0 only** as the putative-sleep state,
+   then derive frame labels directly from those assignments. S1 is non-sleep
+   under this explicit definition, even though it also has low median motion.
    Plot quiet-run durations, class curves, and individual heatmaps. A combined
    sleep/speed figure shows individual ant values, equal-ant class means, and
    ten-minute time courses. Whole-recording sleep is quiet samples / classified
@@ -70,9 +75,20 @@ downstream readers also require PyArrow and Shapely.
    the detailed sleep figure. The whole-recording points have no extra bin filter.
 9. **Clock profiles:** activity and state-derived quietness by time of day,
    using complete light-dark cycles when available.
-10. **Returns and contacts:** retain the same ant classes and use state-derived
+10. **Trip investment:** restore the grid-occupancy trip frequency versus median
+    duration plot, colored by behavioral class, plus class comparisons of return
+    rate and total time on completed trips. Include all classified ants; zero-trip
+    ants retain zero rate/time and have no median duration. Reuse the grid utility's
+    1-s position bins, gap bridging up to 30 s, 5-s border/colony support, 30-s
+    minimum trips, and 20% observed trip coverage. Rates use the full recording
+    duration. Bridged position gaps can contribute to trip duration; these rules
+    do not fill gaps in sleep labels. Trip summaries and uncertainty are saved.
+11. **Returns and contacts:** retain the same ant classes and use state-derived
     quietness for recipient selection, matched controls, and response curves.
     Other right ants remain social context, with unknown sleep where ineligible.
+    Show pooled returns and recipients before individual class panels, with event/ant counts
+    in titles. The precise return-response rules are stricter than trip investment
+    (no long position-gap bridging; observed crossing within five frames).
 
 ## Choices to assess
 
@@ -101,8 +117,8 @@ windows; antennal/turning speeds and mean contacts are within-window means.
 Printed heatmap values retain mm/s, rad/s, or partner-count units. Colors span
 the lowest to highest state mean separately in each feature, allowing comparison
 without mixing units. These pooled means differ from the ant-balanced dictionary
-medians used for quiet-state interpretation; labels and sleep definitions are
-unchanged. Numerical values are in `state_mean_features.csv` and
+medians used for quiet-state interpretation; plotting these means does not alter
+labels. Numerical values are in `state_mean_features.csv` and
 `state_mean_postures.csv` beside the plots.
 
 State comparisons use Leiden resolutions 0.4, 0.8, 1.2, and 1.6. Prefer the finest
@@ -120,10 +136,12 @@ alternating 1-, 3-, 6-, and 24-hour blocks. Hours are validation blocks only;
 class fitting always pools observations directly. Fall back to one class if
 none passes. A reproducible partition is not proof of discrete biological castes.
 
-Quiet-state interpretation defaults to median unsigned body peak <=0.05 mm/s
-and median mean-antennal speed <=0.15 mm/s, applied **after** clustering. Inspect
-the scatter/table and edit `SLEEP_STATES` to test an explicit set. These cutoffs do
-not train states. `MIN_SLEEP_SECONDS=0` shows cluster membership directly; the
+Putative sleep defaults to **`SLEEP_STATES=[0]`**, an explicit post hoc choice.
+The command-line sleep builder also defaults to S0 (`--quiet-states 0`). The
+motion-profile candidate rule (median unsigned body peak <=0.05 mm/s and median
+mean-antennal speed <=0.15 mm/s) remains descriptive; both S0/S1 meet it, but only
+S0 is used for sleep. `SLEEP_STATES=None` explicitly opts into all candidates.
+These choices do not train states. `MIN_SLEEP_SECONDS=0` shows membership directly; the
 bout plot separately assesses persistence. Unknown intervals remain unknown and
 censor bouts. They never count as awakenings. This is putative sleep without an
 arousal assay. **No pre-existing cached sleep labels enter these analyses.**
@@ -135,6 +153,13 @@ contact is therefore partly definition dependent, and a one-second feature
 window can include measurements on both sides of the contact time. The recipient
 comparison is descriptive; inspect the body/antennal motion traces and do not
 treat it as an independent demonstration of contact-induced awakening.
+The recipient analysis still requires ten continuously classified sleeping
+seconds before contact. `recipient_sleep_support.csv` separates unknown history
+from known non-sleep history. It also reports a diagnostic interval ending one
+second before contact, to inspect short windows that straddle onset; that guard
+does not change primary event selection. `recipient_sample_counts.csv` reports
+matched events and ants by class/condition. Bootstrap bands require at least five
+contributing ants and can disappear when splitting a small sample into classes.
 
 Median classified coverage is 52.8% of recording time for left ants and 49.8%
 for right ants, despite their higher detection coverage. Complete skeletons,
@@ -204,15 +229,16 @@ and mean/peak concurrent contacts. Repeat-fit ARI is 0.813; ant-removal ARI is
 9–24 states, but none passed all stability checks. This supports a compact
 vocabulary at the tested scale, not a claim that ants perform only eight actions.
 
-New S0 and S1 are the quiet candidates. Their median body motion is about
+S0 and S1 are low-motion candidates. Their median body motion is about
 0.012 mm/s and median antennal motion about 0.084 and 0.090 mm/s, respectively.
-They are combined for the state-derived putative-sleep plots; both remain
-separate states in the ant-proportion analysis.
+Only S0 enters the current putative-sleep plots and contact-response analysis;
+both remain separate states in the ant-proportion analysis. S1 is not merged
+into sleep. Ant classes and state assignments are unchanged by this interpretation.
 They are quiet-enriched rather than pure immobility states: 62.6% and 57.5% of
 their dictionary windows jointly satisfy the displayed motion limits. State
 membership is the downstream label, without adding another motion threshold.
-About 67–77% of right-colony quiet runs end at missing observations, so observed
-run lengths substantially underestimate uninterrupted quietness. Do not interpret
+Missing observations censor quiet runs, so observed run lengths can substantially
+underestimate uninterrupted quietness. Do not interpret
 those missing-data boundaries as awakenings or claim physiological sleep validation.
 
 The ant comparison selects four classes (10, 14, 8, and 12 ants). K-means and
@@ -232,3 +258,67 @@ tied-covariance two-class GMM matches all 44 spatial labels, but has slightly
 lower temporal stability (ARI 0.955). The broad fit is chosen by behavioral
 stability; spatial agreement does not select it or change the four downstream
 classes. All these spatial comparisons remain descriptive.
+
+## Current display and trip results
+
+The UMAP comparison selects 8 neighbors and min_dist 0.5 by neighborhood
+preservation (median trustworthiness 0.966; five-neighbor overlap 72.7% across
+three seeds). All nine parameter settings show the same four fitted classes.
+This display choice does not select the class partition.
+
+The grid-occupancy trip rules identify 5,923 completed trips across the 44 ants.
+Equal-ant means for C0/C1/C2/C3 are 16.2/17.2/68.2/162.1 completed returns per
+recording day, and 34.5/31.0/382.5/679.2 minutes on completed trips per day.
+The precise response-event rules retain 1,827 returns. These counts differ
+because the trip-investment rules allow longer position gaps and less observed
+support. They are separately named and should not be interchanged.
+
+## Why the contact-response plots became sparse
+
+The comparison below holds the 44 right-ant identities fixed. The earlier
+motion-label analysis and the state-label analysis both retain 1,827 return
+events. Splitting return curves across four ant classes reduces support per
+panel; the pooled view is restored for comparison.
+
+Sleeping-recipient selection is affected much more strongly. The unchanged
+eligibility rule requires ten **continuously classified sleeping seconds**
+before a new contact. The earlier motion classifier used ten-second windows
+with >=50% valid frames, >=90% quiet valid frames, partial landmark support,
+and short-gap handling. State labels require the full-body feature support
+described above. Among 1,103,126 focal ant-contact onsets, a fully classified
+preceding ten seconds is available for 87.6% with the historical motion labels,
+but only 3.2% with either state-label definition. The main loss is continuity
+of label support, not a decrease in detected returns.
+
+| Sleep definition | Recent-return contacts entering matching | Matched contacts |
+| --- | ---: | ---: |
+| Historical motion labels, same 44 ants | 1,036 | 726 |
+| Previous S0 + S1 | 36 | 29 |
+| Current S0 only | 17 | 11 |
+
+The current eleven matched contacts involve eight recipients: C0 has one event
+in one ant, C1 three in three, C2 seven in four, and C3 none. No class has five
+contributing recipients, the minimum for the bootstrap intervals. Sparse curves
+here do not establish class-specific contact responses.
+
+Contact-containing one-second windows can also change the state assigned to
+frames before contact. As a diagnostic, ending the ten-second history one second
+earlier raises all-onset sleep-history support from 1,071 to 8,522 for S0+S1,
+and from 541 to 5,065 for S0. These are counts **before** other eligibility and
+matching filters, not extra matched events. The change is consistent with
+onset-straddling feature windows; ordinary state changes can also contribute.
+The guard is diagnostic only. Primary eligibility, matching rules and S0 sleep
+membership are not relaxed to make plots denser.
+
+`contact_label_history_totals.csv`, `contact_label_history_audit.csv`, and
+`contact_label_coverage_comparison.csv` retain the historical comparison. It is
+reproducible separately, without introducing historical labels into the main
+analysis:
+
+```bash
+python -m analysis.audit_behavior_sleep_contacts --block "$BLOCK" --source "$RUN" \
+  --output "$RUN/report" --previous-labels /path/to/archived_previous_labels
+```
+
+Omit `--previous-labels` to compare the current labels with only the historical
+motion reference. Source metadata is recorded in `contact_label_audit_inputs.json`.

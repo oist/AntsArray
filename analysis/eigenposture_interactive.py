@@ -1,7 +1,7 @@
 # %% 1. Inputs: both colonies for states, right colony for ant classes
 """Full-body behavior -> pooled state proportions -> ant classes -> sleep/space.
 
-Run these ten cells in VS Code/Jupyter. Expensive full-track preprocessing and
+Run these eleven cells in VS Code/Jupyter. Expensive full-track preprocessing and
 method comparisons are produced by full_behavior_extract/states/roles.py.
 Every eligible ant's usable segments are assigned; no hourly clip sampling.
 """
@@ -24,19 +24,20 @@ from umap import UMAP
 from analysis import grid_occupancy_utils as go
 from analysis import sleep_motion_analysis_utils as sma
 from analysis import return_sleep_utils as rs
+from analysis import trip_phenotyping_utils as trip_go
 from analysis.full_behavior_extract import SEED,HZ,FPS
 from analysis.full_behavior_states import NAMES,encode
-from analysis.full_behavior_roles import fit_labels
-from analysis.full_behavior_sleep import build as build_state_sleep,select_quiet_states
+from analysis.full_behavior_roles import fit_labels,compare_ant_umaps
+from analysis.full_behavior_sleep import build as build_state_sleep,select_quiet_states,contact_history_audit
 from analysis.full_behavior_profiles import build as build_state_means
 
 BLOCK=Path(os.environ.get('ANTS_DATASET_ROOT','/home/sam-reiter/bucket/ReiterU/Ants/basler/20260724/block01'))
 SOURCE=Path(os.environ.get('ANTS_BEHAVIOR_SOURCE',str(BLOCK/'analysis_outputs/full_body_behavior_20261011')))
 OUTPUT=Path(os.environ.get('ANTS_ROLE_OUTPUT',str(SOURCE/'report')))
 LIGHT_ON,LIGHT_OFF=5.5,19.5
-# None chooses quiet clusters from the motion-profile table in cell 3. This is
-# POST HOC interpretation, never training labels. Edit to explicit IDs to assess.
-SLEEP_STATES=None
+# Explicit POST HOC interpretation: S0 alone is putative sleep. S1 stays a
+# separate non-sleep state. None opts into motion-profile candidates instead.
+SLEEP_STATES=[0]
 MIN_SLEEP_SECONDS=0  # Primary result: cluster membership; inspect bout durations separately.
 threadpool_limits(limits=4);OUTPUT.mkdir(parents=True,exist_ok=True)
 plt.rcParams.update({'font.size':10,'axes.spines.top':False,'axes.spines.right':False})
@@ -182,16 +183,18 @@ fig.text(.08,.065,'Postures: body in teal, antennae in orange; anterior points r
     f"Both colonies: {len(cohort)} ants; {state_means['sample_count'].sum():,} assigned posture observations. Color is scaled separately for each feature.",fontsize=9,linespacing=1.6)
 show('04_mean_posture_motion')
 quiet_states,motion_profiles=select_quiet_states(SOURCE)
-motion_profiles.to_csv(OUTPUT/'state_motion_profiles.csv',index=False)
 if SLEEP_STATES is not None:quiet_states=np.asarray(SLEEP_STATES,int)
-print('Quiet-state candidates:',quiet_states.tolist(),'\n',motion_profiles.to_string(index=False),flush=True)
+motion_profiles['putative_sleep']=motion_profiles.state.isin(quiet_states)
+motion_profiles.to_csv(OUTPUT/'state_motion_profiles.csv',index=False)
+print('Putative-sleep states:',quiet_states.tolist(),'\n',motion_profiles.to_string(index=False),flush=True)
 fig,ax=plt.subplots(figsize=(6,4),layout='constrained')
 for row in motion_profiles.itertuples():
-    ax.scatter(row.body_peak_median_mm_s,row.antenna_median_mm_s,color=colors[row.state],s=65)
+    ax.scatter(row.body_peak_median_mm_s,row.antenna_median_mm_s,color=colors[row.state],s=100 if row.putative_sleep else 65,
+        edgecolor='black' if row.putative_sleep else 'none',linewidth=1.5)
     ax.annotate(state_names[row.state],(row.body_peak_median_mm_s,row.antenna_median_mm_s),fontsize=8)
 ax.axvline(.05,color='.5',ls=':');ax.axhline(.15,color='.5',ls=':')
 ax.set(xscale='log',yscale='log',xlabel='Median unsigned body peak (mm/s)',
-    ylabel='Median unsigned antennal speed (mm/s)',title='Quiet-cluster interpretation after discovery')
+    ylabel='Median unsigned antennal speed (mm/s)',title=f'Putative sleep: {quiet_states.tolist()} (black outline); thresholds are descriptive')
 show('04_quiet_states')
 
 # %% 4. Count states directly, then normalize; no hourly averaging or extra filter
@@ -236,8 +239,11 @@ show('05_ant_methods')
 class_colors=plt.get_cmap('tab10')(np.arange(k_roles))
 # Each dot is an ANT represented by its eight state proportions. The selected
 # clustering above uses all sqrt(proportion) coordinates; UMAP is only a view.
-role_view=UMAP(n_neighbors=min(8,len(ants)-1),min_dist=.15,n_epochs=400,
-    random_state=SEED,n_jobs=1).fit_transform(role_x)
+umap_scores,role_layouts,selected_view=compare_ant_umaps(role_x)
+umap_scores.to_csv(OUTPUT/'ant_umap_parameter_comparison.csv',index=False)
+np.savez(OUTPUT/'ant_umap_layouts.npz',ants=ants.ant.to_numpy(str),x=role_x,**role_layouts)
+role_view=role_layouts[selected_view]
+view_choice=umap_scores.set_index('key').loc[selected_view]
 class_profiles=np.array([proportions[ants.ant_class.eq(c)].mean(axis=0) for c in range(k_roles)])
 pd.DataFrame(class_profiles,index=[f'C{c}' for c in range(k_roles)],columns=state_names).to_csv(OUTPUT/'class_state_profiles.csv',index_label='ant_class')
 ants[['ant','ant_class']].assign(umap_1=role_view[:,0],umap_2=role_view[:,1]).to_csv(OUTPUT/'ant_class_umap.csv',index=False)
@@ -255,13 +261,26 @@ axes[1].set(xticks=np.arange(n_states),xticklabels=state_names,yticks=np.arange(
     yticklabels=[f'C{c} (n={ants.ant_class.eq(c).sum()})' for c in range(k_roles)],title='Mean state proportions within each ant class')
 fig.colorbar(image,ax=axes[1],label='Class mean of ant state proportions (%)')
 fig.suptitle(f'6a. {n_states} behavioral states → ant state proportions → {k_roles} behavioral ant classes')
-fig.text(.08,.02,f"Fit: {role_choice['model']} in all {n_states} square-root proportion dimensions. UMAP: n=8, min_dist=0.15; display only. Each ant has equal weight.",fontsize=9)
+fig.text(.08,.02,f"Fit: {role_choice['model']} in all {n_states} square-root proportion dimensions. UMAP: n={int(view_choice.n_neighbors)}, min_dist={view_choice.min_dist}; display only.",fontsize=9)
 fig.tight_layout(rect=(0,.055,1,.95));show('06_state_to_ant_classes')
+fig,axes=plt.subplots(3,3,figsize=(12,10))
+for ax,((n,d),group) in zip(axes.flat,umap_scores.groupby(['n_neighbors','min_dist'],sort=True)):
+    xy=role_layouts[f'n{n}_d{d}_seed{SEED}']
+    for c in range(k_roles):
+        ax.scatter(*xy[ants.ant_class.eq(c)].T,s=25,color=class_colors[c],label=f'C{c}')
+    chosen=int(view_choice.n_neighbors)==n and view_choice.min_dist==d
+    ax.set(title=f'n={n}, min_dist={d}'+('  [selected]' if chosen else '')+
+        f'\nMedian trust={group.trustworthiness.median():.3f}, 5-NN overlap={group.neighbor_overlap.median():.0%}',
+        xticks=[],yticks=[])
+handles,labels=axes[0,0].get_legend_handles_labels();fig.legend(handles,labels,loc='lower center',bbox_to_anchor=(.5,.045),ncol=k_roles)
+fig.suptitle('6b. UMAP views of the same behavioral ant classes')
+fig.text(.06,.015,'Three seeds per setting; panels show the fixed primary seed. Selection preserves input neighborhoods, without using class/spatial labels.',fontsize=9)
+fig.tight_layout(rect=(0,.09,1,.96));show('06_ant_umap_comparison')
 ordered=ants.sort_values(['ant_class','track_id']).index.to_numpy()
 fig,axes=plt.subplots(1,2,figsize=(14,9),layout='constrained')
 im=axes[0].imshow(proportions[ordered],aspect='auto',cmap='viridis',vmin=0)
 axes[0].set(xticks=np.arange(n_states),xticklabels=state_names,yticks=np.arange(len(ants)),
-    yticklabels=[f"C{ants.loc[a,'ant_class']} / {ants.loc[a,'track_id']:03d}" for a in ordered],title='6b. Ant state proportions')
+    yticklabels=[f"C{ants.loc[a,'ant_class']} / {ants.loc[a,'track_id']:03d}" for a in ordered],title='6c. Ant state proportions')
 axes[0].tick_params(axis='y',labelsize=7);axes[0].tick_params(axis='x',rotation=90)
 fig.colorbar(im,ax=axes[0],label='Fraction of classified observations')
 axes[1].barh(np.arange(len(ants)),ants.loc[ordered,'detection_fraction'],label='Detection coverage',alpha=.5)
@@ -293,7 +312,7 @@ for i,(side,values) in enumerate(coverage_summary.iterrows()):
     bars=ax.bar(np.arange(len(stages))+(i-.5)*.36,values*100,width=.36,label=f'{side}: {cohort.side.eq(side).sum()} ants')
     ax.bar_label(bars,fmt='%.1f%%',fontsize=9)
 ax.set(xticks=np.arange(len(stages)),xticklabels=['Detected position','Valid full-body\nposture','+ Valid motion','+ Contacts\navailable','State assigned\n(≥250 ms segments)'],
-    ylabel='Mean ant coverage (% of full recording)',ylim=(0,100),title='6c. Where coverage is lost before state assignment')
+    ylabel='Mean ant coverage (% of full recording)',ylim=(0,100),title='6d. Where coverage is lost before state assignment')
 ax.legend()
 fig.text(.08,.025,'Posture: all 10 landmarks, geometry checks, five valid 24-Hz frames, one camera.\n'
     'Motion: finite derivatives, matching position/pose camera, speed ≤20 mm/s. Short segments are removed last.\n'
@@ -467,7 +486,50 @@ clock_profiles.to_csv(OUTPUT / "ant_clock_profiles.csv", index=False)
 clock_audit.to_csv(OUTPUT / "clock_coverage.csv", index=False)
 show("06_clock_profiles")
 
-# %% 10. Returns and sleeping-recipient responses, retaining the same classes
+# %% 10. Grid-occupancy trip investment, retaining all behavioral ant classes
+# Reuse its trip rules: 1-s position bins, bridge state gaps <=30 s, remove
+# <5-s border flicker, >=5-s colony anchors, >=30-s trips, >=20% observed bins.
+# These position-gap rules apply ONLY to trips; sleep gaps remain unknown.
+# Include zero-trip ants in rates/time totals; their median duration is undefined.
+trip_tracks=cluster_table.assign(frame_min=start,frame_max=stop-1)
+completed_trips,trip_positions,trip_diagnostics=trip_go.load_or_extract_completed_trips(
+    trip_tracks,regions,stitched/'per_track',SOURCE/'trips',fps=FPS,start_clock_seconds=clock,
+    bodypoint=0,position_bin_seconds=1,max_state_gap_seconds=30,min_state_run_seconds=5,
+    min_colony_anchor_seconds=5,min_trip_seconds=30,min_trip_coverage=.2,max_path_gap_seconds=3,max_workers=4)
+trip_summary=trip_go.summarize_trip_candidates(trip_tracks,completed_trips,trip_positions,fps=FPS)
+investment=trip_go.compute_trip_investment_confidence(trip_summary,completed_trips,fps=FPS,n_bootstrap=2000,random_state=SEED)
+investment=investment.merge(ants[['side','track_id','ant_class']],on=['side','track_id'],validate='one_to_one').merge(
+    trip_summary[['track_name','total_trip_minutes','observed_trip_hours']],on='track_name',validate='one_to_one')
+investment['trip_minutes_per_day']=investment.total_trip_minutes/investment.recording_days
+investment.to_csv(OUTPUT/'ant_trip_investment.csv',index=False)
+trip_summary.to_csv(OUTPUT/'trip_summary.csv',index=False)
+completed_trips.to_csv(OUTPUT/'completed_trips.csv',index=False)
+trip_diagnostics.to_csv(OUTPUT/'trip_extraction_diagnostics.csv',index=False)
+investment.groupby('ant_class').agg(n_ants=('track_id','size'),n_completed_trips=('n_completed_trips','sum'),
+    completed_trips_per_day=('completed_trips_per_day','mean'),trip_minutes_per_day=('trip_minutes_per_day','mean'),
+    mean_ant_median_trip_minutes=('median_trip_minutes','mean')).to_csv(OUTPUT/'class_trip_investment.csv')
+fig,axes=plt.subplots(1,3,figsize=(16,5));rng=np.random.default_rng(SEED)
+for c in range(k_roles):
+    group=investment[investment.ant_class.eq(c)];valid=group[group.n_completed_trips>0]
+    x,y=valid.completed_trips_per_day,valid.median_trip_minutes
+    axes[0].errorbar(x,y,xerr=np.vstack([x-valid.completed_trips_per_day_ci_low,valid.completed_trips_per_day_ci_high-x]),
+        yerr=np.vstack([y-valid.median_trip_minutes_ci_low,valid.median_trip_minutes_ci_high-y]),fmt='o',
+        color=class_colors[c],alpha=.75,ms=4,elinewidth=.7,label=f'C{c}')
+    for ax,column in zip(axes[1:],['completed_trips_per_day','trip_minutes_per_day']):
+        values=group[column].to_numpy();ax.scatter(c+rng.uniform(-.12,.12,len(values)),values,color=class_colors[c],s=25)
+        ax.plot([c-.23,c+.23],[values.mean()]*2,color='black',lw=2)
+axes[0].set(xlabel='Completed returns / recording day',ylabel='Median time per trip (min)',yscale='log',
+    title='Grid-occupancy trip frequency versus duration');axes[0].legend()
+for ax,label in zip(axes[1:],['Completed returns / recording day','Time on completed trips (min / recording day)']):
+    ax.set(xticks=np.arange(k_roles),xticklabels=[f'C{c}\nn={ants.ant_class.eq(c).sum()}' for c in range(k_roles)],ylabel=label,ylim=(0,None))
+axes[1].set_title('Each point is one ant');axes[2].set_title('Black bars: equal-ant class means')
+fig.suptitle('13. Return rate and time spent on trips by behavioral ant class')
+fig.text(.06,.025,f'Completed colony → outside → colony trips; ≥30 s outside, ≥5 s colony anchors. All {len(ants)} classified ants enter rates and time totals.\n'
+    'Left: Poisson rate / bootstrap median 95% intervals; zero-trip ants have no duration estimate. Trip time includes bridged position gaps ≤30 s.\n'
+    'Rates use full recording time, including missing observations; these trip rules are more permissive than the precise return-response event rules.',fontsize=9)
+fig.tight_layout(rect=(0,.17,1,.95));show('07_trip_investment')
+
+# %% 11. Returns and sleeping-recipient responses, retaining the same classes
 # Same definitions as grid_occupancy: >=30 s outside, >=5 s colony anchors,
 # observed entry crossing within 5 frames; new skeleton contacts <=0.1 mm.
 # Retain ALL right ants as social context, including ants without a role. Their
@@ -483,6 +545,7 @@ chunks, interaction_run = rs.load_published_interaction_chunks(rs.resolve_intera
     BLOCK / "tracks", fps=settings.fps, start_clock_seconds=clock)
 contexts = rs.load_contexts(all_sleep, BLOCK, regions, settings, cache, force=False)
 bouts, coverage = rs.load_contact_bouts(chunks, settings, cache, force=False)
+contact_history_audit(sleep_tracks,bouts,settings.fps,settings.prior_sleep_seconds).to_csv(OUTPUT/'recipient_sleep_support.csv',index=False)
 rs.attach_contact_context(contexts, bouts, coverage, settings)
 all_classes = all_sleep[["side", "track_id"]].merge(cluster_ids[["side", "track_id", "cluster_id"]],
     on=["side", "track_id"], how="left", validate="one_to_one").fillna({"cluster_id": "unclassified_context"})
@@ -492,24 +555,45 @@ return_curves, latency = rs.return_activity_curves(returns, contexts, settings)
 contacts = rs.eligible_sleeping_contacts(sleep_tracks, contexts, bouts, all_returns, settings)
 triggers, matching = rs.match_sleeping_controls(contacts, contexts, settings)
 recipient_curves = rs.trigger_state_curves(triggers, sleep_tracks, contexts, settings)
+# Retain the pooled return view so class splitting can be distinguished from
+# losses caused by recipient eligibility. Return events do not depend on sleep.
+fig,summary=rs.plot_return_curves(return_curves,side='right')
+fig.suptitle(f'All classified right ants: {len(returns)} returns from {returns.track_id.nunique()} ants\n'
+    'Equal-ant means; same return criteria as the class panels')
+summary.to_csv(OUTPUT/'pooled_return_summary.csv',index=False)
+# Pooled recipients make the available evidence visible before class splitting.
+# Counts are matched return-contact events; contributors can fall with lag.
+exposed=triggers[triggers.condition.eq('Recent return contact')]
+fig,summary=rs.plot_recipient_curves(recipient_curves,side='right',xlim=(-30,30))
+fig.suptitle(f'All classified right ants: {len(exposed)} matched return contacts in {exposed.track_id.nunique()} recipients\n'
+    f'Putative sleep = {quiet_states.tolist()}; contact features contribute to labels; 95% intervals require ≥5 contributing ants')
+summary.to_csv(OUTPUT/'pooled_recipient_summary.csv',index=False)
 # The canonical plots pool classes; explicitly subset here so class membership
 # survives all the way to the return and recipient comparisons.
 for label in sorted(cluster_ids.cluster_id.unique()):
     fig, summary = rs.plot_return_curves(return_curves[return_curves.cluster_id.eq(label)], side="right")
-    fig.suptitle(f"Returns: {label} (equal-ant mean; 95% ant bootstrap)")
+    events=returns[returns.cluster_id.eq(label)]
+    fig.suptitle(f"Returns: {label} — {len(events)} returns, {events.track_id.nunique()} ants (equal-ant mean; 95% ant bootstrap)")
     summary.to_csv(OUTPUT / f"{label}_return_summary.csv", index=False)
     fig, summary = rs.plot_recipient_curves(recipient_curves[recipient_curves.cluster_id.eq(label)], side="right", xlim=(-30, 30))
-    fig.suptitle(f"Quiet-state recipients: {label}\nContacts contribute to state labels; inspect motion responses")
+    events=exposed[exposed.cluster_id.eq(label)]
+    fig.suptitle(f"Quiet-state recipients: {label} — {len(events)} matched contacts, {events.track_id.nunique()} ants\n"
+        "Contacts contribute to state labels; 95% intervals require ≥5 contributing ants")
     summary.to_csv(OUTPUT / f"{label}_recipient_summary.csv", index=False)
 returns.to_csv(OUTPUT / "returns.csv", index=False)
 triggers.to_csv(OUTPUT / "matched_triggers.csv", index=False)
 matching.to_csv(OUTPUT / "matching_diagnostics.csv", index=False)
+sample_index=pd.MultiIndex.from_product([sorted(cluster_ids.cluster_id.unique()),
+    ['Recent return contact','No contact control','Other contact']],names=['cluster_id','condition'])
+triggers.groupby(['cluster_id','condition']).agg(n_events=('track_id','size'),n_ants=('track_id','nunique')).reindex(
+    sample_index,fill_value=0).to_csv(OUTPUT/'recipient_sample_counts.csv')
 show("07_return_response")
 (OUTPUT / "summary.json").write_text(json.dumps(dict(source=str(SOURCE),
     n_right_ants=len(ants), n_states=n_states, n_classes=k_roles,
     class_sizes=ants.ant_class.value_counts().sort_index().to_dict(), spatial_ari=spatial_ari,
     spatial_homogeneity=spatial_homogeneity,
     broad_ant_model=coarse_choice, broad_spatial_ari=coarse_spatial_ari,
+    ant_umap_view=selected_view, n_completed_trips=len(completed_trips),
     state_model=selection, ant_model=role_choice, quiet_states=quiet_states.tolist(),
     minimum_sleep_seconds=MIN_SLEEP_SECONDS, sleep_source="discovered state membership; no cached sleep labels",
     complete_clock_cycles=complete_cycles),indent=2)+"\n")

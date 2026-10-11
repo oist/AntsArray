@@ -17,6 +17,35 @@ from threadpoolctl import threadpool_limits
 from analysis.full_behavior_extract import SEED,HZ,FPS
 
 
+def compare_ant_umaps(x,seed=SEED):
+    """Compare display settings by neighborhood preservation, without labels.
+
+    Use three seeds per setting. Select by median five-neighbor trustworthiness,
+    then neighbor overlap. This chooses a view, never a clustering or class K.
+    """
+    from sklearn.manifold import trustworthiness
+    from umap import UMAP
+    k=min(5,(len(x)-1)//2)
+    if k<1:raise ValueError('Need at least three ants for a UMAP comparison')
+    def neighbors(values):
+        distance=squareform(pdist(values));np.fill_diagonal(distance,np.inf)
+        return np.argsort(distance,axis=1)[:,:k]
+    reference=neighbors(x);rows=[];layouts={}
+    for n in sorted(set(min(value,len(x)-1) for value in (4,8,20))):
+        for d in (.02,.15,.5):
+            for repeat in range(3):
+                xy=UMAP(n_neighbors=n,min_dist=d,n_epochs=500,random_state=seed+repeat,n_jobs=1).fit_transform(x)
+                key=f'n{n}_d{d}_seed{seed+repeat}';layouts[key]=xy
+                overlap=np.mean([len(set(a)&set(b))/k for a,b in zip(reference,neighbors(xy))])
+                rows.append(dict(key=key,n_neighbors=n,min_dist=d,seed=seed+repeat,
+                    trustworthiness=trustworthiness(x,xy,n_neighbors=k),neighbor_overlap=overlap))
+    scores=pd.DataFrame(rows)
+    ranking=scores.groupby(['n_neighbors','min_dist'],as_index=False)[['trustworthiness','neighbor_overlap']].median().sort_values(
+        ['trustworthiness','neighbor_overlap','n_neighbors','min_dist'],ascending=[False,False,True,True])
+    best=ranking.iloc[0];key=f"n{int(best.n_neighbors)}_d{best.min_dist}_seed{seed}"
+    return scores,layouts,key
+
+
 def fit_labels(x, method, parameter, seed=SEED):
     if method=='kmeans':return KMeans(int(parameter),n_init=20,random_state=seed).fit_predict(x)
     if method=='ward':return AgglomerativeClustering(int(parameter),linkage='ward').fit_predict(x)
