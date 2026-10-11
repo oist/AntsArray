@@ -183,7 +183,7 @@ def build_track_context(row, block_dir: Path, regions: pd.DataFrame,
     last_not_sleep = np.maximum.accumulate(np.where(state != 1, np.arange(len(state)), -1))
     age = np.where(state == 1, (np.arange(len(state)) - last_not_sleep) / settings.fps, 0).astype(np.float32)
     context["sleep_age_seconds"] = sma.sample_dense(age, row.frame_min, sample_frames).astype(np.float32)
-    motion_cache = sm.load_sleep_motion_cache(block_dir / "stitched" / "sleep_motion" / "per_track" / Path(row.track_name).stem)
+    motion_cache = sm.load_sleep_motion_cache(sm.motion_cache_root(block_dir) / "per_track" / Path(row.track_name).stem)
     parameters = json.loads(row.classifier_parameters)
     for name, ids, percentile, fraction in (
         ("body_speed", sm.BODY_BODYPOINT_IDS, "body_percentile", "min_valid_bodypoint_fraction"),
@@ -207,7 +207,7 @@ def context_cache_paths(row, block_dir: Path, regions: pd.DataFrame,
                        "regions": fingerprint(panorama_regions_path(block_dir)),
                        "region_sides": regions[["region_id", "region_type", "side"]].to_dict("records")}
     track_path = block_dir / "stitched" / "per_track" / row.track_name
-    motion_root = block_dir / "stitched" / "sleep_motion" / "per_track" / Path(row.track_name).stem
+    motion_root = sm.motion_cache_root(block_dir) / "per_track" / Path(row.track_name).stem
     sources = {**source_settings, "track": fingerprint(track_path), "labels": fingerprint(Path(row.metadata_path)),
                "motion": fingerprint(motion_root / sm.METADATA_FILENAME)}
     key = cache_key(sources)

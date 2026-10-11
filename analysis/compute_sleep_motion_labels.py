@@ -317,7 +317,7 @@ def main() -> None:
     parser.add_argument("--out-root", type=Path, default=None)
     parser.add_argument("--body-threshold", type=float, default=0.5)
     parser.add_argument("--antenna-threshold", type=float, default=0.7)
-    parser.add_argument("--history-seconds", type=float, default=10.0)
+    parser.add_argument("--history-seconds", type=float, default=1.0)
     parser.add_argument("--quiet-fraction", type=float, default=0.9)
     parser.add_argument("--min-valid-frame-fraction", type=float, default=0.5)
     parser.add_argument("--body-percentile", type=float, default=75.0)

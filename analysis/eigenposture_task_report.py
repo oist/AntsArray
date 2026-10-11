@@ -1,4 +1,4 @@
-"""Run the right-colony interactive cells headlessly and bundle the figures."""
+"""Run the selected-colony interactive cells headlessly and bundle the figures."""
 import argparse
 import os
 from pathlib import Path
@@ -22,7 +22,7 @@ def run_analysis(output):
     shutil.copy2(source, output / "eigenposture_interactive.py")
     shutil.copy2(source.with_suffix(".md"), output / "README.md")
     descriptions=[]
-    with PdfPages(output / "right_behavior_classes.pdf") as pdf:
+    with PdfPages(output / (namespace["SIDE"]+"_behavior_classes.pdf")) as pdf:
         for number in plt.get_fignums():
             figure=plt.figure(number)
             text=add_pdf_description(figure)

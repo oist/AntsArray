@@ -1016,7 +1016,7 @@ cd "${REPO_ROOT}"
   --block-dir "${block_dir}" \\
   --sleep-motion-root "${stitched_dir}/sleep_motion" \\
   --out-root "${stitched_dir}/sleep_motion_labels" \\
-  --body-threshold 0.5 --antenna-threshold 0.7 --history-seconds 10
+  --body-threshold 0.5 --antenna-threshold 0.7 --history-seconds 1
 EOF
   chmod 755 "$sleep_motion_labels_script"
 

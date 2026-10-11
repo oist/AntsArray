@@ -176,6 +176,8 @@ if [[ -n "$OPERATION_SCRIPT" ]]; then
       default_output_name="speed_vectors"
       ;;
     compute_track_sleep_motion)
+      # Changed measurement semantics must invalidate old generic success markers.
+      if [[ "$DONE_MARKER" == "_SUCCESS" ]]; then DONE_MARKER="_SUCCESS_same_camera_v1"; fi
       default_operation_name="sleep_motion"
       default_output_name="sleep_motion"
       ;;

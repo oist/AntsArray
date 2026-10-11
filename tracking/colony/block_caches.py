@@ -31,7 +31,7 @@ PARAMETERS = {
     "speed_vectors": ("fps", "mm_per_px", "x_col", "y_col", "bodypoint_filter",
                       "max_interp_gap_frames", "smooth_sigma_frames", "max_speed_mm_s"),
     "colony_presence_vectors": ("mm_per_px", "x_col", "y_col", "bodypoint_filter", "colony_boxes_mm"),
-    "sleep_motion": ("fps", "mm_per_px", "cache_max_gap_frames", "format_version", "speed_assignment"),
+    "sleep_motion": ("fps", "mm_per_px", "cache_max_gap_frames", "format_version", "speed_assignment", "motion_version", "camera_policy"),
     "sleep_motion_labels": ("fps", "classifier_type", "classifier_parameters"),
     "sleep_predictions": ("fps", "mm_per_px", "model_path", "model_feature_set", "feature_mode",
                           "n_model_features", "speed_windows_seconds"),

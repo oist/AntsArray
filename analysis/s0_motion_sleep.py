@@ -23,7 +23,7 @@ from analysis.compute_sleep_motion_labels import (
     _atomic_save_array, _atomic_write_json, _atomic_write_parquet, _sleep_bouts,
 )
 
-PARAMETERS = dict(window_seconds=10., quiet_fraction_threshold=.9,
+PARAMETERS = dict(window_seconds=1., quiet_fraction_threshold=.9,
     min_valid_frame_fraction=.5, require_full_window=True,
     body_bodypoint_ids=list(sm.BODY_BODYPOINT_IDS), antenna_bodypoint_ids=list(sm.ANTENNA_BODYPOINT_IDS),
     body_percentile=75., antenna_percentile=75., min_valid_bodypoint_fraction=.75,
@@ -51,8 +51,11 @@ def thresholds(sample, quantile=.95):
 def prepare(source,block,work,index):
     ant=pd.read_csv(source/'inventory.csv').iloc[index]
     folder=work/'measurements'/Path(ant.track_name).stem;folder.mkdir(parents=True,exist_ok=True)
-    cache_path=block/'stitched/sleep_motion/per_track'/Path(ant.track_name).stem
+    cache_root=sm.motion_cache_root(block)
+    cache_path=cache_root/'per_track'/Path(ant.track_name).stem
     cache=sm.load_sleep_motion_cache(cache_path);n=int(cache.metadata['n_frames'])
+    if cache.metadata.get('motion_version') != sm.MOTION_VERSION:
+        raise ValueError(f'Rebuild the motion cache with compute_track_sleep_motion.py before S0 calibration: {cache_path}')
     vectors={}
     for name,ids,fraction in [('body',sm.BODY_BODYPOINT_IDS,.75),('antenna',sm.ANTENNA_BODYPOINT_IDS,.5)]:
         vectors[name]=sm.aggregate_bodypoint_group_slice(cache,0,n,bodypoint_ids=ids,
@@ -208,6 +211,19 @@ def refresh_return_contexts(source,block,tracks,regions,settings,output):
     print('Fresh sleep context from unchanged physical measurements:',len(rows),'tracks',flush=True)
 
 
+def run(source, block, work, output, workers=4):
+    """Complete calibration and fresh labels as one pipeline stage."""
+    from concurrent.futures import ProcessPoolExecutor
+    from functools import partial
+    count=len(pd.read_csv(source/'inventory.csv'))
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        list(pool.map(partial(prepare,source,block,work),range(count)))
+    calibrate(source,work,output)
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        list(pool.map(partial(label,source,work,output),range(count)))
+    finalize(source,output)
+
+
 def submit(args):
     args.work.mkdir(parents=True,exist_ok=True);jobs=args.work/'jobs';jobs.mkdir(exist_ok=True)
     count=len(pd.read_csv(args.source/'inventory.csv'));previous=None;ids={}
@@ -231,13 +247,15 @@ def submit(args):
 
 if __name__=='__main__':
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('stage',choices=['prepare','calibrate','label','finalize','submit'])
+    p.add_argument('stage',choices=['prepare','calibrate','label','finalize','submit','run'])
     for name in ['source','block','work','output']:p.add_argument('--'+name,type=Path,required=True)
+    p.add_argument('--workers',type=int,default=4)
     p.add_argument('--index',type=int,default=0);p.add_argument('--concurrency',type=int,default=24)
     p.add_argument('--sbatch',default='sbatch');p.add_argument('--partition',default='compute');p.add_argument('--python',default=sys.executable)
     p.add_argument('--start-stage',choices=['prepare','calibrate','label','finalize'],default='prepare',help='Resume completed preparation without rereading motion measurements')
     a=p.parse_args()
-    if a.stage=='submit':submit(a)
+    if a.stage=='run':run(a.source,a.block,a.work,a.output,a.workers)
+    elif a.stage=='submit':submit(a)
     elif a.stage=='prepare':prepare(a.source,a.block,a.work,a.index)
     elif a.stage=='calibrate':calibrate(a.source,a.work,a.output)
     elif a.stage=='label':label(a.source,a.work,a.output,a.index)

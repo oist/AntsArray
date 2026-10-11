@@ -12,6 +12,8 @@ import re
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
+from analysis.camera_motion import RECORDING_COLUMNS, MOTION_VERSION, recording_keys
 
 
 SPEED_FILENAME = "bodypoint_speed_mm_s.npy"
@@ -31,6 +33,11 @@ def track_id_from_name(path: Path) -> int | None:
 def side_from_name(path: Path) -> str | None:
     match = re.search(r"(?:^|_)(left|right)(?:_|\.|$)", Path(path).name, flags=re.IGNORECASE)
     return match.group(1).lower() if match else None
+
+
+def motion_cache_root(block: Path) -> Path:
+    """Allow isolated recomputation without overwriting a published cache."""
+    return Path(os.environ.get('ANTS_MOTION_CACHE_ROOT', str(Path(block) / 'stitched/sleep_motion')))
 
 
 def cache_dir_for_track(root: Path, track_path: Path) -> Path:
@@ -75,13 +82,19 @@ def _atomic_write_json(path: Path, value: dict[str, object]) -> None:
 def read_pose_rows(track_path: Path) -> pd.DataFrame:
     track_path = Path(track_path)
     wanted = ["Frame", "Bodypoint", "X", "Y"]
-    rows = pd.read_parquet(track_path, columns=wanted)
+    available = pq.ParquetFile(track_path).schema_arrow.names
+    provenance = [name for name in ('SleapCam', *RECORDING_COLUMNS) if name in available]
+    rows = pd.read_parquet(track_path, columns=wanted + provenance)
+    # Legacy single-view inputs without provenance retain their former behavior.
+    # Explicitly unknown camera IDs must never be joined to a known view.
+    rows['_camera'] = pd.to_numeric(rows['SleapCam'], errors='coerce') if 'SleapCam' in rows else 0
+    rows['_recording'] = recording_keys(rows)
     missing = set(wanted).difference(rows.columns)
     if missing:
         raise ValueError(f"{track_path.name} is missing required columns: {sorted(missing)}")
     for col in wanted:
         rows[col] = pd.to_numeric(rows[col], errors="coerce")
-    rows = rows.dropna(subset=wanted).copy()
+    rows = rows.loc[np.isfinite(rows[wanted]).all(axis=1)].copy()
     if rows.empty:
         raise ValueError(f"{track_path.name} has no finite pose rows")
     rows["Frame"] = np.rint(rows["Frame"]).astype(np.int64)
@@ -100,7 +113,8 @@ def compute_sleep_motion_cache(
     """Compute a dense frame-by-bodypoint speed cache for one track.
 
     Speeds are assigned to the later sample in each bodypoint pair and divided
-    by the actual frame gap. The gap matrix allows downstream code to apply a
+    by the actual frame gap, within the same SLEAP camera and recording.
+    Alternating views use the previous observation from that view. The gap matrix allows downstream code to apply a
     stricter maximum gap without reading the pose parquet again.
     """
 
@@ -159,18 +173,19 @@ def compute_sleep_motion_cache(
         gap_matrix[:] = 0
 
         bodypoint_columns = {int(bodypoint): column for column, bodypoint in enumerate(bodypoint_ids)}
-        for bodypoint, group in rows.groupby("Bodypoint", sort=False):
+        valid_by_bodypoint = {str(int(bp)): 0 for bp in bodypoint_ids}
+        groups = rows.loc[rows['_camera'].notna() & (rows['_camera'] >= 0)]
+        for (bodypoint, _camera, _recording), group in groups.groupby(
+                ['Bodypoint', '_camera', '_recording'], sort=False, observed=True):
             column = bodypoint_columns[int(bodypoint)]
             frames = group["Frame"].to_numpy(np.int64, copy=False)
             x = group["X"].to_numpy(np.float64, copy=False)
             y = group["Y"].to_numpy(np.float64, copy=False)
             if len(frames) < 2:
-                valid_by_bodypoint[str(int(bodypoint))] = 0
                 continue
             frame_gap = np.diff(frames)
             valid = (frame_gap > 0) & (frame_gap <= cache_max_gap_frames)
             if not valid.any():
-                valid_by_bodypoint[str(int(bodypoint))] = 0
                 continue
             later_frames = frames[1:][valid]
             dense_index = np.searchsorted(cache_frames, later_frames)
@@ -184,7 +199,7 @@ def compute_sleep_motion_cache(
             speed = speed[finite]
             speed_matrix[dense_index, column] = speed.astype(np.float32, copy=False)
             gap_matrix[dense_index, column] = gaps.astype(np.uint8, copy=False)
-            valid_by_bodypoint[str(int(bodypoint))] = int(len(speed))
+            valid_by_bodypoint[str(int(bodypoint))] += int(len(speed))
 
         speed_matrix.flush()
         gap_matrix.flush()
@@ -207,7 +222,10 @@ def compute_sleep_motion_cache(
     source_stat = track_path.stat()
     n_valid_speed_values = int(sum(valid_by_bodypoint.values()))
     metadata: dict[str, object] = {
-        "format_version": 2,
+        "format_version": 3,
+        "motion_version": MOTION_VERSION,
+        "camera_policy": "same SLEAP camera and recording; actual elapsed frames",
+        "camera_provenance": "SleapCam" if "SleapCam" in rows else "legacy_single_view",
         "track_path": str(track_path),
         "track_name": track_path.name,
         "track_id": track_id_from_name(track_path),
@@ -557,7 +575,7 @@ def classify_body_antenna_quiet(
     fps: float,
     body_speed_threshold_mm_s: float = 0.5,
     antenna_speed_threshold_mm_s: float = 0.7,
-    window_seconds: float = 10.0,
+    window_seconds: float = 1.0,
     quiet_fraction_threshold: float = 0.9,
     min_valid_fraction: float = 0.5,
     require_full_window: bool = True,

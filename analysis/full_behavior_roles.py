@@ -208,15 +208,15 @@ def compare_reductions(root, output, weighting='state'):
     return table
 
 
-def run(root):
-    output=root/'roles';output.mkdir(exist_ok=True)
+def run(root,side='right',output=None):
+    output=Path(output) if output is not None else root/'roles';output.mkdir(exist_ok=True)
     inventory=pd.read_csv(root/'inventory.csv');ants=inventory[inventory.selected].reset_index(drop=True)
     choice=json.loads((root/'models/selection.json').read_text());k=choice['n_states']
     counts,hourly=pooled_counts(root,ants,k)
     p=proportions(counts);assert np.isfinite(p).all(), 'A selected ant has no usable posture/motion observations'
     pd.DataFrame(p,index=ants.ant,columns=[f'S{s}' for s in range(k)]).to_csv(output/'all_ant_state_proportions.csv')
     np.savez_compressed(output/'state_counts.npz',counts=counts,hourly=hourly,ants=ants.ant.to_numpy(str))
-    right=ants.side.eq('right').to_numpy();ants=ants[right].reset_index(drop=True);p=p[right];hourly=hourly[right]
+    right=ants.side.eq(side).to_numpy();ants=ants[right].reset_index(drop=True);p=p[right];hourly=hourly[right]
     x=np.sqrt(p);np.testing.assert_allclose((x*x).sum(axis=1),1)
     table,assignments,details=evaluate_models(x,hourly)
     table.to_csv(output/'method_comparison.csv',index=False)
@@ -231,6 +231,7 @@ def run(root):
     ants['ant_class']=labels;ants['classified_seconds']=counts[right].sum(axis=1)/HZ
     ants.to_csv(output/'ant_classes.csv',index=False)
     pd.DataFrame(p,index=ants.ant,columns=[f'S{s}' for s in range(k)]).to_csv(output/'ant_state_proportions.csv')
+    selected['side']=side
     selected['rule']='Among passing nontrivial models, maximize the minimum of ant-removal ARI/Jaccard 10th percentiles and worst temporal ARI/Jaccard over 1/3/6/24-hour splits. Break ties by fewer classes, then silhouette. All state proportions, no spatial inputs.'
     (output/'selection.json').write_text(json.dumps(selected,indent=2)+'\n')
     print('SELECTED ANT CLASSES',json.dumps(selected), 'sizes',np.bincount(labels).tolist(),flush=True)
@@ -239,7 +240,7 @@ def run(root):
 if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--root',type=Path,required=True)
     parser.add_argument('--compare-reductions',type=Path,help='Audit smaller state/class models in a separate directory')
-    parser.add_argument('--merge-weighting',choices=['state','observation'],default='observation');args=parser.parse_args()
+    parser.add_argument('--merge-weighting',choices=['state','observation'],default='observation');parser.add_argument('--side',choices=['left','right'],default='right');parser.add_argument('--output',type=Path);args=parser.parse_args()
     with threadpool_limits(limits=4):
         if args.compare_reductions:compare_reductions(args.root,args.compare_reductions,args.merge_weighting)
-        else:run(args.root)
+        else:run(args.root,args.side,args.output)

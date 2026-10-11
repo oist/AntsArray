@@ -39,7 +39,7 @@ class S0MotionTests(unittest.TestCase):
             np.save(cache/sm.SPEED_FILENAME,speed);np.save(cache/sm.FRAME_GAP_FILENAME,np.ones((2400,10),np.uint8))
             np.save(cache/sm.BODYPOINT_IDS_FILENAME,np.arange(10));np.save(cache/sm.FRAMES_FILENAME,np.arange(2400))
             (cache/sm.METADATA_FILENAME).write_text(json.dumps(dict(n_frames=2400,frame_min=0,frame_max=2399,
-                fps=24.,speed_shape=[2400,10],cache_max_gap_frames=5)))
+                fps=24.,speed_shape=[2400,10],cache_max_gap_frames=5,motion_version=sm.MOTION_VERSION)))
             s0.prepare(source,block,work,0);s0.calibrate(source,work,out);s0.label(source,work,out,0);s0.finalize(source,out)
             state=np.load(out/'per_track/one/sleep_state.npy')
             self.assertEqual(state[800],1)  # No classified posture at this time.
@@ -51,6 +51,11 @@ class S0MotionTests(unittest.TestCase):
                 body_speed_threshold_mm_s=params['body_speed_threshold_mm_s'],
                 antenna_speed_threshold_mm_s=params['antenna_speed_threshold_mm_s'])['state']
             np.testing.assert_array_equal(changed[:1200],state[:1200])
+            metadata=json.loads((cache/sm.METADATA_FILENAME).read_text())
+            metadata.pop('motion_version')
+            (cache/sm.METADATA_FILENAME).write_text(json.dumps(metadata))
+            with self.assertRaisesRegex(ValueError,'Rebuild the motion cache'):
+                s0.prepare(source,block,work,0)
 
 
 if __name__=='__main__':unittest.main()

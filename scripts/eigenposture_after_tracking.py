@@ -82,6 +82,7 @@ def prepare(args):
                      args.state_dir / f'interactions_complete_{block}.ok']
     prerequisites += [args.work_block / 'stitched' / folder / marker for folder, marker in [
         ('speed_vectors', 'speed_vector_complete.ok'), ('sleep_motion', 'sleep_motion_complete.ok'),
+        ('posture_interpolated', 'posture_interpolation_complete.ok'),
         (args.grid_output_name, 'grid_occupancy_complete.ok')]]
     config_path = args.state_dir / 'eigenposture_watch.json'
     config = dict(epoch=args.run_epoch or int(time.time()), prerequisites=list(map(str, prerequisites)),

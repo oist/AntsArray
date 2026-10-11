@@ -12,10 +12,10 @@ def overview(n_states=8,n_classes=2):
         ax.text(x+w/2,y+h-.04,title,ha='center',va='top',weight='bold',fontsize=12)
         ax.text(x+w/2,y+h/2-.025,body,ha='center',va='center',fontsize=10,linespacing=1.5)
     def arrow(a,b):ax.add_patch(FancyArrowPatch(a,b,arrowstyle='-|>',mutation_scale=17,lw=1.5,color='#34495e'))
-    box(.015,.61,.215,.29,'TRACKING','ArUco identity + SLEAP\nBody and antenna landmarks\nPosition and exact contacts','#edf2f7')
+    box(.015,.61,.215,.29,'TRACKING','ArUco identity + SLEAP\nPosture gaps ≤1 s interpolated\nPosition and observed contacts','#edf2f7')
     box(.265,.61,.215,.29,'STATE DEFINITION','Both colonies; >60% detected\nBody-aligned posture PCs\nUnsigned motion + contacts\nShort windows; Leiden','#e4f3ed')
     box(.515,.61,.215,.29,'BEHAVIORAL STATES',f'{n_states}-state reference dictionary\nCheck fewer states and refits\nFlag weak states\nS0 = putative sleep state','#fff0d7')
-    box(.765,.61,.215,.29,'ANT CLASSES',f'Right colony\nEach ant’s state proportions\nAll {n_states} dimensions\n{n_classes} classes; prioritize stability','#e9e5f6')
+    box(.765,.61,.215,.29,'ANT CLASSES',f'{side.capitalize()} colony\nEach ant’s state proportions\nAll {n_states} dimensions\n{n_classes} classes; prioritize stability','#e9e5f6')
     for x in [.23,.48,.73]:arrow((x,.75),(x+.034,.75))
     box(.015,.13,.285,.29,'S0 → MOTION ENVELOPE','Body + antenna speeds during S0\nEqual-ant 95th percentiles\nFresh trailing-window motion labels','#fff0d7')
     box(.355,.13,.285,.29,'SLEEP AND RETURNS','S0 occupancy and quiet runs\nMotion-defined sleep over time\nReturn-contact responses by class','#e5f1fa')
@@ -32,22 +32,19 @@ def overview(n_states=8,n_classes=2):
 
 NOTES={
 '00_workflow':('Analysis overview',
-    'Identity tracking links each ant across time, while SLEAP provides body and antennal landmarks. '
+    'Identity tracking links each ant across time, while SLEAP provides body and antennal landmarks. Posture gaps of at most one second are linearly interpolated before extraction. '
     'Both colonies contribute posture, motion and exact contact features to the behavioral-state model. '
-    'S0 is interpreted as the putative sleep state. Right-colony ants are grouped by their proportions of all reference states; '
+    'S0 is interpreted as the putative sleep state. Ants in the selected colony are grouped by their proportions of all reference states; '
     'spatial occupancy is examined only afterward. A separate branch calibrates a motion envelope from S0 and applies it '
     'to every track, retaining partial-pose observations for return-contact analyses. This broader motion label is not identical to S0 membership.'),
 '01_full_body_pca':('Full-body posture coordinates',
     'All ten landmarks are translated, rotated and normalized by body-axis length before PCA over the full recording. '
     'The left panel shows cumulative explained variance; the right shows coordinate loadings for the first eight modes. '
-    'Four PCs retain about 89.8% of the measured posture variance. The fit includes both colonies and excludes invalid full-body observations. '
+    'The fit includes both colonies and excludes invalid full-body observations. '
     'This describes joint articulation without selecting antenna straightness as a starting feature.'),
-'02_feature_expansion':('Original feature and state-resolution audit',
+'02_feature_expansion':('Choosing a reproducible behavioral vocabulary',
     'Each point is a feature representation and Leiden resolution. Seed agreement and agreement after removing ants measure reproducibility; '
-    'outlined points passed the original single-perturbation size and stability requirements. The reference eight-state solution uses four posture PCs, five motion features '
-    'and two concurrent-contact features. More features or higher resolution produced finer partitions that failed one or more checks. '
-    'The expanded repeat audit in the next figures weakens the evidence for eight reproducible states. The dictionary is retained as a provisional reference, '
-    'not a validated count of biological behaviors.'),
+    'outlined points pass all stated size and stability requirements. The selected feature set and state count are shown in the plot. The title states whether the selected model passes the stability criteria. An exploratory fallback is reported if no candidate passes; the state count is not a biological total of possible actions.'),
 '02_state_reduction':('Testing smaller state vocabularies',
     'Curves test Ward merges of the existing state centroids, either weighting each state equally or using its observation count in the ant-balanced dictionary. '
     'The first panel measures the original between-state feature variation retained by a merge. The other panels show median repeat-seed and held-out-ant ARI. '
@@ -61,14 +58,14 @@ NOTES={
     'The reference labels remain useful coordinates for ant proportions, but uncertain fine states should not be treated as independently validated biological categories.'),
 '03_state_umaps':('Views of the same eight states',
     'Dots are sampled short behavioral windows, colored by their fixed Leiden state. Each panel changes only UMAP display settings. '
-    'Leiden was fitted in the balanced feature space, not in these two-dimensional coordinates. Gaps and camera changes delimit windows. '
+    'Leiden was fitted in the balanced feature space, not in these two-dimensional coordinates. Missing samples and recording boundaries delimit windows; motion is estimated within each camera. '
     'Visible island size, distance and separation depend on the embedding parameters and do not constitute independent evidence for additional states.'),
 '04_state_profiles':('Features distinguishing behavioral states',
     'Rows are states and columns are the features used for clustering. Values summarize the ant-balanced dictionary and are shown after the '
     'same transformations and family scaling used for fitting. Color compares standardized features, not physical units. '
     'Posture, movement and concurrent contacts jointly define a state; no spatial labels or historical sleep labels entered the fit.'),
 '04_mean_posture_motion':('Mean posture and motion of each state',
-    'Skeletons show actual mean body-aligned coordinates for all assigned observations, with a common scale across states. Body segments are teal '
+    'Skeletons show mean body-aligned coordinates after bounded interpolation for all assigned observations, with a common scale across states. Body segments are teal '
     'and antennae orange. The heatmap prints motion and contact measurements in physical units, with color scaled separately within each feature. '
     'Means are weighted by observed duration, so partial windows contribute their measured length. These pooled means can differ from the '
     'ant-balanced dictionary medians in the previous figure and can conceal variation within each state.'),
@@ -99,7 +96,7 @@ NOTES={
     'Neither the class labels nor spatial groups enter the display-selection criterion. '
     'Embedding appearance does not change ant membership or select the number of classes.'),
 '06_ant_classes':('Individual state proportions and observed coverage',
-    'Rows are right-colony ants ordered by behavioral class and identity. The heatmap gives the fraction of each ant’s classified observations '
+    'Rows are ants from the selected colony ordered by behavioral class and identity. The heatmap gives the fraction of each ant’s classified observations '
     'in each state. Bars compare tracking detection and usable state classification over the full recording. Full-body posture and motion '
     'requirements exclude observations that still have a tracked position. Missing time is excluded from the proportion denominator and '
     'never becomes an extra state; behavior-dependent missingness remains a possible source of bias.'),
@@ -137,7 +134,7 @@ NOTES={
 '05_motion_sleep':('Sleep over time: the counterpart to the speed figure',
     'Curves show the equal-ant mean percentage of classified time labeled as putative sleep, in ten-minute bins, using fresh S0-calibrated '
     'motion labels. Clock time and light shading match the speed plot. Labels require at least 50% jointly valid body/antenna observations '
-    'in a trailing ten-second window, with at least 90% of those observations below both thresholds. Ant-bins also need 50% label coverage. '
+    'in a trailing one-second window, with at least 90% of those observations below both thresholds. Ant-bins also need 50% label coverage. '
     'The trailing window can delay transitions; unknown periods are excluded. This broader motion definition differs from direct S0 occupancy.'),
 '05_quiet_bouts':('Observed S0 run lengths',
     'Cumulative curves describe contiguous runs of direct S0 membership, separately by ant class. Missing posture or a recording boundary '
@@ -163,11 +160,16 @@ NOTES={
     'available; the recording supplies limited independent repeat days. Coverage rules are applied before estimating each clock-bin mean. '
     'Patterns show time-of-day association within this recording and should not be interpreted as evidence for an endogenous circadian '
     'rhythm without replication or a suitable experimental design.'),
+'06_motion_clock_profiles':('Individual activity and 1-second motion sleep by time of day',
+    'The same ants, clock bins and coverage rules as the preceding direct-S0 matrix, using motion-only labels calibrated from S0. '
+    'A complete trailing one-second window requires at least 50% valid observations and 90% below both body and antenna thresholds. '
+    'Motion is measured within each camera. Gray denotes insufficient evidence, never waking. The broader readout improves coverage '
+    'but can include other low-motion states; this single recording does not establish an endogenous circadian rhythm.'),
 '07_trip_investment':('Return frequency and time invested in trips',
     'The left panel compares each ant’s completed return rate and median trip duration, with Poisson and bootstrap intervals. Other panels '
     'show ant-level return rate and total minutes on completed trips per recording day, grouped by behavioral class. All classified ants '
     'are retained, including zero-trip ants. Grid-occupancy rules bridge position-state gaps up to 30 seconds and require anchored trips '
-    'of at least 30 seconds. These 5,923 completed trips use broader gap rules than the 1,827 precise return-response events.'),
+    'of at least 30 seconds. Completed trips use broader gap rules than precise return-response events; counts are reported for this recording.'),
 }
 
 

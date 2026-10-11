@@ -23,6 +23,42 @@ output is the packet's `report` directory. Install
 downstream readers also require PyArrow and Shapely.
 
 
+## Camera handling and one-second sleep (October 11 update)
+
+The standard colony pipeline now waits for ≤1 s posture interpolation and runs
+both colony reports. Position and posture may come from different overlapping
+cameras in the common panorama. Each coordinate stream uses its own camera
+provenance; a mismatch alone does not invalidate posture.
+
+Posture smoothing uses five complete observations from the same camera and
+recording: the observed center and two observations on either side, each within
+five native frames. Quadratic fits use the actual frame times. The usual
+consecutive-frame case equals the previous five-frame Savitzky–Golay filter.
+Missing centers remain unknown. Position, antenna, turning and PC derivatives
+never subtract coordinates from different cameras. One-second behavioral
+windows can span camera changes after alignment, but never missing samples or
+recording boundaries. View-dependent shape distortion may still affect posture
+means or variability; this is not a camera calibration correction.
+
+The separate sleep readout uses **observed raw landmarks** (including partial
+poses), with displacements paired within the same SLEAP camera and recording.
+Each speed retains its actual frame gap; the sleep classifier accepts gaps up
+to five native frames. Interpolation supports the full-body state model but does
+not itself supply evidence of immobility to this sleep readout. Refit the S0
+thresholds after rebuilding measurements. The trailing sleep window is now
+**1 second**, with ≥50% valid and ≥90% quiet observations. Labels are putative
+sleep, not an exact replacement for S0 or a physiological sleep validation.
+
+Versioned motion success markers prevent old cross-camera caches from being
+silently skipped. Feature/model fingerprints reject stale results; use a fresh
+analysis output directory when changing measurements. `ANTS_MOTION_CACHE_ROOT`
+can point to an isolated replacement cache; calibration and return-context
+readers use the same override. Old published outputs remain readable.
+
+The numerical examples below describe historical July runs and are not results
+of the updated method. Run-specific definitions, metrics and figures are saved
+in each report packet.
+
 ## Fresh motion sleep calibrated from S0
 
 `analysis.s0_motion_sleep` runs four dependent Slurm stages: per-track motion
@@ -55,7 +91,7 @@ only on the other blocks; the final thresholds then use all calibration blocks.
 Neither contact yield, spatial groups nor behavioral ant classes select limits.
 These choices are explicit modeling assumptions, not physiological validation.
 
-Fresh frame labels require a complete trailing ten-second window, at least 50%
+Fresh frame labels require a complete trailing one-second window, at least 50%
 jointly valid body/antenna observations, and at least 90% of the valid observations
 below both limits. Windows without sufficient evidence stay unknown. The same
 rule applies to all 114 tracks, including observations without complete posture.
@@ -100,7 +136,8 @@ before contact, with the same matching criteria as before.
    lateral peak velocity, both head-relative antennal speeds, turning, and exact
    concurrent partner counts; then add within-window PC SD and RMS PC rate.
    Continuous observations are partitioned into at most one-second windows,
-   retaining tails of at least 250 ms. Gaps and camera changes break segments.
+   retaining tails of at least 250 ms. Missing samples and recording boundaries break segments.
+   Camera handoffs can remain inside a window; all motion and PC rates are computed within each camera.
    Three UMAP settings show the same labels; clustering uses the balanced feature
    space, never the 2-D coordinates. Inspect feature profiles and quiet candidates.
    The mean-posture figure adds each state's mean full-body skeleton and a heatmap of its

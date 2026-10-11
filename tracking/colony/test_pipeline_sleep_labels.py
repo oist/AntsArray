@@ -12,6 +12,9 @@ def test_recording_timestamp_override_reaches_mapper_and_requires_one_block(tmp_
     hmats = tmp_path / "H.npz"
     hmats.touch()
     output = tmp_path / "output"
+    old_cache = output / "per_track/TrackID_0001_all_left"
+    old_cache.mkdir(parents=True)
+    (old_cache / "_SUCCESS").touch()  # Old cross-camera motion must be rebuilt.
     command = ["bash", str(root / "tracking/colony/submit_blocks_pipeline.sh"),
                "--blocks_root", str(block.parent), "--hmats", str(hmats),
                "--output_root", str(output), "--experiment_name", "20260726_104256", "--dry_run"]
@@ -43,7 +46,7 @@ def test_motion_labels_follow_motion_cache_and_gate_publication(tmp_path):
     for script in scripts.iterdir():
         subprocess.run(["bash", "-n", str(script)], check=True)
     labels = (scripts / "sleep_motion_labels_block01.sbatch").read_text()
-    assert "--body-threshold 0.5 --antenna-threshold 0.7 --history-seconds 10" in labels
+    assert "--body-threshold 0.5 --antenna-threshold 0.7 --history-seconds 1" in labels
     assert "analysis/compute_sleep_motion_labels.py" in labels
     submitter = (scripts / "submit_per_track_analysis_block01.sbatch").read_text()
     assert "sleep_motion/jobs/sleep_motion_complete_job_id.txt" in submitter
@@ -81,7 +84,7 @@ def test_per_track_worker_uses_exact_python_executable(tmp_path):
          "--operation_script", "analysis/compute_track_sleep_motion.py",
          "--operation_name", "sleep_motion", "--run_workdir", str(root),
          "--worker_python_bin", str(python), "--python_bin", sys.executable,
-         "--no_conda", "--no_transfer_to_bucket", "--dry_run"],
+         "--no_conda", "--no_transfer_to_bucket", "--skip_existing", "--dry_run"],
         check=True, capture_output=True, text=True,
     )
     worker_path = next(line.partition(": ")[2] for line in result.stdout.splitlines()
@@ -89,6 +92,7 @@ def test_per_track_worker_uses_exact_python_executable(tmp_path):
     worker = Path(worker_path).read_text()
     assert f"operation_cmd={python}" in worker
     assert "conda activate" not in worker
+    assert "DONE_MARKER=_SUCCESS_same_camera_v1" in worker
     subprocess.run(["bash", "-n", worker_path], check=True)
 
 

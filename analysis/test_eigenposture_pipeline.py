@@ -26,7 +26,8 @@ def test_standard_pipeline_gates_publication_on_eigenposture(tmp_path):
     subprocess.run(command, check=True, capture_output=True)
     state = output / 'jobs/block02/state'
     config = json.loads((state / 'eigenposture_watch.json').read_text())
-    assert len(config['prerequisites']) == 5
+    assert len(config['prerequisites']) == 6
+    assert any('posture_interpolation_complete.ok' in p for p in config['prerequisites'])
     assert not any('eigenposture_complete' in p for p in config['prerequisites'])
     assert str(state / 'interactions_complete_block02.ok') in config['prerequisites']
     manifest = (state / 'per_track_analysis_markers_block02.tsv').read_text()
@@ -113,3 +114,26 @@ def test_failed_report_never_marks_pipeline_complete(tmp_path):
     assert calls[-1][1]['ANTS_GRID_OUTPUT_NAME'] == 'grid_occupancy_histograms_arena_0p25mm'
     assert calls[-1][1]['ANTS_DATASET_ROOT'] == str(block)
     assert [c[0][2] for c in calls].index('analysis.full_behavior_roles') < [c[0][2] for c in calls].index('analysis.grid_occupancy')
+
+
+def test_reports_follow_fresh_calibration_and_use_separate_colonies(tmp_path):
+    block = tmp_path / 'block'; block.mkdir()
+    (block / 'panorama_regions.csv').write_text('annotations')
+    output = block / 'analysis_outputs/eigenposture'
+    calls = []
+    def command(args, **kwargs):
+        calls.append((args, kwargs['env'].copy()))
+        if 'analysis.eigenposture_task_report' in args:
+            side=kwargs['env']['ANTS_COLONY_SIDE']
+            assert Path(kwargs['env']['ANTS_ROLE_MODELS']).name == ('roles' if side=='right' else 'roles_left')
+            folder=Path(args[-1]);folder.mkdir(parents=True)
+            (folder/'summary.json').write_text('{}')
+            (folder/(side+'_behavior_classes.pdf')).touch()
+    with patch('analysis.eigenposture_pipeline.validate_interactions'), \
+         patch('analysis.eigenposture_pipeline.subprocess.run', side_effect=command):
+        run(block,block,output,4,.25)
+    stages=[args[2] for args,_ in calls]
+    assert stages.index('analysis.s0_motion_sleep') < stages.index('analysis.eigenposture_task_report')
+    assert '--posture-root' in calls[0][0]
+    assert [env['ANTS_COLONY_SIDE'] for args,env in calls if args[2]=='analysis.eigenposture_task_report']==['right','left']
+    assert (output/'eigenposture_complete.ok').exists()

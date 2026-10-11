@@ -69,31 +69,41 @@ def run(block: Path, source_block: Path, output: Path, workers: int, grid_size_m
     # annotated-arena derivative, at the requested resolution.
     env['ANTS_GRID_OUTPUT_NAME'] = grid_output_name
     commands = [
-        ['analysis.full_behavior_extract', '--block', str(block), '--output', str(output), '--workers', str(workers)],
+        ['analysis.full_behavior_extract', '--block', str(block), '--output', str(output), '--workers', str(workers),
+         '--posture-root', str(block / 'stitched/posture_interpolated/per_track')],
         ['analysis.full_behavior_states', 'features', '--root', str(output), '--workers', str(workers)],
         ['analysis.full_behavior_states', 'learn', '--root', str(output)],
         ['analysis.full_behavior_states', 'assign', '--root', str(output)],
         ['analysis.full_behavior_profiles', '--root', str(output)],
         ['analysis.full_behavior_roles', '--root', str(output)],
+        ['analysis.full_behavior_roles', '--root', str(output), '--side', 'left', '--output', str(output / 'roles_left')],
+        ['analysis.s0_motion_sleep', 'run', '--source', str(output), '--block', str(block),
+         '--work', str(output / 'motion_work'), '--output', str(output / 'sleep_from_s0_motion_20261011'), '--workers', str(workers)],
         ['analysis.grid_occupancy', str(block), '--headless', '--occupancy-only',
          '--grid-workers', str(workers), '--grid-size-mm', str(grid_size_mm),
          '--figure-root', str(output / 'spatial_reference')],
         ['analysis.eigenposture_task_report', '--source', str(output), '--output', str(output / 'report')],
+        ['analysis.eigenposture_task_report', '--source', str(output), '--output', str(output / 'report_left')],
     ]
     provenance = dict(source_block=str(source_block), analysis_block=str(block),
                       annotations=str(regions), annotation_sha256=hashlib.sha256(regions.read_bytes()).hexdigest(),
                       commands=commands, entrypoint='analysis/eigenposture_interactive.py',
-                      state_cohort='both', ant_classes='right', grid_size_mm=grid_size_mm)
+                      state_cohort='both', ant_classes='separate left and right', posture='interpolated <=1 second',
+                      motion='same camera and recording', sleep_window_seconds=1, grid_size_mm=grid_size_mm)
     (output / 'pipeline_run.json').write_text(json.dumps(provenance, indent=2) + '\n')
     repo = Path(__file__).resolve().parents[1]
     for command in commands:
         if command[0] == 'analysis.eigenposture_task_report':
             env['ANTS_GRID_OUTPUT_NAME'] = arena_grid_output_name(grid_size_mm)
+            side='left' if command[-1] == str(output / 'report_left') else 'right'
+            env['ANTS_COLONY_SIDE']=side
+            env['ANTS_ROLE_MODELS']=str(output / ('roles_left' if side=='left' else 'roles'))
         print('RUN', command, flush=True)
         subprocess.run([sys.executable, '-m', *command], cwd=repo, env=env, check=True)
-    for name in ('summary.json', 'right_behavior_classes.pdf'):
-        if not (output / 'report' / name).is_file():
-            raise FileNotFoundError(output / 'report' / name)
+    for side,folder in [('right','report'),('left','report_left')]:
+        for name in ('summary.json', side+'_behavior_classes.pdf'):
+            if not (output / folder / name).is_file():
+                raise FileNotFoundError(output / folder / name)
     marker.write_text('completed eigenposture_interactive\n')
 
 

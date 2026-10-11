@@ -5,6 +5,7 @@ landmark dictionary drawn across the complete recording for tractable scaling.
 Spatial coordinates and sleep labels are never model inputs or selectors.
 """
 import argparse
+import hashlib
 from concurrent.futures import ProcessPoolExecutor
 import json
 from pathlib import Path
@@ -51,16 +52,27 @@ def segment_windows(valid, camera, width=12, minimum=3):
 def make_features(task):
     root, ant=task; threadpool_limits(limits=1)
     output=root/'features'/ant.replace(':','_');output.mkdir(parents=True,exist_ok=True)
-    if (output/'metadata.json').exists():return json.loads((output/'metadata.json').read_text())
     source=root/'sequences'/ant.replace(':','_')
+    signature=dict(version='camera_local_rates_v1',
+        sequence=hashlib.sha256((source/'metadata.json').read_bytes()).hexdigest(),
+        pca=hashlib.sha256((root/'full_body_pca.npz').read_bytes()).hexdigest())
+    if (output/'metadata.json').exists():
+        cached=json.loads((output/'metadata.json').read_text())
+        if cached.get('signature')==signature:return cached
+        raise ValueError('Features belong to different measurements; use a fresh analysis output directory')
     pose=np.load(source/'pose.npy',mmap_mode='r');motion=np.load(source/'motion.npy',mmap_mode='r')
-    camera=np.load(source/'camera.npy',mmap_mode='r')
+    camera=np.load(source/'recording.npy',mmap_mode='r')
+    pose_rate=np.load(source/'pose_rate.npy',mmap_mode='r')
     contact=np.load(root/'contacts'/(ant.replace(':','_')+'.npy'),mmap_mode='r')
     coverage=np.load(root/'contacts'/(ant.split(':')[0]+'_covered.npy'),mmap_mode='r')
-    with np.load(root/'full_body_pca.npz') as z:pc=((pose-z['center'])@z['modes'][:8].T).astype(np.float32)
+    with np.load(root/'full_body_pca.npz') as z:
+        pc=((pose-z['center'])@z['modes'][:8].T).astype(np.float32)
+        pc_rate=(pose_rate@z['modes'][:8].T).astype(np.float32)
     valid=np.isfinite(pc).all(axis=1)&np.isfinite(motion).all(axis=1)&coverage[::2][:len(pc)]
     # At least 250 ms is necessary for a variation/rate estimate. This is a
     # feature-support rule, not hourly/ant filtering. Audit the omitted tails.
+    # Camera changes do not split body-aligned features; recordings and missing
+    # samples still do. PC rates below were already estimated within each view.
     starts,lengths=segment_windows(valid,camera)
     n=len(starts);features=np.empty((n,len(NAMES)),np.float32)
     for lo in range(0,n,20000):
@@ -69,8 +81,7 @@ def make_features(task):
         ix=np.minimum(s[:,None]+offsets,s[:,None]+length[:,None]-1)
         values=pc[ix];mean=(values*mask[:,:,None]).sum(axis=1)/length[:,None]
         sd=np.sqrt(((values-mean[:,None])**2*mask[:,:,None]).sum(axis=1)/length[:,None])
-        delta=np.diff(values,axis=1)*HZ
-        rate=np.sqrt((delta**2*mask[:,1:,None]).sum(axis=1)/(length[:,None]-1))
+        rate=np.sqrt((pc_rate[ix]**2*mask[:,:,None]).sum(axis=1)/length[:,None])
         speeds=motion[ix]
         peaks=np.where(mask[:,:,None],speeds[:,:,:2],-np.inf).max(axis=1)
         averages=(speeds[:,:,2:]*mask[:,:,None]).sum(axis=1)/length[:,None]
@@ -82,7 +93,7 @@ def make_features(task):
         features[lo:hi]=np.column_stack([mean,sd,rate,peaks,averages,exact])
     assert np.isfinite(features).all()
     np.save(output/'raw.npy',features);np.save(output/'start.npy',starts);np.save(output/'length.npy',lengths)
-    info=dict(ant=ant,n_windows=n,n_observed_samples=int(valid.sum()),n_assigned_samples=int(lengths.sum()),
+    info=dict(signature=signature,ant=ant,n_windows=n,n_observed_samples=int(valid.sum()),n_assigned_samples=int(lengths.sum()),
               excluded_short_samples=int(valid.sum()-lengths.sum()),median_window_seconds=float(np.median(lengths)/HZ),
               mean_window_seconds=float(np.mean(lengths)/HZ))
     (output/'metadata.json').write_text(json.dumps(info,indent=2)+'\n')
@@ -304,6 +315,13 @@ def reduction_scan(root, output, repeats=5, seed_repeats=3, weighting='state'):
 def learn(root):
     ants=pd.read_csv(root/'inventory.csv');ants=ants[ants.selected].reset_index(drop=True)
     output=root/'models';output.mkdir(exist_ok=True)
+    signature={ant:hashlib.sha256((root/'features'/ant.replace(':','_')/'metadata.json').read_bytes()).hexdigest() for ant in ants.ant}
+    manifest=output/'feature_inputs.json'
+    if manifest.exists() and json.loads(manifest.read_text())!=signature:
+        raise ValueError('State models belong to different features; use a fresh analysis output directory')
+    if not manifest.exists() and any((output/(name+'.npz')).exists() for name in SETS):
+        raise ValueError('Unversioned state models: use a fresh analysis output directory')
+    manifest.write_text(json.dumps(signature,sort_keys=True)+'\n')
     rng=np.random.default_rng(SEED)
     raw=[];ant_ids=[];window_ids=[]
     for ai,ant in enumerate(ants.ant):
