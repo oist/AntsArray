@@ -11,6 +11,29 @@ from analysis import return_sleep_utils as rs
 from analysis import arena_grid_utils as arena
 
 
+def test_recording_coverage_rejects_short_tracks_with_high_within_track_coverage(tmp_path):
+    arrays = [tmp_path / name for name in ("occupancy.npy", "x.npy", "y.npy")]
+    for path in arrays:
+        path.touch()
+    tracks = pd.DataFrame({
+        "track_name": ["well_observed", "single_frame", "short_track"],
+        "side": ["left"] * 3,
+        "present_frac": [.8, 1., .9],
+        "n_observed_frames": [800, 1, 90],
+        "speed_n_observed_frames": [800, 1, None],
+        "occupancy_path": [arrays[0]] * 3,
+        "x_edges_path": [arrays[1]] * 3,
+        "y_edges_path": [arrays[2]] * 3,
+    })
+    measured = go.use_recording_detection_fraction(tracks, 1000)
+    assert measured.present_frac.tolist() == [.8, .001, .09]
+    assert measured.track_span_present_frac.tolist() == [.8, 1., .9]
+    assert go.select_good_tracks(measured).track_name.tolist() == ["well_observed"]
+    assert tracks.present_frac.tolist() == [.8, 1., .9]
+    with pytest.raises(ValueError, match="positive integer"):
+        go.use_recording_detection_fraction(tracks, 0)
+
+
 def _grid(block, name):
     root = block / "stitched" / name
     metadata = root / "per_track" / "ant_left" / "grid_occupancy_metadata.json"

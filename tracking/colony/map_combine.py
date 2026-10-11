@@ -80,7 +80,7 @@ def resolve_x_threshold(data_dir: Path, override: float | None = None) -> float:
         )
         return float(override)
     block_dir = Path(data_dir).parent
-    current_regions_path = panorama_regions_path(block_dir)
+    current_regions_path = panorama_regions_path(block_dir, search_earlier_dates=False)
     regions_path = panorama_regions_path(block_dir, search_earlier_dates=True)
     if not regions_path.exists():
         message = (

@@ -373,6 +373,28 @@ def attach_detection_fraction(tracks: pd.DataFrame, speed_root: Path | None = No
     return out
 
 
+def use_recording_detection_fraction(tracks: pd.DataFrame, frame_count: int) -> pd.DataFrame:
+    """Measure observation coverage against recorded time, including absent tails.
+
+    A one-frame track must not qualify as fully observed merely because its
+    first and last detections coincide. For combined recordings, callers pass
+    the sum of recorded block frames, excluding unrecorded gaps.
+    """
+    if frame_count <= 0 or int(frame_count) != frame_count:
+        raise ValueError("Recording frame count must be a positive integer")
+    out = tracks.copy()
+    observed = out["n_observed_frames"]
+    if "speed_n_observed_frames" in out:
+        observed = out["speed_n_observed_frames"].fillna(observed)
+    if observed.isna().any() or ((observed < 0) | (observed > frame_count)).any():
+        raise ValueError("Observed frame counts fall outside the recording span")
+    out["track_span_present_frac"] = out["present_frac"]
+    out["recording_n_frames"] = int(frame_count)
+    out["present_frac"] = observed / frame_count
+    out["present_frac_source"] = "recorded_frame_count"
+    return out
+
+
 def select_good_tracks(
     tracks: pd.DataFrame,
     min_present_frac: float = 0.40,
@@ -746,9 +768,10 @@ def plot_cluster_mean_histograms(
         vmax = float(np.nanpercentile(np.concatenate([image.ravel() for image in images]), vmax_percentile))
 
     n_clusters = len(clusters)
-    n_cols = min(4, n_clusters)
-    n_rows = int(np.ceil(n_clusters / n_cols))
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 3.6 * n_rows), squeeze=False)
+    n_rows = int(np.ceil(n_clusters / min(4, n_clusters)))
+    n_cols = int(np.ceil(n_clusters / n_rows))
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 3.6 * n_rows),
+                             squeeze=False, layout="constrained")
     last_im = None
     for ax, cluster in zip(axes.ravel(), clusters):
         image = display_histogram(mean_hists[int(cluster)], mode)
@@ -829,6 +852,7 @@ def plot_cluster_example_histograms(
         n_cols,
         figsize=(3.2 * n_cols, 3.0 * n_rows),
         squeeze=False,
+        layout="constrained",
     )
     last_im = None
     positions = {cluster: 0 for cluster in clusters}

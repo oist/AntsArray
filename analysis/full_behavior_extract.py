@@ -49,9 +49,14 @@ def count_contacts(frames,a,b,ids,n_frames):
 
 
 def contacts(block,output,ants):
+    from analysis import grid_occupancy_utils as go
     from analysis.return_sleep_utils import resolve_interaction_root,load_published_interaction_chunks
+    speed_tracks=go.load_speed_tracks(block/'stitched/speed_vectors')
+    if not np.allclose(speed_tracks.fps,FPS):
+        raise ValueError(f'Full-body extraction requires {FPS} fps')
+    context=go.recording_context(block,speed_tracks)
     chunks,run=load_published_interaction_chunks(resolve_interaction_root(block),block/'tracks',fps=FPS,
-        start_clock_seconds=9*3600+31*60+10)
+        start_clock_seconds=context['start_clock_seconds'])
     root=output/'contacts';root.mkdir(exist_ok=True);n_frames=int(ants.n_frames.iloc[0])
     fingerprint=dict(run_id=run['run_id'],files=[stamp(c.interaction_path) for c in chunks],
         ants=ants.ant.tolist(),definition='unique concurrent partners, no temporal joining')
@@ -117,8 +122,10 @@ def extract_one(task):
     for lo in range(2,n-2,120000):
         hi=min(n-2,lo+120000);centers=np.arange(lo,hi,2);ix=centers[:,None]+np.arange(-2,3)
         shape,anterior,valid=align_body(xy[lo-2:hi+2],scale);offsets=centers-lo+2
-        aligned=savgol_filter(shape,5,2,axis=0,mode='interp')[offsets]
-        derivative=savgol_filter(shape,5,2,deriv=1,delta=1/FPS,axis=0,mode='interp')[offsets]*scale
+        # Only centered five-frame windows are retained. Padding is never
+        # sampled; avoid fitting unused edge polynomials to missing poses.
+        aligned=savgol_filter(shape,5,2,axis=0,mode='constant',cval=np.nan)[offsets]
+        derivative=savgol_filter(shape,5,2,deriv=1,delta=1/FPS,axis=0,mode='constant',cval=np.nan)[offsets]*scale
         good=valid[ix-(lo-2)].all(axis=1)&(cam[ix]>=0).all(axis=1)&(np.ptp(cam[ix],axis=1)==0)
         velocity=((position[ix]-position[ix[:,2:3]])*np.arange(-2,3)[None,:,None]).sum(axis=1)*(FPS*MM_PER_PX/10)
         orientation=anterior[offsets];lateral=np.column_stack([-orientation[:,1],orientation[:,0]])

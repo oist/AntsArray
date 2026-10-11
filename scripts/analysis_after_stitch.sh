@@ -4,6 +4,7 @@
 #
 # Routines dispatched (one Slurm job per TrackID_*.parquet, via
 # scripts/per_track_slurm_fanout.sh):
+#   posture_interpolation (analysis/compute_track_posture_interpolation.py)
 #   colony_presence  (analysis/compute_track_colony_presence_vector.py)
 #   speed_vector     (analysis/compute_track_speed_vector.py)   [needs scipy]
 #   sleep_motion     (analysis/compute_track_sleep_motion.py)
@@ -203,6 +204,8 @@ run_routine() {  # $1 operation_script(basename)  $2 operation_name  $3 output_n
   fi
 }
 
+posture_args_text="$(printf '%q %q %q %q' --fps "$fps" --max_gap_seconds 1.0)"
+run_routine compute_track_posture_interpolation.py posture_interpolation posture_interpolated "$posture_args_text"
 run_routine compute_track_colony_presence_vector.py colony_presence colony_presence_vectors
 speed_args_text="$(printf '%q %q' --max_speed_mm_s "$speed_max_mm_s")"
 run_routine compute_track_speed_vector.py           speed_vector    speed_vectors "$speed_args_text"

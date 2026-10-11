@@ -75,6 +75,7 @@ SOURCE_GRID_ROOT = go.resolve_grid_root(DATASET_ROOT, GRID_OUTPUT_NAME)
 # Reuse those arrays directly. Preserve the existing single-block arena workflow.
 USE_ANNOTATED_ARENA_BOUNDS = not go.is_combined_recording(DATASET_ROOT)
 PANORAMA_REGIONS_PATH = go.panorama_regions_path(ANNOTATION_ROOT)
+print(f"Selected panorama annotations: {PANORAMA_REGIONS_PATH}", flush=True)
 if not USE_ANNOTATED_ARENA_BOUNDS:
     print(f"Reusing existing occupancy histograms: {SOURCE_GRID_ROOT} (no track rereading)", flush=True)
 GRID_ROOT = (
@@ -125,6 +126,12 @@ RECORDING_LABEL = (f"{RECORDING_CONTEXT['recording_date']}: {' + '.join(RECORDIN
 experiment_start_clock_seconds = RECORDING_CONTEXT["start_clock_seconds"]
 recording_start_frame = RECORDING_CONTEXT["frame_min"]
 recording_stop_frame = RECORDING_CONTEXT["frame_stop"]
+recording_frame_count = recording_stop_frame - recording_start_frame
+combination_manifest_path = STITCHED_ROOT / "block_combination.json"
+if combination_manifest_path.is_file():
+    combination_manifest = json.loads(combination_manifest_path.read_text())
+    recording_frame_count = sum(block["num_frames"] for block in combination_manifest["blocks"])
+track_table = go.use_recording_detection_fraction(track_table, recording_frame_count)
 good_tracks = go.select_good_tracks(track_table, MIN_PRESENT_FRAC, side="both")
 
 print(f"Loaded {len(track_table)} grid histograms from {GRID_ROOT}")

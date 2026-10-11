@@ -73,6 +73,7 @@ OUTPUT_ROOT/
     tracks/
     stitched/
     interactions/
+    analysis_outputs/eigenposture/
   jobs/
     block02/
       scripts/
@@ -92,6 +93,7 @@ The data folders under `block02/` are copied back to the corresponding bucket bl
 /bucket/.../<date>/block02/tracks
 /bucket/.../<date>/block02/stitched
 /bucket/.../<date>/block02/interactions
+/bucket/.../<date>/block02/analysis_outputs/eigenposture
 ```
 
 `jobs/block02/` contains generated sbatch scripts, worker logs, job ID files, completion markers, and transfer manifests. It is not copied as analysis data.
@@ -125,9 +127,13 @@ The pipeline uses small submitter jobs to create many independent Slurm workers,
 1. The block map job creates all panorama PKLs for the block.
 2. A tracking submitter job runs after mapping and submits one worker per chunk/side.
 3. A stitch job runs after all tracking workers finish and writes block-level per-track outputs.
-4. A per-track analysis submitter runs after stitching and submits speed, colony-presence, grid-occupancy, and sleep-prediction workers. Sleep-prediction workers wait for the speed-vector completion job.
+4. A per-track analysis submitter runs after stitching and submits posture interpolation, speed, sleep-motion, and grid-occupancy workers. Legacy mode also runs colony-presence and sleep-label workers.
 5. An interaction submitter job runs after all tracking workers finish and submits one worker per chunk/side interaction parquet.
-6. A login-side transfer watcher waits for fresh stitch, per-track analysis, and interaction completion markers, then rsyncs the block output folders back to bucket.
+6. The standard `eigenposture_interactive.py` analysis waits for stitched tracks,
+   speed/motion/grid caches, and complete skeleton contacts. A Slurm job builds
+   the full-recording model packet and runs the interactive cells headlessly.
+7. A login-side transfer watcher waits for fresh stitch, per-track cache,
+   interaction, and eigenposture completion markers, then rsyncs outputs to bucket.
 
 The same pattern is used for generic per-track analysis with `scripts/per_track_slurm_fanout.sh`: one worker per `TrackID_*.parquet`, one completion marker after all workers, then a login-side transfer watcher.
 
@@ -208,9 +214,12 @@ Stitched parquets preserve time gaps using frame counts and chunk timing metadat
 
 ### 4. Per-Track Analysis
 
-After stitching, `scripts/per_track_slurm_fanout.sh` runs the standard per-track operations over `stitched/per_track/`:
+After stitching, `scripts/per_track_slurm_fanout.sh` prepares interpolated posture,
+speed, motion, and grid caches over `stitched/per_track/`. The optional legacy mode
+(`--no_eigenposture`) also produces colony-presence and old sleep labels:
 
 ```text
+block02/stitched/posture_interpolated/
 block02/stitched/colony_presence_vectors/
 block02/stitched/speed_vectors/
 block02/stitched/sleep_motion/
@@ -225,6 +234,53 @@ Motion-based sleep labels run after the body/antenna motion caches finish and
 are included in the completion markers required for publication. They are
 separate from the optional trained-classifier predictions. Occupancy grids
 default to 0.25 mm bins; `--grid_size_mm` overrides the bin size.
+
+`analysis/compute_track_posture_interpolation.py` linearly fills bounded gaps of
+at most one second (24 missing frames at 24 fps) in SLEAP bodypoints 1–9. Every
+intervening frame must retain a matched tag anchor and tracked position in the
+same SLEAP camera and recording. It never fills a missing identity, a whole-pose
+loss, an unbounded gap, or the tag trajectory. Existing finite coordinates and
+frame/timing metadata are preserved. The pipeline passes its `--fps` setting.
+
+Each worker writes a separate full parquet under
+`posture_interpolated/per_track/<track_stem>/<track_name>.parquet`, with
+`PostureInterpolated` and `PostureGapFrames` columns. Its
+`posture_interpolation_metadata.json` records source size/mtime, parameters,
+code hash, per-node gap counts, complete-frame counts, and elapsed time.
+Detector confidence is never invented for added nodes. The block transfer waits
+for `posture_interpolation_complete.ok`. This operation recomputes after each
+stitch so a stale per-track success marker cannot silently reuse old posture.
+Original `stitched/per_track/` files and existing analysis inputs are unchanged;
+using interpolated posture in a report requires an explicit downstream selection.
+
+To run just this new fan-out on a previously tracked block (on the login node):
+
+```bash
+bash scripts/per_track_slurm_fanout.sh \
+  --per_track_dir /bucket/ReiterU/Ants/basler/20260928/block01-sync/stitched/per_track \
+  --operation_script analysis/compute_track_posture_interpolation.py \
+  --operation_args '--fps 24 --max_gap_seconds 1.0'
+```
+
+The standard downstream report is `analysis/eigenposture_interactive.py`, run
+by `analysis/eigenposture_pipeline.py` after these inputs and interactions finish.
+It writes the model packet and PNG/PDF report to
+`analysis_outputs/eigenposture/` in the original block. It learns states from
+both colonies; the current script fits ant classes and downstream comparisons
+for the right colony. Annotations fall back to the latest earlier recording.
+The standard report derives putative sleep from the discovered states. The
+legacy motion-threshold and trained-classifier sleep jobs run only when
+`--no_eigenposture` selects the older downstream workflow.
+
+Use `--eigenposture_python_bin /path/to/python` for an environment with
+`analysis/eigenposture_leiden_requirements.txt` installed. Its default is
+`~/.venvs/ants-eigenposture/bin/python`; dependencies are checked before jobs are
+submitted. The tracking Python can remain the unit tracking environment.
+Report resources default to 4 CPUs, 128 GB, and 2 days, adjustable with
+`--eigenposture_cpus`, `--eigenposture_mem`, and `--eigenposture_time`.
+`--no_eigenposture` opts out of the report. `--no_analysis` and
+`--no_per_track_analysis` also disable it; a report requires interactions.
+The lightweight login watcher log is `jobs/<block>/logs/eigenposture/watcher.log`.
 
 ### 5. Chunk Interaction Analysis
 

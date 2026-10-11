@@ -1,5 +1,6 @@
 """Scientific invariants: alignment, exact contacts, and gap-aware windows."""
 import unittest
+from unittest.mock import patch
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -12,6 +13,40 @@ from analysis.full_behavior_profiles import state_sums
 
 
 class FullBehaviorTests(unittest.TestCase):
+    def test_extraction_keeps_missing_edges_unknown_without_fitting_them(self):
+        from analysis.full_behavior_extract import extract_one
+        skeleton=np.array([[0,0],[12,0],[-20,0],[-45,4],[16,5],[24,12],[33,12],
+                           [16,-5],[24,-12],[33,-12]],float)
+        with TemporaryDirectory() as directory:
+            root=Path(directory);block=root/'block';output=root/'output'
+            tracks=block/'stitched/per_track';tracks.mkdir(parents=True)
+            frame=np.repeat(np.arange(4,24),10);point=np.tile(np.arange(10),20)
+            data=pd.DataFrame(dict(Frame=frame,Bodypoint=point,X=skeleton[point,0],Y=skeleton[point,1],
+                SleapCam=0,TrackX=0.,TrackY=0.,CameraID=0))
+            data.to_parquet(tracks/'ant.parquet',index=False)
+            result=extract_one((block,output,dict(ant='right:001',track_name='ant.parquet',n_frames=32)))
+            self.assertEqual(result['valid_pose_samples'],8)
+            pose=np.load(output/'sequences/right_001/pose.npy')
+            motion=np.load(output/'sequences/right_001/motion.npy')
+            expected,_,_=align_body(skeleton[None],20*MM_PER_PX)
+            np.testing.assert_allclose(pose[3:11],np.tile(expected.reshape(1,20),(8,1)),atol=1e-6)
+            np.testing.assert_allclose(motion[3:11],0,atol=1e-6)
+            self.assertTrue(np.isnan(pose[:3]).all() and np.isnan(pose[11:]).all())
+
+    def test_contacts_use_recording_clock_instead_of_july_clock(self):
+        from analysis.full_behavior_extract import contacts
+        with TemporaryDirectory() as directory:
+            root=Path(directory);block=root/'20260928/block01-sync'
+            tracks=pd.DataFrame(dict(track_name=['TrackID_0001_all_135717_right.parquet'],
+                fps=[24.],frame_min=[0],frame_max=[23]))
+            ants=pd.DataFrame(dict(ant=['right:001'],side=['right'],track_id=[1],n_frames=[24]))
+            with patch('analysis.grid_occupancy_utils.load_speed_tracks',return_value=tracks), \
+                 patch('analysis.return_sleep_utils.resolve_interaction_root',return_value=block/'interactions'), \
+                 patch('analysis.return_sleep_utils.load_published_interaction_chunks',return_value=([],{'run_id':'test'})) as loader:
+                contacts(block,root,ants)
+            self.assertEqual(loader.call_args.kwargs['start_clock_seconds'],13*3600+57*60+17)
+            self.assertFalse(np.load(root/'contacts/right_covered.npy').any())
+
     def test_zero_trip_ant_keeps_zero_rate_and_missing_duration(self):
         from analysis.trip_phenotyping_utils import compute_trip_investment_confidence
         ants=pd.DataFrame(dict(side=['right']*2,track_id=[1,2],track_name=['one','two'],frame_min=[0,0],frame_max=[86399,86399]))

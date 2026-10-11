@@ -1,4 +1,4 @@
-"""Block-local panorama annotations and optional earlier-date lookup for tracking."""
+"""Block-local panorama annotations with fallback to the latest earlier recording."""
 
 from pathlib import Path
 import csv
@@ -40,13 +40,13 @@ def panorama_dataset_dir(block_dir: Path) -> Path:
 
 def panorama_regions_path(
     block_dir: Path, suffix: str = ".csv", *, for_write: bool = False,
-    search_earlier_dates: bool = False,
+    search_earlier_dates: bool = True,
 ) -> Path:
     """Save in the selected block; prefer local annotations when reading.
 
-    Share the immediate dated parent of a block. Tracking can opt into looking
-    under earlier recording folders in the same dataset root, including their
-    block*/ annotations. Rank by recording date first, then file modification
+    Share the immediate dated parent of a block, then fall back to earlier
+    recording folders in the same dataset root, including their block*/
+    annotations. Rank by recording date first, then file modification
     time within that date, with a deterministic path tie-break. Never borrow
     same-day sibling-block or future-date annotations. Writes stay block-local.
     """

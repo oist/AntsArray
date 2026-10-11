@@ -167,6 +167,10 @@ if [[ -n "$OPERATION_SCRIPT" ]]; then
   operation_script_stem="$(basename "$OPERATION_SCRIPT")"
   operation_script_stem="${operation_script_stem%.*}"
   case "$operation_script_stem" in
+    compute_track_posture_interpolation)
+      default_operation_name="posture_interpolation"
+      default_output_name="posture_interpolated"
+      ;;
     compute_track_speed_vector)
       default_operation_name="speed_vector"
       default_output_name="speed_vectors"

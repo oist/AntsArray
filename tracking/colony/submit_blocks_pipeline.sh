@@ -5,7 +5,7 @@
 #   1. submit one SLURM job to create panorama PKLs
 #   2. submit a dependent SLURM job that fans out per-chunk/side tracking jobs
 #   3. submit a dependent stitch job that writes stitched/per_track outputs
-#   4. submit dependent per-track analysis fanout jobs for speed/presence/occupancy/sleep motion/sleep
+#   4. submit dependent per-track analysis fanout jobs for posture interpolation/speed/presence/occupancy/sleep motion/sleep
 #   5. submit a dependent SLURM job that fans out per-chunk interaction jobs
 #   6. transfer completed flash outputs back to bucket
 #
@@ -170,6 +170,14 @@ ANALYSIS_CPUS=4
 ANALYSIS_MEM="16G"
 ANALYSIS_TIME="0-12:00:00"
 
+# Standard block report: full-recording eigenposture_interactive workflow.
+# The per-track caches above and skeleton contacts are its input preparation.
+RUN_EIGENPOSTURE=1
+EIGENPOSTURE_PYTHON_BIN="${EIGENPOSTURE_PYTHON_BIN:-${HOME_DIR}/.venvs/ants-eigenposture/bin/python}"
+EIGENPOSTURE_CPUS=4
+EIGENPOSTURE_MEM="128G"
+EIGENPOSTURE_TIME="2-00:00:00"
+
 # Email notifications (empty = off; or pass --notify_email). Sends:
 #   - Slurm FAIL mail from every orchestration job (map/submit/stitch/fan-outs)
 #   - ONE failure-digest email if any per-chunk tracking worker fails (an
@@ -261,6 +269,11 @@ run_analysis="$RUN_ANALYSIS"
 analysis_cpus="$ANALYSIS_CPUS"
 analysis_mem="$ANALYSIS_MEM"
 analysis_time="$ANALYSIS_TIME"
+run_eigenposture="$RUN_EIGENPOSTURE"
+eigenposture_python_bin="$EIGENPOSTURE_PYTHON_BIN"
+eigenposture_cpus="$EIGENPOSTURE_CPUS"
+eigenposture_mem="$EIGENPOSTURE_MEM"
+eigenposture_time="$EIGENPOSTURE_TIME"
 notify_email="$NOTIFY_EMAIL"
 dry_run="$DRY_RUN"
 force_submit=0
@@ -371,6 +384,13 @@ Optional:
   --analysis_cpus N         CPUs per per-track analysis job. Default: 4
   --analysis_mem MEM        Memory per per-track analysis job. Default: 16G
   --analysis_time TIME      Time per per-track analysis job. Default: 0-12:00:00
+  --no_eigenposture         Disable the standard eigenposture_interactive report.
+  --eigenposture_python_bin PATH
+                            Python with analysis/eigenposture_leiden_requirements.txt installed.
+                            Default: ~/.venvs/ants-eigenposture/bin/python
+  --eigenposture_cpus N     Extraction workers / job CPUs. Default: 4
+  --eigenposture_mem MEM    Report job memory. Default: 128G
+  --eigenposture_time TIME  Report job time. Default: 2-00:00:00
   --notify_email ADDR       Email ADDR when tracking completes (track_done END
                             mail + a transfer-complete email once outputs are on
                             the bucket) and on failures (Slurm FAIL mail on
@@ -469,6 +489,11 @@ while [[ $# -gt 0 ]]; do
     --analysis_cpus) analysis_cpus="$2"; shift 2 ;;
     --analysis_mem) analysis_mem="$2"; shift 2 ;;
     --analysis_time) analysis_time="$2"; shift 2 ;;
+    --no_eigenposture) run_eigenposture=0; shift ;;
+    --eigenposture_python_bin) eigenposture_python_bin="$2"; shift 2 ;;
+    --eigenposture_cpus) eigenposture_cpus="$2"; shift 2 ;;
+    --eigenposture_mem) eigenposture_mem="$2"; shift 2 ;;
+    --eigenposture_time) eigenposture_time="$2"; shift 2 ;;
     --notify_email) notify_email="$2"; shift 2 ;;
     --dry_run) dry_run=1; shift ;;
     --force_submit) force_submit=1; shift ;;
@@ -476,6 +501,17 @@ while [[ $# -gt 0 ]]; do
     *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
+
+if [[ "$run_analysis" -eq 0 || "$run_per_track_analysis" -eq 0 ]]; then
+  run_eigenposture=0
+fi
+if [[ "$run_eigenposture" -eq 1 && "$run_interactions" -eq 0 ]]; then
+  echo "ERROR: eigenposture requires skeleton interactions; use --no_eigenposture with --no_interactions." >&2
+  exit 2
+fi
+if [[ "$run_eigenposture" -eq 1 && "$dry_run" -eq 0 ]]; then
+  python3 "$REPO_ROOT/scripts/eigenposture_after_tracking.py" --check-environment "$eigenposture_python_bin"
+fi
 
 if [[ -z "$sleep_conda_env" ]]; then
   sleep_conda_env="$conda_env"
@@ -655,14 +691,21 @@ for block_dir in "${blocks[@]}"; do
     printf '%s\t%s\n' "$interaction_dir" "$bucket_interaction_dir" >> "$transfer_manifest"
   fi
   if [[ "$run_per_track_analysis" -eq 1 ]]; then
-    printf '%s\t%s\n' "colony_presence" "$stitched_dir/colony_presence_vectors/colony_presence_complete.ok" >> "$per_track_analysis_marker_manifest"
+    if [[ "$run_eigenposture" -eq 0 ]]; then
+      printf '%s\t%s\n' "colony_presence" "$stitched_dir/colony_presence_vectors/colony_presence_complete.ok" >> "$per_track_analysis_marker_manifest"
+      printf '%s\t%s\n' "sleep_motion_labels" "$stitched_dir/sleep_motion_labels/sleep_motion_labels_complete.ok" >> "$per_track_analysis_marker_manifest"
+    fi
+    printf '%s\t%s\n' "posture_interpolation" "$stitched_dir/posture_interpolated/posture_interpolation_complete.ok" >> "$per_track_analysis_marker_manifest"
     printf '%s\t%s\n' "speed_vector" "$stitched_dir/speed_vectors/speed_vector_complete.ok" >> "$per_track_analysis_marker_manifest"
     printf '%s\t%s\n' "sleep_motion" "$stitched_dir/sleep_motion/sleep_motion_complete.ok" >> "$per_track_analysis_marker_manifest"
-    printf '%s\t%s\n' "sleep_motion_labels" "$stitched_dir/sleep_motion_labels/sleep_motion_labels_complete.ok" >> "$per_track_analysis_marker_manifest"
     printf '%s\t%s\n' "grid_occupancy" "$stitched_dir/${grid_occupancy_output_name}/grid_occupancy_complete.ok" >> "$per_track_analysis_marker_manifest"
-    if [[ "$run_sleep_predictions" -eq 1 ]]; then
+    if [[ "$run_sleep_predictions" -eq 1 && "$run_eigenposture" -eq 0 ]]; then
       printf '%s\t%s\n' "sleep_prediction" "$stitched_dir/sleep_predictions/sleep_prediction_complete.ok" >> "$per_track_analysis_marker_manifest"
     fi
+  fi
+  if [[ "$run_eigenposture" -eq 1 ]]; then
+    printf '%s\t%s\n' "eigenposture" "$work_dir/analysis_outputs/eigenposture/eigenposture_complete.ok" >> "$per_track_analysis_marker_manifest"
+    printf '%s\t%s\n' "$work_dir/analysis_outputs/eigenposture" "$block_dir/analysis_outputs/eigenposture" >> "$transfer_manifest"
   fi
 
   map_script="$script_dir/map_${block_name}.sbatch"
@@ -1016,11 +1059,13 @@ sleep_motion_operation_args=(
 sleep_motion_operation_args_text="\$(printf ' %q' "\${sleep_motion_operation_args[@]}")"
 sleep_motion_operation_args_text="\${sleep_motion_operation_args_text# }"
 
+if [[ "${run_eigenposture}" -eq 0 ]]; then
 bash "${PER_TRACK_FANOUT_SH}" \\
   --per_track_dir "${stitched_dir}/per_track" \\
   --operation_script analysis/compute_track_colony_presence_vector.py \\
   --operation_name colony_presence \\
   --output_name colony_presence_vectors \\
+  --bucket_output_dir "${bucket_stitched_dir}/colony_presence_vectors" \\
   --run_workdir "${REPO_ROOT}" \\
   --conda_bin "${conda_bin}" \\
   --conda_env "${conda_env}" \\
@@ -1032,6 +1077,27 @@ bash "${PER_TRACK_FANOUT_SH}" \\
   --mem "${per_track_analysis_mem}" \\
   --time "${per_track_analysis_time}" \\
   --no_transfer_to_bucket${skip_existing_arg}
+fi
+
+# Recompute from each completed stitch; do not reuse a bare, possibly stale _SUCCESS.
+bash "${PER_TRACK_FANOUT_SH}" \\
+  --per_track_dir "${stitched_dir}/per_track" \\
+  --operation_script analysis/compute_track_posture_interpolation.py \\
+  --operation_name posture_interpolation \\
+  --output_name posture_interpolated \\
+  --operation_args "--fps ${fps} --max_gap_seconds 1.0" \\
+  --bucket_output_dir "${bucket_stitched_dir}/posture_interpolated" \\
+  --run_workdir "${REPO_ROOT}" \\
+  --conda_bin "${conda_bin}" \\
+  --conda_env "${conda_env}" \\
+  --python_bin "${python_bin}" \\
+  --no_conda --worker_python_bin "${python_bin}" \\
+  --sbatch_bin "${sbatch_bin}" \\
+  --partition "${partition}" \\
+  --cpus "${per_track_analysis_cpus}" \\
+  --mem "${per_track_analysis_mem}" \\
+  --time "${per_track_analysis_time}" \\
+  --no_transfer_to_bucket
 
 bash "${PER_TRACK_FANOUT_SH}" \\
   --per_track_dir "${stitched_dir}/per_track" \\
@@ -1039,6 +1105,7 @@ bash "${PER_TRACK_FANOUT_SH}" \\
   --operation_name speed_vector \\
   --output_name speed_vectors \\
   --operation_args "\${speed_operation_args_text}" \\
+  --bucket_output_dir "${bucket_stitched_dir}/speed_vectors" \\
   --run_workdir "${REPO_ROOT}" \\
   --conda_bin "${conda_bin}" \\
   --conda_env "${conda_env}" \\
@@ -1056,6 +1123,7 @@ bash "${PER_TRACK_FANOUT_SH}" \\
   --operation_script analysis/compute_track_sleep_motion.py \\
   --operation_name sleep_motion \\
   --output_name sleep_motion \\
+  --bucket_output_dir "${bucket_stitched_dir}/sleep_motion" \\
   --operation_args "\${sleep_motion_operation_args_text}" \\
   --run_workdir "${REPO_ROOT}" \\
   --conda_bin "${conda_bin}" \\
@@ -1074,6 +1142,7 @@ bash "${PER_TRACK_FANOUT_SH}" \\
   --operation_script analysis/compute_track_grid_occupancy.py \\
   --operation_name grid_occupancy \\
   --output_name "\${grid_occupancy_output_name}" \\
+  --bucket_output_dir "${bucket_stitched_dir}/\${grid_occupancy_output_name}" \\
   --operation_args "\${grid_occupancy_operation_args_text}" \\
   --run_workdir "${REPO_ROOT}" \\
   --conda_bin "${conda_bin}" \\
@@ -1087,6 +1156,7 @@ bash "${PER_TRACK_FANOUT_SH}" \\
   --time "${per_track_analysis_time}" \\
   --no_transfer_to_bucket${skip_existing_arg}
 
+if [[ "${run_eigenposture}" -eq 0 ]]; then
 motion_complete_id_path="${stitched_dir}/sleep_motion/jobs/sleep_motion_complete_job_id.txt"
 motion_dependency_args=()
 if [[ -s "\${motion_complete_id_path}" ]]; then
@@ -1100,8 +1170,9 @@ fi
 motion_labels_id="\$("${sbatch_bin}" --parsable "\${motion_dependency_args[@]}" "${sleep_motion_labels_script}")"
 printf '%s\n' "\${motion_labels_id}" > "${state_dir}/sleep_motion_labels_job_id_${block_name}.txt"
 echo "Submitted motion-based sleep labels: \${motion_labels_id}"
+fi
 
-if [[ "${run_sleep_predictions}" -eq 1 ]]; then
+if [[ "${run_sleep_predictions}" -eq 1 && "${run_eigenposture}" -eq 0 ]]; then
   speed_vector_complete_job_id_file="${stitched_dir}/speed_vectors/jobs/speed_vector_complete_job_id.txt"
   sleep_dependency_args=()
   if [[ -s "\${speed_vector_complete_job_id_file}" ]]; then
@@ -1129,6 +1200,7 @@ if [[ "${run_sleep_predictions}" -eq 1 ]]; then
     --operation_script analysis/compute_track_sleep_predictions.py \\
     --operation_name sleep_prediction \\
     --output_name sleep_predictions \\
+    --bucket_output_dir "${bucket_stitched_dir}/sleep_predictions" \\
     --operation_args "\${sleep_operation_args_text}" \\
     --run_workdir "${REPO_ROOT}" \\
     --conda_bin "${conda_bin}" \\
@@ -1358,6 +1430,13 @@ EOF
   chmod 755 "$transfer_script"
 
   if [[ "$dry_run" -eq 1 ]]; then
+    if [[ "$run_eigenposture" -eq 1 ]]; then
+      python3 "$REPO_ROOT/scripts/eigenposture_after_tracking.py" \
+        --source-block "$block_dir" --work-block "$work_dir" --state-dir "$state_dir" \
+        --python-bin "$eigenposture_python_bin" --cpus "$eigenposture_cpus" \
+        --mem "$eigenposture_mem" --time "$eigenposture_time" --partition "$partition" \
+        --grid-size-mm "$grid_occupancy_grid_size_mm" --grid-output-name "$grid_occupancy_output_name" --dry-run
+    fi
     echo "[dry-run] map script: $map_script"
     echo "[dry-run] tracking submitter script: $track_submit_script"
     if [[ "$run_per_track_analysis" -eq 1 ]]; then
@@ -1375,6 +1454,15 @@ EOF
 
   map_job_id="$("$sbatch_bin" --parsable "$map_script")"
   track_submit_job_id="$("$sbatch_bin" --parsable --dependency=afterok:"$map_job_id" "$track_submit_script")"
+  if [[ "$run_eigenposture" -eq 1 ]]; then
+    python3 "$REPO_ROOT/scripts/eigenposture_after_tracking.py" \
+      --source-block "$block_dir" --work-block "$work_dir" --state-dir "$state_dir" \
+      --python-bin "$eigenposture_python_bin" --cpus "$eigenposture_cpus" \
+      --mem "$eigenposture_mem" --time "$eigenposture_time" --partition "$partition" \
+      --sbatch-bin "$sbatch_bin" --notify-email "$notify_email" \
+      --grid-size-mm "$grid_occupancy_grid_size_mm" --grid-output-name "$grid_occupancy_output_name" \
+      --poll-seconds "$transfer_poll_seconds"
+  fi
   if [[ "$run_interactions" -eq 1 ]]; then
     if [[ "$run_per_track_analysis" -eq 1 ]]; then
       echo "Submitted $block_name: map job $map_job_id, tracking fan-out job $track_submit_job_id; per-track analysis will be scheduled after stitch; interaction fan-out will be scheduled after tracking workers"

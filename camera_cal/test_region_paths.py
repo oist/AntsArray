@@ -59,7 +59,7 @@ def annotation(root, relative, *, mtime=100):
     return path
 
 
-def test_tracking_fallback_ranks_recording_date_before_file_mtime(tmp_path):
+def test_default_fallback_ranks_recording_date_before_file_mtime(tmp_path):
     block = tmp_path / "20260515/block03"
     block.mkdir(parents=True)
     annotation(tmp_path, "20260501/block02", mtime=999)
@@ -67,8 +67,9 @@ def test_tracking_fallback_ranks_recording_date_before_file_mtime(tmp_path):
     annotation(tmp_path, "20260516/block01", mtime=2000)
     annotation(tmp_path, "20260515/block01", mtime=2000)
     assert panorama_regions_path(block, search_earlier_dates=True) == expected
-    # The GUI and analysis helpers still opt into historical borrowing explicitly.
-    assert panorama_regions_path(block) == block / "panorama_regions.csv"
+    assert panorama_regions_path(block) == expected
+    assert panorama_regions_path(block, search_earlier_dates=False) == block / "panorama_regions.csv"
+    assert panorama_regions_path(block, for_write=True) == block / "panorama_regions.csv"
 
 
 def test_fallback_skips_empty_dates_and_uses_latest_file_within_date(tmp_path):
