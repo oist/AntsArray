@@ -90,16 +90,6 @@ def test_sampling_is_capped_per_state_and_stable_under_track_reordering(labelled
                                   reordered.sort_values(order).reset_index(drop=True))
 
 
-def test_grid_posture_cell_reports_missing_labels(tmp_path, capsys):
-    script = Path(__file__).with_name("grid_occupancy.py")
-    cell = next(cell for cell in script.read_text().split("# %%") if "# Sleep/wake posture distribution," in cell)
-    root = tmp_path / "labels"
-    exec(cell, dict(GRID_ROOT=tmp_path, SLEEP_LABEL_ROOT=root, sleep_label_tracks=None))
-    output = capsys.readouterr().out
-    assert "MISSING INPUT" in output and str(root) in output
-    assert not (tmp_path / "sleep_motion_analysis").exists()
-
-
 def test_legacy_plot_interface_still_returns_three_tables(labelled_tracks, monkeypatch):
     tracks, root = labelled_tracks
     points, _ = sma.load_sleep_posture_points(tracks, root, root / "cache")

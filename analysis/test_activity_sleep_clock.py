@@ -1,9 +1,6 @@
 """Clock matrices preserve physical units, unknowns, cycle boundaries and identity."""
 
-import ast
-import math
 from pathlib import Path
-from types import SimpleNamespace
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -179,41 +176,3 @@ def test_clock_matrices_have_shared_scales_cycle_columns_and_no_row_scaling(tmp_
     finally:
         for fig in figures:
             plt.close(fig)
-
-
-def test_grid_contains_clock_matrix_cell_and_uses_existing_saver():
-    script = Path(__file__).with_name("grid_occupancy.py").read_text()
-    cell = next(cell for cell in script.split("# %%") if "# Individual activity/sleep versus time of day" in cell)
-    tree = ast.parse(cell)
-    names = [node.func.attr for node in ast.walk(tree)
-             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)]
-    assert "compute_activity_sleep_clock_profiles" in names
-    assert "plot_activity_sleep_clock_matrices" in names
-    assert "show" in names
-    assert "install_auto_savefig" not in cell  # Do not redirect later figures.
-
-
-@pytest.mark.parametrize("start_hour,hours,complete,min_cycles,partial", [
-    (19.5, 14, 0, 1, True),
-    (14.34, 66, 2, 2, False),
-    (14.34, 30, 0, 1, True),
-    (5.5, 24, 1, 1, False),
-    (5.5, 48, 2, 2, False),
-])
-def test_grid_clock_defaults_follow_available_complete_light_dark_cycles(
-    start_hour, hours, complete, min_cycles, partial,
-):
-    script = Path(__file__).with_name("grid_occupancy.py").read_text()
-    cell = next(cell for cell in script.split("# %%") if "# Individual activity/sleep versus time of day" in cell)
-    names = {"clock_speed_tracks", "clock_fps", "clock_recording_start_frame", "clock_recording_stop_frame",
-             "clock_cycle_offset_seconds", "clock_n_complete_cycles",
-             "CLOCK_MATRIX_MIN_CYCLES", "CLOCK_MATRIX_INCLUDE_PARTIAL_CYCLES"}
-    assignments = [node for node in ast.parse(cell).body if isinstance(node, ast.Assign)
-                   and any(isinstance(target, ast.Name) and target.id in names for target in node.targets)]
-    namespace = dict(math=math, go=SimpleNamespace(load_speed_tracks=lambda _: pd.DataFrame({"fps": [24]})),
-                     SPEED_ROOT=None, recording_start_frame=0, recording_stop_frame=int(hours * 3600 * 24),
-                     LIGHT_ON_HOUR=5.5, experiment_start_clock_seconds=start_hour * 3600)
-    exec(compile(ast.Module(body=assignments, type_ignores=[]), "grid_clock_settings", "exec"), namespace)
-    assert namespace["clock_n_complete_cycles"] == complete
-    assert namespace["CLOCK_MATRIX_MIN_CYCLES"] == min_cycles
-    assert namespace["CLOCK_MATRIX_INCLUDE_PARTIAL_CYCLES"] is partial

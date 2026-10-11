@@ -12,7 +12,7 @@ Local development:
 uv sync
 ```
 
-For the interactive long-timescale dashboards, use `uv sync --extra interactive`.
+For interactive plotting dependencies, use `uv sync --extra interactive`.
 The dependency versions are recorded in `uv.lock`; use `uv sync --locked` (with
 the same extras) when reproducing a checkout. Run the synthetic regression suite
 without recording data or Slurm access with:
@@ -22,14 +22,13 @@ uv sync --locked --extra interactive --extra test
 MPLBACKEND=Agg uv run --locked --extra interactive --extra test python -m pytest -q
 ```
 
-The source checkout includes the analysis helpers, dashboard templates, contact
-geometry, sleep-motion processing, block-combination tools, and their tests.
-See [analysis workflows](analysis/README.md),
-[long-timescale analysis](analysis/long_timescale.md), and
-[block combination](tracking/colony/block_combination.md) for entry points.
-The older directed-interaction workflow lives at
-`analysis/exploratory/interaction_analysis.py`; current skeleton-contact and
-sleep-response analysis is documented in the analysis guide.
+The supported behavioral workflow is
+[`analysis/eigenposture_interactive.py`](analysis/eigenposture_interactive.py).
+Its helpers, preprocessing, contact geometry, sleep-motion processing, and
+block-combination tools remain in the checkout. Superseded analysis scripts and
+dashboards have been removed; their committed versions remain in Git history.
+See [analysis workflows](analysis/README.md)
+and [block combination](tracking/colony/block_combination.md) for entry points.
 
 Matching a local run also requires the same external inputs and settings:
 recordings/detections or finished tracks, calibration homographies, panorama
@@ -638,78 +637,21 @@ grid_y_edges_mm.npy
 grid_occupancy_metadata.json
 ```
 
-## Interactive Analysis Scripts
+## Behavioral Analysis
 
-The interactive scripts are plain Python files with `# %%` cells. Open them in VS Code and run cells in the Jupyter interactive window. They try to enable `%matplotlib qt` for interactive figures.
+Open [`analysis/eigenposture_interactive.py`](analysis/eigenposture_interactive.py)
+and run its `# %%` cells in order. This is the retained behavioral analysis:
+body-aligned posture PCA, behavioral states, ant classes from state proportions,
+and downstream spatial, speed, sleep, trip, and return-contact comparisons.
+[`analysis/eigenposture_task_report.py`](analysis/eigenposture_task_report.py)
+runs the same cells headlessly and produces the PNG/PDF report. See the
+[workflow guide](analysis/README.md) and
+[methods and parameter choices](analysis/eigenposture_interactive.md).
 
-### `analysis/colony_speed.py`
-
-Loads bucket `stitched/speed_vectors`, filters tracks with `n_observed_frames / n_frames > 0.40`, attaches `colony_presence_vectors`, and plots:
-
-- left/right colony-average speed time series;
-- light on/off shading from absolute time parsed from track metadata;
-- individual ant speed traces;
-- speed plus colony in/out for a selected ant;
-- all-ant speed images;
-- all-ant speed images ordered by fraction of valid frames spent in the colony;
-- quiet-period images using the speed threshold.
-
-Helper functions live in `analysis/colony_speed_utils.py`.
-
-### `analysis/grid_occupancy.py`
-
-Loads bucket `stitched/grid_occupancy_histograms`, attaches speed metadata for detection-rate filtering, and plots:
-
-- one ant's 2D occupancy histogram;
-- UMAP + Leiden clustering separately for left and right colonies;
-- `track_cluster_ids.csv` mapping `TrackID` to cluster ID;
-- UMAP cluster plots;
-- cluster mean occupancy histograms;
-- example ant histograms from each cluster;
-- cluster-average speed time series with light on/off shading;
-- quiet-period images sorted by occupancy cluster.
-
-Helper functions live in `analysis/grid_occupancy_utils.py`.
-
-### `analysis/cluster_time_of_day_occupancy.py`
-
-Loads `grid_occupancy.py` cluster assignments and recomputes time-of-day occupancy locally from the per-track stitched parquets. Times are relative to light on at 5:30 AM by default.
-
-It can cache binned cluster occupancy into:
-
-```text
-stitched/grid_occupancy_histograms/time_of_day_cluster_occupancy/
-```
-
-and plots all clusters as tiled occupancy maps with optional additional time binning and smoothing.
-
-### `analysis/ant_interaction_lightweight_test.py`
-
-Local debugging script for tuning interaction radii and antenna bodypoint behavior on one chunk. It can generate labeled SLEAP skeleton debug images with interaction radii marked. Production interaction extraction is in `tracking/colony/interaction_batch.py` and `tracking/colony/interaction_one_chunk.py`.
-
-### `analysis/exploratory/interaction_analysis.py` (legacy directed interactions)
-
-Loads bucket `interactions/` chunk parquet files with the matching `tracks/` chunk parquet and `stitched/grid_occupancy_histograms/track_cluster_ids.csv`. Use `CHUNKS = "all"` to run every chunk for the selected side, `CHUNKS = "000"` for a single chunk, or `MAX_CHUNKS` while tuning.
-
-Expensive intermediate tables are cached under:
-
-```text
-stitched/analysis_cache/interaction_analysis/
-```
-
-Set `FORCE_REBUILD_CACHE = True` in the script to recompute them. The script also caches derived pair tables, per-ant event tables, time-count tables, time-series tables, and spatial histogram arrays so display-only changes can rerun without rebuilding the heavy summaries.
-
-It plots:
-
-- directed cluster-pair interaction strengths, normalized by possible directed ant pairs by default;
-- antenna/source interaction locations by occupancy cluster, normalized per ant by default;
-- body/receiver interaction locations by occupancy cluster, normalized per ant by default;
-- per-ant interaction strengths by time since light on, averaged over light-cycle days by default;
-- per-ant spatial interaction heatmaps tiled by cluster and time-of-day bin, averaged over light-cycle days by default;
-- immobile-bout tests that threshold speed, count interactions involving each immobile ant, and correlate interaction count with time to mobility or bout length.
-- wake-prediction regressions that compare elapsed immobility time, cumulative interaction count, and their weighted combination as predictors of waking from immobility.
-
-Helper functions live in `analysis/interaction_analysis_utils.py`.
+`analysis/grid_occupancy.py` prepares the independent spatial reference labels
+and QC plots used by that report. Its former speed, sleep, trip, rhythm, and
+contact-analysis cells have been removed. Shared utility modules remain where
+required by the supported report, preprocessing, or tracking review tools.
 
 ## Manual Commands
 
@@ -823,10 +765,10 @@ For current tracking outputs, the main overlay follows `TrackX/TrackY`; toggles 
 | `analysis/export_sleep_crop_videos.py` | Export per-ant crop videos for fast sleep/wake labeling. |
 | `analysis/sleep_classifier.py` | Train/apply random-forest supervised sleep classifier. |
 | `analysis/sleep_classifier_features.py` | Shared posture and velocity feature extraction helpers. |
-| `analysis/colony_speed.py` | VS Code/Jupyter interactive speed and colony-presence plots. |
-| `analysis/grid_occupancy.py` | VS Code/Jupyter interactive grid occupancy clustering plots. |
-| `analysis/cluster_time_of_day_occupancy.py` | Local time-of-day occupancy analysis by cluster. |
-| `analysis/exploratory/interaction_analysis.py` | Legacy directed-interaction spatial and time-of-day plots. |
+| `analysis/eigenposture_interactive.py` | Supported interactive behavioral analysis. |
+| `analysis/eigenposture_task_report.py` | Headless PNG/PDF report from the same analysis cells. |
+| `analysis/grid_occupancy.py` | Prepare independent spatial reference labels and QC plots. |
+| `tracking/colony/combine_blocks.py` | Combine tracked blocks and their preprocessing caches. |
 | `tracking/stitch_tracks.py` | Chunk/block stitcher and trajectory PNG writer. |
 | `run_aruco.py` | ArUco detection for one video. |
 

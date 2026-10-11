@@ -289,10 +289,9 @@ The published packet retains features, model comparisons, assignments, PCA,
 coverage/provenance, classes, derived quiet labels, and the report. Large dense
 pose/motion arrays are reproducible local intermediates. `models/state_means.*`
 retains the small all-observation summary; plots reuse it without the dense
-arrays. Rebuild that summary after changing assignments or features. The preceding
-eight-state
-sampled-clip analysis remains documented in `fine_behavior.md` as a historical
-result; its state numbers are not interchangeable with this rebuilt dictionary.
+arrays. Rebuild that summary after changing assignments or features. Earlier
+sampled-clip scripts have been removed; their committed versions remain in Git
+history. Their state numbers are not interchangeable with this dictionary.
 
 ## Full-recording state result
 
@@ -387,14 +386,8 @@ calibrated from S0, while keeping the original event eligibility and matching ru
 S0 membership remains unchanged for state and ant classification.
 
 `contact_label_history_totals.csv`, `contact_label_history_audit.csv`, and
-`contact_label_coverage_comparison.csv` retain the historical comparison. It is
-reproducible separately, without introducing historical labels into the main
-analysis:
-
-```bash
-python -m analysis.audit_behavior_sleep_contacts --block "$BLOCK" --source "$RUN" \
-  --output "$RUN/report" --previous-labels /path/to/archived_previous_labels
-```
-
-Omit `--previous-labels` to compare the current labels with only the historical
-motion reference. Source metadata is recorded in `contact_label_audit_inputs.json`.
+`contact_label_coverage_comparison.csv` retain the historical comparison in the
+published dataset. Source metadata is recorded in `contact_label_audit_inputs.json`.
+The standalone historical-label diagnostic has been removed; its committed
+version remains in Git history. The supported report uses the current S0 and
+S0-calibrated motion definitions described above.

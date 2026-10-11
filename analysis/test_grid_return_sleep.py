@@ -1,6 +1,5 @@
-"""Grid integration retains the probe's definitions and reports absent inputs."""
+"""Shared return/sleep loaders validate track identities and published contacts."""
 
-import ast
 import json
 from pathlib import Path
 
@@ -12,33 +11,6 @@ from analysis import interaction_analysis_utils as ia
 from analysis import return_sleep_utils as rs
 from analysis import sleep_motion_analysis_utils as sma
 from tracking.colony.skeleton_contacts import CONTACT_GEOMETRY
-
-
-SCRIPT = Path(__file__).with_name("grid_occupancy.py")
-
-
-def _cell(marker):
-    return next(cell for cell in SCRIPT.read_text().split("# %%") if marker in cell)
-
-
-def test_grid_and_probe_return_defaults_match():
-    settings = []
-    for path in (SCRIPT, SCRIPT.parent / "exploratory" / "return_sleep_analysis.py"):
-        call, = [node for node in ast.walk(ast.parse(path.read_text()))
-                 if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                 and node.func.attr == "ReturnSettings"]
-        settings.append(eval(compile(ast.Expression(call), str(path), "eval"), {"rs": rs}))
-    assert rs.asdict(settings[0]) == rs.asdict(settings[1])
-
-
-def test_missing_sleep_labels_report_path_and_figures(tmp_path, capsys):
-    namespace = dict(DATASET_ROOT=tmp_path, STITCHED_ROOT=tmp_path / "stitched", sma=sma, cluster_id_table=None)
-    exec(_cell("# Return/sleep figures 1 and 2:"), namespace)
-    output = capsys.readouterr().out
-    assert "MISSING INPUT" in output and "figures 1 and 2" in output
-    assert str(tmp_path / "stitched" / "sleep_motion_labels") in output
-    assert "compute_sleep_motion_labels.py" in output
-    assert namespace["sleep_label_tracks"] is None
 
 
 def test_sleep_loader_uses_selected_filename_not_duplicate_ant_export(tmp_path):
@@ -58,22 +30,6 @@ def test_sleep_loader_uses_selected_filename_not_duplicate_ant_export(tmp_path):
         sma.load_sleep_label_tracks(tmp_path)
     with pytest.raises(FileNotFoundError, match="Missing sleep labels"):
         sma.load_sleep_label_tracks(tmp_path, clusters.assign(track_name="missing_right.parquet"))
-
-
-def test_missing_response_inputs_list_paths_and_skip_both_figures(tmp_path, capsys):
-    namespace = dict(DATASET_ROOT=tmp_path, STITCHED_ROOT=tmp_path / "stitched", GRID_ROOT=tmp_path / "grid", rs=rs,
-                     SLEEP_LABEL_ROOT=tmp_path / "labels", PANORAMA_REGIONS_PATH=tmp_path / "panorama_regions.csv")
-    exec(_cell("# Return/sleep figure 4:"), namespace)
-    exec(_cell("# Return/sleep figure 7:"), namespace)
-    output = capsys.readouterr().out
-    assert "MISSING INPUTS" in output and "figures 4 and 7" in output
-    for path in (tmp_path / "tracks", tmp_path / "stitched" / "sleep_motion" / "per_track",
-                 tmp_path / "interactions" / "transfer_complete.ok",
-                 tmp_path / "interactions" / "run_manifest.json",
-                 tmp_path / "panorama_regions.csv", tmp_path / "labels" / "per_track"):
-        assert str(path) in output
-    assert not namespace["return_sleep_ready"]
-    assert not namespace["RETURN_SLEEP_OUTPUT_ROOT"].exists()
 
 
 @pytest.fixture
