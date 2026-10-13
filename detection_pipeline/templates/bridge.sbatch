@@ -51,9 +51,10 @@ EXPORT_ROOT="/work/ReiterU/$USER/sleap_export"
 # of the key too: an engine exported with another cap must never be picked up by a
 # cache hit (the pre-key engines all carry sleap-nn's default cap of 20, which
 # truncated nest cameras), and one built for a smaller batch cannot serve a larger
-# inference batch. cap x batch is limited to 192 crops (see export_sleap_trt.sh), so
-# an unset batch follows the cap. The partition stays the LAST component -- the A100
-# adoption below strips it.
+# inference batch. cap x batch is limited by the instance model's crop budget
+# (SLEAP_ENGINE_CROPS from pipeline.sh, lib/engine_crops.sh), so an unset batch follows
+# the cap. An env file from before the budget was exported ran 640 models: 192 crops.
+# The partition stays the LAST component -- the A100 adoption below strips it.
 # A pipeline.env written before the cap existed exports SLEAP_BATCH_SIZE=8 but no cap:
 # that batch was chosen for sleap-nn's cap of 20, so derive both afresh rather than pair
 # cap 96 with batch 8 (768 crops, which cannot build).
@@ -61,8 +62,9 @@ if [[ -z "${SLEAP_MAX_INSTANCES:-}" ]]; then
 	SLEAP_MAX_INSTANCES=96
 	SLEAP_BATCH_SIZE=""
 fi
+SLEAP_ENGINE_CROPS="${SLEAP_ENGINE_CROPS:-192}"
 if [[ -z "${SLEAP_BATCH_SIZE:-}" ]]; then
-	SLEAP_BATCH_SIZE=$(( 192 / SLEAP_MAX_INSTANCES ))
+	SLEAP_BATCH_SIZE=$(( SLEAP_ENGINE_CROPS / SLEAP_MAX_INSTANCES ))
 	(( SLEAP_BATCH_SIZE > 8 )) && SLEAP_BATCH_SIZE=8
 fi
 engine_dir_for() {   # <cap> <batch> -> the cached export dir of that engine
@@ -206,7 +208,7 @@ if (( SKIP_TRT_EXPORT == 0 )) && [[ "$SLEAP_RUNTIME" != "pytorch" ]]; then
 	for cap in $(cut -f3 "$CAPS_TSV" | sort -rnu); do
 		batch="$SLEAP_BATCH_SIZE"
 		if [[ "${SLEAP_CAP_MODE:-uniform}" == "nest" ]]; then
-			batch=$(( 192 / cap ))
+			batch=$(( ${SLEAP_ENGINE_CROPS:-192} / cap ))
 			(( batch > 8 )) && batch=8
 		fi
 		ensure_engine "$cap" "$batch"

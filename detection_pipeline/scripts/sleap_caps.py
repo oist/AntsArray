@@ -33,7 +33,9 @@ from datetime import datetime, timedelta, timezone
 
 JST = timezone(timedelta(hours=9))
 CAM_RE = re.compile(r"^cam\d{2}$")
-MAX_ENGINE_CROPS = 192   # cap x batch above this cannot build (see export_sleap_trt.sh)
+# Largest crop budget of any measured crop size (lib/engine_crops.sh): a cap above it never
+# builds. pipeline.sh checks the caps against the instance model's own, smaller budget.
+MAX_ENGINE_CROPS = 192
 TIME_FORMATS = ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y-%m-%d")
 # A chunk's real span can sit a GOP (60 s) off the nominal one (seek landing, off-grid
 # keyframes) and host clocks differ by seconds, so each chunk is checked over its span

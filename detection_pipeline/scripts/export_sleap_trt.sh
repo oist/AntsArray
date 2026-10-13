@@ -36,11 +36,10 @@ SLEAP_MODULE="${SLEAP_MODULE:-sleap-nn/0.2.0}"
 # the cap on 98-100 % of frames; 96 finds 70 ants/frame (max 82) with no frame at the
 # cap and the same detections as 128, 31 % faster. So 96.
 MAX_INSTANCES="${MAX_INSTANCES:-96}"
-# The centered-instance model runs on up to cap x batch crops of 640x640 at once.
-# Measured on A100: <= 192 crops builds (20x8, 48x4, 64x3, 96x2, 128x1); 240, 256
-# and 288 fail ("no tactics to implement ... MaxPool"), with any workspace size.
-# So the batch follows the cap unless MAX_BATCH is set.
-MAX_ENGINE_CROPS=192
+# The centered-instance model runs on up to cap x batch crops at once, and TensorRT cannot
+# build above a crop budget that depends on the model's crop size (192 at 640, 140 at 768;
+# lib/engine_crops.sh). So the batch follows the cap and the crop unless MAX_BATCH is set.
+source "$(dirname "$(readlink -f "$0")")/../lib/engine_crops.sh"
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
@@ -58,6 +57,11 @@ done
 [[ -d "$CENTROID" ]] || { echo "[ERR] --centroid not a dir: $CENTROID" >&2; exit 2; }
 [[ -d "$INSTANCE" ]] || { echo "[ERR] --instance not a dir: $INSTANCE" >&2; exit 2; }
 [[ -n "$OUT" ]]      || usage
+CROP="$(instance_crop_size "$INSTANCE")" || {
+	echo "[ERR] no fixed crop_size in $INSTANCE/training_config.yaml; the engine's crop budget depends on it" >&2; exit 2; }
+MAX_ENGINE_CROPS="$(max_engine_crops "$CROP")" || {
+	echo "[ERR] crop $CROP has no measured engine limit; measure which cap x batch builds at this crop" \
+	     "and add it to lib/engine_crops.sh" >&2; exit 2; }
 [[ "$MAX_INSTANCES" =~ ^[1-9][0-9]*$ ]] || {
 	echo "[ERR] --max-instances must be a positive integer, got '$MAX_INSTANCES'" >&2; exit 2; }
 (( MAX_INSTANCES <= MAX_ENGINE_CROPS )) || {

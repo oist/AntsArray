@@ -37,9 +37,14 @@ export -f module sleap-nn
 """
 
 
-def run_export(workdir, *extra, env_extra=None, fakes=FAKES):
+def run_export(workdir, *extra, env_extra=None, fakes=FAKES, crop="640"):
     model = workdir / "model"
     model.mkdir(exist_ok=True)
+    config = model / "training_config.yaml"
+    if crop is None:
+        config.unlink(missing_ok=True)
+    else:
+        config.write_text("data_config:\n  preprocessing:\n    crop_size: %s\n" % crop)
     out = workdir / "export"
     log = workdir / "sleap_nn_calls.log"
     args = ["--centroid", str(model), "--instance", str(model), "--out", str(out), *extra]
@@ -88,6 +93,30 @@ def test_cap_times_batch_over_the_engine_limit_is_refused(tmp_path):
     result, _, calls = run_export(tmp_path, "--max-instances", "256")   # no batch fits at all
     assert result.returncode != 0
     assert calls == []
+
+
+def test_a_768_crop_model_gets_the_smaller_crop_budget(tmp_path):
+    # Measured on A100 (2026-10-13): at 768x768 cap 96 builds only at batch 1, cap 20 up to 7.
+    for cap, batch in (("96", "1"), ("20", "7")):
+        d = tmp_path / ("k" + cap)
+        d.mkdir()
+        result, _, calls = run_export(d, "--max-instances", cap, crop="768")
+        assert result.returncode == 0, result.stderr
+        assert "--max-batch-size %s" % batch in calls[0], (cap, calls)
+    d = tmp_path / "over"
+    d.mkdir()
+    result, _, calls = run_export(d, "--max-instances", "20", env_extra={"MAX_BATCH": "8"}, crop="768")
+    assert result.returncode != 0
+    assert "140" in result.stderr
+    assert calls == []
+
+
+def test_a_model_with_an_unmeasured_or_unknown_crop_is_refused(tmp_path):
+    for crop in ("704", "null", None):
+        result, _, calls = run_export(tmp_path, crop=crop)
+        assert result.returncode != 0, crop
+        assert "crop" in result.stderr, crop
+        assert calls == [], crop
 
 
 def test_cap_is_configurable_by_flag_and_env(tmp_path):

@@ -24,9 +24,14 @@ def test_batch_startup_ignores_broken_user_hook(tmp_path, filename, modules_read
     else:
         model = tmp_path / "model"
         model.mkdir()
+        (model / "training_config.yaml").write_text("data_config:\n  preprocessing:\n    crop_size: 640\n")
         args = ["--centroid", str(model), "--instance", str(model),
                 "--out", str(tmp_path / "export")]
-    script = tmp_path / "job.sh"
+    # The export script sources the pipeline's own lib by a path relative to itself.
+    (tmp_path / "lib").mkdir()
+    (tmp_path / "lib/engine_crops.sh").write_text((ROOT / "lib/engine_crops.sh").read_text())
+    (tmp_path / "scripts").mkdir()
+    script = tmp_path / "scripts/job.sh"
     script.write_text(source + '\nprintf "STARTUP_OK\\n"\n')
     setup = """
 fake_module() {
@@ -41,6 +46,8 @@ fake_module() {
 source() {
     if [[ "$1" == /etc/profile ]]; then
         module() { fake_module "$@"; }
+    elif [[ "$1" == */lib/engine_crops.sh ]]; then
+        builtin source "$@"   # the pipeline's own library, not a user hook
     else
         printf 'BROKEN_USER_HOOK\\n' >&2
         return 127

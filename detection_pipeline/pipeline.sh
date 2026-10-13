@@ -92,8 +92,10 @@ SLEAP runtime:
                                     below; you only set them to hold resources back.
   --sleap-module NAME               saion module name. default: sleap-nn/0.2.0
   --sleap-batch-size N              inference batch = the engine's max batch. default: auto =
-                                    min(8, 192 / cap) on the exported path (cap x batch over
-                                    192 crops cannot build), 8 on the 'sleap-nn track' path.
+                                    min(8, budget / cap) on the exported path, where budget is
+                                    the most cap x batch crops that build at the instance
+                                    model's crop size (192 at 640, 140 at 768); 8 on the
+                                    'sleap-nn track' path.
                                     Only with --sleap-max-instances (per-camera caps set
                                     each engine's batch from its cap)
   Instance cap (most animals kept per frame; baked into the TRT/ONNX export and its cache
@@ -252,9 +254,9 @@ SKIP_TRT_EXPORT=0
 SAION_PARTITION=largegpu
 SLEAP_MODULE="sleap-nn/0.2.0"
 # TRT per-frame inference batch. Empty = auto, resolved after arg parsing: on the
-# exported path min(8, 192 / cap), because the engine runs cap x batch crops of
-# 640x640 and TensorRT cannot build above 192 (measured 2026-10-05: 20x8, 48x4,
-# 64x3, 96x2, 128x1 build; 240+ crops fail); 8 on the 'sleap-nn track' path.
+# exported path min(8, budget / cap), because the engine runs cap x batch crops at once
+# and TensorRT cannot build above a budget set by the instance model's crop size
+# (lib/engine_crops.sh: 192 at 640, 140 at 768); 8 on the 'sleap-nn track' path.
 SLEAP_BATCH_SIZE=""
 # Per-frame instance cap of the exported engine (sleap-nn export --max-instances).
 # sleap-nn defaults to 20, which silently dropped ants on every colony nest camera.
@@ -538,9 +540,21 @@ fi
 # read it), and runs without a SLEAP leg never read it, so those stay uniform and never
 # need the table. In nest mode SLEAP_MAX_INSTANCES names the nest engine (the largest);
 # the bridge adds one engine per other cap that occurs.
-MAX_ENGINE_CROPS=192
 EXPORTED_PATH=0
 if (( SKIP_TRT_EXPORT == 0 )) && [[ "$SLEAP_RUNTIME" != "pytorch" ]]; then EXPORTED_PATH=1; fi
+# Crop budget of the exported engine: the most cap x batch crops that build at the
+# instance model's crop size. Runs without a SLEAP leg build no engine and keep 192.
+MAX_ENGINE_CROPS=192
+if (( EXPORTED_PATH == 1 && ONLY_CHUNK != 1 && ONLY_ARUCO != 1 && ONLY_BACKUP != 1 )); then
+	source "$LIB_DIR/engine_crops.sh"
+	_crop="$(instance_crop_size "$SLEAP_MODEL_INSTANCE")" || {
+		echo "[ERR] no fixed crop_size in $SLEAP_MODEL_INSTANCE/training_config.yaml;" \
+		     "the TensorRT engine's crop budget depends on it" >&2; exit 2; }
+	MAX_ENGINE_CROPS="$(max_engine_crops "$_crop")" || {
+		echo "[ERR] instance model crop $_crop has no measured engine limit; measure which" \
+		     "cap x batch builds at this crop and add it to lib/engine_crops.sh" >&2; exit 2; }
+	echo "[INFO] instance model crop $_crop: engine budget $MAX_ENGINE_CROPS crops (cap x batch)"
+fi
 if [[ -n "$SLEAP_MAX_INSTANCES" ]] || (( EXPORTED_PATH == 0 || ONLY_ARUCO == 1 || ONLY_BACKUP == 1 )); then
 	SLEAP_CAP_MODE=uniform
 	SLEAP_MAX_INSTANCES="${SLEAP_MAX_INSTANCES:-$SLEAP_NEST_CAP}"
@@ -555,7 +569,7 @@ else
 	SLEAP_MAX_INSTANCES="$SLEAP_NEST_CAP"
 fi
 # Inference batch. On the exported path it is also the engine's max batch, and the
-# engine runs cap x batch crops at once, which TensorRT cannot build above 192.
+# engine runs cap x batch crops at once, which TensorRT cannot build above the crop budget.
 if (( EXPORTED_PATH == 1 )); then
 	(( SLEAP_MAX_INSTANCES <= MAX_ENGINE_CROPS )) || {
 		echo "[ERR] --sleap-max-instances $SLEAP_MAX_INSTANCES exceeds the $MAX_ENGINE_CROPS-crop engine limit even at batch 1" >&2; exit 2; }
@@ -696,7 +710,7 @@ fi
 # a saion blip must not block a submission the bridge will retry anyway.
 if (( ONLY_CHUNK != 1 && ONLY_ARUCO != 1 && ONLY_BACKUP != 1 )); then
 	_saion_rc=0
-	ssh -x -oBatchMode=yes -oStrictHostKeyChecking=no -oConnectTimeout=15 saion 		"test -f '$SCRIPTS_DIR/sleap2h5.py' && test -f '$LIB_DIR/ship_logs.sh' && test -f '$LIB_DIR/hosts.sh'" 		2>/dev/null || _saion_rc=$?
+	ssh -x -oBatchMode=yes -oStrictHostKeyChecking=no -oConnectTimeout=15 saion 		"test -f '$SCRIPTS_DIR/sleap2h5.py' && test -f '$LIB_DIR/ship_logs.sh' && test -f '$LIB_DIR/hosts.sh' && test -f '$LIB_DIR/engine_crops.sh'"		2>/dev/null || _saion_rc=$?
 	if (( _saion_rc == 255 )); then
 		echo "[WARN] could not reach saion to verify this checkout is visible there; SLEAP tasks need $SCRIPTS_DIR on saion" >&2
 	elif (( _saion_rc != 0 )); then
@@ -770,6 +784,7 @@ export SAION_PARTITION="$SAION_PARTITION"
 export SLEAP_MODULE="$SLEAP_MODULE"
 export SLEAP_BATCH_SIZE="$SLEAP_BATCH_SIZE"
 export SLEAP_MAX_INSTANCES="$SLEAP_MAX_INSTANCES"
+export SLEAP_ENGINE_CROPS="$MAX_ENGINE_CROPS"
 export SLEAP_CAP_MODE="$SLEAP_CAP_MODE"
 export SLEAP_NEST_CAMS="$JOBS_ROOT/nest_cams.tsv"
 export SLEAP_NEST_CAP="$SLEAP_NEST_CAP"

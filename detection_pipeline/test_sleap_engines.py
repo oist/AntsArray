@@ -94,6 +94,16 @@ def test_bridge_makes_one_engine_per_cap_in_nest_mode(tmp_path):
         ("cam01", "000", "96"), ("cam01", "001", "96"), ("cam11", "000", "20"), ("cam11", "001", "20")]
 
 
+def test_bridge_batches_follow_the_crop_budget_of_the_model(tmp_path):
+    # pipeline.sh exports the instance model's budget: 140 crops at crop 768.
+    r, out, calls = run_bridge_caps(tmp_path, "SLEAP_CAP_MODE=nest SLEAP_NEST_CAP=96 SLEAP_OTHER_CAP=20 "
+                                              "SLEAP_MAX_INSTANCES=96 SLEAP_BATCH_SIZE=1 SLEAP_ENGINE_CROPS=140")
+
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert calls == ["96 1", "20 7"]
+    assert out["ENGINES"] == "96:1:%s 20:7:%s" % (K96.replace("k96b2", "k96b1"), K20.replace("k20b8", "k20b7"))
+
+
 def test_bridge_keeps_one_engine_for_a_uniform_run(tmp_path):
     # An env file from before per-camera caps (no SLEAP_CAP_MODE) or --sleap-max-instances.
     r, out, calls = run_bridge_caps(tmp_path, "SLEAP_MAX_INSTANCES=96 SLEAP_BATCH_SIZE=2")
