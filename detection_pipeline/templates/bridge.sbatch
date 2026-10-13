@@ -67,9 +67,14 @@ if [[ -z "${SLEAP_BATCH_SIZE:-}" ]]; then
 	SLEAP_BATCH_SIZE=$(( SLEAP_ENGINE_CROPS / SLEAP_MAX_INSTANCES ))
 	(( SLEAP_BATCH_SIZE > 8 )) && SLEAP_BATCH_SIZE=8
 fi
+# An engine that fills a below-threshold anchor (tag) node from the centroid
+# (SLEAP_ANCHOR_FILL=1, export_sleap_trt.sh --anchor-fill) gives different output, so it
+# carries __afill in its key. An env file from before the fallback has no
+# SLEAP_ANCHOR_FILL and keeps its plain engines.
 engine_dir_for() {   # <cap> <batch> -> the cached export dir of that engine
-	local id
-	id="$(basename "$SLEAP_MODEL_CENTROID")__$(basename "$SLEAP_MODEL_INSTANCE")__k${1}b${2}__${SAION_PARTITION}"
+	local id fill=""
+	[[ "${SLEAP_ANCHOR_FILL:-0}" == 1 ]] && fill="__afill"
+	id="$(basename "$SLEAP_MODEL_CENTROID")__$(basename "$SLEAP_MODEL_INSTANCE")__k${1}b${2}${fill}__${SAION_PARTITION}"
 	echo "$EXPORT_ROOT/${id//\//_}"
 }
 EXPORT_DIR="$(engine_dir_for "$SLEAP_MAX_INSTANCES" "$SLEAP_BATCH_SIZE")"
@@ -117,12 +122,14 @@ ensure_engine() {
 	if [[ -n "$adopted" ]]; then
 		echo "[OK] reusing SM80 engine from $adopted (same arch as $SAION_PARTITION)"
 		ssh_retry saion "mkdir -p '$dir' &&
-			for f in model.trt model.trt.metadata.json model.onnx export_metadata.json training_config_centroid.yaml training_config_centered_instance.yaml; do
+			for f in model.trt model.trt.metadata.json model.onnx export_metadata.json training_config_centroid.yaml training_config_centered_instance.yaml anchor_fill.json; do
 				[[ -f '$adopted/'\$f ]] && ln -sf '$adopted/'\$f '$dir/'\$f
 			done; true" \
 			|| { echo "[ERR] engine adoption failed" >&2; exit 3; }
 	else
 		echo "[INFO] no sibling engine for cap $cap; building on $SAION_PARTITION via $SCRIPTS_DIR/export_sleap_trt.sh"
+		local fill_flag=""
+		[[ "${SLEAP_ANCHOR_FILL:-0}" == 1 ]] && fill_flag=" --anchor-fill"
 		# export_sleap_trt.sh srun's itself onto $SAION_PARTITION and blocks until done
 		ssh_login_retry saion "SLEAP_MODULE='${SLEAP_MODULE:-sleap-nn/0.2.0}' MAX_BATCH='$batch' bash '$SCRIPTS_DIR/export_sleap_trt.sh' \
 			--centroid '$SLEAP_MODEL_CENTROID' \
@@ -130,7 +137,7 @@ ensure_engine() {
 			--out '$dir' \
 			--runtime '$SLEAP_RUNTIME' \
 			--partition '$SAION_PARTITION' \
-			--max-instances '$cap'" \
+			--max-instances '$cap'$fill_flag" \
 			|| { echo "[ERR] TRT export failed" >&2; exit 3; }
 	fi
 }

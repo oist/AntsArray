@@ -366,6 +366,32 @@ def test_saion_partition_is_not_inherited_from_the_contract():
     assert settings["saion_partition"] == "short-a100"
 
 
+def test_recorded_descriptions_become_valid_pipeline_flags():
+    # The contract records the tag-node fallback as centroid/off and per-camera caps as a
+    # description; neither value is a pipeline.sh argument as it stands.
+    def settings_for(detection):
+        state = ps.new_state("/blk", 1800, "mkv",
+                             {VID_A: {"n_chunks": 5, "fps": 24.0, "frame_count": 216000}}, detection)
+        settings, conflicts = mp.resolve_settings({"chunk_sec": 7200}, state, {})
+        assert conflicts == []
+        return settings
+
+    on = settings_for({"sleap_anchor_fill": "centroid",
+                       "sleap_max_instances": "nest96=cam01,cam09@2026-07-01T00:00;other20"})
+    assert "sleap_anchor_fill" not in on and "no_sleap_anchor_fill" not in on   # the default
+    assert "sleap_max_instances" not in on                    # per-camera caps = the default
+    assert "--sleap-anchor-fill" not in mp.settings_flags(on)
+
+    off = settings_for({"sleap_anchor_fill": "off", "sleap_max_instances": "96"})
+    assert mp.settings_flags(off) == ["--chunk-ext", "mkv", "--chunk-sec", "1800",
+                                      "--no-sleap-anchor-fill", "--sleap-max-instances", "96"]
+
+    # A block whose SLEAP outputs predate the fallback continues without it.
+    old = settings_for({"sleap_model_instance": "/models/x.centered_instance"})
+    assert old.get("no_sleap_anchor_fill") is True
+    assert settings_for({"aruco_dict": "/d.npz"}).get("no_sleap_anchor_fill") is None
+
+
 def _defaults_file(block):
     p = os.path.join(block.root, "defaults.json")
     with open(p, "w") as f:

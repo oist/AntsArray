@@ -229,6 +229,39 @@ def test_instance_cap_is_filled_into_old_contracts_and_a_raise_only_warns():
         b.close()
 
 
+def test_tag_node_fallback_never_mixes_within_a_block():
+    """Whether the engine filled a below-threshold tag node from the centroid changes the tag
+    node of ~1-2 % of instances, so a block keeps one setting. A contract that recorded a SLEAP
+    leg before the key existed was made without the fill: its missing value means "off"."""
+    old = Block()
+    try:
+        assert old.sync() == 0                                   # SLEAP leg, no fill key
+        assert old.sync({"sleap_anchor_fill": "centroid"}) == 3  # would mix plain and filled
+        assert "sleap_anchor_fill" not in old.state()["detection"]
+        assert old.sync({"sleap_anchor_fill": "off"}) == 0       # continue it as it was made
+        assert old.state()["detection"]["sleap_anchor_fill"] == "off"
+    finally:
+        old.close()
+
+    new = Block()
+    try:
+        assert new.sync({"sleap_anchor_fill": "centroid"}) == 0
+        assert new.state()["detection"]["sleap_anchor_fill"] == "centroid"
+        assert new.sync({"sleap_anchor_fill": "off"}) == 3
+    finally:
+        new.close()
+
+    aruco_first = Block()                                        # no SLEAP output yet
+    try:
+        assert aruco_first.sync(legs="aruco", drop=("sleap_model_centroid", "sleap_model_instance",
+                                                    "sleap_module", "sleap_runtime", "saion_partition",
+                                                    "sleap_max_instances")) == 0
+        assert aruco_first.sync({"sleap_anchor_fill": "centroid"}) == 0
+        assert aruco_first.state()["detection"]["sleap_anchor_fill"] == "centroid"
+    finally:
+        aruco_first.close()
+
+
 def test_empty_aruco_params_is_a_value_not_absence():
     """'' means detector defaults. A later run must not be free to change it."""
     b = Block()

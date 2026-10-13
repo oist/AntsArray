@@ -9,6 +9,7 @@ usage() {
 	cat >&2 <<EOT
 Usage: $0 --centroid <dir> --instance <dir> --out <dir>
           [--runtime tensorrt|onnx|both] [--partition NAME] [--max-instances N]
+          [--anchor-fill]
 
 TRT engines are GPU-architecture-specific. Build on the same partition the
 predict jobs will run on, otherwise the engine will refuse to load.
@@ -16,6 +17,11 @@ predict jobs will run on, otherwise the engine will refuse to load.
 --max-instances is the most animals the engine keeps per frame. It is baked into
 the exported centroid graph, so it can only be changed by exporting again; an
 existing export with a different cap is refused, never reused.
+
+--anchor-fill exports through sleap_nn_export_anchor_fill.py: where the instance
+model leaves the anchor (tag) node below threshold, the engine puts the centroid
+there (Score_node stays 0) instead of NaN, and anchor_fill.json records it. An
+existing export with the other setting is refused, never reused.
 
 Defaults:
   --runtime        tensorrt
@@ -36,10 +42,12 @@ SLEAP_MODULE="${SLEAP_MODULE:-sleap-nn/0.2.0}"
 # the cap on 98-100 % of frames; 96 finds 70 ants/frame (max 82) with no frame at the
 # cap and the same detections as 128, 31 % faster. So 96.
 MAX_INSTANCES="${MAX_INSTANCES:-96}"
+ANCHOR_FILL=0
+SELF_DIR="$(dirname "$(readlink -f "$0")")"
 # The centered-instance model runs on up to cap x batch crops at once, and TensorRT cannot
 # build above a crop budget that depends on the model's crop size (192 at 640, 140 at 768;
 # lib/engine_crops.sh). So the batch follows the cap and the crop unless MAX_BATCH is set.
-source "$(dirname "$(readlink -f "$0")")/../lib/engine_crops.sh"
+source "$SELF_DIR/../lib/engine_crops.sh"
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
@@ -49,6 +57,7 @@ while [[ $# -gt 0 ]]; do
 		--runtime)   RUNTIME="$2"; shift 2 ;;
 		--partition) PARTITION="$2"; shift 2 ;;
 		--max-instances) MAX_INSTANCES="$2"; shift 2 ;;
+		--anchor-fill) ANCHOR_FILL=1; shift ;;
 		-h|--help)   usage ;;
 		*) echo "[ERR] unknown arg: $1" >&2; usage ;;
 	esac
@@ -93,16 +102,25 @@ case "$RUNTIME" in
 	*) echo "[ERR] unknown --runtime $RUNTIME (tensorrt|onnx|both)" >&2; exit 2 ;;
 esac
 
+FILL_RECORD="$OUT/anchor_fill.json"
+fill_args=()
+(( ANCHOR_FILL == 0 )) || fill_args=(--anchor-fill)
+
 if [[ -f "$marker" ]]; then
 	have_k="$(exported_meta "$OUT" max_instances)"
 	have_b="$(exported_meta "$OUT" max_batch_size)"
-	if [[ "$have_k" == "$MAX_INSTANCES" && "$have_b" == "$MAX_BATCH" ]]; then
-		echo "[OK] export already at $OUT (marker $marker, max_instances $have_k, max_batch_size $have_b)"
+	have_fill=0
+	[[ -f "$FILL_RECORD" ]] && have_fill=1
+	if [[ "$have_k" == "$MAX_INSTANCES" && "$have_b" == "$MAX_BATCH" && "$have_fill" == "$ANCHOR_FILL" ]]; then
+		echo "[OK] export already at $OUT (marker $marker, max_instances $have_k, max_batch_size $have_b," \
+		     "anchor fill $have_fill)"
 		exit 0
 	fi
 	echo "[ERR] $OUT already holds an export with max_instances=${have_k:-unrecorded}," \
-	     "max_batch_size=${have_b:-unrecorded}; asked for $MAX_INSTANCES / $MAX_BATCH." >&2
-	echo "      Export to another --out; the pipeline's engine cache key carries both (__k<N>b<B>__)." >&2
+	     "max_batch_size=${have_b:-unrecorded}, anchor fill $have_fill;" \
+	     "asked for $MAX_INSTANCES / $MAX_BATCH / anchor fill $ANCHOR_FILL." >&2
+	echo "      Export to another --out; the pipeline's engine cache key carries all three" \
+	     "(__k<N>b<B>__, __afill__)." >&2
 	exit 2
 fi
 
@@ -113,7 +131,7 @@ if [[ -z "${SLURM_JOB_ID:-}" ]]; then
 	MAX_BATCH="$MAX_BATCH" exec srun -p "$PARTITION" -c 8 --mem=64G --gres=gpu:1 -t 0-2 \
 		bash "$(readlink -f "$0")" \
 		--centroid "$CENTROID" --instance "$INSTANCE" --out "$OUT" \
-		--runtime "$RUNTIME" --partition "$PARTITION" --max-instances "$MAX_INSTANCES"
+		--runtime "$RUNTIME" --partition "$PARTITION" --max-instances "$MAX_INSTANCES" "${fill_args[@]}"
 fi
 
 # Batch jobs need the site modules, not interactive conda/mamba hooks. Sourcing
@@ -132,6 +150,7 @@ echo "  out:      $OUT"
 echo "  runtime:  $RUNTIME"
 echo "  max_instances: $MAX_INSTANCES"
 echo "  max_batch_size: $MAX_BATCH"
+echo "  anchor fill: $ANCHOR_FILL"
 
 case "$RUNTIME" in
 	tensorrt) fmt=tensorrt ;;
@@ -143,18 +162,22 @@ esac
 # batch (SLEAP_BATCH_SIZE) must not exceed it. Speed barely depends on it -- per frame
 # ~9.6 ms + 0.63 ms x cap on A100, the same for sparse and dense cameras, because the
 # engine runs every crop slot whether or not an animal fills it.
-sleap-nn export "$CENTROID" "$INSTANCE" \
-	-o "$OUT" \
-	-f "$fmt" \
-	--precision fp16 \
-	--max-batch-size "$MAX_BATCH" \
-	--max-instances "$MAX_INSTANCES" \
-	--device cuda
+export_args=("$CENTROID" "$INSTANCE" -o "$OUT" -f "$fmt" --precision fp16
+             --max-batch-size "$MAX_BATCH" --max-instances "$MAX_INSTANCES" --device cuda)
+if (( ANCHOR_FILL == 1 )); then
+	# The sleap-nn module's own interpreter, so the patch loads the same sleap_nn.
+	sleap_py="${SLEAP_NN_PYTHON:-$(dirname "$(readlink -f "$(command -v sleap-nn)")")/python}"
+	"$sleap_py" "$SELF_DIR/sleap_nn_export_anchor_fill.py" export "${export_args[@]}"
+	[[ -f "$FILL_RECORD" ]] || {
+		echo "[ERR] the anchor-fill export wrote no $FILL_RECORD" >&2; exit 3; }
+else
+	sleap-nn export "${export_args[@]}"
+fi
 
 have="$(exported_meta "$OUT" max_instances)"
 if [[ "$have" != "$MAX_INSTANCES" ]]; then
 	echo "[ERR] export metadata records max_instances=${have:-nothing}, asked for $MAX_INSTANCES" >&2
 	exit 3
 fi
-echo "[OK] exported to $OUT (max_instances $have)"
+echo "[OK] exported to $OUT (max_instances $have, anchor fill $ANCHOR_FILL)"
 ls -lh "$OUT"

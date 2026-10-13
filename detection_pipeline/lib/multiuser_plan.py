@@ -317,8 +317,22 @@ def resolve_settings(defaults, state, overrides):
         ch = state.get("chunking", {})
         settings["chunk_sec"] = int(ch.get("chunk_sec"))
         settings["chunk_ext"] = ch.get("chunk_ext")
-        for k, v in state.get("detection", {}).items():
+        detection = dict(state.get("detection", {}))
+        # A SLEAP leg recorded before the tag-node fallback existed was made without it.
+        for k, v in ps.IMPLIED_IF_SLEAP_RECORDED.items():
+            if k not in detection and "sleap_model_instance" in detection:
+                detection[k] = v
+        for k, v in detection.items():
             if k in _CONTRACT_ONLY or k in _NOT_INHERITED:
+                continue
+            if k == "sleap_anchor_fill":
+                # Recorded as centroid/off; only "off" is a pipeline.sh flag (the default is on).
+                if v == "off":
+                    settings["no_sleap_anchor_fill"] = True
+                continue
+            if k == "sleap_max_instances" and not str(v).isdigit():
+                # Per-camera caps are recorded as a description ("nest96=...;other20"), which
+                # is what pipeline.sh does by default; only a uniform cap is a flag value.
                 continue
             settings[k] = v
     conflicts = []

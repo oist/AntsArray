@@ -55,7 +55,13 @@ MISSING = object()
 # Keys whose value changes the CONTENT of an output that keeps the same name.
 # A mismatch is refused outright.
 HARD_KEYS = ("chunk_sec", "chunk_ext", "aruco_dict", "aruco_params",
-             "sleap_model_centroid", "sleap_model_instance")
+             "sleap_model_centroid", "sleap_model_instance", "sleap_anchor_fill")
+# sleap_anchor_fill ("centroid" / "off") records whether the exported engine put the
+# centroid into an anchor (tag) node the instance model left below threshold. That changes
+# the tag node of ~1-2 % of instances, so a block must not mix the two.
+# A contract that recorded a SLEAP leg before this key existed was made without the fill:
+# for it, a missing value means "off", not "never recorded".
+IMPLIED_IF_SLEAP_RECORDED = {"sleap_anchor_fill": "off"}
 
 # Keys that describe how the work was scheduled or executed rather than what it
 # produced. Recorded for provenance; a change only warns. sleap_runtime belongs
@@ -75,7 +81,7 @@ ALWAYS_KEYS = ("chunk_sec", "chunk_ext")
 LEG_KEYS = {
     "aruco": ("aruco_dict", "aruco_params", "aruco_script"),
     "sleap": ("sleap_model_centroid", "sleap_model_instance", "sleap_module",
-              "sleap_runtime", "saion_partition", "sleap_max_instances"),
+              "sleap_runtime", "saion_partition", "sleap_max_instances", "sleap_anchor_fill"),
 }
 
 # Output basenames in data/. Mirrors catalog/const.py, kept local so this module
@@ -252,6 +258,12 @@ def check_contract(state, proposed, legs):
             continue
         have = recorded.get(key, MISSING)
         want = proposed[key]
+        if have is MISSING and key in IMPLIED_IF_SLEAP_RECORDED \
+                and "sleap_model_instance" in recorded:
+            have = IMPLIED_IF_SLEAP_RECORDED[key]
+            if _norm(have) == _norm(want):
+                fills.append((key, None, want))
+                continue
         if have is MISSING:
             fills.append((key, None, want))
         elif _norm(have) != _norm(want):
@@ -535,6 +547,14 @@ def cmd_sync(args):
             "      overwrite existing outputs with content that no longer lines up\n"
             "      with the outputs it does not overwrite.\n\n")
         _print_diff("      conflicting settings:", violations)
+        for key, have, _ in violations:
+            if key != "sleap_anchor_fill":
+                continue
+            made_without = _norm(have) == "off"
+            sys.stderr.write(
+                "\n      sleap_anchor_fill: this block's SLEAP outputs were made %s the tag-node\n"
+                "      fallback; %s --no-sleap-anchor-fill to continue it as it was made.\n"
+                % ("without" if made_without else "with", "pass" if made_without else "drop"))
         sys.stderr.write(
             "\n      contract: %s\n"
             "      Either match the recorded settings, or start a separate\n"

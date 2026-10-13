@@ -175,6 +175,75 @@ def test_export_whose_metadata_disagrees_fails(tmp_path):
     assert "max_instances" in result.stderr
 
 
+# Stands in for the sleap-nn module's python running scripts/sleap_nn_export_anchor_fill.py:
+# records its argv and writes the export plus the fallback record, like the real script.
+FAKE_FILL_PYTHON = """#!/bin/bash
+printf '%s\\n' "$*" >> "$FAKE_LOG"
+out="" k=20 b=8
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -o) out="$2"; shift 2 ;;
+        --max-instances) k="$2"; shift 2 ;;
+        --max-batch-size) b="$2"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+mkdir -p "$out"
+printf '{\\n  "max_instances": %s,\\n  "max_batch_size": %s\\n}\\n' "$k" "$b" > "$out/export_metadata.json"
+cp "$out/export_metadata.json" "$out/model.trt.metadata.json"
+: > "$out/model.trt"
+[[ -n "${FAKE_NO_RECORD:-}" ]] || echo '{"anchor_index": 0}' > "$out/anchor_fill.json"
+"""
+
+
+def fill_env(tmp_path, **extra):
+    py = tmp_path / "fake_python"
+    py.write_text(FAKE_FILL_PYTHON)
+    py.chmod(0o755)
+    return {"SLEAP_NN_PYTHON": py.as_posix(), **extra}
+
+
+def test_anchor_fill_exports_through_the_fallback_script(tmp_path):
+    result, out, calls = run_export(tmp_path, "--max-instances", "96", "--anchor-fill",
+                                    env_extra=fill_env(tmp_path))
+    assert result.returncode == 0, result.stderr
+    assert len(calls) == 1
+    assert "sleap_nn_export_anchor_fill.py export" in calls[0]
+    assert "--max-instances 96" in calls[0] and "--max-batch-size 2" in calls[0]
+    assert "-f tensorrt" in calls[0] and "--precision fp16" in calls[0]
+    assert (out / "anchor_fill.json").exists()
+
+
+def test_anchor_fill_and_plain_exports_are_never_reused_for_each_other(tmp_path):
+    log = tmp_path / "sleap_nn_calls.log"
+    plain, _, _ = run_export(tmp_path, "--max-instances", "96")
+    assert plain.returncode == 0, plain.stderr
+    log.unlink()
+    fill, _, calls = run_export(tmp_path, "--max-instances", "96", "--anchor-fill", env_extra=fill_env(tmp_path))
+    assert fill.returncode != 0
+    assert "anchor" in fill.stderr
+    assert calls == []
+
+    d = tmp_path / "filled"
+    d.mkdir()
+    first, _, _ = run_export(d, "--max-instances", "96", "--anchor-fill", env_extra=fill_env(d))
+    assert first.returncode == 0, first.stderr
+    (d / "sleap_nn_calls.log").unlink()
+    again, _, calls = run_export(d, "--max-instances", "96")
+    assert again.returncode != 0
+    assert calls == []
+    same, _, calls = run_export(d, "--max-instances", "96", "--anchor-fill", env_extra=fill_env(d))
+    assert same.returncode == 0, same.stderr
+    assert calls == []                      # cached fallback engine, no rebuild
+
+
+def test_anchor_fill_export_without_its_record_fails(tmp_path):
+    result, _, _ = run_export(tmp_path, "--max-instances", "96", "--anchor-fill",
+                              env_extra=fill_env(tmp_path, FAKE_NO_RECORD="1"))
+    assert result.returncode != 0
+    assert "anchor_fill.json" in result.stderr
+
+
 def _bridge_key_block():
     bridge = (ROOT / "templates/bridge.sbatch").read_text()
     start = bridge.index("SLEAP_MAX_INSTANCES=") if "if [[ -z \"${SLEAP_MAX_INSTANCES" not in bridge \
@@ -212,3 +281,22 @@ def test_bridge_engine_cache_key_carries_cap_and_batch():
     ensure = _bridge_function("ensure_engine")
     assert "--max-instances '$cap'" in ensure
     assert "MAX_BATCH='$batch'" in ensure
+
+
+def test_bridge_keys_and_exports_the_tag_node_fallback_only_when_asked():
+    # An env file from before the fallback (no SLEAP_ANCHOR_FILL) keeps the plain engines.
+    base = ("EXPORT_ROOT=/work/x; SAION_PARTITION=largegpu; SLEAP_RUNTIME=tensorrt; SCRIPTS_DIR=/s;"
+            " SLEAP_MODEL_CENTROID=/m/a.centroid; SLEAP_MODEL_INSTANCE=/m/a.centered_instance\n"
+            "ssh_retry() { return 1; }\n"                       # no engine anywhere yet
+            "ssh_login_retry() { echo \"EXPORT $2\"; }\n")
+    funcs = _bridge_function("engine_dir_for") + _bridge_function("ensure_engine")
+    for env, key, flag in (("", "k96b1__largegpu", False), ("SLEAP_ANCHOR_FILL=0", "k96b1__largegpu", False),
+                           ("SLEAP_ANCHOR_FILL=1", "k96b1__afill__largegpu", True)):
+        sh = "%s%s\n%s\nengine_dir_for 96 1; ensure_engine 96 1" % (base, env, funcs)
+        r = subprocess.run(["bash", "-c", sh], text=True, capture_output=True, timeout=10)
+        lines = r.stdout.splitlines()
+        assert lines[0] == "/work/x/a.centroid__a.centered_instance__" + key, (env, r.stdout, r.stderr)
+        export = [line for line in lines if line.startswith("EXPORT ")]
+        assert len(export) == 1, (env, r.stdout, r.stderr)
+        assert ("--out '%s'" % lines[0]) in export[0]
+        assert ("--anchor-fill" in export[0]) == flag, (env, export[0])

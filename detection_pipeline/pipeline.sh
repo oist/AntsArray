@@ -109,6 +109,11 @@ SLEAP runtime:
   --sleap-other-cap N               cap for the others.    default: 20
   --sleap-max-instances N           one cap for EVERY camera instead (no table; e.g. cap-96
                                     re-run views). sleap-nn's own 20 truncated nest cameras
+  --no-sleap-anchor-fill            leave a below-threshold tag (anchor) node NaN. Default:
+                                    the engine puts the centroid there (Score_node 0), since
+                                    tracking drops an instance without its tag node; engine
+                                    key __afill__. Use only to continue a block started
+                                    without it
   --sleap-cpus N                    cpus per sleap task. default: auto = cpu_cap/concurrency
   --sleap-mem SIZE                  mem per sleap task.  default: auto = mem_cap/concurrency
   --sleap-wall D-HH                 per-task walltime.   default: auto = partition wall
@@ -270,6 +275,14 @@ SLEAP_MAX_INSTANCES=""
 NEST_CAMS_TABLE="/bucket/ReiterU/Ants/basler/_catalog/nest_cams.tsv"
 SLEAP_NEST_CAP=96
 SLEAP_OTHER_CAP=20
+# Tag-node fallback on the exported path: where the centered-instance model leaves the
+# anchor (tag) node below threshold, the engine puts the centroid there instead of NaN.
+# The centroid model is anchored on the tag, so the centroid is the tag estimate; tracking
+# drops an instance whose tag node is NaN. The crop-768 model left it NaN ~4x as often as
+# the 640 one (20260928 c010 cam09: 0.37 -> 1.57 %); with the fallback, 0 %. Nothing else
+# in the output changes. --no-sleap-anchor-fill keeps the plain engines (to continue a
+# block that was started without it).
+SLEAP_ANCHOR_FILL=1
 ARUCO_CONCURRENCY=100   # compute assoc cap=2000 cpu; at -c 16 that's ~125 concurrent max, so 100 leaves headroom for the bridge (also on compute)
 # Sleap GPU concurrency + per-task resources. Empty = auto-derived from the
 # selected --saion-partition after arg parsing (see saion_caps below):
@@ -339,6 +352,7 @@ while [[ $# -gt 0 ]]; do
 		--sleap-module) SLEAP_MODULE="$2"; shift 2 ;;
 		--sleap-batch-size) SLEAP_BATCH_SIZE="$2"; shift 2 ;;
 		--sleap-max-instances) SLEAP_MAX_INSTANCES="$2"; shift 2 ;;
+		--no-sleap-anchor-fill) SLEAP_ANCHOR_FILL=0; shift ;;
 		--nest-cams) NEST_CAMS_TABLE="$2"; shift 2 ;;
 		--sleap-nest-cap) SLEAP_NEST_CAP="$2"; shift 2 ;;
 		--sleap-other-cap) SLEAP_OTHER_CAP="$2"; shift 2 ;;
@@ -554,6 +568,18 @@ if (( EXPORTED_PATH == 1 && ONLY_CHUNK != 1 && ONLY_ARUCO != 1 && ONLY_BACKUP !=
 		echo "[ERR] instance model crop $_crop has no measured engine limit; measure which" \
 		     "cap x batch builds at this crop and add it to lib/engine_crops.sh" >&2; exit 2; }
 	echo "[INFO] instance model crop $_crop: engine budget $MAX_ENGINE_CROPS crops (cap x batch)"
+fi
+# The tag-node fallback lives in the exported engine; 'sleap-nn track' has none.
+(( EXPORTED_PATH == 1 )) || SLEAP_ANCHOR_FILL=0
+if (( SLEAP_ANCHOR_FILL == 1 && ONLY_CHUNK != 1 && ONLY_ARUCO != 1 && ONLY_BACKUP != 1 )); then
+	# The fallback patches sleap-nn 0.3's export wrapper; 0.2.0 would fail only at build time.
+	_ver="${SLEAP_MODULE##*/}"
+	if ! [[ "$_ver" =~ ^([0-9]+)\.([0-9]+) ]] || (( BASH_REMATCH[1] == 0 && BASH_REMATCH[2] < 3 )); then
+		echo "[ERR] the tag-node fallback needs a sleap-nn 0.3+ module; --sleap-module is '$SLEAP_MODULE'." >&2
+		echo "      Pass --sleap-module sleap-nn/0.3.3, or --no-sleap-anchor-fill for plain engines." >&2
+		exit 2
+	fi
+	echo "[INFO] tag-node fallback on: a below-threshold tag node takes the centroid (engine key __afill__)"
 fi
 if [[ -n "$SLEAP_MAX_INSTANCES" ]] || (( EXPORTED_PATH == 0 || ONLY_ARUCO == 1 || ONLY_BACKUP == 1 )); then
 	SLEAP_CAP_MODE=uniform
@@ -785,6 +811,7 @@ export SLEAP_MODULE="$SLEAP_MODULE"
 export SLEAP_BATCH_SIZE="$SLEAP_BATCH_SIZE"
 export SLEAP_MAX_INSTANCES="$SLEAP_MAX_INSTANCES"
 export SLEAP_ENGINE_CROPS="$MAX_ENGINE_CROPS"
+export SLEAP_ANCHOR_FILL="$SLEAP_ANCHOR_FILL"
 export SLEAP_CAP_MODE="$SLEAP_CAP_MODE"
 export SLEAP_NEST_CAMS="$JOBS_ROOT/nest_cams.tsv"
 export SLEAP_NEST_CAP="$SLEAP_NEST_CAP"
@@ -880,6 +907,9 @@ if (( ONLY_BACKUP != 1 )); then
 		# The cap only exists on the exported path; 'sleap-nn track' does not read it.
 		if (( SKIP_TRT_EXPORT == 0 )) && [[ "$SLEAP_RUNTIME" != "pytorch" ]]; then
 			STATE_SET+=(--set "sleap_max_instances=$SLEAP_CAPS_DESC")
+			_fill_desc=off
+			(( SLEAP_ANCHOR_FILL == 1 )) && _fill_desc=centroid
+			STATE_SET+=(--set "sleap_anchor_fill=$_fill_desc")
 		fi
 	fi
 	NEW_RUN_ARG=()
