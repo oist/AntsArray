@@ -7,22 +7,43 @@ Layout:
   - White quiet zone (margin) around each marker (default 0.3mm)
   - ID labels positioned outside the margin
   - Cutting crop marks at row/column boundaries for precise cutting
+  - Black ink-spread pre-compensation (--black-shrink-mm, see ink_spread.py)
 
 Usage:
     python aruco_detection/custom_dicts/generate_cuttable_sheet.py \
         --npz aruco_detection/custom_dicts/custom_4x4_A100_d4_20260410_103938.npz \
         --output aruco_detection/custom_dicts/custom_4x4_A100_d4_cuttable.png
+
+    # one sheet per black shrink 0 / 0.03 / 0.05 / 0.08 mm, plus a before/after preview
+    python aruco_detection/custom_dicts/generate_cuttable_sheet.py --npz ... \
+        --output D:/uv_test/A100.png --compare-shrink
 """
 
 from __future__ import annotations
 
 import argparse
 import html
+import io
+import struct
+import sys
+import traceback
+import zlib
+from collections import Counter
+from contextlib import redirect_stdout
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import cv2
 import cv2.aruco as aruco
 import numpy as np
+
+import ink_spread
+
+DEFAULT_DPI = 2540               # 100 px/mm: 0.25 mm modules and 0.01 mm shrink steps are whole pixels
+DEFAULT_BLACK_SHRINK_MM = 0.03   # best of 0/0.03/0.05/0.08 on the eufyMake E1, arena test 2026-10-20 (README)
+COMPARE_SHRINK_MM = (0.0, 0.03, 0.05, 0.08)
+SHRINK_TOLERANCE_MM = 0.005      # warn when the pixel grid misplaces the shrunk edge by more
 
 
 def load_custom_dictionary(npz_path):
@@ -77,6 +98,45 @@ def default_cols(copies):
     return copies * max(1, 10 // copies)
 
 
+def png_with_dpi(png: bytes, dpi: float) -> bytes:
+    """Add a pHYs chunk after IHDR so DPI-aware software prints the sheet at its true size."""
+    if png[12:16] != b"IHDR":
+        raise ValueError("not a PNG starting with IHDR")
+    ppm = round(dpi / 0.0254)   # pixels per metre; 2540 dpi = 100000 exactly
+    body = b"pHYs" + struct.pack(">IIB", ppm, ppm, 1)
+    chunk = struct.pack(">I", len(body) - 4) + body + struct.pack(">I", zlib.crc32(body))
+    ihdr_end = 8 + 4 + 4 + 13 + 4   # signature + IHDR length, type, data, CRC
+    return png[:ihdr_end] + chunk + png[ihdr_end:]
+
+
+@dataclass(frozen=True)
+class SheetReport:
+    """What one PNG sheet holds: the shrink as placed on its pixels and how its tags read back."""
+
+    path: Path
+    plan: ink_spread.ShrinkPlan
+    module_mm: float
+    expected: int
+    decoded: int
+    missing: tuple[int, ...]      # printed IDs that did not decode (one entry per lost copy)
+    unexpected: tuple[int, ...]   # IDs read that were not printed (wrong decodes)
+
+    @property
+    def readable(self) -> bool:
+        return self.decoded == self.expected and not self.unexpected
+
+
+def read_back(img, dictionary, seq):
+    """(decoded, missing, unexpected) when OpenCV reads the sheet with no bit correction."""
+    params = aruco.DetectorParameters()
+    params.errorCorrectionRate = 0.0   # every bit must read as printed
+    _, ids, _ = aruco.ArucoDetector(dictionary, params).detectMarkers(img)
+    found = Counter() if ids is None else Counter(int(i) for i in ids.ravel())
+    want = Counter(seq)
+    return (sum((found & want).values()), tuple(sorted((want - found).elements())),
+            tuple(sorted((found - want).elements())))
+
+
 def generate_cuttable_sheet(
     dictionary: aruco.Dictionary,
     n_markers: int,
@@ -88,14 +148,20 @@ def generate_cuttable_sheet(
     col_gap_mm: float = 1.2,
     crop_mark_mm: float = 2.0,
     page_margin_mm: float = 8.0,
-    dpi: int = 600,
+    dpi: int = DEFAULT_DPI,
     cols: int = 10,
     ids: list[int] | None = None,
     title: str | None = None,
-):
+    black_shrink_mm: float = DEFAULT_BLACK_SHRINK_MM,
+) -> SheetReport:
     """Generate a cuttable tag sheet with crop marks.
 
     `ids` is the print order (see tag_sequence); None = every marker once, in ID order.
+
+    `black_shrink_mm` erodes each marker's black area by that distance right after
+    generateImageMarker, to pre-compensate ink spread (see ink_spread); 0 = as designed.
+    Layout, white margins and tag size do not change. The PNG holds only 0 and 255, records
+    `dpi`, and is read back with OpenCV; tags that do not decode as their ID are warned about.
 
     Physical layout per tag:
         [margin][marker][margin]
@@ -110,6 +176,9 @@ def generate_cuttable_sheet(
     """
     seq = tag_sequence(ids, n_markers)
     rows = (len(seq) + cols - 1) // cols
+    module_mm = marker_mm / (dictionary.markerSize + 2)
+    ink_spread.check_shrink(black_shrink_mm, module_mm)
+    plan = ink_spread.ShrinkPlan(black_shrink_mm, dpi)
 
     # Convert dimensions to pixels
     marker_px = mm_to_px(marker_mm, dpi)
@@ -133,7 +202,8 @@ def generate_cuttable_sheet(
 
     if title is None:
         title = f"Custom_A  {n_markers} markers  min_d={min_d}  marker={marker_mm}mm  margin={margin_mm}mm"
-    footer_text = f"DPI: {dpi}  |  Cut along crop marks  |  Each tag: {marker_mm + 2*margin_mm:.1f}mm x {marker_mm + 2*margin_mm:.1f}mm"
+    footer_text = (f"DPI: {dpi}  |  Black shrink: {black_shrink_mm:.3f}mm  |  "
+                   f"Each tag: {marker_mm + 2*margin_mm:.1f}mm x {marker_mm + 2*margin_mm:.1f}mm")
     font = cv2.FONT_HERSHEY_SIMPLEX
     font_scale = mm_to_px(2.0, dpi) / 30  # scale relative to desired text height
 
@@ -158,12 +228,13 @@ def generate_cuttable_sheet(
     ox = page_margin_px + crop_mark_px
     oy = page_margin_px + crop_mark_px + title_h
 
-    # Create white sheet
+    # Create white sheet. Everything is drawn pure black without anti-aliasing, so the
+    # sheet holds only 0 and 255 and the printer lays no grey halftone.
     sheet = np.ones((sheet_h, sheet_w), dtype=np.uint8) * 255
 
     # -- Title --
     cv2.putText(sheet, title, (ox, oy - mm_to_px(2, dpi)),
-                font, font_scale, 0, max(1, dpi // 300), cv2.LINE_AA)
+                font, font_scale, 0, max(1, dpi // 300), cv2.LINE_8)
 
     # Scale ruler (10mm)
     ruler_x = ox + content_w - mm_to_px(12, dpi)
@@ -175,7 +246,7 @@ def generate_cuttable_sheet(
         th = mm_to_px(0.8 if tick_mm % 5 == 0 else 0.4, dpi)
         cv2.line(sheet, (tx, ruler_y - th), (tx, ruler_y + th), 0, max(1, dpi // 300))
     cv2.putText(sheet, "10 mm", (ruler_x + ruler_len + mm_to_px(1, dpi), ruler_y + mm_to_px(0.5, dpi)),
-                font, font_scale * 0.6, 0, max(1, dpi // 300), cv2.LINE_AA)
+                font, font_scale * 0.6, 0, max(1, dpi // 300), cv2.LINE_8)
 
     # -- Draw markers and ID labels --
     for k, mid in enumerate(seq):
@@ -189,8 +260,9 @@ def generate_cuttable_sheet(
         mx = tag_x + margin_px
         my = tag_y + margin_px
 
-        # Generate marker
+        # Generate marker, then pre-compensate ink spread (the white margin around it stays)
         img = aruco.generateImageMarker(dictionary, mid, marker_px)
+        img = ink_spread.shrink_black(img, plan.px)
         sheet[my:my + marker_px, mx:mx + marker_px] = img
 
         # ID label — centered below the tag, in the gap area
@@ -200,10 +272,10 @@ def generate_cuttable_sheet(
         lx = tag_x + (tag_w - tw) // 2
         ly = tag_y + tag_h + mm_to_px(1.2, dpi)
         cv2.putText(sheet, label, (lx, ly), font, label_font_scale, 0,
-                    max(1, dpi // 300), cv2.LINE_AA)
+                    max(1, dpi // 300), cv2.LINE_8)
 
     # -- Crop marks: L-shaped corner marks at all 4 corners of each tag --
-    crop_color = 100  # dark gray
+    crop_color = 0
     crop_thickness = max(1, dpi // 600)
     arm_len = mm_to_px(0.6, dpi)  # length of each arm of the L
     corner_gap = mm_to_px(0.15, dpi)  # tiny gap between corner mark and tag edge
@@ -245,9 +317,14 @@ def generate_cuttable_sheet(
     # -- Print info footer --
     footer_y = sheet_h - page_margin_px
     cv2.putText(sheet, footer_text, (ox, footer_y),
-                font, font_scale * 0.5, 120, max(1, dpi // 300), cv2.LINE_AA)
+                font, font_scale * 0.5, 0, max(1, dpi // 300), cv2.LINE_8)
 
-    cv2.imwrite(str(output_path), sheet)
+    ok, buf = cv2.imencode(".png", sheet)
+    if not ok:
+        raise OSError(f"PNG encoding failed for {output_path}")
+    Path(output_path).write_bytes(png_with_dpi(buf.tobytes(), dpi))
+    decoded, missing, unexpected = read_back(cv2.imdecode(buf, cv2.IMREAD_GRAYSCALE), dictionary, seq)
+    report = SheetReport(Path(output_path), plan, module_mm, len(seq), decoded, missing, unexpected)
 
     # Print physical dimensions
     sheet_w_mm = sheet_w * 25.4 / dpi
@@ -256,7 +333,18 @@ def generate_cuttable_sheet(
     print(f"  Tag cut size: {marker_mm + 2*margin_mm:.1f} x {marker_mm + 2*margin_mm:.1f} mm")
     print(f"  Grid: {cols} x {rows}")
     print(f"  DPI: {dpi}")
+    lone_black, lone_white = plan.lone_module_mm(module_mm)
+    print(f"  Black shrink: {black_shrink_mm:g} mm = {plan.px:.2f} px -> edges move {plan.edge_px} px "
+          f"= {plan.edge_mm:.4f} mm (lone module: black {lone_black:.3f} / white {lone_white:.3f} mm)")
+    if abs(plan.error_mm) > SHRINK_TOLERANCE_MM + 1e-9:   # a half-pixel tie at 2540 dpi is not a miss
+        print(f"  WARNING: at {dpi} dpi the shrink lands {plan.error_mm:+.4f} mm off {black_shrink_mm:g} mm; "
+              f"use --dpi {DEFAULT_DPI} (1 px = 0.01 mm)")
+    print(f"  Read back: {decoded}/{len(seq)} tags decode as their ID (OpenCV, errorCorrectionRate=0)")
+    if not report.readable:
+        print(f"  WARNING: black shrink {black_shrink_mm:g} mm leaves tags OpenCV cannot read as printed: "
+              f"missing {list(missing)}, read as unprinted IDs {list(unexpected)}")
     print(f"  Saved: {output_path}")
+    return report
 
 
 def generate_cuttable_svg(
@@ -275,15 +363,23 @@ def generate_cuttable_svg(
     name: str = "Custom_A",
     ids: list[int] | None = None,
     title: str | None = None,
+    black_shrink_mm: float = DEFAULT_BLACK_SHRINK_MM,
 ):
     """Generate a cuttable tag sheet as SVG (vector format).
 
     All coordinates and sizes are in millimeters (SVG user units = mm via viewBox).
     Output is true vector — markers are rectangles, labels are text, crop marks are lines.
     `ids` is the print order (see tag_sequence); None = every marker once, in ID order.
+
+    `black_shrink_mm` is the PNG's ink-spread compensation drawn exactly: the black square
+    shrinks by d per side and every white cell grows by d with corner radius d, which is the
+    black area eroded by a disc of radius d.
     """
     seq = tag_sequence(ids, n_markers)
     rows = (len(seq) + cols - 1) // cols
+    d = black_shrink_mm
+    ink_spread.check_shrink(d, marker_mm / (dictionary.markerSize + 2))
+    rounded = f' rx="{d}" ry="{d}"' if d > 0 else ""
 
     # Tag cut boundary (marker + 2 margins)
     tag_w = marker_mm + 2 * margin_mm
@@ -297,7 +393,7 @@ def generate_cuttable_svg(
 
     if title is None:
         title = f"{name}  {n_markers} markers  min_d={min_d}  marker={marker_mm}mm  margin={margin_mm}mm"
-    footer = (f"Vector SVG  |  Cut along corner marks  |  "
+    footer = (f"Vector SVG  |  Black shrink: {d:.3f}mm  |  "
               f"Each tag: {tag_w:.1f}mm x {tag_h:.1f}mm")
 
     # Widen a re-tagging sheet to fit its text (Helvetica averages < 0.6 em per
@@ -365,11 +461,13 @@ def generate_cuttable_svg(
         # Black border (full marker square)
         mx = tag_x + margin_mm
         my = tag_y + margin_mm
-        # Render full black square first
+        # Render full black square first (shrunk by d per side: the outside is white)
         svg.append(
-            f'  <rect x="{mx}" y="{my}" width="{marker_mm}" height="{marker_mm}" fill="black"/>'
+            f'  <rect x="{mx + d}" y="{my + d}" width="{marker_mm - 2 * d}" '
+            f'height="{marker_mm - 2 * d}" fill="black"/>'
         )
-        # Then render WHITE cells where the data bit is 0 (in the inner 4x4 region)
+        # Then render WHITE cells where the data bit is 0 (in the inner 4x4 region),
+        # each grown by d with round corners
         pattern = extract_marker_pattern(dictionary, mid, 4)
         # Inner data starts at 1 cell offset
         for ri in range(4):
@@ -378,8 +476,8 @@ def generate_cuttable_svg(
                     cx = mx + (ci + 1) * cell_mm
                     cy = my + (ri + 1) * cell_mm
                     svg.append(
-                        f'  <rect x="{cx}" y="{cy}" width="{cell_mm}" height="{cell_mm}" '
-                        f'fill="white"/>'
+                        f'  <rect x="{cx - d}" y="{cy - d}" width="{cell_mm + 2 * d}" '
+                        f'height="{cell_mm + 2 * d}"{rounded} fill="white"/>'
                     )
 
         # --- L-shaped corner crop marks at 4 corners of tag cut boundary ---
@@ -394,13 +492,13 @@ def generate_cuttable_svg(
             svg.append(
                 f'  <line x1="{cx + dx * crop_gap_mm}" y1="{cy}" '
                 f'x2="{cx + dx * (crop_gap_mm + crop_arm_mm)}" y2="{cy}" '
-                f'stroke="#666" stroke-width="0.1"/>'
+                f'stroke="black" stroke-width="0.1"/>'
             )
             # Vertical arm
             svg.append(
                 f'  <line x1="{cx}" y1="{cy + dy * crop_gap_mm}" '
                 f'x2="{cx}" y2="{cy + dy * (crop_gap_mm + crop_arm_mm)}" '
-                f'stroke="#666" stroke-width="0.1"/>'
+                f'stroke="black" stroke-width="0.1"/>'
             )
 
         # --- ID label centered below tag ---
@@ -416,7 +514,7 @@ def generate_cuttable_svg(
     footer_y = sheet_h - page_margin_mm
     svg.append(
         f'  <text x="{ox}" y="{footer_y}" font-family="Helvetica, Arial, sans-serif" '
-        f'font-size="1.2" fill="#555">{footer}</text>'
+        f'font-size="1.2" fill="black">{footer}</text>'
     )
 
     svg.append('</svg>')
@@ -424,32 +522,50 @@ def generate_cuttable_svg(
     output_path.write_text("\n".join(svg), encoding="utf-8")
     print(f"  Sheet (SVG): {sheet_w:.1f} x {sheet_h:.1f} mm")
     print(f"  Tag cut size: {tag_w:.1f} x {tag_h:.1f} mm")
+    print(f"  Black shrink: {d:g} mm (exact vector)")
     print(f"  Saved: {output_path}")
 
 
-def main():
-    p = argparse.ArgumentParser(description="Generate cuttable ArUco tag sheet")
-    p.add_argument("--npz", required=True, help="Custom dictionary NPZ file")
-    p.add_argument("--output", required=True,
-                   help="Output path. Extension determines format: .png, .svg, or .pdf "
-                        "(if extension is .png, also saves matching .svg next to it)")
-    p.add_argument("--marker-mm", type=float, default=1.5, help="Marker size in mm (default: 1.5)")
-    p.add_argument("--margin-mm", type=float, default=0.3, help="White margin in mm (default: 0.3)")
-    p.add_argument("--dpi", type=int, default=600, help="Output DPI for PNG (default: 600)")
-    p.add_argument("--cols", type=int, default=None,
-                   help="Columns (default: ~10, a multiple of --copies so an ID's copies share a row)")
-    p.add_argument("--name", default="Custom_A", help="Dictionary name shown in title")
-    p.add_argument("--ids", default=None,
-                   help='Print only these IDs, e.g. "3,13,57-59" (re-tagging); default: every ID')
-    p.add_argument("--copies", type=int, default=1, help="Tags per ID (default: 1)")
-    p.add_argument("--title", default=None, help="Title line (default: dictionary summary)")
-    p.add_argument("--no-svg", action="store_true",
-                   help="Skip SVG output when generating PNG (default: also save SVG)")
-    args = p.parse_args()
+def variant_path(output_path: Path, shrink_mm: float, many: bool) -> Path:
+    """The output path itself, or <stem>_shrink<mm>mm<ext> when several shrinks are written."""
+    if not many:
+        return output_path
+    return output_path.with_name(f"{output_path.stem}_shrink{shrink_mm:g}mm{output_path.suffix}")
 
-    output_path = Path(args.output)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
 
+def print_shrink_summary(reports: list[SheetReport]) -> None:
+    first = reports[0]
+    print(f"\nBlack shrink summary ({first.plan.dpi:g} dpi, module {first.module_mm:.3f} mm; "
+          "lone = a module with the other colour on both sides):")
+    print(f"  {'shrink mm':>9}  {'px':>6}  {'edge px':>7}  {'edge mm':>7}  {'error mm':>8}  "
+          f"{'lone black':>10}  {'lone white':>10}  {'decoded':>8}  file")
+    for r in reports:
+        black_mm, white_mm = r.plan.lone_module_mm(r.module_mm)
+        print(f"  {r.plan.mm:>9g}  {r.plan.px:>6.2f}  {r.plan.edge_px:>7d}  {r.plan.edge_mm:>7.4f}  "
+              f"{r.plan.error_mm:>+8.4f}  {black_mm:>10.3f}  {white_mm:>10.3f}  "
+              f"{f'{r.decoded}/{r.expected}':>8}  {r.path.name}")
+    for r in reports:
+        if not r.readable:
+            print(f"WARNING: black shrink {r.plan.mm:g} mm: only {r.decoded}/{r.expected} tags decode as "
+                  "designed; the printed tags read only if the ink spreads back most of the shrink")
+
+
+def write_preview(dictionary, mid, shrinks, dpi, marker_mm, margin_mm, path: Path) -> None:
+    """Zoomed before/after of one tag for every shrink, design (0) first."""
+    modules = dictionary.markerSize + 2
+    marker = aruco.generateImageMarker(dictionary, mid, mm_to_px(marker_mm, dpi))
+    plans = [ink_spread.ShrinkPlan(mm, dpi) for mm in sorted({0.0, *shrinks})]
+    img = ink_spread.preview_strip(
+        marker, mm_to_px(margin_mm, dpi), modules, marker_mm / modules, plans,
+        f"ID {mid} @ {dpi} dpi   red: black turned white   blue: design modules")
+    ok, buf = cv2.imencode(".png", img)
+    if not ok:
+        raise OSError(f"PNG encoding failed for {path}")
+    path.write_bytes(buf.tobytes())
+    print(f"Preview: {path}")
+
+
+def run(args, output_path: Path) -> None:
     dictionary, n_markers, min_d, _patterns = load_custom_dictionary(args.npz)
     print(f"Loaded: {n_markers} markers, min_d={min_d}")
 
@@ -461,39 +577,111 @@ def main():
     cols = args.cols if args.cols is not None else default_cols(args.copies)
 
     ext = output_path.suffix.lower()
-    if ext == ".svg":
-        generate_cuttable_svg(
-            dictionary, n_markers, min_d, output_path,
-            marker_mm=args.marker_mm,
-            margin_mm=args.margin_mm,
-            cols=cols,
-            name=args.name,
-            ids=seq,
-            title=args.title,
-        )
-    elif ext == ".png":
-        generate_cuttable_sheet(
-            dictionary, n_markers, min_d, output_path,
-            marker_mm=args.marker_mm,
-            margin_mm=args.margin_mm,
-            dpi=args.dpi,
-            cols=cols,
-            ids=seq,
-            title=args.title,
-        )
-        if not args.no_svg:
-            svg_path = output_path.with_suffix(".svg")
+    if ext not in (".png", ".svg"):
+        raise ValueError(f"Unsupported output extension: {ext}. Use .png or .svg")
+    shrinks = list(COMPARE_SHRINK_MM) if args.compare_shrink else list(dict.fromkeys(args.black_shrink_mm))
+    for mm in shrinks:   # fail before writing any sheet
+        ink_spread.check_shrink(mm, args.marker_mm / (dictionary.markerSize + 2))
+    many = len(shrinks) > 1
+
+    reports = []
+    for mm in shrinks:
+        path = variant_path(output_path, mm, many)
+        print(f"\nBlack shrink {mm:g} mm -> {path.name}")
+        if ext == ".png":
+            reports.append(generate_cuttable_sheet(
+                dictionary, n_markers, min_d, path,
+                marker_mm=args.marker_mm,
+                margin_mm=args.margin_mm,
+                dpi=args.dpi,
+                cols=cols,
+                ids=seq,
+                title=args.title,
+                black_shrink_mm=mm,
+            ))
+        if ext == ".svg" or not args.no_svg:
             generate_cuttable_svg(
-                dictionary, n_markers, min_d, svg_path,
+                dictionary, n_markers, min_d, path.with_suffix(".svg"),
                 marker_mm=args.marker_mm,
                 margin_mm=args.margin_mm,
                 cols=cols,
                 name=args.name,
                 ids=seq,
                 title=args.title,
+                black_shrink_mm=mm,
             )
-    else:
-        raise ValueError(f"Unsupported output extension: {ext}. Use .png or .svg")
+
+    if reports:
+        print_shrink_summary(reports)
+    if ext == ".png" and any(mm > 0 for mm in shrinks):
+        write_preview(dictionary, (seq or [0])[0], shrinks, args.dpi, args.marker_mm, args.margin_mm,
+                      output_path.with_name(f"{output_path.stem}_shrink_preview.png"))
+
+
+class _Tee(io.TextIOBase):
+    """Write to several text streams at once (console + run log)."""
+
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, s):
+        for stream in self.streams:
+            stream.write(s)
+        return len(s)
+
+    def flush(self):
+        for stream in self.streams:
+            stream.flush()
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(description="Generate cuttable ArUco tag sheet")
+    p.add_argument("--npz", required=True, help="Custom dictionary NPZ file")
+    p.add_argument("--output", required=True,
+                   help="Output path. Extension determines format: .png, .svg, or .pdf "
+                        "(if extension is .png, also saves matching .svg next to it)")
+    p.add_argument("--marker-mm", type=float, default=1.5, help="Marker size in mm (default: 1.5)")
+    p.add_argument("--margin-mm", type=float, default=0.3, help="White margin in mm (default: 0.3)")
+    p.add_argument("--dpi", type=int, default=DEFAULT_DPI,
+                   help=f"Output DPI for PNG (default: {DEFAULT_DPI} = 100 px/mm, written into the PNG)")
+    p.add_argument("--black-shrink-mm", type=float, nargs="+", default=None, metavar="MM",
+                   help="Move every black edge inward by MM to pre-compensate ink spread "
+                        f"(default: {DEFAULT_BLACK_SHRINK_MM}; 0 = as designed). Several values write "
+                        "one sheet each, named <output>_shrink<MM>mm")
+    p.add_argument("--compare-shrink", action="store_true",
+                   help="Same as --black-shrink-mm " + " ".join(f"{v:g}" for v in COMPARE_SHRINK_MM))
+    p.add_argument("--cols", type=int, default=None,
+                   help="Columns (default: ~10, a multiple of --copies so an ID's copies share a row)")
+    p.add_argument("--name", default="Custom_A", help="Dictionary name shown in title")
+    p.add_argument("--ids", default=None,
+                   help='Print only these IDs, e.g. "3,13,57-59" (re-tagging); default: every ID')
+    p.add_argument("--copies", type=int, default=1, help="Tags per ID (default: 1)")
+    p.add_argument("--title", default=None, help="Title line (default: dictionary summary)")
+    p.add_argument("--no-svg", action="store_true",
+                   help="Skip SVG output when generating PNG (default: also save SVG)")
+    args = p.parse_args(argv)
+    if args.compare_shrink and args.black_shrink_mm is not None:
+        p.error("--compare-shrink sets the shrinks itself; drop --black-shrink-mm")
+    if args.black_shrink_mm is None:
+        args.black_shrink_mm = [DEFAULT_BLACK_SHRINK_MM]
+
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    log = io.StringIO()
+    try:
+        with redirect_stdout(_Tee(sys.stdout, log)):
+            run(args, output_path)
+    except Exception:
+        log.write(traceback.format_exc())   # the log must say why the run stopped
+        raise
+    finally:
+        log_path = output_path.parent / f"generate_cuttable_sheet_log_{datetime.now().astimezone():%Y%m%d_%H%M%S}.txt"
+        try:
+            log_path.write_text(log.getvalue(), encoding="utf-8")
+            print(f"Log: {log_path}")
+        except OSError as e:   # never mask the run's own error
+            print(f"Could not write the log {log_path}: {e}", file=sys.stderr)
 
 
 if __name__ == "__main__":

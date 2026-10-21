@@ -19,7 +19,8 @@ compute task per chunk plus a summary job (a few minutes in total). Results:
 ```
 /flash/ReiterU/$USER/tag_roster/<date>_<block>_c<first>-<last>/out/
     needed_ids.txt       what to print, per side
-    retag_left.png/.svg  cuttable sheet (open in Liene), 2 tags per ID
+    retag_left.png/.svg  cuttable sheet (open in Liene), 2 tags per ID, 2540 dpi,
+                         black shrunk 0.03 mm for ink spread (../custom_dicts/README.md)
     retag_right.png/.svg
     roster_status.csv    every ID x side: status, rates per chunk, last seen
 ```
