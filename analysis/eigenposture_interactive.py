@@ -32,6 +32,7 @@ from analysis.full_behavior_sleep import build as build_state_sleep,select_quiet
 from analysis.full_behavior_profiles import build as build_state_means
 from analysis.behavior_report_figures import overview,label_figure
 from analysis.s0_motion_sleep import refresh_return_contexts
+from analysis.eigenposture_inputs import MOTION_OUTPUT_NAME, validate_report_inputs
 from matplotlib.colors import ListedColormap
 
 BLOCK=Path(os.environ.get('ANTS_DATASET_ROOT','/home/sam-reiter/bucket/ReiterU/Ants/basler/20260724/block01'))
@@ -47,7 +48,10 @@ LIGHT_ON,LIGHT_OFF=5.5,19.5
 # separate non-sleep state. None opts into motion-profile candidates instead.
 SLEEP_STATES=[0]
 MIN_SLEEP_SECONDS=0  # Primary result: cluster membership; inspect bout durations separately.
-MOTION_SLEEP=Path(os.environ.get('ANTS_MOTION_SLEEP',str(SOURCE/'sleep_from_s0_motion_20261011')))
+MOTION_SLEEP=Path(os.environ.get('ANTS_MOTION_SLEEP',str(SOURCE/MOTION_OUTPUT_NAME)))
+# Validate the same generated inputs in interactive and headless runs, before
+# fitting report layouts or saving any figures.
+grid_root = validate_report_inputs(BLOCK, SOURCE, MOTION_SLEEP)
 threadpool_limits(limits=4);OUTPUT.mkdir(parents=True,exist_ok=True)
 plt.rcParams.update({'font.size':10,'axes.spines.top':False,'axes.spines.right':False})
 
@@ -414,7 +418,6 @@ eligible=np.ones(len(ants),bool);ids=np.arange(len(ants))
 # The utilities call the numerical class column 'leiden_cluster' for historical
 # reasons. Here it contains the selected ANT CLASS.
 stitched = BLOCK / "stitched"
-grid_root = stitched / "grid_occupancy_histograms_arena"
 grid = go.load_grid_tracks(grid_root)
 cluster_table = ants[eligible][["side", "track_id", "track_name", "ant_class"]].merge(
     grid, on=["side", "track_id", "track_name"], how="left", validate="one_to_one", indicator=True)

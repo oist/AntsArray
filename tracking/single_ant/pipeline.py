@@ -1,102 +1,78 @@
 #!/usr/bin/env python3
-"""
-Run the single-ant ArUco-aligned merge, then stitch outputs across runs.
+"""Prepare, run, and verify the SLEAP-only single-ant pipeline.
 
-Stage 1: tracking/single_ant/build_tracks.py logic (per-run, per-camera, per-arena parquet).
-Stage 2: tracking/stitch_tracks.py logic (per-track parquet and PNGs across runs).
+Run ``python -m tracking.single_ant.pipeline --help`` from the repository root.
+Cluster inference/CPU fanout is provided by ``submit.py``.
 """
-
 from __future__ import annotations
 
+import argparse
+import json
 import sys
 from pathlib import Path
 
-# Allow namespace-package style imports from repo root.
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
-    sys.path.append(str(REPO_ROOT))
+    sys.path.insert(0, str(REPO_ROOT))
 
-from tracking.single_ant.build_tracks import run_on_timestamp_subfolders  # type: ignore
-from tracking.stitch_tracks import main as stitch_tracks  # type: ignore
+from tracking.single_ant.workflow import (
+    Settings, finalize, load_manifest, prepare, stitch_camera, track_recording,
+)
 
 
 def main() -> None:
-    import argparse
-
-    ap = argparse.ArgumentParser(
-        description="Run single_ant merge, then stitch outputs across runs."
-    )
-    ap.add_argument("--input_folder", type=Path, required=True)
-    ap.add_argument("--out_dir", type=Path, required=True)
-    ap.add_argument("--xcol", type=str, default="X")
-    ap.add_argument("--ycol", type=str, default="Y")
-    ap.add_argument("--track_col", type=str, default="Track")
-    ap.add_argument("--frame_col", type=str, default="Frame")
-    ap.add_argument("--fps", type=float, default=24.0)
-    ap.add_argument(
-        "--detection_source",
-        choices=["auto", "sleap", "aruco"],
-        default="auto",
-        help="Detection input mode for stage 1: auto (prefer SLEAP, fallback ArUco), sleap only, or aruco only.",
-    )
-    ap.add_argument(
-        "--write_track_files",
-        action="store_true",
-        help="Also write per-track files in stage 1 (*_track-<id>.parquet). Off by default for single-ant datasets.",
-    )
-    ap.add_argument(
-        "--stitch_columns",
-        nargs="+",
-        default=None,
-        help="Columns to carry into stitched outputs.",
-    )
-    ap.add_argument(
-        "--no_track_pngs",
-        action="store_true",
-        help="Do not write time-colored trajectory PNGs during stitching.",
-    )
-    ap.add_argument(
-        "--track_png_dir",
-        type=Path,
-        default=None,
-        help="Directory for track PNGs. Default: <out_dir>/track_pngs",
-    )
-    ap.add_argument("--track_png_width", type=int, default=1200)
-    ap.add_argument("--track_png_height", type=int, default=900)
-    ap.add_argument("--skip_existing", action="store_true", help="Do not overwrite existing stitched parquet or PNG files.")
-    args = ap.parse_args()
-
-    run_on_timestamp_subfolders(
-        input_folder=args.input_folder,
-        out_dir=args.out_dir,
-        xcol=args.xcol,
-        ycol=args.ycol,
-        track_col=args.track_col,
-        frame_col=args.frame_col,
-        detection_source=args.detection_source,
-        write_track_files=args.write_track_files,
-    )
-
-    stitch_columns = args.stitch_columns
-    if stitch_columns is None:
-        stitch_columns = [args.frame_col, args.track_col, "X", "Y", "Bodypoint"]
-
-    stitch_tracks(
-        args.out_dir,
-        args.out_dir,
-        stitch_columns,
-        fps=args.fps,
-        string=".parquet",
-        frame_col=args.frame_col,
-        track_col=args.track_col,
-        write_track_pngs=not args.no_track_pngs,
-        png_dir=args.track_png_dir,
-        x_col="X",
-        y_col="Y",
-        png_width=args.track_png_width,
-        png_height=args.track_png_height,
-        skip_existing=args.skip_existing,
-    )
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    p = commands.add_parser("prepare", help="Freeze and validate videos, masks, times, and model provenance")
+    p.add_argument("--input-folder", "--input_folder", required=True, type=Path)
+    p.add_argument("--out-dir", "--out_dir", required=True, type=Path)
+    p.add_argument("--model-centroid", required=True, type=Path)
+    p.add_argument("--model-instance", required=True, type=Path)
+    p.add_argument("--export-dir", required=True, type=Path)
+    p.add_argument("--export-metadata", type=Path, help="Freeze effective thresholds and graph hash from a validated export")
+    p.add_argument("--build-trt-if-missing", action="store_true", help="Compile a validated ONNX graph in the first GPU worker")
+    p.add_argument("--timezone", default="Asia/Tokyo")
+    p.add_argument("--sleap-module", default="sleap-nn/0.3.3")
+    p.add_argument("--anchor-bodypoint", type=int, default=1)
+    p.add_argument("--min-score", type=float, default=0.2)
+    p.add_argument("--min-nodes", type=int, default=2)
+    p.add_argument("--max-distance", type=float, default=100.0)
+    p.add_argument("--reacquire-seconds", type=float, default=5.0)
+    for name in ("track", "stitch", "finalize", "run"):
+        p = commands.add_parser(name)
+        p.add_argument("--manifest", type=Path, required=True)
+        p.add_argument("--work-output", type=Path, help="Write on compute scratch; keep detections at the manifest's output")
+        if name == "track":
+            p.add_argument("--recording", required=True)
+        elif name == "stitch":
+            p.add_argument("--camera", required=True)
+    args = parser.parse_args()
+    if args.command == "prepare":
+        result = prepare(args.input_folder, args.out_dir, model_centroid=args.model_centroid,
+                         model_instance=args.model_instance, export_dir=args.export_dir,
+                         timezone=args.timezone, module=args.sleap_module,
+                         export_metadata=args.export_metadata, build_trt_if_missing=args.build_trt_if_missing,
+                         settings=Settings(args.anchor_bodypoint, args.min_score, args.min_nodes,
+                                           args.max_distance, args.reacquire_seconds))
+        print(f"Prepared {len(result['recordings'])} recordings / {len(result['cameras'])} cameras")
+        return
+    manifest = load_manifest(args.manifest)
+    if args.work_output:
+        manifest["detections_root"] = manifest["output"]
+        manifest["output"] = str(args.work_output)
+    if args.command == "track":
+        result = track_recording(manifest, args.recording)
+    elif args.command == "stitch":
+        result = stitch_camera(manifest, args.camera)
+    elif args.command == "finalize":
+        result = finalize(manifest)
+    else:
+        for recording in manifest["recordings"]:
+            track_recording(manifest, recording["key"])
+        for camera in manifest["cameras"]:
+            stitch_camera(manifest, camera)
+        result = finalize(manifest)
+    print(json.dumps(result, indent=2))
 
 
 if __name__ == "__main__":

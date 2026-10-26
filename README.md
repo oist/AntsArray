@@ -27,8 +27,9 @@ The supported behavioral workflow is
 Its helpers, preprocessing, contact geometry, sleep-motion processing, and
 block-combination tools remain in the checkout. Superseded analysis scripts and
 dashboards have been removed; their committed versions remain in Git history.
-See [analysis workflows](analysis/README.md)
-and [block combination](tracking/colony/block_combination.md) for entry points.
+See [analysis workflows](analysis/README.md),
+[single-ant SLEAP tracking](tracking/single_ant/README.md), and
+[block combination](tracking/colony/block_combination.md) for entry points.
 
 Matching a local run also requires the same external inputs and settings:
 recordings/detections or finished tracks, calibration homographies, panorama
@@ -130,8 +131,9 @@ The pipeline uses small submitter jobs to create many independent Slurm workers,
 4. A per-track analysis submitter runs after stitching and submits posture interpolation, speed, sleep-motion, and grid-occupancy workers. Legacy mode also runs colony-presence and sleep-label workers.
 5. An interaction submitter job runs after all tracking workers finish and submits one worker per chunk/side interaction parquet.
 6. The standard `eigenposture_interactive.py` analysis waits for stitched tracks,
-   speed/motion/grid caches, and complete skeleton contacts. A Slurm job builds
-   the full-recording model packet and runs the interactive cells headlessly.
+   interpolated posture, speed/motion/grid caches, and complete skeleton contacts.
+   A Slurm job builds the full-recording model packet, calibrates S0 motion-sleep
+   labels, and runs the interactive cells headlessly for both colonies.
 7. A login-side transfer watcher waits for fresh stitch, per-track cache,
    interaction, and eigenposture completion markers, then rsyncs outputs to bucket.
 
@@ -266,8 +268,8 @@ The standard downstream report is `analysis/eigenposture_interactive.py`, run
 by `analysis/eigenposture_pipeline.py` after these inputs and interactions finish.
 It writes the model packet and PNG/PDF report to
 `analysis_outputs/eigenposture/` in the original block. It learns states from
-both colonies; the current script fits ant classes and downstream comparisons
-for the right colony. Annotations fall back to the latest earlier recording.
+both colonies, then fits ant classes and downstream comparisons separately for
+each colony. Annotations fall back to the latest earlier recording.
 The standard report derives putative sleep from the discovered states. The
 legacy motion-threshold and trained-classifier sleep jobs run only when
 `--no_eigenposture` selects the older downstream workflow.
@@ -281,6 +283,30 @@ Report resources default to 4 CPUs, 128 GB, and 2 days, adjustable with
 `--no_eigenposture` opts out of the report. `--no_analysis` and
 `--no_per_track_analysis` also disable it; a report requires interactions.
 The lightweight login watcher log is `jobs/<block>/logs/eigenposture/watcher.log`.
+
+Every launch, including a dry run, copies the pipeline source into
+`jobs/code_snapshots/code_*/`. All queued stages use that copy; editing the
+checkout or changing the deployed release cannot mix preprocessing and report
+versions. `PIPELINE_SOURCE.json` records file hashes and is included in the
+published analysis provenance.
+
+Posture, speed, motion, and grid caches are rebuilt after stitching. Motion and
+posture are then checked against the source tracks and required cache versions
+before model fitting. Reports
+use the grid resolution recorded in `pipeline_run.json` (or an explicit
+`ANTS_GRID_OUTPUT_NAME`) and check calibrated sleep labels before plotting.
+`analysis_outputs/eigenposture/pipeline_status.json` records the current stage
+and any error. The login watchers check Slurm failures, cancellation, memory
+limits, and unsatisfied dependencies on each poll; a failed analysis stops
+write-back with the reason in its log. Each transfer attempt clears its previous
+success marker and fails if any expected source folder is missing.
+After repairing and resubmitting a
+failed stage, restart the generated transfer script to resume publication.
+For a plotting failure after preprocessing has completed, pass `--reports-only`
+to `analysis.eigenposture_pipeline` with the same block, source block, output,
+and grid resolution. This validates the existing inputs and reruns both colony
+reports without refitting the completed models. Submission also renders the
+overview for both colonies as a smoke check of the report API.
 
 ### 5. Chunk Interaction Analysis
 

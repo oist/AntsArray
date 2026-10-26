@@ -316,7 +316,8 @@ Optional:
   --x_threshold FLOAT       Panorama left/right split X (must match the hmats
                             calibration). Empty = full-arena panorama_regions.csv from this
                             recording or the latest earlier date.
-  --skip_existing           Do not overwrite existing outputs. Default: on.
+  --skip_existing           Reuse existing tracking outputs. Default: on.
+                            Standard per-track caches are rebuilt after stitching.
   --force_recompute         Overwrite/recompute existing flash outputs.
   --map_cpus N              CPUs for panorama jobs. Default: 8
   --map_mem MEM             Memory for panorama jobs. Default: 64G
@@ -528,6 +529,25 @@ fi
 if [[ "$submit_root_overridden" -eq 0 ]]; then
   submit_root="$output_root/jobs"
 fi
+# Jobs change directory into the source snapshot, so user paths must retain
+# their meaning from the submitter's working directory.
+blocks_root="$(realpath -- "$blocks_root")"
+hmats="$(realpath -- "$hmats")"
+output_root="$(realpath -m -- "$output_root")"
+submit_root="$(realpath -m -- "$submit_root")"
+for runtime_name in python_bin eigenposture_python_bin conda_bin sbatch_bin; do
+  runtime_value="${!runtime_name}"
+  if [[ "$runtime_value" == */* && "$runtime_value" != /* ]]; then
+    # Preserve a virtualenv's Python symlink rather than resolving its target.
+    printf -v "$runtime_name" '%s' "$(pwd -P)/$runtime_value"
+  fi
+done
+if [[ -n "$sleep_model" ]]; then
+  sleep_model="$(realpath -m -- "$sleep_model")"
+fi
+if [[ -n "$grid_occupancy_bounds_json" ]]; then
+  grid_occupancy_bounds_json="$(realpath -m -- "$grid_occupancy_bounds_json")"
+fi
 missing_flash_mount=""
 for flash_mount in /flash/ant_tmp /flash/ReiterU/ant_tmp; do
   if [[ "$submit_root" == "$flash_mount"* || "$output_root" == "$flash_mount"* ]]; then
@@ -554,6 +574,16 @@ if [[ "$dry_run" -eq 0 && "$transfer_to_bucket" -eq 1 ]] && ! command -v rsync >
   echo "ERROR: transfer watcher requires rsync, but rsync was not found." >&2
   exit 2
 fi
+
+# Pin every stage, including later fan-outs and reports, to the same source.
+# Do this for dry runs too so the rendered scripts describe a reproducible run.
+REPO_ROOT="$(python3 "$REPO_ROOT/scripts/pipeline_snapshot.py" --source "$REPO_ROOT" --parent "$submit_root/code_snapshots")"
+SCRIPT_DIR="$REPO_ROOT/tracking/colony"
+PIPELINE_PY="$SCRIPT_DIR/pipeline.py"
+COMBINE_BATCH_PY="$SCRIPT_DIR/combine_batch.py"
+INTERACTION_BATCH_PY="$SCRIPT_DIR/interaction_batch.py"
+PER_TRACK_FANOUT_SH="$REPO_ROOT/scripts/per_track_slurm_fanout.sh"
+echo "Pipeline source snapshot: $REPO_ROOT"
 
 # Email notification plumbing. The body-capable sender lives in the detection
 # tree (repo deploys as one unit); without it, fall back to header-only Slurm
@@ -588,6 +618,7 @@ fi
 
 submitted=0
 for block_dir in "${blocks[@]}"; do
+  run_epoch="$(date +%s)"
   [[ -d "$block_dir" ]] || continue
 
   data_dir="$block_dir/data"
@@ -1116,7 +1147,7 @@ bash "${PER_TRACK_FANOUT_SH}" \\
   --cpus "${per_track_analysis_cpus}" \\
   --mem "${per_track_analysis_mem}" \\
   --time "${per_track_analysis_time}" \\
-  --no_transfer_to_bucket${skip_existing_arg}
+  --no_transfer_to_bucket
 
 bash "${PER_TRACK_FANOUT_SH}" \\
   --per_track_dir "${stitched_dir}/per_track" \\
@@ -1135,7 +1166,7 @@ bash "${PER_TRACK_FANOUT_SH}" \\
   --cpus "${per_track_analysis_cpus}" \\
   --mem "${per_track_analysis_mem}" \\
   --time "${per_track_analysis_time}" \\
-  --no_transfer_to_bucket${skip_existing_arg}
+  --no_transfer_to_bucket
 
 bash "${PER_TRACK_FANOUT_SH}" \\
   --per_track_dir "${stitched_dir}/per_track" \\
@@ -1154,7 +1185,7 @@ bash "${PER_TRACK_FANOUT_SH}" \\
   --cpus "${per_track_analysis_cpus}" \\
   --mem "${per_track_analysis_mem}" \\
   --time "${per_track_analysis_time}" \\
-  --no_transfer_to_bucket${skip_existing_arg}
+  --no_transfer_to_bucket
 
 if [[ "${run_eigenposture}" -eq 0 ]]; then
 motion_complete_id_path="${stitched_dir}/sleep_motion/jobs/sleep_motion_complete_job_id.txt"
@@ -1277,7 +1308,7 @@ poll_seconds="${transfer_poll_seconds}"
 delete_flash_after_transfer="${delete_flash_after_transfer}"
 lock_dir="${transfer_lock_dir}"
 transfer_done_file="${transfer_done_file}"
-run_epoch="$(date +%s)"
+run_epoch="${run_epoch}"
 
 NOTIFY_EMAIL="${notify_email}"
 notify_lib="${NOTIFY_LIB}"
@@ -1359,6 +1390,8 @@ if [[ -s "\${manifest}" ]]; then
 fi
 
 acquire_lock
+# A restarted transfer must not retain success from a previous attempt.
+rm -f "\${transfer_done_file}"
 wait_for_fresh_file() {
   local path="\$1"
   local label="\$2"
@@ -1367,6 +1400,13 @@ wait_for_fresh_file() {
   fi
   log "Waiting for \${label}: \${path}"
   while true; do
+    if [[ "${run_eigenposture}" -eq 1 && -s "${state_dir}/eigenposture_watch.json" ]]; then
+      if ! failure="\$(python3 "${REPO_ROOT}/scripts/eigenposture_after_tracking.py" \\
+          --check-failure "${state_dir}/eigenposture_watch.json" 2>&1)"; then
+        log "ERROR: \${failure}"
+        return 1
+      fi
+    fi
     if [[ -s "\${path}" ]]; then
       mtime="\$(file_mtime "\${path}")"
       if [[ "\${mtime}" =~ ^[0-9]+$ ]] && (( mtime >= run_epoch )); then
@@ -1407,8 +1447,8 @@ fi
 while IFS=\$'\t' read -r src dst; do
   [[ -n "\${src}" && -n "\${dst}" ]] || continue
   if [[ ! -d "\${src}" ]]; then
-    log "WARNING: source directory missing, skipping: \${src}"
-    continue
+    log "ERROR: expected transfer source is missing: \${src}"
+    exit 2
   fi
   mkdir -p "\${dst}"
   log "rsync \${src}/ -> \${dst}/"
@@ -1435,7 +1475,7 @@ EOF
         --source-block "$block_dir" --work-block "$work_dir" --state-dir "$state_dir" \
         --python-bin "$eigenposture_python_bin" --cpus "$eigenposture_cpus" \
         --mem "$eigenposture_mem" --time "$eigenposture_time" --partition "$partition" \
-        --grid-size-mm "$grid_occupancy_grid_size_mm" --grid-output-name "$grid_occupancy_output_name" --dry-run
+        --grid-size-mm "$grid_occupancy_grid_size_mm" --grid-output-name "$grid_occupancy_output_name" --run-epoch "$run_epoch" --dry-run
     fi
     echo "[dry-run] map script: $map_script"
     echo "[dry-run] tracking submitter script: $track_submit_script"
@@ -1461,7 +1501,7 @@ EOF
       --mem "$eigenposture_mem" --time "$eigenposture_time" --partition "$partition" \
       --sbatch-bin "$sbatch_bin" --notify-email "$notify_email" \
       --grid-size-mm "$grid_occupancy_grid_size_mm" --grid-output-name "$grid_occupancy_output_name" \
-      --poll-seconds "$transfer_poll_seconds"
+      --poll-seconds "$transfer_poll_seconds" --run-epoch "$run_epoch"
   fi
   if [[ "$run_interactions" -eq 1 ]]; then
     if [[ "$run_per_track_analysis" -eq 1 ]]; then

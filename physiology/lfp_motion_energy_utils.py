@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import mmap
 from dataclasses import dataclass
@@ -166,7 +167,12 @@ class PhysiologyRecording:
         )
         self.motion_energy = cleaned.astype(np.float32, copy=False)
         self.me_attrs = dict(self.me_attrs)
+        self.me_attrs["artifact_filter_enabled"] = True
         self.me_attrs["artifact_filter_method"] = method
+        self.me_attrs["artifact_filter_diff_height"] = diff_height
+        self.me_attrs["artifact_filter_period_frames"] = int(period_frames)
+        self.me_attrs["artifact_filter_before_frames"] = int(before_frames)
+        self.me_attrs["artifact_filter_after_frames"] = int(after_frames)
         self.me_attrs["artifact_filter_n_frames"] = int(len(artifact_frames))
         return artifact_frames
 
@@ -391,6 +397,28 @@ def resolve_kilosort_folder(path: Path) -> Path:
     if path.is_file() and path.name == "spike_times.npy":
         return path.parent
     if path.is_dir():
+        preferred = [
+            path / "kilosort4",
+            path / "kilosort",
+            path / "full" / "kilosort4",
+        ]
+        for candidate in preferred:
+            if (candidate / "spike_times.npy").exists():
+                return candidate
+
+        direct_matches = sorted(
+            folder
+            for folder in path.iterdir()
+            if folder.is_dir()
+            and folder.name.startswith("kilosort")
+            and (folder / "spike_times.npy").exists()
+        )
+        if len(direct_matches) == 1:
+            return direct_matches[0]
+        if len(direct_matches) > 1:
+            examples = "\n  ".join(str(match) for match in direct_matches[:10])
+            raise ValueError(f"Multiple direct Kilosort folders found; pass one explicitly:\n  {examples}")
+
         matches = sorted(folder for folder in path.rglob("*") if folder.is_dir() and (folder / "spike_times.npy").exists())
         if not matches:
             raise FileNotFoundError(f"No Kilosort folder with spike_times.npy found under {path}")
@@ -995,6 +1023,302 @@ def find_lfp_motion_energy_cache(
     return None
 
 
+def lfp_motion_energy_trace_cache_settings(
+    recording: PhysiologyRecording,
+    channels: np.ndarray,
+    *,
+    target_rate_hz: float,
+    start_s: float,
+    stop_s: float,
+    smooth_seconds: float,
+    lfp_bandpass_hz: tuple[float, float] | None,
+    motion_energy_envelope: bool = True,
+) -> dict[str, object]:
+    channels = validate_lfp_channels(channels, recording.lfp.n_lfp_channels)
+    return {
+        "cache_version": 1,
+        "processing_version": 1,
+        "channels": [int(ch) for ch in channels],
+        "target_rate_hz": float(target_rate_hz),
+        "sample_rate_hz": float(recording.lfp_downsampled_rate(target_rate_hz)),
+        "start_s": float(start_s),
+        "stop_s": float(stop_s),
+        "smooth_seconds": float(smooth_seconds),
+        "lfp_bandpass_hz": None
+        if lfp_bandpass_hz is None
+        else [float(lfp_bandpass_hz[0]), float(lfp_bandpass_hz[1])],
+        "motion_energy_envelope": bool(motion_energy_envelope),
+    }
+
+
+def lfp_motion_energy_trace_cache_key(settings: dict[str, object]) -> str:
+    payload = json.dumps(settings, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
+
+
+def default_lfp_motion_energy_trace_cache_path(
+    recording: PhysiologyRecording,
+    channels: np.ndarray,
+    *,
+    target_rate_hz: float,
+    start_s: float,
+    stop_s: float,
+    smooth_seconds: float,
+    lfp_bandpass_hz: tuple[float, float] | None,
+    motion_energy_envelope: bool = True,
+) -> Path:
+    channels = np.asarray(channels, dtype=np.int64)
+    return (
+        recording.experiment_path
+        / f"lfp_me_envelope_cache_{float(target_rate_hz):g}hz_{channel_label(channels)}.h5"
+    )
+
+
+def _trace_cache_bandpass_attr(lfp_bandpass_hz: tuple[float, float] | None) -> str:
+    value = None if lfp_bandpass_hz is None else [float(lfp_bandpass_hz[0]), float(lfp_bandpass_hz[1])]
+    return json.dumps(value, sort_keys=True)
+
+
+def _json_ready_scalar(value: object) -> object:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, np.generic):
+        return value.item()
+    return str(value)
+
+
+def _motion_energy_processing_attr(me_attrs: dict[str, object]) -> str:
+    keys = (
+        "artifact_filter_enabled",
+        "artifact_filter_method",
+        "artifact_filter_diff_height",
+        "artifact_filter_period_frames",
+        "artifact_filter_before_frames",
+        "artifact_filter_after_frames",
+        "artifact_filter_n_frames",
+    )
+    signature = {key: _json_ready_scalar(me_attrs.get(key, None)) for key in keys}
+    return json.dumps(signature, sort_keys=True, separators=(",", ":"))
+
+
+def lfp_motion_energy_trace_cache_matches(
+    cache_path: Path,
+    channels: np.ndarray,
+    *,
+    sample_rate_hz: float,
+    start_s: float | None = None,
+    stop_s: float | None = None,
+    smooth_seconds: float,
+    lfp_bandpass_hz: tuple[float, float] | None,
+    motion_energy_envelope: bool = True,
+    motion_energy_processing_json: str | None = None,
+    allow_channel_mismatch: bool = False,
+) -> bool:
+    cache_path = Path(cache_path)
+    if not cache_path.exists():
+        return False
+
+    try:
+        with h5py.File(cache_path, "r") as h5:
+            if not {"channels", "t_video_s", "lfp_trace", "motion_energy"}.issubset(h5.keys()):
+                return False
+
+            if int(h5.attrs.get("cache_version", -1)) != 1:
+                return False
+            cache_rate_hz = float(h5.attrs.get("sample_rate_hz", np.nan))
+            if not np.isfinite(cache_rate_hz) or not np.isclose(cache_rate_hz, sample_rate_hz, rtol=0, atol=1e-6):
+                return False
+
+            cached_channels = h5["channels"][:].astype(np.int64, copy=False)
+            requested_channels = np.asarray(channels, dtype=np.int64)
+            if not allow_channel_mismatch and not np.array_equal(cached_channels, requested_channels):
+                return False
+
+            cached_smooth = float(h5.attrs.get("smooth_seconds", np.nan))
+            if not np.isfinite(cached_smooth) or not np.isclose(cached_smooth, float(smooth_seconds), rtol=0, atol=1e-9):
+                return False
+
+            cached_bandpass = str(h5.attrs.get("lfp_bandpass_hz_json", ""))
+            if cached_bandpass != _trace_cache_bandpass_attr(lfp_bandpass_hz):
+                return False
+            cached_me_envelope = bool(h5.attrs.get("motion_energy_envelope", True))
+            if cached_me_envelope != bool(motion_energy_envelope):
+                return False
+            if motion_energy_processing_json is not None:
+                cached_me_processing = str(h5.attrs.get("motion_energy_processing_json", ""))
+                if cached_me_processing != motion_energy_processing_json:
+                    return False
+
+            if start_s is not None or stop_s is not None:
+                if h5["t_video_s"].shape[0] == 0:
+                    return False
+                cache_start_s = float(h5.attrs.get("start_video_s", h5["t_video_s"][0]))
+                cache_stop_s = float(h5.attrs.get("stop_video_s", h5["t_video_s"][-1]))
+                tolerance_s = max(1.0 / sample_rate_hz, 1e-6)
+                if start_s is not None and float(start_s) < cache_start_s - tolerance_s:
+                    return False
+                if stop_s is not None and float(stop_s) > cache_stop_s + tolerance_s:
+                    return False
+    except OSError:
+        return False
+
+    return True
+
+
+def find_lfp_motion_energy_trace_cache(
+    recording: PhysiologyRecording,
+    channels: np.ndarray,
+    *,
+    target_rate_hz: float = 250.0,
+    start_s: float | None = None,
+    stop_s: float | None = None,
+    smooth_seconds: float = 0.0,
+    lfp_bandpass_hz: tuple[float, float] | None = None,
+    motion_energy_envelope: bool = True,
+    cache_path: Path | None = None,
+    allow_channel_mismatch: bool = False,
+    search_other_channel_caches: bool = False,
+) -> Path | None:
+    channels = validate_lfp_channels(channels, recording.lfp.n_lfp_channels)
+    sample_rate_hz = recording.lfp_downsampled_rate(target_rate_hz)
+    motion_energy_processing_json = _motion_energy_processing_attr(recording.me_attrs)
+    candidates: list[Path] = []
+
+    if cache_path is not None:
+        candidates.append(Path(cache_path))
+    if start_s is not None and stop_s is not None:
+        candidates.append(
+            default_lfp_motion_energy_trace_cache_path(
+                recording,
+                channels,
+                target_rate_hz=target_rate_hz,
+                start_s=float(start_s),
+                stop_s=float(stop_s),
+                smooth_seconds=smooth_seconds,
+                lfp_bandpass_hz=lfp_bandpass_hz,
+                motion_energy_envelope=motion_energy_envelope,
+            )
+        )
+
+    if search_other_channel_caches:
+        candidates.extend(
+            sorted(
+                recording.experiment_path.glob("lfp_me_envelope_cache_*hz_*.h5"),
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
+            )
+        )
+
+    seen: set[Path] = set()
+    for candidate in candidates:
+        candidate = candidate.resolve()
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if lfp_motion_energy_trace_cache_matches(
+            candidate,
+            channels,
+            sample_rate_hz=sample_rate_hz,
+            start_s=start_s,
+            stop_s=stop_s,
+            smooth_seconds=smooth_seconds,
+            lfp_bandpass_hz=lfp_bandpass_hz,
+            motion_energy_envelope=motion_energy_envelope,
+            motion_energy_processing_json=motion_energy_processing_json,
+            allow_channel_mismatch=allow_channel_mismatch,
+        ):
+            return candidate
+
+    return None
+
+
+def load_lfp_motion_energy_trace_cache_channels(cache_path: Path) -> np.ndarray:
+    with h5py.File(Path(cache_path), "r") as h5:
+        return h5["channels"][:].astype(np.int64, copy=False)
+
+
+def load_lfp_motion_energy_trace_cache(
+    cache_path: Path,
+    *,
+    start_s: float | None = None,
+    duration_s: float | None = None,
+) -> TraceResult:
+    cache_path = Path(cache_path)
+    with h5py.File(cache_path, "r") as h5:
+        t_all = h5["t_video_s"][:]
+        if t_all.size == 0:
+            sample_slice = slice(0, 0)
+        else:
+            start = float(t_all[0]) if start_s is None else float(start_s)
+            stop = float(t_all[-1]) if duration_s is None else start + float(duration_s)
+            sample_start = int(np.searchsorted(t_all, start, side="left"))
+            sample_stop = int(np.searchsorted(t_all, stop, side="right"))
+            sample_slice = slice(sample_start, sample_stop)
+
+        t_video_s = h5["t_video_s"][sample_slice]
+        lfp_trace = h5["lfp_trace"][sample_slice].astype(np.float32, copy=False)
+        motion_energy = h5["motion_energy"][sample_slice].astype(np.float32, copy=False)
+        sample_rate_hz = float(h5.attrs.get("sample_rate_hz", np.nan))
+
+    return TraceResult(t_video_s, lfp_trace, motion_energy, sample_rate_hz)
+
+
+def save_lfp_motion_energy_trace_cache(
+    cache_path: Path,
+    trace: TraceResult,
+    channels: np.ndarray,
+    *,
+    recording: PhysiologyRecording,
+    target_rate_hz: float,
+    smooth_seconds: float,
+    lfp_bandpass_hz: tuple[float, float] | None,
+    motion_energy_envelope: bool = True,
+) -> Path:
+    cache_path = Path(cache_path)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = cache_path.with_name(cache_path.name + ".tmp")
+    if tmp_path.exists():
+        tmp_path.unlink()
+
+    channels = validate_lfp_channels(channels, recording.lfp.n_lfp_channels)
+    with h5py.File(tmp_path, "w") as h5:
+        h5.attrs["cache_version"] = 1
+        h5.attrs["processing_version"] = 1
+        h5.attrs["experiment_path"] = str(recording.experiment_path)
+        h5.attrs["lfp_bin_path"] = str(recording.lfp.bin_path)
+        h5.attrs["me_path"] = str(recording.me_path)
+        h5.attrs["target_rate_hz"] = float(target_rate_hz)
+        h5.attrs["sample_rate_hz"] = float(trace.sample_rate_hz)
+        h5.attrs["smooth_seconds"] = float(smooth_seconds)
+        h5.attrs["lfp_bandpass_hz_json"] = _trace_cache_bandpass_attr(lfp_bandpass_hz)
+        h5.attrs["motion_energy_envelope"] = bool(motion_energy_envelope)
+        h5.attrs["motion_energy_processing_json"] = _motion_energy_processing_attr(recording.me_attrs)
+        h5.attrs["start_video_s"] = float(trace.t_video_s[0]) if trace.t_video_s.size else np.nan
+        h5.attrs["stop_video_s"] = float(trace.t_video_s[-1]) if trace.t_video_s.size else np.nan
+        h5.attrs["n_samples"] = int(trace.t_video_s.size)
+        h5.attrs["n_channels"] = int(channels.size)
+        h5.attrs["lfp_processing"] = (
+            "gain-corrected LFP; per-channel temporal mean removed; optional bandpass; "
+            "Hilbert envelope per channel; mean envelope across selected channels; optional smoothing"
+        )
+        h5.attrs["motion_energy_processing"] = (
+            "motion energy sampled at LFP times; optional bandpass; optional Hilbert envelope; optional smoothing"
+        )
+        h5.create_dataset("channels", data=channels.astype(np.int64, copy=False))
+        h5.create_dataset("t_video_s", data=trace.t_video_s.astype(np.float64, copy=False), compression="gzip")
+        h5.create_dataset("lfp_trace", data=trace.lfp_trace.astype(np.float32, copy=False), compression="gzip")
+        h5.create_dataset(
+            "motion_energy",
+            data=trace.motion_energy.astype(np.float32, copy=False),
+            compression="gzip",
+        )
+
+    tmp_path.replace(cache_path)
+    size_mb = cache_path.stat().st_size / 1024**2
+    print(f"saved LFP/ME envelope cache: {cache_path} ({size_mb:.2f} MiB)")
+    return cache_path
+
+
 def build_lfp_motion_energy_cache(
     recording: PhysiologyRecording,
     output_path: Path,
@@ -1511,13 +1835,43 @@ def compute_lfp_magnitude_and_me(
     lfp_bandpass_hz: tuple[float, float] | None = None,
     use_cache: bool = True,
     cache_path: Path | None = None,
+    use_trace_cache: bool = True,
+    trace_cache_path: Path | None = None,
+    trace_cache_overwrite: bool = False,
+    motion_energy_envelope: bool = True,
 ) -> TraceResult:
     channels = validate_lfp_channels(channels, recording.lfp.n_lfp_channels)
     output_sample_rate_hz = recording.lfp_downsampled_rate(target_rate_hz)
     overlap_start_s, overlap_stop_s = recording.lfp_video_overlap()
     start_s = max(float(start_s), overlap_start_s)
     stop_s = overlap_stop_s if duration_s is None else min(float(start_s) + float(duration_s), overlap_stop_s)
+    if stop_s <= start_s:
+        empty = np.empty(0, dtype=np.float32)
+        return TraceResult(np.empty(0, dtype=np.float64), empty, empty, output_sample_rate_hz)
 
+    if use_trace_cache and trace_cache_overwrite:
+        print("LFP/ME envelope cache overwrite enabled; skipping processed-cache load")
+    if use_trace_cache and not trace_cache_overwrite:
+        found_trace_cache = find_lfp_motion_energy_trace_cache(
+            recording,
+            channels,
+            target_rate_hz=target_rate_hz,
+            start_s=start_s,
+            stop_s=stop_s,
+            smooth_seconds=smooth_seconds,
+            lfp_bandpass_hz=lfp_bandpass_hz,
+            motion_energy_envelope=motion_energy_envelope,
+            cache_path=trace_cache_path,
+        )
+        if found_trace_cache is not None:
+            print(f"using cached LFP/ME envelope data: {found_trace_cache}")
+            return load_lfp_motion_energy_trace_cache(
+                found_trace_cache,
+                start_s=start_s,
+                duration_s=stop_s - start_s,
+            )
+
+    trace: TraceResult | None = None
     if use_cache:
         found_cache = find_lfp_motion_energy_cache(
             recording,
@@ -1528,88 +1882,135 @@ def compute_lfp_magnitude_and_me(
             cache_path=cache_path,
         )
         if found_cache is not None:
-            print(f"using cached LFP/ME data: {found_cache}")
+            print(f"using cached raw LFP/ME data: {found_cache}; recomputing envelopes")
             cache = load_lfp_motion_energy_cache(
                 found_cache,
                 start_s=start_s,
                 duration_s=stop_s - start_s,
                 channels=channels,
             )
-            return compute_lfp_magnitude_and_me_from_cache(
+            motion_energy = recording.sample_motion_energy(cache.t_video_s).astype(np.float32, copy=False)
+            print("resampled motion energy from current recording state")
+            trace = compute_lfp_magnitude_and_me_from_cache(
                 cache,
                 smooth_seconds=smooth_seconds,
                 lfp_bandpass_hz=lfp_bandpass_hz,
+                motion_energy=motion_energy,
+                motion_energy_envelope=motion_energy_envelope,
             )
 
-    all_t: list[np.ndarray] = []
-    all_mag: list[np.ndarray] = []
-    all_me: list[np.ndarray] = []
-    if lfp_bandpass_hz is not None:
-        low_hz, high_hz = lfp_bandpass_hz
-        print(f"bandpass filtering LFP and motion energy: {low_hz:g}-{high_hz:g} Hz; computing envelopes")
-    else:
-        print("computing LFP and motion-energy envelopes without bandpass filtering")
-    current = start_s
-    while current < stop_s:
-        chunk_duration = min(float(chunk_seconds), stop_s - current)
-        loaded = recording.load_lfp_downsampled(
-            current,
-            chunk_duration,
-            channels,
-            target_rate_hz=target_rate_hz,
-            read_chunk_seconds=read_chunk_seconds,
-            read_mode=read_mode,
-        )
-        output_sample_rate_hz = loaded.sample_rate_hz
-        if loaded.t_video_s.size == 0:
-            current += chunk_duration
-            continue
-
-        lfp_chunk = subtract_static_channel_mean(loaded.lfp_uv)
-        me_chunk = recording.sample_motion_energy(loaded.t_video_s)
+    if trace is None:
+        all_t: list[np.ndarray] = []
+        all_mag: list[np.ndarray] = []
+        all_me: list[np.ndarray] = []
+        me_mode = "motion-energy envelope" if motion_energy_envelope else "raw motion energy"
         if lfp_bandpass_hz is not None:
-            for chan_idx in range(lfp_chunk.shape[0]):
-                lfp_chunk[chan_idx] = butter_filter_1d(
-                    lfp_chunk[chan_idx],
+            low_hz, high_hz = lfp_bandpass_hz
+            print(f"bandpass filtering LFP and motion energy: {low_hz:g}-{high_hz:g} Hz; computing LFP envelope and {me_mode}")
+        else:
+            print(f"computing LFP envelope and {me_mode} without bandpass filtering")
+        current = start_s
+        while current < stop_s:
+            chunk_duration = min(float(chunk_seconds), stop_s - current)
+            loaded = recording.load_lfp_downsampled(
+                current,
+                chunk_duration,
+                channels,
+                target_rate_hz=target_rate_hz,
+                read_chunk_seconds=read_chunk_seconds,
+                read_mode=read_mode,
+            )
+            output_sample_rate_hz = loaded.sample_rate_hz
+            if loaded.t_video_s.size == 0:
+                current += chunk_duration
+                continue
+
+            lfp_chunk = subtract_static_channel_mean(loaded.lfp_uv)
+            me_chunk = recording.sample_motion_energy(loaded.t_video_s)
+            if lfp_bandpass_hz is not None:
+                for chan_idx in range(lfp_chunk.shape[0]):
+                    lfp_chunk[chan_idx] = butter_filter_1d(
+                        lfp_chunk[chan_idx],
+                        sample_rate_hz=output_sample_rate_hz,
+                        highpass_hz=low_hz,
+                        lowpass_hz=high_hz,
+                        order=2,
+                    )
+                me_chunk = butter_filter_1d(
+                    me_chunk,
                     sample_rate_hz=output_sample_rate_hz,
                     highpass_hz=low_hz,
                     lowpass_hz=high_hz,
                     order=2,
                 )
-            me_chunk = butter_filter_1d(
-                me_chunk,
-                sample_rate_hz=output_sample_rate_hz,
-                highpass_hz=low_hz,
-                lowpass_hz=high_hz,
-                order=2,
+
+            lfp_envelopes = np.empty_like(lfp_chunk, dtype=np.float32)
+            for chan_idx in range(lfp_chunk.shape[0]):
+                lfp_envelopes[chan_idx] = amplitude_envelope_1d(lfp_chunk[chan_idx])
+            lfp_mag = np.nanmean(lfp_envelopes, axis=0).astype(np.float32)
+            if motion_energy_envelope:
+                me_chunk = amplitude_envelope_1d(me_chunk)
+            if smooth_seconds > 0:
+                win = max(1, int(round(float(smooth_seconds) * output_sample_rate_hz)))
+                lfp_mag = moving_average(lfp_mag, win)
+                me_chunk = moving_average(me_chunk, win)
+
+            all_t.append(loaded.t_video_s)
+            all_mag.append(lfp_mag)
+            all_me.append(me_chunk)
+            current += chunk_duration
+            print(f"processed through {current / 60.0:.2f} / {stop_s / 60.0:.2f} min")
+
+        if not all_t:
+            empty = np.empty(0, dtype=np.float32)
+            return TraceResult(np.empty(0, dtype=np.float64), empty, empty, output_sample_rate_hz)
+
+        trace = TraceResult(
+            np.concatenate(all_t),
+            np.concatenate(all_mag),
+            np.concatenate(all_me),
+            output_sample_rate_hz,
+        )
+
+    if use_trace_cache and trace.t_video_s.size:
+        output_trace_cache_path = (
+            Path(trace_cache_path)
+            if trace_cache_path is not None
+            else default_lfp_motion_energy_trace_cache_path(
+                recording,
+                channels,
+                target_rate_hz=target_rate_hz,
+                start_s=start_s,
+                stop_s=stop_s,
+                smooth_seconds=smooth_seconds,
+                lfp_bandpass_hz=lfp_bandpass_hz,
+                motion_energy_envelope=motion_energy_envelope,
+            )
+        )
+        should_write_trace_cache = trace_cache_overwrite or not lfp_motion_energy_trace_cache_matches(
+            output_trace_cache_path,
+            channels,
+            sample_rate_hz=trace.sample_rate_hz,
+            start_s=start_s,
+            stop_s=stop_s,
+            smooth_seconds=smooth_seconds,
+            lfp_bandpass_hz=lfp_bandpass_hz,
+            motion_energy_envelope=motion_energy_envelope,
+            motion_energy_processing_json=_motion_energy_processing_attr(recording.me_attrs),
+        )
+        if should_write_trace_cache:
+            save_lfp_motion_energy_trace_cache(
+                output_trace_cache_path,
+                trace,
+                channels,
+                recording=recording,
+                target_rate_hz=target_rate_hz,
+                smooth_seconds=smooth_seconds,
+                lfp_bandpass_hz=lfp_bandpass_hz,
+                motion_energy_envelope=motion_energy_envelope,
             )
 
-        lfp_envelopes = np.empty_like(lfp_chunk, dtype=np.float32)
-        for chan_idx in range(lfp_chunk.shape[0]):
-            lfp_envelopes[chan_idx] = amplitude_envelope_1d(lfp_chunk[chan_idx])
-        lfp_mag = np.nanmean(lfp_envelopes, axis=0).astype(np.float32)
-        me_chunk = amplitude_envelope_1d(me_chunk)
-        if smooth_seconds > 0:
-            win = max(1, int(round(float(smooth_seconds) * output_sample_rate_hz)))
-            lfp_mag = moving_average(lfp_mag, win)
-            me_chunk = moving_average(me_chunk, win)
-
-        all_t.append(loaded.t_video_s)
-        all_mag.append(lfp_mag)
-        all_me.append(me_chunk)
-        current += chunk_duration
-        print(f"processed through {current / 60.0:.2f} / {stop_s / 60.0:.2f} min")
-
-    if not all_t:
-        empty = np.empty(0, dtype=np.float32)
-        return TraceResult(np.empty(0, dtype=np.float64), empty, empty, output_sample_rate_hz)
-
-    return TraceResult(
-        np.concatenate(all_t),
-        np.concatenate(all_mag),
-        np.concatenate(all_me),
-        output_sample_rate_hz,
-    )
+    return trace
 
 
 def compute_lfp_magnitude_and_me_from_cache(
@@ -1617,16 +2018,28 @@ def compute_lfp_magnitude_and_me_from_cache(
     *,
     smooth_seconds: float = 0.0,
     lfp_bandpass_hz: tuple[float, float] | None = None,
+    motion_energy: np.ndarray | None = None,
+    motion_energy_envelope: bool = True,
 ) -> TraceResult:
     if cache.lfp_uv.size == 0:
         empty = np.empty(0, dtype=np.float32)
         return TraceResult(cache.t_video_s, empty, cache.motion_energy, cache.sample_rate_hz)
 
     lfp_chunk = subtract_static_channel_mean(cache.lfp_uv)
-    me_chunk = cache.motion_energy.astype(np.float32, copy=True)
+    me_source = cache.motion_energy if motion_energy is None else np.asarray(motion_energy, dtype=np.float32)
+    if me_source.shape[0] != cache.t_video_s.shape[0]:
+        raise ValueError(
+            "motion_energy must have one sample per cached LFP sample "
+            f"({me_source.shape[0]:,} != {cache.t_video_s.shape[0]:,})"
+        )
+    me_chunk = me_source.astype(np.float32, copy=True)
+    me_mode = "motion-energy envelope" if motion_energy_envelope else "raw motion energy"
     if lfp_bandpass_hz is not None:
         low_hz, high_hz = lfp_bandpass_hz
-        print(f"bandpass filtering cached LFP and motion energy: {low_hz:g}-{high_hz:g} Hz; computing envelopes")
+        print(
+            f"bandpass filtering cached LFP and motion energy: {low_hz:g}-{high_hz:g} Hz; "
+            f"computing LFP envelope and {me_mode}"
+        )
         for chan_idx in range(lfp_chunk.shape[0]):
             lfp_chunk[chan_idx] = butter_filter_1d(
                 lfp_chunk[chan_idx],
@@ -1643,13 +2056,14 @@ def compute_lfp_magnitude_and_me_from_cache(
             order=2,
         )
     else:
-        print("computing cached LFP and motion-energy envelopes without bandpass filtering")
+        print(f"computing cached LFP envelope and {me_mode} without bandpass filtering")
 
     lfp_envelopes = np.empty_like(lfp_chunk, dtype=np.float32)
     for chan_idx in range(lfp_chunk.shape[0]):
         lfp_envelopes[chan_idx] = amplitude_envelope_1d(lfp_chunk[chan_idx])
     lfp_mag = np.nanmean(lfp_envelopes, axis=0).astype(np.float32)
-    me_chunk = amplitude_envelope_1d(me_chunk)
+    if motion_energy_envelope:
+        me_chunk = amplitude_envelope_1d(me_chunk)
     if smooth_seconds > 0:
         win = max(1, int(round(float(smooth_seconds) * cache.sample_rate_hz)))
         lfp_mag = moving_average(lfp_mag, win)

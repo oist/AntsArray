@@ -34,6 +34,43 @@ The report includes summary figures and `right_behavior_classes.pdf`, with a
 text description for every figure. It reuses prepared inputs; it is not a
 replacement for tracking or feature extraction.
 
+The colony pipeline builds posture, motion, model, S0 calibration/label, and
+spatial-reference inputs before running reports for both colonies. Interactive
+and headless reports validate these inputs before plotting. The report selects
+the arena grid recorded by `pipeline_run.json`; set `ANTS_GRID_OUTPUT_NAME` only
+to override it or select a grid for an older manually prepared packet.
+Missing or stale sleep calibration is an error: run
+`python -m analysis.eigenposture_pipeline --help` for the complete preprocessing
+entry point. Pipeline progress and failures are recorded in
+`analysis_outputs/eigenposture/pipeline_status.json`.
+
+## Compare roles between recording blocks
+
+`compare_behavior_blocks.py` transfers a baseline eigenposture packet to a
+follow-up recording: baseline PCA, feature normalization, and state dictionary
+are frozen, and ants are matched by **colony side plus tag ID**. Both blocks
+must already have the standard eigenposture outputs. Use a fresh work/output
+directory for a different pair or reference model:
+
+```bash
+python -m analysis.compare_behavior_blocks \
+  --before /path/to/baseline/block --after /path/to/followup/block \
+  --work /scratch/role-comparison --output /path/to/comparison --workers 8
+python -m analysis.report_behavior_transition /path/to/comparison
+```
+
+The current comparison requires a follow-up of at most 24 hours and a complete
+baseline interval covering the same clock hours. It transfers the existing
+baseline ant classes with a nearest-centroid rule, also clusters both days
+jointly, and checks outside activity, completed trips, direct ArUco detections,
+coverage, and classification without contact features. A colony with one
+baseline class cannot support nurse-to-forager class transitions. The report
+marks lower-coverage pairs separately; missing IDs are not confirmed removals.
+The report's treatment and nominal light-schedule metadata currently describe
+the 20260915/block01 → 20260916/block02 experiment and must be updated for a
+different experiment. One-hour resampling intervals are within-recording
+sensitivity measures, not independent experimental replication.
+
 ## Retained preprocessing and shared code
 
 | Files | Purpose |

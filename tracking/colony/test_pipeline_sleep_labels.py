@@ -123,8 +123,9 @@ def test_custom_scratch_analysis_destinations_follow_source_block(tmp_path):
         "speed_operation_args_text": "--max_speed_mm_s 20.0",
         "sleep_operation_args_text": "",
     }
+    snapshot = next((output / 'jobs/code_snapshots').glob('code_*'))
     calls = [line.strip() for line in text.splitlines()
-             if line.strip().startswith(f'bash "{root}/scripts/per_track_slurm_fanout.sh"')]
+             if line.strip().startswith(f'bash "{snapshot}/scripts/per_track_slurm_fanout.sh"')]
     assert len(calls) == 6
     for call in calls:
         call = call.replace('"${sleep_dependency_args[@]}"', "")

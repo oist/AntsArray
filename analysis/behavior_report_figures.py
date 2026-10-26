@@ -5,7 +5,9 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import FancyBboxPatch, FancyArrowPatch
 
 
-def overview(n_states=8,n_classes=2):
+def overview(n_states=8,n_classes=2,side='right'):
+    if side not in ('left', 'right'):
+        raise ValueError(f'Unknown colony side: {side}')
     fig,ax=plt.subplots(figsize=(15,7));ax.set(xlim=(0,1),ylim=(0,1));ax.axis('off')
     def box(x,y,w,h,title,body,color):
         ax.add_patch(FancyBboxPatch((x,y),w,h,boxstyle='round,pad=0.009',fc=color,ec='#34495e',lw=1.2))

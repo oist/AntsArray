@@ -1019,14 +1019,38 @@ def time_args_from_subset_spec(spec: SubsetSpec) -> list[str]:
 
 
 def dataset_slug_for_path(bin_path: Path, root: Path) -> str:
+    source_root = dataset_source_root_for_path(bin_path, root)
+    stem = bin_path.name[:-4] if bin_path.name.endswith(".bin") else bin_path.stem
+    return safe_slug(f"{source_root.name}_{stem}", max_len=96)
+
+
+def dataset_source_root_for_path(bin_path: Path, root: Path) -> Path:
     try:
         rel = bin_path.relative_to(root)
     except ValueError:
-        rel = bin_path.name
-    rel_text = str(rel)
-    if rel_text.endswith(".bin"):
-        rel_text = rel_text[:-4]
-    return safe_slug(rel_text, max_len=160)
+        return bin_path.parent
+    if len(rel.parts) > 1:
+        return root / rel.parts[0]
+    return bin_path.parent
+
+
+def publish_dir_name_for_task(
+    bin_path: Path,
+    *,
+    subset_label: str,
+    is_full: bool,
+    source_root_ap_count: int,
+) -> str:
+    if is_full and source_root_ap_count == 1:
+        return "kilosort4"
+
+    parts = ["kilosort4"]
+    if source_root_ap_count > 1:
+        stem = bin_path.name[:-4] if bin_path.name.endswith(".bin") else bin_path.stem
+        parts.append(safe_slug(stem, max_len=48))
+    if not is_full:
+        parts.append(safe_slug(subset_label, max_len=48))
+    return safe_slug("_".join(parts), max_len=120)
 
 
 def is_bucket_path(path: Path) -> bool:
@@ -1278,18 +1302,21 @@ def submit_saion_jobs(args: argparse.Namespace) -> None:
     input_path = args.input.expanduser().resolve()
     scan_root = input_path.parent if input_path.is_file() else input_path
     ap_bins = find_ap_bins_recursive(input_path)
-    publish_root = (args.saion_publish_root or args.saion_output_root or (scan_root / "kilosort_saion")).expanduser().resolve()
+    central_publish_root = args.saion_publish_root or args.saion_output_root
+    publish_root = central_publish_root.expanduser().resolve() if central_publish_root is not None else None
     if args.saion_work_root is not None:
         work_root = args.saion_work_root.expanduser().resolve()
-    elif is_bucket_path(publish_root):
+    elif publish_root is not None and is_bucket_path(publish_root):
         work_root = default_saion_work_root(publish_root).resolve()
+    elif is_bucket_path(scan_root):
+        work_root = default_saion_work_root(scan_root / "kilosort4").resolve()
     else:
-        work_root = publish_root
+        work_root = scan_root / "kilosort_work"
     jobs_root = (args.saion_jobs_root or (work_root / "jobs")).expanduser().resolve()
     logs_dir = jobs_root / "logs"
     jobs_root.mkdir(parents=True, exist_ok=True)
     logs_dir.mkdir(parents=True, exist_ok=True)
-    publish_enabled = publish_root != work_root
+    publish_layout = "central" if publish_root is not None else "source"
 
     global_specs: list[SubsetSpec] = []
     normal_spec = normal_time_args_as_subset(args)
@@ -1303,7 +1330,13 @@ def submit_saion_jobs(args: argparse.Namespace) -> None:
     tasks: list[dict[str, Any]] = []
     label_counts: dict[tuple[str, str], int] = {}
     needs_conversion_for_channels = args.channels != "all" or bool(args.drop_sync)
+    source_root_ap_counts: dict[Path, int] = {}
     for bin_path in ap_bins:
+        source_root = dataset_source_root_for_path(bin_path, scan_root)
+        source_root_ap_counts[source_root] = source_root_ap_counts.get(source_root, 0) + 1
+
+    for bin_path in ap_bins:
+        source_root = dataset_source_root_for_path(bin_path, scan_root)
         dataset_label = dataset_slug_for_path(bin_path, scan_root)
         specs = build_subset_specs_for_dataset(
             args=args,
@@ -1320,25 +1353,35 @@ def submit_saion_jobs(args: argparse.Namespace) -> None:
                 subset_label = f"{subset_label}_{label_counts[key]:02d}"
 
             task_dir = work_root / dataset_label / subset_label
-            publish_task_dir = publish_root / dataset_label / subset_label if publish_enabled else None
+            publish_dir_name = publish_dir_name_for_task(
+                bin_path,
+                subset_label=subset_label,
+                is_full=spec.is_full,
+                source_root_ap_count=source_root_ap_counts.get(source_root, 1),
+            )
+            if publish_root is None:
+                publish_task_dir = source_root / publish_dir_name
+            else:
+                publish_task_dir = publish_root / dataset_label / publish_dir_name
             results_dir = task_dir / "kilosort4"
             conversion_needed = needs_conversion_for_channels or not spec.is_full
             output_bin = None
             publish_output_bin = None
             if conversion_needed:
                 output_bin = task_dir / f"{safe_slug(bin_path.stem, max_len=80)}_{subset_label}.bin"
-                if publish_task_dir is not None:
-                    publish_output_bin = publish_task_dir / output_bin.name
+                publish_output_bin = publish_task_dir / output_bin.name
             tasks.append(
                 {
                     "task_index": len(tasks),
                     "bin_path": str(bin_path),
+                    "source_root": str(source_root),
                     "dataset_label": dataset_label,
                     "subset_label": subset_label,
+                    "publish_dir_name": publish_dir_name,
                     "output_bin": str(output_bin) if output_bin is not None else None,
                     "results_dir": str(results_dir),
                     "publish_output_bin": str(publish_output_bin) if publish_output_bin is not None else None,
-                    "publish_results_dir": str(publish_task_dir / "kilosort4") if publish_task_dir is not None else None,
+                    "publish_results_dir": str(publish_task_dir),
                     "time_args": time_args_from_subset_spec(spec),
                     "start_sec": spec.start_sec,
                     "end_sec": spec.end_sec,
@@ -1392,7 +1435,8 @@ def submit_saion_jobs(args: argparse.Namespace) -> None:
     manifest = {
         "input": str(input_path),
         "scan_root": str(scan_root),
-        "publish_root": str(publish_root),
+        "publish_layout": publish_layout,
+        "publish_root": str(publish_root) if publish_root is not None else None,
         "work_root": str(work_root),
         "jobs_root": str(jobs_root),
         "publish_host": args.saion_publish_host,
@@ -1417,9 +1461,11 @@ def submit_saion_jobs(args: argparse.Namespace) -> None:
     print(f"  AP datasets: {len(ap_bins):,}")
     print(f"  tasks: {len(tasks):,}")
     print(f"  work_root: {work_root}")
-    print(f"  publish_root: {publish_root}")
-    if publish_enabled:
-        print(f"  publish_host: {args.saion_publish_host or '(direct only)'}")
+    if publish_root is None:
+        print("  publish_layout: source folders")
+    else:
+        print(f"  publish_layout: central root {publish_root}")
+    print(f"  publish_host: {args.saion_publish_host or '(direct only)'}")
     print(f"  jobs_root: {jobs_root}")
     print(f"  worklist: {worklist_path}")
     print(f"  sbatch: {sbatch_path}")
@@ -1782,13 +1828,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--saion-output-root",
         type=Path,
         default=None,
-        help="Final root for per-dataset Kilosort outputs. Default: INPUT/kilosort_saion for directory input.",
+        help=(
+            "Central final root for per-dataset Kilosort outputs. "
+            "Default: copy each task back into its source dataset folder."
+        ),
     )
     cluster.add_argument(
         "--saion-publish-root",
         type=Path,
         default=None,
-        help="Alias/override for the final publish root. Defaults to --saion-output-root.",
+        help=(
+            "Alias/override for a central final publish root. "
+            "Omit to publish into source dataset folders."
+        ),
     )
     cluster.add_argument(
         "--saion-work-root",

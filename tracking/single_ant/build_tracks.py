@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 """
+Legacy CSV/ArUco workflow. New SLEAP-only runs use pipeline.py and workflow.py;
+see tracking/single_ant/README.md. Kept for reproducing historical outputs.
+
 Combine per-frame detections into per-arena track files across ALL chunks, using
 ArUco HDF5 to define TRUE chunk lengths and prevent frame drift.
 
