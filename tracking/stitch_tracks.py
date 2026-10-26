@@ -15,6 +15,8 @@ CHANGE:
 from __future__ import annotations
 
 import re
+import sys
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -23,6 +25,9 @@ from typing import Dict, List, Tuple, Optional
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
 # -----------------------
@@ -190,17 +195,21 @@ def ensure_trackid(df: pd.DataFrame, track_col: str) -> pd.DataFrame:
 
 
 
-def parquet_columns(fp: Path) -> set[str]:
+def parquet_columns(fp: Path, *, metadata=None) -> set[str]:
+    if metadata is not None:
+        return set(metadata.schema.names)
     import pyarrow.parquet as pq
 
-    return set(pq.ParquetFile(fp).schema_arrow.names)
+    with pq.ParquetFile(fp) as pf:
+        return set(pf.schema_arrow.names)
 
 
-def parquet_num_frames(fp: Path) -> Optional[int]:
-    import pyarrow.parquet as pq
-
-    metadata = pq.ParquetFile(fp).schema_arrow.metadata or {}
-    raw = metadata.get(b"num_frames")
+def parquet_num_frames(fp: Path, *, metadata=None) -> Optional[int]:
+    if metadata is None:
+        import pyarrow.parquet as pq
+        with pq.ParquetFile(fp) as pf:
+            metadata = pf.metadata
+    raw = (metadata.metadata or {}).get(b"num_frames")
     if raw is None:
         return None
     try:
@@ -218,18 +227,37 @@ def write_parquet_with_num_frames(
     engine: str,
     compression: str,
 ) -> None:
-    if engine != "pyarrow":
-        df.to_parquet(out_path, index=False, engine=engine, compression=compression)
-        return
+    temporary = out_path.with_name(f".{out_path.name}.{uuid.uuid4().hex}.partial")
+    try:
+        if engine != "pyarrow":
+            df.to_parquet(temporary, index=False, engine=engine, compression=compression)
+        else:
+            import pyarrow as pa
+            import pyarrow.parquet as pq
 
-    import pyarrow as pa
-    import pyarrow.parquet as pq
+            table = pa.Table.from_pandas(df, preserve_index=False)
+            md = dict(table.schema.metadata or {})
+            md[b"num_frames"] = str(int(num_frames)).encode("utf-8")
+            table = table.replace_schema_metadata(md)
+            pq.write_table(table, str(temporary), compression=compression)
+        temporary.replace(out_path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
-    table = pa.Table.from_pandas(df, preserve_index=False)
-    md = dict(table.schema.metadata or {})
-    md[b"num_frames"] = str(int(num_frames)).encode("utf-8")
-    table = table.replace_schema_metadata(md)
-    pq.write_table(table, str(out_path), compression=compression)
+
+def complete_parquet(path: Path, engine: str = "pyarrow") -> bool:
+    """A timeout can leave a filename without a valid Parquet footer."""
+    if not path.is_file():
+        return False
+    try:
+        if engine == "pyarrow":
+            import pyarrow.parquet as pq
+            with pq.ParquetFile(path) as pf:
+                return "Frame" in pf.schema_arrow.names
+        import fastparquet
+        return "Frame" in fastparquet.ParquetFile(path).columns
+    except (OSError, ValueError):
+        return False
 
 
 def read_track_rows_streaming(
@@ -239,6 +267,8 @@ def read_track_rows_streaming(
     track_col: str,
     track_id: int,
     engine: str,
+    metadata=None,
+    row_groups: Optional[list[int]] = None,
 ) -> pd.DataFrame:
     if engine != "pyarrow":
         df = pd.read_parquet(path, columns=columns, engine=engine)
@@ -247,24 +277,27 @@ def read_track_rows_streaming(
 
     import pyarrow.compute as pc
     import pyarrow.parquet as pq
+    from tracking.core.track_parquet import candidate_row_groups
 
-    pf = pq.ParquetFile(path)
     pieces: list[pd.DataFrame] = []
-    for row_group_idx in range(pf.num_row_groups):
-        table = pf.read_row_group(row_group_idx, columns=columns)
-        if track_col not in table.column_names:
-            if int(track_id) != 0:
+    with pq.ParquetFile(path, metadata=metadata) as pf:
+        if row_groups is None:
+            row_groups = candidate_row_groups(pf.metadata, track_col, int(track_id))
+        for row_group_idx in row_groups:
+            table = pf.read_row_group(row_group_idx, columns=columns)
+            if track_col not in table.column_names:
+                if int(track_id) != 0:
+                    continue
+                df_piece = table.to_pandas()
+                df_piece[track_col] = 0
+                pieces.append(df_piece)
                 continue
-            df_piece = table.to_pandas()
-            df_piece[track_col] = 0
-            pieces.append(df_piece)
-            continue
 
-        track_arr = pc.cast(table[track_col], "int64", safe=False)
-        mask = pc.equal(track_arr, int(track_id))
-        if pc.sum(pc.cast(mask, "int64")).as_py() == 0:
-            continue
-        pieces.append(table.filter(mask).to_pandas())
+            track_arr = pc.cast(table[track_col], "int64", safe=False)
+            mask = pc.equal(track_arr, int(track_id))
+            if pc.sum(pc.cast(mask, "int64")).as_py() == 0:
+                continue
+            pieces.append(table.filter(mask).to_pandas())
 
     if not pieces:
         return pd.DataFrame(columns=columns)
@@ -566,7 +599,7 @@ def stitch_group(
         remaining_track_ids = {
             int(tid)
             for tid in track_ids_filter
-            if not stitched_parquet_path(per_track_dir, int(tid), suffix_tag).exists()
+            if not complete_parquet(stitched_parquet_path(per_track_dir, int(tid), suffix_tag), engine)
         }
         if not remaining_track_ids:
             print(f"Skipping existing stitch output for {suffix_tag}", flush=True)
@@ -589,11 +622,19 @@ def stitch_group(
     pbar = tqdm(files_sorted, desc=f"Index [{suffix_tag}]", unit="file", leave=False)
 
     for fp in pbar:
-        cols_in_file = parquet_columns(fp)
+        metadata = None
+        groups_by_ant = None
+        if engine == "pyarrow":
+            import pyarrow.parquet as pq
+            from tracking.core.track_parquet import ant_row_groups
+            with pq.ParquetFile(fp) as pf:
+                metadata = pf.metadata
+            groups_by_ant = ant_row_groups(metadata, track_col)
+        cols_in_file = parquet_columns(fp, metadata=metadata)
         if frame_col not in cols_in_file:
             continue
 
-        num_frames_meta = parquet_num_frames(fp)
+        num_frames_meta = parquet_num_frames(fp, metadata=metadata)
 
         if num_frames_meta is not None:
             local_len = int(num_frames_meta)
@@ -632,9 +673,12 @@ def stitch_group(
         if track_ids_filter is not None:
             track_ids.update(int(tid) for tid in track_ids_filter)
         elif track_col in cols_in_file:
-            tid_df = pd.read_parquet(fp, columns=[track_col], engine=engine)
-            tid_series = pd.to_numeric(tid_df[track_col], errors="coerce").dropna()
-            track_ids.update(int(tid) for tid in tid_series.unique())
+            if groups_by_ant is not None:
+                track_ids.update(groups_by_ant)
+            else:
+                tid_df = pd.read_parquet(fp, columns=[track_col], engine=engine)
+                tid_series = pd.to_numeric(tid_df[track_col], errors="coerce").dropna()
+                track_ids.update(int(tid) for tid in tid_series.unique())
         else:
             track_ids.add(0)
 
@@ -645,6 +689,8 @@ def stitch_group(
                 "local_len": local_len,
                 "frame_offset": frame_offset,
                 "dt": dt,
+                "metadata": metadata,
+                "groups_by_ant": groups_by_ant,
             }
         )
 
@@ -661,17 +707,23 @@ def stitch_group(
         target_dir = png_dir if png_dir is not None else (per_track_dir.parent / "track_pngs")
         png_path = target_dir / f"TrackID_{tid:04d}_all_{suffix_tag}.png"
 
-        if skip_existing and out_path.exists():
+        if skip_existing and complete_parquet(out_path, engine):
             continue
 
         parts: List[pd.DataFrame] = []
         for info in file_infos:
+            groups = info["groups_by_ant"]
+            row_groups = groups.get(int(tid), []) if groups is not None else None
+            if row_groups == []:
+                continue
             df = read_track_rows_streaming(
                 info["path"],
                 columns=info["existing"],
                 track_col=track_col,
                 track_id=int(tid),
                 engine=engine,
+                metadata=info["metadata"],
+                row_groups=row_groups,
             )
             if df.empty:
                 continue

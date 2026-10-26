@@ -204,7 +204,6 @@ def get_complete_tracks(
     if stream_output:
         try:
             import pyarrow as pa  # type: ignore
-            import pyarrow.parquet as pq  # type: ignore
         except Exception as exc:
             raise RuntimeError("stream_output requires pyarrow") from exc
 
@@ -229,7 +228,9 @@ def get_complete_tracks(
             ],
             metadata={b"num_frames": str(int(num_frames)).encode("utf-8")},
         )
-        parquet_writer = pq.ParquetWriter(str(output_path_obj), parquet_schema)
+        from tracking.core.track_parquet import AntParquetWriter
+
+        parquet_writer = AntParquetWriter(output_path_obj, parquet_schema)
 
     def _flush_output_rows() -> None:
         nonlocal output_rows, parquet_writer
@@ -1155,19 +1156,24 @@ def get_complete_tracks(
                     )
 
         df = pd.DataFrame(rows, columns=output_columns)
+        if df.empty:
+            # Empty observations still need an integer ID/frame schema.
+            df = df.astype({"Frame": "int64", "TrackID": "int64"})
         outp = Path(output_path)
         outp.parent.mkdir(parents=True, exist_ok=True)
 
         try:
             import pyarrow as pa  # type: ignore
-            import pyarrow.parquet as pq  # type: ignore
+        except ImportError:
+            df.to_parquet(outp)
+        else:
+            from tracking.core.track_parquet import AntParquetWriter
 
             table = pa.Table.from_pandas(df, preserve_index=False)
             md = dict(table.schema.metadata or {})
             md[b"num_frames"] = str(int(num_frames)).encode("utf-8")
             table = table.replace_schema_metadata(md)
-            pq.write_table(table, str(outp))
-        except Exception:
-            df.to_parquet(outp)
+            with AntParquetWriter(outp, table.schema) as parquet_output:
+                parquet_output.write_table(table)
 
     return all_pos
