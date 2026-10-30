@@ -178,6 +178,15 @@ def read_roster(path, month):
     return out
 
 
+def read_collected(path):
+    """{colony key: collection date} from colonies.csv (collected_on; blank = not known)."""
+    out = {}
+    for where, row in read_rows(path, ("colony", "collected_on")):
+        if row["collected_on"]:
+            out[colony_key(row["colony"])] = check_date(row["collected_on"], "collected_on", where)
+    return out
+
+
 def read_arena(path):
     """Validated rows of arena.csv (valid_from,left,right[,note]), values stripped.
 

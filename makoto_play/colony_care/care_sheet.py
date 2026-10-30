@@ -7,9 +7,11 @@ paint + count of adults and pupae, dead tag IDs, comments, events). Photographs 
 become rows of basler/_colonies/husbandry_log.csv (README.md).
 
 The colonies come from colonies.csv (care_from / care_until) in --colonies-dir, or --colonies.
+Records of the month already in husbandry_log.csv are printed into the sheets (--blank: not).
 
-    python makoto_play/colony_care/care_sheet.py --month 2026-10 \
-        --colonies-dir Z:/ReiterU/Ants/basler/_colonies --out sheets/care_2026-10.pdf
+    python makoto_play/colony_care/care_sheet.py --month 2026-11 \
+        --colonies-dir Z:/ReiterU/Ants/basler/_colonies \
+        --out Z:/ReiterU/Ants/basler/_colonies/sheets/2026-11/care_2026-11.pdf
 """
 import argparse
 import contextlib
@@ -21,16 +23,22 @@ from pathlib import Path
 import matplotlib
 from matplotlib.backends.backend_pdf import PdfPages
 
+import husbandry as H
+import sheet_fill as F
 import sheet_model as M
 import sheet_pages as P
 
+LOG_NAME = "husbandry_log.csv"
 
-def render(colonies, month, out_pdf, arena=None, png_dir=None, feeding=True):
+
+def render(colonies, month, out_pdf, arena=None, png_dir=None, feeding=True, records=None):
     """Write the two feeding sheets (unless feeding=False) and one page per colony to out_pdf.
 
     arena = rows from M.read_arena(), or None when arena.csv was not read (no arena lines).
-    A PNG preview per page goes into png_dir. The PDF is written under a temporary name and
-    renamed at the end, so a failed run never leaves a PDF that silently lacks pages.
+    records = sheet_fill.Records whose entries of the month are printed into the sheets, or
+    None for blank sheets. A PNG preview per page goes into png_dir. The PDF is written under a
+    temporary name and renamed at the end, so a failed run never leaves a PDF that silently
+    lacks pages.
     """
     if not colonies and not feeding:
         raise M.InputError("nothing to print: no colonies and no feeding sheet")
@@ -39,9 +47,12 @@ def render(colonies, month, out_pdf, arena=None, png_dir=None, feeding=True):
     if feeding:
         P.feeding_slots(colonies)                       # fails early when too many colonies
         pages += [("feeding_%s_P%d.png" % (tag, page),
-                   lambda page=page: P.draw_feeding_page(month, page, colonies, arena)) for page in (1, 2)]
+                   lambda page=page: P.draw_feeding_page(month, page, colonies, arena,
+                                                         fill=_feeding_fill(records, month, page)))
+                  for page in (1, 2)]
     pages += [("care_C%s_%s.png" % (M.colony_key(c), tag),
-               lambda c=c: P.draw_colony_page(c, month, M.arena_header(arena, c, month, end)))
+               lambda c=c: P.draw_colony_page(c, month, M.arena_header(arena, c, month, end),
+                                              fill=_colony_fill(records, c, month)))
               for c in colonies]
     out_pdf = Path(out_pdf)
     out_pdf.parent.mkdir(parents=True, exist_ok=True)
@@ -67,6 +78,18 @@ def render(colonies, month, out_pdf, arena=None, png_dir=None, feeding=True):
     return out_pdf
 
 
+def _feeding_fill(records, month, page):
+    if records is None:
+        return None
+    return F.feeding_days(records.entries, *M.feeding_pages(month)[page - 1])
+
+
+def _colony_fill(records, colony, month):
+    if records is None:
+        return None
+    return F.colony_fill(records.entries, colony, month, records.collected.get(M.colony_key(colony)))
+
+
 class _Tee:
     """Write to several streams at once (the console and the run log)."""
 
@@ -89,7 +112,9 @@ def main(argv=None):
                    help="colony names, e.g. 8,Mix,10#1,22-29 (default: the roster in colonies.csv)")
     p.add_argument("--no-feeding", action="store_true", help="leave out the shared feeding sheets")
     p.add_argument("--colonies-dir", type=Path, default=None,
-                   help="basler/_colonies: colonies.csv (roster) and arena.csv (who is in the arena)")
+                   help="basler/_colonies: colonies.csv (roster, collection dates), arena.csv (who is in "
+                        "the arena) and husbandry_log.csv (records printed into the sheets)")
+    p.add_argument("--blank", action="store_true", help="print the sheets without the records of husbandry_log.csv")
     p.add_argument("--out", type=Path, default=None, help="output PDF")
     p.add_argument("--png-dir", type=Path, default=None, help="also write a PNG preview per page")
     a = p.parse_args(argv)
@@ -118,9 +143,11 @@ def _run(a, out):
         colonies = M.read_roster(a.colonies_dir / "colonies.csv", month)
     else:
         colonies = []
-    render(colonies, month, out, arena=arena, png_dir=a.png_dir, feeding=not a.no_feeding)
+    records = None if a.blank or not a.colonies_dir else _read_records(a.colonies_dir)
+    render(colonies, month, out, arena=arena, png_dir=a.png_dir, feeding=not a.no_feeding, records=records)
     print("care sheets %s -> %s" % (month.strftime("%Y-%m"), out))
     print("  colony sheets: %s" % (", ".join(colonies) or "-"))
+    print("  " + _records_line(a, records, colonies, month))
     if arena is None:
         print("  arena.csv not read (no --colonies-dir): sheets carry no arena line")
         return 0
@@ -137,6 +164,26 @@ def _run(a, out):
         if in_arena:
             print("  colony %s: %s" % (c, text))
     return 0
+
+
+def _read_records(colonies_dir):
+    """husbandry_log.csv (no rows when it is not there) and the collection dates of colonies.csv."""
+    log, roster = colonies_dir / LOG_NAME, colonies_dir / "colonies.csv"
+    return F.Records(H.read_log(log) if log.exists() else [],
+                     M.read_collected(roster) if roster.exists() else {})
+
+
+def _records_line(a, records, colonies, month):
+    """What was printed into the sheets, for the run log."""
+    if records is None:
+        return "printed blank (%s)" % ("--blank" if a.blank else "no --colonies-dir")
+    log = a.colonies_dir / LOG_NAME
+    if not log.exists():
+        return "no %s in %s: printed without records" % (LOG_NAME, a.colonies_dir)
+    days = [] if a.no_feeding else F.feeding_days(records.entries, month, M.month_end(month))
+    with_records = [c for c in colonies if F.colony_fill(records.entries, c, month).has_records]
+    return "filled from %s: feeding days: %s; colony sheets with records: %s" % (
+        log, ", ".join(d.strftime("%m/%d") for d in days) or "-", ", ".join(with_records) or "-")
 
 
 if __name__ == "__main__":

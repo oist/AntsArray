@@ -85,7 +85,8 @@ def _check_event_fields(event, what, n, where):
 
 # --- per colony ---------------------------------------------------------------------------
 
-def _of(entries, colony):
+def of_colony(entries, colony):
+    """Entries of one colony (names compared without case; feeding rounds for 'all' left out)."""
     key = M.colony_key(colony)
     return [e for e in entries if e.colony != ALL and M.colony_key(e.colony) == key]
 
@@ -94,7 +95,7 @@ def _is_male(e):
     return e.event == "dead" and e.what == MALE
 
 
-def _size(e):
+def entry_size(e):
     """Number of ants an entry stands for: n, else the number of IDs, else None."""
     return e.n if e.n is not None else (len(e.ids) or None)
 
@@ -116,7 +117,7 @@ def adult_estimate(entries, colony, on):
     without any full count. Changes of unknown size, and a result below zero, are listed in
     `unknown`.
     """
-    own = [e for e in _of(entries, colony) if e.date <= on]
+    own = [e for e in of_colony(entries, colony) if e.date <= on]
     counts = [(e.date, e.time, i, e) for i, e in enumerate(own) if e.event == "census" and e.what == "adult"]
     if not counts:
         return None
@@ -126,7 +127,7 @@ def adult_estimate(entries, colony, on):
     added = lost = 0
     unknown = []
     for e in after:
-        size = _size(e)
+        size = entry_size(e)
         if size is None:
             unknown.append("%s %s: %s" % (e.date, e.event, e.note or "number not recorded"))
         elif e.event == "painted":
@@ -145,11 +146,11 @@ Totals = namedtuple("Totals", "feedings dead males notes")
 
 def totals(entries, colony):
     """Whole-record totals of a colony: feedings, dead females, dead males, dated notes."""
-    own = _of(entries, colony)
+    own = of_colony(entries, colony)
     return Totals(
         feedings=sum(1 for e in own if e.event == "fed"),
-        dead=sum(_size(e) or 0 for e in own if e.event == "dead" and not _is_male(e)),
-        males=sum(_size(e) or 0 for e in own if _is_male(e)),
+        dead=sum(entry_size(e) or 0 for e in own if e.event == "dead" and not _is_male(e)),
+        males=sum(entry_size(e) or 0 for e in own if _is_male(e)),
         notes=tuple("%s %s" % (e.date, e.what) for e in own if e.event == "note" and e.what),
     )
 
@@ -167,7 +168,7 @@ def _last(items):
 
 def colony_summary(entries, colony, on):
     """What the log says about a colony on a day (history newest first, feeding rounds left out)."""
-    own = [e for e in _of(entries, colony) if e.date <= on]
+    own = [e for e in of_colony(entries, colony) if e.date <= on]
     recent = [e for e in own if (on - e.date).days < RECENT_DAYS]
     not_fed = {e.date for e in own if e.event == "not_fed"}
     fed = [e.date for e in entries if e.event == "fed" and e.date <= on and e.date not in not_fed
@@ -185,7 +186,7 @@ def colony_summary(entries, colony, on):
         last_fed=max(fed) if fed else None,
         last_leftover=(leftover.date, leftover.what) if leftover else None,
         last_water=water.date if water else None,
-        dead_28d=sum(_size(e) or 0 for e in recent if e.event == "dead" and not _is_male(e)),
+        dead_28d=sum(entry_size(e) or 0 for e in recent if e.event == "dead" and not _is_male(e)),
         new_28d=sum(e.n or 0 for e in recent if e.event == "painted"),
         last_paint=(paint.date, paint.what) if paint else None,
         tray=(tray_date, tray_status(tray_date, on)),

@@ -157,6 +157,16 @@ def test_read_roster_rejects_bad_rows(tmp_path, body, match):
         M.read_roster(write_roster(tmp_path, body), OCT)
 
 
+def test_read_collected_gives_the_collection_date_per_colony_key(tmp_path):
+    p = write_roster(tmp_path, "8,,2024-10-17,,,,2024-10-30,\nMix,,,,,,2025-01-08,\n10#1,,2024-10-17,,,,,\n")
+    assert M.read_collected(p) == {"8": date(2024, 10, 17), "10.1": date(2024, 10, 17)}
+
+
+def test_read_collected_rejects_a_bad_date(tmp_path):
+    with pytest.raises(M.InputError, match="collected_on"):
+        M.read_collected(write_roster(tmp_path, "8,,2024/10/17,,,,2024-10-30,\n"))
+
+
 def test_read_roster_explains_missing_care_columns(tmp_path):
     p = write_roster(tmp_path, "8,,,,,\n", header="colony,gamergate_tag,collected_on,census_on,census,note\n")
     with pytest.raises(M.InputError, match="care_from"):

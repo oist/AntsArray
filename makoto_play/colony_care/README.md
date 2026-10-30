@@ -23,15 +23,38 @@ One PDF per calendar month, all pages A4 landscape:
   dead tagged ants; comments; and events. Adults are not counted every week (see below).
 
 ```powershell
-python makoto_play/colony_care/care_sheet.py --month 2026-10 `
-    --colonies-dir Z:\ReiterU\Ants\basler\_colonies --out sheets\care_2026-10.pdf --png-dir sheets\png
+python makoto_play/colony_care/care_sheet.py --month 2026-11 `
+    --colonies-dir Z:\ReiterU\Ants\basler\_colonies `
+    --out Z:\ReiterU\Ants\basler\_colonies\sheets\2026-11\care_2026-11.pdf `
+    --png-dir Z:\ReiterU\Ants\basler\_colonies\sheets\2026-11\png
 ```
 
-The colonies come from the roster in `colonies.csv` (below), in file order; `--colonies
-8,Mix,22-29` overrides it (e.g. to reprint one colony sheet with `--no-feeding`). Without
-`--colonies-dir` and `--colonies`, only the feeding sheets are printed, with blank columns.
-A log of the run is written next to the PDF; it warns when a colony is in the arena but has
-no colony sheet.
+The PDFs (and scans of the filled sheets) are kept in `basler/_colonies/sheets/<YYYY-MM>/`, not
+in this repository. The colonies come from the roster in `colonies.csv` (below), in file
+order; `--colonies 8,Mix,22-29` overrides it (e.g. to reprint one colony sheet with
+`--no-feeding`). Without `--colonies-dir` and `--colonies`, only the feeding sheets are
+printed, with blank columns. A log of the run is written next to the PDF; it warns when a
+colony is in the arena but has no colony sheet.
+
+**Records already in the log are printed into the sheets** (in blue), so a sheet printed
+again, or late in the month, shows what was done and the carers write only what is missing:
+
+- feeding sheets: time and initials of each feeding round, each colony's D and L (D = dead
+  females; dead rows are logged only when D > 0, so an L code 0-3 read from a sheet with no
+  dead row is D 0), a slash for `not_fed`;
+- colony sheets: `Collected` (`colonies.csv` `collected_on`) and `Last tray change` (latest
+  `tray_changed` up to the end of the month); per 7-day line the paint day (date of painting,
+  else of the pupa count, and the initials), colours, new adults (0 when the pupae were
+  counted but nobody was painted), pupae (last count), tag IDs of dead ants and the `note`
+  rows as comments; the events of the month (`tray_changed`, `nest_changed`, `tagged`,
+  `census adult` = count, `arena_in`/`arena_out`, `removed`, `tag_lost` = other) with the
+  type ticked; when more than 8, the last line says how many more are in the log.
+- A number that was not recorded (a `painted` or `dead` row without n or IDs) is printed as
+  `?` (`3+?` with known ones), never as 0.
+
+The run log lists the days and colonies that got records. `--blank` prints the sheets
+without them. A missing `husbandry_log.csv` prints blank sheets (with the collection dates);
+a bad row in it stops the run with its line number.
 
 What goes where:
 
@@ -81,8 +104,9 @@ version-1 code with ~1 mm modules) and four ArUco markers (`DICT_4X4_50`, ids 0-
 from top left) for reading photos of filled sheets automatically later. Photograph a whole
 sheet so that it fills the frame.
 
-Code: `sheet_model.py` (months, feeding plan, names, codes, roster, arena.csv), `sheet_pages.py`
-(drawing), `care_sheet.py` (PDF and command line).
+Code: `sheet_model.py` (months, feeding plan, names, codes, roster, arena.csv), `sheet_fill.py`
+(what the log says for each cell), `sheet_pages.py` (drawing), `care_sheet.py` (PDF and command
+line).
 
 ## Roster: `colonies.csv` columns `care_from`, `care_until`
 

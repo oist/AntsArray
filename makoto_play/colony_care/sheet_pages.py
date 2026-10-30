@@ -9,7 +9,9 @@ from datetime import timedelta
 
 import cv2
 from matplotlib.figure import Figure
+from matplotlib.font_manager import FontProperties
 from matplotlib.patches import Rectangle
+from matplotlib.textpath import text_to_path
 
 import sheet_model as M
 
@@ -25,6 +27,9 @@ MAX_FEEDING_COLONIES = 18   # more than this no longer fits the width
 EVENT_TYPES = ("tray", "nest", "tagging #", "count", "arena in", "arena out", "removal", "other")
 EVENT_TYPE_STEP = 14.0      # mm between the event-type tick boxes
 EVENT_ROWS, EVENT_H = 8, 6.5
+WEEKS_TOP, WEEKS_BOTTOM = 37.0, 118.0   # the weekly lines of a colony sheet (mm from the top)
+FILL_COLOR, FILL_PT = "#1f4e9c", 8.0     # records printed from husbandry_log.csv
+PT_MM = 25.4 / 72
 LEFTOVER_SCALE = "0 none, 1 a little, 2 about half, 3 most or all"
 
 # (title, hint, width mm); None = the rest of the line
@@ -67,8 +72,54 @@ def _new_page(width, height):
     return fig, ax
 
 
-def _text(ax, x, y, s, size=7.0, color="black", weight="normal", ha="left", va="top"):
-    ax.text(x, y, s, fontsize=size, color=color, fontweight=weight, ha=ha, va=va)
+def _text(ax, x, y, s, size=7.0, color="black", weight="normal", ha="left", va="top", parse_math=True):
+    ax.text(x, y, s, fontsize=size, color=color, fontweight=weight, ha=ha, va=va, parse_math=parse_math)
+
+
+def _filled(ax, x, y, s, size=FILL_PT, ha="left", va="top"):
+    """A value from husbandry_log.csv, in the colour that sets it apart from the printed form.
+
+    Printed as written: a '$' in a note is not the start of a formula.
+    """
+    _text(ax, x, y, s, size=size, color=FILL_COLOR, ha=ha, va=va, parse_math=False)
+
+
+def _width_mm(s, size):
+    """Width of a text (with its spaces) in mm, measured without a renderer."""
+    width, _, _ = text_to_path.get_text_width_height_descent(s, FontProperties(size=size), ismath=False)
+    return width * PT_MM
+
+
+def _shrink(s, width_mm, size=FILL_PT):
+    """Font size (pt) at which s fits into width_mm: size, or smaller."""
+    return min(size, size * width_mm / max(_width_mm(s, size), 1e-6))
+
+
+def _fit(s, width_mm, size, max_lines):
+    """s wrapped into lines of at most width_mm; when it needs more than max_lines, the last ends in '…'."""
+    lines, line = [], ""
+    for word in s.split():
+        if _width_mm((line + " " + word).strip(), size) <= width_mm:
+            line = (line + " " + word).strip()
+            continue
+        if line:
+            lines.append(line)
+        while _width_mm(word, size) > width_mm:           # a word longer than the width is split
+            k = 1
+            while k < len(word) and _width_mm(word[:k + 1], size) <= width_mm:
+                k += 1
+            lines.append(word[:k])
+            word = word[k:]
+        line = word
+    if line:
+        lines.append(line)
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+        last = lines[-1]
+        while last and _width_mm(last + "…", size) > width_mm:
+            last = last[:-1]
+        lines[-1] = last.rstrip() + "…"
+    return lines
 
 
 def _box(ax, x, y, w, h, lw=0.6, fill=None):
@@ -135,10 +186,11 @@ def _title(ax, big, small, max_width=None):
 
 # --- per-colony sheet ----------------------------------------------------------------------
 
-def draw_colony_page(colony, month, arena):
+def draw_colony_page(colony, month, arena, fill=None):
     """Paint, count, dead tag IDs, comments and events of one colony for a month.
 
-    arena = M.arena_header(...) or None.
+    arena = M.arena_header(...) or None. fill = sheet_fill.ColonyFill to print into the sheet,
+    or None for a blank one.
     """
     fig, ax = _new_page(A4_LONG, A4_SHORT)
     photo = " (photograph tags into the tag_photos inbox C%s_dead)" % colony if colony.isdigit() else ""
@@ -149,30 +201,72 @@ def draw_colony_page(colony, month, arena):
           size=7.5, color=GREY)
     qr_x = A4_LONG - MARGIN - MARKER - QR_GAP - QR
     _status_line(ax, INFO_X, MARGIN + 1, arena, qr_x - 3 - INFO_X)
-    _text(ax, INFO_X, MARGIN + 8, "Last tray change: ______________   (every 2-3 months)", size=8)
-    _text(ax, INFO_X, MARGIN + 15, "Collected: ______________", size=8)
+    _header_field(ax, MARGIN + 8, "Last tray change: ", "   (every 2-3 months)", fill and fill.last_tray)
+    _header_field(ax, MARGIN + 15, "Collected: ", "", fill and fill.collected)
     cols = _columns(MARGIN, A4_LONG - MARGIN, COLONY_COLS)
-    top, head = 37.0, 9.0
-    _draw_head(ax, cols, top, head)
+    head = 9.0
+    _draw_head(ax, cols, WEEKS_TOP, head)
     weeks = M.week_ranges(month)
-    row_h = (118.0 - top - head) / len(weeks)
-    for k, (first, last) in enumerate(weeks):
-        _draw_colony_week(ax, cols, top + head + k * row_h, row_h, first, last)
-    _draw_events(ax, 122.0, MARGIN, A4_LONG - MARGIN)
+    filled_weeks = fill.weeks if fill else [None] * len(weeks)
+    row_h = (WEEKS_BOTTOM - WEEKS_TOP - head) / len(weeks)
+    for k, ((first, last), week) in enumerate(zip(weeks, filled_weeks, strict=True)):
+        _draw_colony_week(ax, cols, WEEKS_TOP + head + k * row_h, row_h, first, last, week)
+    _draw_events(ax, 122.0, MARGIN, A4_LONG - MARGIN, fill.events if fill else ())
     return fig
 
 
-def _draw_colony_week(ax, cols, y, h, first, last):
+def _header_field(ax, y, label, after, value):
+    """'label ______________ after' in the colony sheet header, or the date from the log on the line."""
+    blank = "______________"
+    _text(ax, INFO_X, y, label, size=8)
+    label_w = _width_mm(label, 8)
+    if value:
+        _filled(ax, INFO_X + label_w, y, value.isoformat())
+    else:
+        _text(ax, INFO_X + label_w, y, blank, size=8)
+    if after:
+        _text(ax, INFO_X + label_w + _width_mm(blank, 8), y, after, size=8)
+
+
+def _draw_colony_week(ax, cols, y, h, first, last, week=None):
     for x, w, _, _ in cols:
         _box(ax, x, y, w, h)
     wx, px = cols[0][0], cols[1][0]
     _text(ax, wx + 1.2, y + 1.2, "%s -\n%s" % (first.strftime("%m/%d"), last.strftime("%m/%d")),
           size=7.5, weight="bold")
-    _text(ax, px + 1.2, y + 1.5, "Date ___/___", size=7, color=GREY)
-    _text(ax, px + 1.2, y + h / 2 + 0.5, "By ________", size=7, color=GREY)
+    if week is None or week.date is None:
+        _text(ax, px + 1.2, y + 1.5, "Date ___/___", size=7, color=GREY)
+        _text(ax, px + 1.2, y + h / 2 + 0.5, "By ________", size=7, color=GREY)
+    else:
+        by_x = px + 1.2 + _width_mm("By ", 7)
+        _text(ax, px + 1.2, y + 1.5, "Date", size=7, color=GREY)
+        _filled(ax, px + 1.2 + _width_mm("Date ", 7), y + 1.2, week.date.strftime("%m/%d"))
+        if week.by:
+            _text(ax, px + 1.2, y + h / 2 + 0.5, "By", size=7, color=GREY)
+            _filled(ax, by_x, y + h / 2 + 0.2, week.by, size=_shrink(week.by, px + cols[1][1] - 1.0 - by_x))
+        else:                                               # initials not in the log: still to be written
+            _text(ax, px + 1.2, y + h / 2 + 0.5, "By ________", size=7, color=GREY)
+    if week is not None:
+        _fill_colony_week(ax, cols, y, h, week)
 
 
-def _draw_events(ax, top, x0, x1):
+def _fill_colony_week(ax, cols, y, h, week):
+    """Colour, new adults, pupae, dead tag IDs and comments of one week from the log."""
+    (cx, cw, _, _), (nx, nw, _, _), (ux, uw, _, _), (dx, dw, _, _), (mx, mw, _, _) = cols[2:]
+    mid = y + h / 2
+    for x, w, value in ((cx, cw, week.colour), (nx, nw, week.new_adults), (ux, uw, week.pupae)):
+        if value not in (None, ""):
+            s = str(value)
+            _filled(ax, x + w / 2, mid, s, size=_shrink(s, w - 2.0, 10.0), ha="center", va="center")
+    for x, w, s, size in ((dx, dw, " ".join(str(i) for i in week.dead_ids), FILL_PT),
+                          (mx, mw, "; ".join(week.comments), 7.5)):
+        if s:
+            max_lines = max(1, int((h - 2.0) / (size * PT_MM * 1.25)))
+            _filled(ax, x + 1.2, y + 1.2, "\n".join(_fit(s, w - 2.4, size, max_lines)), size=size)
+
+
+def _draw_events(ax, top, x0, x1, events=()):
+    """Events table; events from the log fill its lines (the last line says how many did not fit)."""
     _text(ax, x0, top, "Events - date, time (to the minute while in the arena), tick the type, "
           "details, initials", size=7.5, weight="bold")
     cols = _columns(x0, x1, EVENT_COLS)
@@ -180,16 +274,38 @@ def _draw_events(ax, top, x0, x1):
     for x, w, title, _ in cols:
         _box(ax, x, head_y, w, 5.0, lw=0.8)
         _text(ax, x + 1.0, head_y + 0.9, title, size=6.5, weight="bold")
+    shown = list(events) if len(events) <= EVENT_ROWS else list(events[:EVENT_ROWS - 1])
+    more = len(events) - len(shown)
     type_x = cols[2][0]
     for r in range(EVENT_ROWS):
         y = head_y + 5.0 + r * EVENT_H
+        event = shown[r] if r < len(shown) else None
         for x, w, _, _ in cols:
             _box(ax, x, y, w, EVENT_H, lw=0.5)
-        _text(ax, x0 + 1.0, y + 1.8, "___/___", size=6.5, color=GREY)
+        if event is None and not (more and r == EVENT_ROWS - 1):
+            _text(ax, x0 + 1.0, y + 1.8, "___/___", size=6.5, color=GREY)
         for i, name in enumerate(EVENT_TYPES):
             bx = type_x + 1.0 + i * EVENT_TYPE_STEP
-            _box(ax, bx, y + 2.1, 2.2, 2.2, lw=0.5)
+            _box(ax, bx, y + 2.1, 2.2, 2.2, lw=0.5, fill=FILL_COLOR if event and event.kind == name else None)
             _text(ax, bx + 3.0, y + 1.9, name, size=5.8, color=GREY)
+        if event is not None:
+            _fill_event(ax, cols, y, event)
+    if more:
+        _filled(ax, cols[3][0] + 1.0, head_y + 5.0 + (EVENT_ROWS - 0.5) * EVENT_H,
+                "+%d more in husbandry_log.csv" % more, size=7, va="center")
+
+
+def _fill_event(ax, cols, y, event):
+    (ax0, _, _, _), (tx, tw, _, _), _, (dx, dw, _, _), (bx, bw, _, _) = cols
+    mid = y + EVENT_H / 2
+    _filled(ax, ax0 + 1.0, mid, event.date.strftime("%m/%d"), size=7, va="center")
+    if event.time:
+        _filled(ax, tx + 1.0, mid, event.time, size=_shrink(event.time, tw - 2.0, 7), va="center")
+    details = _fit(event.details, dw - 2.0, 7, 1)
+    if details:
+        _filled(ax, dx + 1.0, mid, details[0], size=7, va="center")
+    if event.by:
+        _filled(ax, bx + 1.0, mid, event.by, size=_shrink(event.by, bw - 2.0, 7), va="center")
 
 
 # --- shared feeding sheet ------------------------------------------------------------------
@@ -207,10 +323,11 @@ def feeding_slots(colonies):
     return list(colonies) + [""] * (FEEDING_SLOTS - len(colonies))
 
 
-def draw_feeding_page(month, page, colonies, arena_rows):
+def draw_feeding_page(month, page, colonies, arena_rows, fill=None):
     """One line per day (half a month) with a dead / left-over pair per colony.
 
-    arena_rows = rows of arena.csv or None (unknown).
+    arena_rows = rows of arena.csv or None (unknown). fill = {day: sheet_fill.FeedingDay} to print
+    into the sheet, or None for a blank one.
     """
     first, last = M.feeding_pages(month)[page - 1]
     fig, ax = _new_page(A4_LONG, A4_SHORT)
@@ -230,9 +347,14 @@ def draw_feeding_page(month, page, colonies, arena_rows):
     _draw_feeding_head(ax, fixed, slots, x0, slot_w, top, head, in_arena)
     days = [first + timedelta(days=k) for k in range((last - first).days + 1)]
     row_h = (186.0 - top - head) / len(days)
+    keys = [M.colony_key(name) if name else None for name in slots]
     for i, day in enumerate(days):
         y = top + head + i * row_h
-        _draw_feeding_day(ax, fixed, len(slots), x0, slot_w, y, row_h, day)
+        recorded = (fill or {}).get(day)
+        _draw_feeding_day(ax, fixed, len(slots), x0, slot_w, y, row_h, day,
+                          blank_time=not (recorded and recorded.time))
+        if recorded:
+            _fill_feeding_day(ax, fixed, keys, x0, slot_w, y, row_h, recorded)
         if day.weekday() == 0 and i:
             ax.plot([MARGIN, A4_LONG - MARGIN], [y, y], color="black", lw=1.6)
     return fig
@@ -254,7 +376,30 @@ def _draw_feeding_head(ax, fixed, slots, x0, slot_w, top, head, in_arena):
             _text(ax, x + (j + 0.5) * slot_w / 2, top + head - 3.4, sub, size=5.5, color=GREY, ha="center")
 
 
-def _draw_feeding_day(ax, fixed, n_slots, x0, slot_w, y, h, day):
+def _fill_feeding_day(ax, fixed, keys, x0, slot_w, y, h, recorded):
+    """Time and initials of the round, and each colony's D | L pair (slashed when not fed)."""
+    mid = y + h / 2
+    (tx, tw, _, _), (bx, bw, _, _) = fixed[3:5]
+    if recorded.time:
+        _filled(ax, tx + tw - 1.0, mid, recorded.time, size=_shrink(recorded.time, tw - 1.5),
+                ha="right", va="center")
+    if recorded.by:
+        _filled(ax, bx + bw / 2, mid, recorded.by, size=_shrink(recorded.by, bw - 1.5), ha="center", va="center")
+    for k, key in enumerate(keys):
+        cell = recorded.cells.get(key) if key else None
+        if cell is None:
+            continue
+        x = x0 + k * slot_w
+        if cell.not_fed:
+            ax.plot([x + 0.6, x + slot_w - 0.6], [y + h - 0.6, y + 0.6], color=FILL_COLOR, lw=0.9)
+        for j, value in enumerate((cell.dead, cell.left)):
+            if value not in (None, ""):
+                s = str(value)
+                _filled(ax, x + (j + 0.5) * slot_w / 2, mid, s, size=_shrink(s, slot_w / 2 - 0.8),
+                        ha="center", va="center")
+
+
+def _draw_feeding_day(ax, fixed, n_slots, x0, slot_w, y, h, day, blank_time=True):
     shade = SHADE if day.weekday() >= 5 else None
     for x, w, _, _ in fixed:
         _box(ax, x, y, w, h, lw=0.5, fill=shade)
@@ -267,4 +412,5 @@ def _draw_feeding_day(ax, fixed, n_slots, x0, slot_w, y, h, day):
     _text(ax, wx + 1.0, mid, M.DAY_NAMES[day.weekday()], size=7, va="center")
     plan = M.planned_food(day)
     _text(ax, px + 1.0, mid, plan, size=6.5, va="center", weight="bold" if plan == M.FEED_ALL else "normal")
-    _text(ax, tx + tw - 1.0, mid, "__:__", size=6, color=GREY, ha="right", va="center")
+    if blank_time:
+        _text(ax, tx + tw - 1.0, mid, "__:__", size=6, color=GREY, ha="right", va="center")

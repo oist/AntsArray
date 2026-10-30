@@ -9,6 +9,8 @@ import pytest
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import care_sheet as S  # noqa: E402
+import husbandry as H  # noqa: E402
+import sheet_fill as F  # noqa: E402
 import sheet_model as M  # noqa: E402
 import sheet_pages as P  # noqa: E402
 
@@ -138,10 +140,10 @@ def test_colony_arena_line_stays_clear_of_the_qr_code_and_readable(text):
 def test_render_leaves_no_pdf_when_a_page_fails(tmp_path, monkeypatch):
     real = P.draw_colony_page
 
-    def fail_on_22(colony, *args):
+    def fail_on_22(colony, *args, **kwargs):
         if colony == "22":
             raise RuntimeError("boom")
-        return real(colony, *args)
+        return real(colony, *args, **kwargs)
 
     monkeypatch.setattr(P, "draw_colony_page", fail_on_22)
     with pytest.raises(RuntimeError):
@@ -233,3 +235,152 @@ def test_main_fails_and_logs_errors(tmp_path, case, message):
     assert not out.exists()
     log = logs(tmp_path)
     assert "error:" in log and message in log
+
+
+# --- sheets filled from the log -------------------------------------------------------------
+
+FILLED_DAY = {date(2026, 10, 23): F.FeedingDay("12:55", "YK",
+                                               {"8": F.FeedingCell(1, "3", False),
+                                                "MIX": F.FeedingCell(None, "", True)})}
+PAINT_DAY = F.ColonyWeek(date(2026, 10, 29), "YK", "G+G", 4, 0, (13, 28), ("queen present",))
+COLONY_FILL = F.ColonyFill(date(2024, 10, 17), date(2026, 9, 1), [F.EMPTY_WEEK] * 4 + [PAINT_DAY],
+                           [F.ColonyEvent(date(2026, 10, 8), "15:44", "nest", "new nests", "MH")])
+
+
+def filled(fig):
+    return [t for t in fig.axes[0].texts if t.get_color() == P.FILL_COLOR]
+
+
+def extent_mm(fig, text):
+    """(x0, x1, y0, y1) of a text on the page in mm (y down)."""
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    box = text.get_window_extent(FigureCanvasAgg(fig).get_renderer())
+    (x0, y1), (x1, y0) = fig.axes[0].transData.inverted().transform(box)
+    return x0, x1, y0, y1
+
+
+def test_feeding_sheet_prints_the_recorded_round_and_cells():
+    fig = P.draw_feeding_page(OCT, 2, ["8", "Mix"], None, fill=FILLED_DAY)
+    assert sorted(t.get_text() for t in filled(fig)) == ["1", "12:55", "3", "YK"]
+    ax = fig.axes[0]
+    assert len([line for line in ax.lines if line.get_color() == P.FILL_COLOR]) == 1    # Mix not fed
+    assert sum(t.get_text() == "__:__" for t in ax.texts) == 15                          # 16 days, 1 filled
+
+
+def test_colony_sheet_prints_the_header_dates_weeks_and_events():
+    from matplotlib.colors import to_hex
+    fig = P.draw_colony_page("22", OCT, None, fill=COLONY_FILL)
+    assert {t.get_text() for t in filled(fig)} == {
+        "2024-10-17", "2026-09-01", "10/29", "YK", "G+G", "4", "0", "13 28", "queen present",
+        "10/08", "15:44", "new nests", "MH"}
+    ax = fig.axes[0]
+    assert sum(t.get_text() == "Date ___/___" for t in ax.texts) == 4
+    ticks = [p for p in ax.patches if p.get_fill() and to_hex(p.get_facecolor()) == P.FILL_COLOR]
+    assert len(ticks) == 1
+
+
+def test_colony_sheet_says_how_many_events_did_not_fit():
+    events = [F.ColonyEvent(date(2026, 10, d), "", "other", "event %d" % d, "") for d in range(1, 11)]
+    fig = P.draw_colony_page("22", OCT, None, fill=F.ColonyFill(None, None, [F.EMPTY_WEEK] * 5, events))
+    texts = [t.get_text() for t in filled(fig)]
+    assert "event 7" in texts and "event 8" not in texts
+    assert "+3 more in husbandry_log.csv" in texts
+
+
+def test_filled_text_stays_inside_its_cell():
+    long = ("a long comment that goes on and on " * 12).strip()
+    week = F.ColonyWeek(date(2026, 10, 29), "YK MH", "G+G W+R", 123, 45, tuple(range(1, 40)), (long, long))
+    fill = F.ColonyFill(None, None, [F.EMPTY_WEEK] * 4 + [week],
+                        [F.ColonyEvent(date(2026, 10, 8), "15:44", "removal", long, "MH")])
+    fig = P.draw_colony_page("22", OCT, None, fill=fill)
+    cols = {title: (x, x + w) for x, w, title, _ in P._columns(P.MARGIN, P.A4_LONG - P.MARGIN, P.COLONY_COLS)}
+    event_cols = {title: (x, x + w) for x, w, title, _ in P._columns(P.MARGIN, P.A4_LONG - P.MARGIN, P.EVENT_COLS)}
+    week_bottom = P.WEEKS_BOTTOM
+    for t in filled(fig):
+        x0, x1, y0, y1 = extent_mm(fig, t)
+        if t.get_text().startswith("1 2 3"):
+            left, right = cols["Dead: tag IDs"]
+        elif t.get_text().startswith("a long") and y0 < week_bottom:
+            left, right = cols["Comments"]
+        elif t.get_text().startswith("a long"):
+            left, right = event_cols["Details"]
+            assert y1 - y0 < P.EVENT_H
+        else:
+            continue
+        assert left < x0 and x1 < right, t.get_text()[:20]
+        assert y0 < week_bottom or y1 < P.A4_SHORT - P.MARGIN - P.MARKER
+
+
+def test_filled_text_is_printed_as_written():
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    week = F.EMPTY_WEEK._replace(comments=("paid $5 and $6",))
+    events = [F.ColonyEvent(date(2026, 10, 8), "", "tray", " ", "")]
+    fig = P.draw_colony_page("22", OCT, None, fill=F.ColonyFill(None, None, [F.EMPTY_WEEK] * 4 + [week], events))
+    [comment] = [t for t in filled(fig) if "$" in t.get_text()]
+    assert comment.get_text() == "paid $5 and $6" and not comment.get_parse_math()
+    FigureCanvasAgg(fig).draw()
+
+
+def spy_pages(monkeypatch):
+    """Record the fill each page is drawn with."""
+    calls = []
+    for name in ("draw_feeding_page", "draw_colony_page"):
+        real = getattr(P, name)
+
+        def wrapper(*args, real=real, name=name, **kwargs):
+            calls.append((name, kwargs.get("fill")))
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(P, name, wrapper)
+    return calls
+
+
+def write_log(tmp_path, body):
+    p = tmp_path / "husbandry_log.csv"
+    p.write_text(",".join(H.FIELDS) + "\n" + body, encoding="utf-8")
+    return p
+
+
+LOG_BODY = "2026-10-23,12:55,all,fed,MW+RR+J,,,,YK,src,,\n2026-10-29,,22,census,pupa,4,,,YK,src,,\n"
+
+
+def test_render_fills_the_pages_from_the_records(tmp_path, monkeypatch):
+    calls = spy_pages(monkeypatch)
+    records = F.Records(H.read_log(write_log(tmp_path, LOG_BODY)), {"22": date(2026, 7, 30)})
+    S.render(["22"], OCT, tmp_path / "s.pdf", records=records)
+    feeding = [fill for name, fill in calls if name == "draw_feeding_page"]
+    assert feeding[0] == {} and list(feeding[1]) == [date(2026, 10, 23)]
+    [colony] = [fill for name, fill in calls if name == "draw_colony_page"]
+    assert colony.collected == date(2026, 7, 30) and colony.weeks[4].pupae == 4
+
+
+def test_render_without_records_prints_blank_sheets(tmp_path, monkeypatch):
+    calls = spy_pages(monkeypatch)
+    S.render(["22"], OCT, tmp_path / "s.pdf")
+    assert [fill for _, fill in calls] == [None, None, None]
+
+
+def test_main_fills_the_sheets_from_husbandry_log(tmp_path, monkeypatch):
+    write_tables(tmp_path)
+    write_log(tmp_path, LOG_BODY)
+    calls = spy_pages(monkeypatch)
+    assert S.main(["--month", "2026-10", "--out", str(tmp_path / "s.pdf"), "--colonies-dir", str(tmp_path)]) == 0
+    log = logs(tmp_path)
+    assert "filled from" in log and "feeding days: 10/23" in log and "colony sheets with records: 22" in log
+    assert all(fill is not None for _, fill in calls)
+
+
+def test_main_blank_prints_the_sheets_without_records(tmp_path, monkeypatch):
+    write_tables(tmp_path)
+    write_log(tmp_path, LOG_BODY)
+    calls = spy_pages(monkeypatch)
+    assert S.main(["--month", "2026-10", "--out", str(tmp_path / "s.pdf"), "--colonies-dir", str(tmp_path),
+                   "--blank"]) == 0
+    assert all(fill is None for _, fill in calls)
+    assert "printed blank" in logs(tmp_path)
+
+
+def test_main_without_a_log_prints_the_sheets_without_records_and_says_so(tmp_path):
+    write_tables(tmp_path)
+    assert S.main(["--month", "2026-10", "--out", str(tmp_path / "s.pdf"), "--colonies-dir", str(tmp_path)]) == 0
+    assert "no husbandry_log.csv" in logs(tmp_path)
