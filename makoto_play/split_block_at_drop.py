@@ -105,13 +105,94 @@ def probe_gop(mkv, scan=3200):
 # --------------------------------------------------------------------------- #
 # ffmpeg split
 # --------------------------------------------------------------------------- #
-def split_one(mkv, K, head_dir, tail_dir, staging_root, verify_decode=False):
+def _packet_census(mkv, fps):
+    """Packet-header census of a file, streamed (memory ~1 byte per frame).
+
+    Returns dict(packets, keyframes, first_key, dupes, lo, hi). Display index = round((pts - pts of
+    the first packet) * fps); the first packet of a closed-GOP file is its IDR, displayed first.
+    The file holds exactly the display frames 0..packets-1 iff `_census_exact` says so."""
+    cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0",
+           "-show_entries", "packet=pts_time,flags", "-of", "csv=p=0", mkv]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            universal_newlines=True)
+    c = {"packets": 0, "keyframes": 0, "first_key": False, "dupes": 0, "lo": None, "hi": None}
+    seen = bytearray()
+    t0 = None
+    for line in proc.stdout:
+        p = line.strip().split(",")
+        if len(p) < 2 or p[0] in ("", "N/A"):
+            continue
+        t = float(p[0])
+        if t0 is None:
+            t0 = t
+            c["first_key"] = "K" in p[1]
+        idx = int(round((t - t0) * fps))
+        c["packets"] += 1
+        c["keyframes"] += "K" in p[1]
+        c["lo"] = idx if c["lo"] is None else min(c["lo"], idx)
+        c["hi"] = idx if c["hi"] is None else max(c["hi"], idx)
+        if idx < 0:
+            continue
+        if idx >= len(seen):
+            seen.extend(bytes(max(idx + 1 - len(seen), 1 << 20)))
+        c["dupes"] += seen[idx]
+        seen[idx] = 1
+    proc.wait()
+    return c
+
+
+def _census_exact(c, n):
+    """True iff the census shows exactly display frames 0..n-1, one packet each, starting on a keyframe.
+    n packets, no duplicate index, all indices within [0, n-1] => every index present (pigeonhole)."""
+    return (c["packets"] == n and n > 0 and c["dupes"] == 0 and c["first_key"]
+            and c["lo"] == 0 and c["hi"] == n - 1)
+
+
+def _census_str(c):
+    return (f"packets={c['packets']:,} keyframes={c['keyframes']} first_key={c['first_key']} "
+            f"dupes={c['dupes']} display=[{c['lo']},{c['hi']}]")
+
+
+def split_head_only(mkv, K, gop, fps, head_dir, stage):
+    """Copy only frames [0,K) of `mkv` (K must be a keyframe) and verify the result.
+
+    `-frames:v K` under stream copy writes exactly the first K packets and stops reading
+    the source there, so a long tail is neither read nor written. Because K is an IDR,
+    the first K packets in decode order are exactly the frames [0,K) in display order.
+    The census below proves it for every file: K packets whose display indices are
+    exactly 0..K-1 (a decode-order prefix always contains every frame it references, so
+    this also means every frame decodes) and ceil(K/gop) keyframes."""
+    name = os.path.basename(mkv)
+    head = os.path.join(stage, "head.mkv")
+    cmd = ["ffmpeg", "-hide_banner", "-v", "error", "-y", "-i", mkv,
+           "-map", "0:v:0", "-c", "copy", "-frames:v", str(K), "-f", "matroska", head]
+    t0 = dt.datetime.now()
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          universal_newlines=True)
+    dur = (dt.datetime.now() - t0).total_seconds()
+    if proc.returncode != 0:
+        return {"name": name, "ok": False, "err": (proc.stderr or "ffmpeg failed")[-500:]}
+    c = _packet_census(head, fps)
+    want_keys = -(-K // gop)
+    if not _census_exact(c, K) or c["keyframes"] != want_keys:
+        return {"name": name, "ok": False,
+                "err": f"head census {_census_str(c)} (expected {K:,} packets, display [0,{K - 1}], "
+                       f"{want_keys} keyframes)"}
+    os.replace(head, os.path.join(head_dir, name))
+    return {"name": name, "ok": True, "sec": dur, "head_frames": c["packets"],
+            "tail_present": False, "stage": stage}
+
+
+def split_one(mkv, K, head_dir, tail_dir, staging_root, verify_decode=False,
+              head_only=False, gop=DEFAULT_GOP, fps=DEFAULT_FPS):
     """Stream-copy split `mkv` at frame K. Returns dict(result)."""
     name = os.path.basename(mkv)
     stage = os.path.join(staging_root, name + ".stage")
     if os.path.isdir(stage):
         shutil.rmtree(stage, ignore_errors=True)
     os.makedirs(stage, exist_ok=True)
+    if head_only:
+        return split_head_only(mkv, K, gop, fps, head_dir, stage)
     seg_pat = os.path.join(stage, "seg_%03d.mkv")
     seg_list = os.path.join(stage, "seg_list.csv")
 
@@ -133,19 +214,36 @@ def split_one(mkv, K, head_dir, tail_dir, staging_root, verify_decode=False):
     seg1 = os.path.join(stage, "seg_001.mkv")
     if not os.path.exists(seg0):
         return {"name": name, "ok": False, "err": "no head segment produced"}
-    head_frames = None
+    if os.path.exists(os.path.join(stage, "seg_002.mkv")):
+        return {"name": name, "ok": False, "err": "segmenter produced more than two segments"}
+    # The segmenter cuts at the first keyframe AT OR AFTER K, so a camera whose GOP grid was
+    # shifted by an extra (scene-cut) IDR would be cut late without any error. The census proves
+    # the head is exactly frames [0,K) and the tail is a gap-free run starting on a keyframe.
+    hc = _packet_census(seg0, fps)
+    want_keys = -(-K // gop)
+    if not _census_exact(hc, K) or hc["keyframes"] != want_keys:
+        return {"name": name, "ok": False,
+                "err": f"head census {_census_str(hc)} (expected {K:,} packets, display [0,{K - 1}], "
+                       f"{want_keys} keyframes)"}
+    head_frames = hc["packets"]
     if verify_decode:
         head_frames = _decode_count(seg0)
         if head_frames != K:
             return {"name": name, "ok": False,
                     "err": f"decoded head={head_frames}, expected {K}"}
+    tail_present = os.path.exists(seg1)
+    tail_frames = 0
+    if tail_present:
+        tc = _packet_census(seg1, fps)
+        if not _census_exact(tc, tc["packets"]):
+            return {"name": name, "ok": False, "err": f"tail census {_census_str(tc)} (not gap-free)"}
+        tail_frames = tc["packets"]
 
     os.replace(seg0, os.path.join(head_dir, name))   # same volume => instant
-    tail_present = os.path.exists(seg1)
     if tail_present:
         os.replace(seg1, os.path.join(tail_dir, name))
     return {"name": name, "ok": True, "sec": dur, "head_frames": head_frames,
-            "tail_present": tail_present, "stage": stage}
+            "tail_present": tail_present, "tail_frames": tail_frames, "stage": stage}
 
 
 def _decode_count(mkv):
@@ -270,10 +368,11 @@ def tail_sidecar(orig, K, block_name):
     sc["derived"] = {
         "tool": TOOL, "from": block_name, "segment": "tail (-2)",
         "frameOffset": K, "tailFrames": tail_n,
-        "note": "DISPOSABLE tail (frames [K, end) of the original). Contains the "
-                "PC2 frame drops and the early stop. provenance.gaps/telemetry "
-                "still use ORIGINAL file-frame indices (subtract frameOffset for "
-                "tail-local). Kept only so nothing is silently discarded.",
+        "note": "tail = frames [K, end) of the original; file frame f here is original "
+                "file frame f + frameOffset. It holds whatever broke cross-camera "
+                "alignment (drops, early stops), so cameras need not agree here. "
+                "provenance.gaps/telemetry still use ORIGINAL file-frame indices "
+                "(subtract frameOffset for tail-local).",
     }
     return sc
 
@@ -300,6 +399,12 @@ def main():
                     help="decode-count head to confirm exactly K frames (slow)")
     ap.add_argument("--force", action="store_true",
                     help="redo cameras whose outputs already exist")
+    ap.add_argument("--out-dir", default=None,
+                    help="write the head here instead of <block>-1; logs and staging go under it "
+                         "too, so the source block may be read-only (e.g. /hpacquire)")
+    ap.add_argument("--head-only", action="store_true",
+                    help="keep only frames [0,K): the tail is neither read nor written "
+                         "(-frames:v K), and every head is verified by a packet census")
     args = ap.parse_args()
 
     block = os.path.abspath(args.block.rstrip("/\\"))
@@ -307,11 +412,14 @@ def main():
         sys.exit(f"not a directory: {block}")
     block_name = os.path.basename(block)
     parent = os.path.dirname(block)
-    head_dir = os.path.join(parent, block_name + "-1")
-    tail_dir = os.path.join(parent, block_name + "-2")
+    head_dir = os.path.abspath(args.out_dir) if args.out_dir else os.path.join(parent, block_name + "-1")
+    tail_dir = None if args.head_only else os.path.join(parent, block_name + "-2")
+    work_root = head_dir if args.out_dir else block      # where _split_logs / _split_staging live
+    if args.out_dir:
+        os.makedirs(head_dir, exist_ok=True)
 
     global _LOG_FH
-    logdir = os.path.join(block, "_split_logs")
+    logdir = os.path.join(work_root, "_split_logs")
     os.makedirs(logdir, exist_ok=True)
     stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     _LOG_FH = open(os.path.join(logdir, f"split_{stamp}.log"), "w", encoding="utf-8")
@@ -347,7 +455,7 @@ def main():
     dur_h = K / fps / 3600
     log(f"head = frames [0,{K:,}) = {K:,} frames (~{dur_h:.2f} h @ {fps:g}fps); "
         f"tail = [{K:,}, end)")
-    log(f"outputs: {head_dir}  +  {tail_dir}")
+    log(f"outputs: {head_dir}  +  {tail_dir or '(no tail: --head-only)'}")
 
     if args.dry_run:
         log("DRY RUN -- planned per-camera actions:")
@@ -363,25 +471,31 @@ def main():
         log("dry run complete; nothing written.")
         return
 
-    os.makedirs(head_dir, exist_ok=True)
-    os.makedirs(tail_dir, exist_ok=True)
-    staging_root = os.path.join(block, "_split_staging")
+    out_dirs = [head_dir] + ([tail_dir] if tail_dir else [])
+    for d in out_dirs:
+        os.makedirs(d, exist_ok=True)
+    staging_root = os.path.join(work_root, "_split_staging")
     os.makedirs(staging_root, exist_ok=True)
 
-    # session log + split manifest into both output dirs
+    # session log + split manifest into the output dir(s)
     for sess in glob.glob(os.path.join(block, "sess_*.txt")):
-        for d in (head_dir, tail_dir):
-            shutil.copy2(sess, os.path.join(d, os.path.basename(sess)))
+        for d in out_dirs:
+            dst = os.path.join(d, os.path.basename(sess))
+            shutil.copy2(sess, dst)
+            os.chmod(dst, 0o664)    # /hpacquire files are owner-only; the lab must read the copy
     split_info = {
         "tool": TOOL, "source_block": block, "split_frame": K, "gop": gop,
         "fps": fps, "first_dropped_pulse": (min(drop_pulses.values())
                                             if drop_pulses else None),
         "drop_pulses_per_cam": drop_pulses,
         "generated": stamp,
-        "note": "head (-1) = clean aligned frames [0,K); tail (-2) = disposable "
-                "remainder. Originals under source_block are untouched.",
+        "head_only": bool(args.head_only),
+        "note": ("head = clean aligned frames [0,K); the tail [K,end) was discarded. "
+                 "Originals under source_block are untouched." if args.head_only else
+                 "head (-1) = clean aligned frames [0,K); tail (-2) = disposable "
+                 "remainder. Originals under source_block are untouched."),
     }
-    for d in (head_dir, tail_dir):
+    for d in out_dirs:
         with open(os.path.join(d, "SPLIT_INFO.json"), "w", encoding="utf-8") as fh:
             json.dump(split_info, fh, indent=2)
 
@@ -402,7 +516,8 @@ def main():
     def work(m):
         name = os.path.basename(m)
         log(f"START {name}  ({os.path.getsize(m)/1e9:.1f} GB)")
-        r = split_one(m, K, head_dir, tail_dir, staging_root, args.verify)
+        r = split_one(m, K, head_dir, tail_dir, staging_root, args.verify,
+                      head_only=args.head_only, gop=gop, fps=fps)
         if not r["ok"]:
             log(f"FAIL  {name}: {r['err']}")
             return r
@@ -410,15 +525,19 @@ def main():
         write_sidecar(os.path.join(head_dir, name),
                       clean_head_sidecar(orig, K, block_name))
         if r["tail_present"]:
-            write_sidecar(os.path.join(tail_dir, name),
-                          tail_sidecar(orig, K, block_name))
+            tsc = tail_sidecar(orig, K, block_name)
+            want = tsc["recorder"]["framesEncoded"]
+            if r.get("tail_frames") is not None and r["tail_frames"] != want:
+                log(f"WARN  {name}: tail holds {r['tail_frames']:,} frames, sidecar implies {want:,}")
+            write_sidecar(os.path.join(tail_dir, name), tsc)
         open(os.path.join(staging_root, name + ".ok"), "w").write(stamp)
         try:
             shutil.rmtree(r["stage"])
         except OSError:
             pass
+        tail_msg = f", tail {r['tail_frames']:,}" if r.get("tail_present") else ""
         log(f"DONE  {name}  in {r['sec']/60:.1f} min "
-            f"(head {r.get('head_frames') or K} frames)")
+            f"(head {r.get('head_frames') or K:,}{tail_msg} frames, census ok)")
         return r
 
     if args.jobs <= 1:
@@ -434,9 +553,16 @@ def main():
     log(f"==== finished: {ok} ok, {len(bad)} failed ====")
     for r in bad:
         log(f"  FAILED {r['name']}: {r['err']}")
+    if bad or ok != len(todo):
+        sys.exit(1)
     if not bad and ok == len(todo):
-        log("all cameras split successfully. Originals untouched. "
-            "block-1 = clean head, block-2 = disposable tail.")
+        if args.head_only:
+            shutil.rmtree(staging_root, ignore_errors=True)   # only .ok markers remain
+            log(f"all cameras cut successfully: {head_dir} holds frames [0,{K:,}) of every "
+                "camera; tail discarded. Originals untouched.")
+        else:
+            log("all cameras split successfully. Originals untouched. "
+                "block-1 = clean head, block-2 = disposable tail.")
 
 
 if __name__ == "__main__":
