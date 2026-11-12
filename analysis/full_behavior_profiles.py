@@ -17,7 +17,7 @@ MOTION_NAMES = ['forward_peak', 'lateral_peak', 'antenna_A_mean', 'antenna_B_mea
                 'turn_mean', 'exact_contact_mean', 'exact_contact_peak']
 
 
-def state_sums(pose, starts, lengths, states, raw, n_states, batch_size=20000):
+def state_sums(pose, starts, lengths, states, raw, n_states, batch_size=20000,social_features=True):
     """Sum actual aligned coordinates and duration-weighted window features.
 
     A short tail contributes only its observed samples. Unassigned frames,
@@ -40,7 +40,7 @@ def state_sums(pose, starts, lengths, states, raw, n_states, batch_size=20000):
         assert np.isfinite(observed).all()
         window_sum = np.sum(observed * mask[:, :, None], axis=1, dtype=np.float64)
         features = np.asarray(raw[lo:hi, 24:31], dtype=np.float64)
-        assert np.isfinite(features).all()
+        assert np.isfinite(features if social_features else features[:,:5]).all()
         for j in range(20):
             posture[:, j] += np.bincount(label, weights=window_sum[:, j], minlength=n_states)
         for j in range(7):
@@ -51,6 +51,8 @@ def state_sums(pose, starts, lengths, states, raw, n_states, batch_size=20000):
 def build(root):
     """Recompute the compact summary; never refit or relabel the state model."""
     root = Path(root)
+    protocol=root/'analysis_protocol.json'
+    social=not protocol.exists() or json.loads(protocol.read_text()).get('social_features',True)
     cohort = pd.read_csv(root / 'inventory.csv').query('selected')
     dictionary_path = root / 'models/dictionary.npz'
     with np.load(dictionary_path) as z:
@@ -62,7 +64,7 @@ def build(root):
         paths = [sequence / 'pose.npy', features / 'start.npy', features / 'length.npy',
                  root / 'assignments' / name / 'state.npy', features / 'raw.npy']
         arrays = [np.load(path, mmap_mode='r') for path in paths]
-        count, shape, values = state_sums(*arrays, n_states)
+        count, shape, values = state_sums(*arrays, n_states,social_features=social)
         counts.append(count); posture.append(shape); motion.append(values)
         provenance.append(dict(ant=ant, extraction=json.loads((sequence / 'metadata.json').read_text()),
             inputs=[dict(file=str(p.relative_to(root)), bytes=p.stat().st_size,
@@ -82,6 +84,9 @@ def build(root):
         posture='Mean actual aligned coordinates, normalized by each ant median body-axis length; no PCA reconstruction',
         features='Duration-weighted means of window features; forward/lateral and peak contacts remain window maxima',
         inputs=provenance)
+    if not social:
+        metadata.update(social_features=False,unmeasured_features=MOTION_NAMES[5:],
+            weighting='Pooled observed duration across eligible individual ants; each assigned 12-Hz sample has equal weight')
     (root / 'models/state_means.json').write_text(json.dumps(metadata, indent=2) + '\n')
     table = pd.DataFrame(mean_features, columns=MOTION_NAMES)
     table.insert(0, 'observed_hours', count / HZ / 3600)

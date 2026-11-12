@@ -31,7 +31,7 @@ def track_id_from_name(path: Path) -> int | None:
 
 
 def side_from_name(path: Path) -> str | None:
-    match = re.search(r"(?:^|_)(left|right)(?:_|\.|$)", Path(path).name, flags=re.IGNORECASE)
+    match = re.search(r"(?:^|_)(left|right|single)(?:_|\.|$)", Path(path).name, flags=re.IGNORECASE)
     return match.group(1).lower() if match else None
 
 

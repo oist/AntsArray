@@ -34,6 +34,23 @@ The report includes summary figures and `right_behavior_classes.pdf`, with a
 text description for every figure. It reuses prepared inputs; it is not a
 replacement for tracking or feature extraction.
 
+## Single-ant analysis
+
+The [manual-cup workflow](../tracking/single_ant/manual_cup_tracking.md) runs
+tracking, cross-date stitching, and `tracking.single_ant.eigenposture` on
+individually housed ants. The
+[single-ant eigenposture report](single_ant_eigen_report.md) reuses the applicable
+colony methods while excluding unmeasured social features. Discovery coverage
+and local full-posture prediction eligibility are recorded separately.
+
+`single_ant_sleep_speed_report.py` compares observed posture-state membership
+with tag-position speed. Select the putative sleep labels explicitly, for
+example `--sleep-states 0 1 2`; all other observed states form the comparison
+group, and missing observations remain unknown. Reports include per-ant and
+colony/role summaries, aligned timelines, held-out-ant speed thresholds,
+stationary-bout comparisons, and temporal sensitivity checks. Outputs use a
+separate directory and preserve the source dictionary and state assignments.
+
 ## Retained preprocessing and shared code
 
 | Files | Purpose |

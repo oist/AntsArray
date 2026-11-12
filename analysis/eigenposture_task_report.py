@@ -8,7 +8,7 @@ import json
 from analysis.behavior_report_figures import add_pdf_description
 
 
-def run_analysis(output):
+def run_analysis(output, single_ant=False):
     os.environ["MPLBACKEND"] = "Agg"
     os.environ["ANTS_ROLE_OUTPUT"] = str(output)
     import matplotlib
@@ -18,9 +18,14 @@ def run_analysis(output):
     plt.close("all")
     output = Path(output)
     source = Path(__file__).with_name("eigenposture_interactive.py")
-    namespace = runpy.run_path(str(source))
+    if single_ant:
+        from analysis.single_ant_eigen_report import run_cells
+        namespace = run_cells(source)
+    else:
+        namespace = runpy.run_path(str(source))
     shutil.copy2(source, output / "eigenposture_interactive.py")
-    shutil.copy2(source.with_suffix(".md"), output / "README.md")
+    documentation = source.with_name('single_ant_eigen_report.md') if single_ant else source.with_suffix('.md')
+    shutil.copy2(documentation, output / "README.md")
     descriptions=[]
     with PdfPages(output / (namespace["SIDE"]+"_behavior_classes.pdf")) as pdf:
         for number in plt.get_fignums():
@@ -48,7 +53,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--source", type=Path, help="Full-body model packet; defaults to the block's published packet")
+    parser.add_argument('--single-ant', action='store_true', help='Use the same posture, state, class, speed and sleep cells for one cup cohort')
     args = parser.parse_args()
     if args.source is not None:
         os.environ["ANTS_BEHAVIOR_SOURCE"] = str(args.source)
-    run_analysis(args.output)
+    run_analysis(args.output, single_ant=args.single_ant)

@@ -5,21 +5,22 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import FancyBboxPatch, FancyArrowPatch
 
 
-def overview(n_states=8,n_classes=2):
+def overview(n_states=8,n_classes=2,side='right'):
     fig,ax=plt.subplots(figsize=(15,7));ax.set(xlim=(0,1),ylim=(0,1));ax.axis('off')
     def box(x,y,w,h,title,body,color):
         ax.add_patch(FancyBboxPatch((x,y),w,h,boxstyle='round,pad=0.009',fc=color,ec='#34495e',lw=1.2))
         ax.text(x+w/2,y+h-.04,title,ha='center',va='top',weight='bold',fontsize=12)
         ax.text(x+w/2,y+h/2-.025,body,ha='center',va='center',fontsize=10,linespacing=1.5)
     def arrow(a,b):ax.add_patch(FancyArrowPatch(a,b,arrowstyle='-|>',mutation_scale=17,lw=1.5,color='#34495e'))
-    box(.015,.61,.215,.29,'TRACKING','ArUco identity + SLEAP\nPosture gaps ≤1 s interpolated\nPosition and observed contacts','#edf2f7')
-    box(.265,.61,.215,.29,'STATE DEFINITION','Both colonies; >60% detected\nBody-aligned posture PCs\nUnsigned motion + contacts\nShort windows; Leiden','#e4f3ed')
+    single=side=='single'
+    box(.015,.61,.215,.29,'TRACKING','ArUco identity + SLEAP\nPosture gaps ≤1 s interpolated\n'+('Fixed manually labeled cups' if single else 'Position and observed contacts'),'#edf2f7')
+    box(.265,.61,.215,.29,'STATE DEFINITION',('Single ants; >60% detected' if single else 'Both colonies; >60% detected')+'\nBody-aligned posture PCs\n'+('Unsigned body/antenna motion' if single else 'Unsigned motion + contacts')+'\nShort windows; Leiden','#e4f3ed')
     box(.515,.61,.215,.29,'BEHAVIORAL STATES',f'{n_states}-state reference dictionary\nCheck fewer states and refits\nFlag weak states\nS0 = putative sleep state','#fff0d7')
-    box(.765,.61,.215,.29,'ANT CLASSES',f'{side.capitalize()} colony\nEach ant’s state proportions\nAll {n_states} dimensions\n{n_classes} classes; prioritize stability','#e9e5f6')
+    box(.765,.61,.215,.29,'ANT CLASSES',('Single-ant cohort' if single else f'{side.capitalize()} colony')+f'\nEach ant’s state proportions\nAll {n_states} dimensions\n{n_classes} classes; prioritize stability','#e9e5f6')
     for x in [.23,.48,.73]:arrow((x,.75),(x+.034,.75))
     box(.015,.13,.285,.29,'S0 → MOTION ENVELOPE','Body + antenna speeds during S0\nEqual-ant 95th percentiles\nFresh trailing-window motion labels','#fff0d7')
-    box(.355,.13,.285,.29,'SLEEP AND RETURNS','S0 occupancy and quiet runs\nMotion-defined sleep over time\nReturn-contact responses by class','#e5f1fa')
-    box(.695,.13,.285,.29,'CLASS ANALYSIS','Spatial occupancy emerges\nSpeed and sleep time courses\nTrip rate and time away','#e9e5f6')
+    box(.355,.13,.285,.29,'SLEEP AND ACTIVITY' if single else 'SLEEP AND RETURNS','S0 occupancy and quiet runs\nMotion-defined sleep over time\n'+('Individual daily profiles' if single else 'Return-contact responses by class'),'#e5f1fa')
+    box(.695,.13,.285,.29,'CLASS ANALYSIS',('Position within each cup\nSpeed and sleep time courses\nIndividual time-of-day profiles' if single else 'Spatial occupancy emerges\nSpeed and sleep time courses\nTrip rate and time away'),'#e9e5f6')
     arrow((.60,.61),(.60,.51));arrow((.60,.51),(.16,.51));arrow((.16,.51),(.16,.42))
     arrow((.30,.275),(.355,.275));arrow((.87,.61),(.87,.42))
     arrow((.80,.60),(.63,.43))

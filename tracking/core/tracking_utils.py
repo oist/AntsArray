@@ -572,12 +572,19 @@ def get_complete_tracks(
             cam_i = int(cam_val) if np.isfinite(cam_val) else None
             aruco_by_tag.setdefault(int(tag_id), []).append((float(ax), float(ay), cam_i))
 
+        nodes_by_instance: Dict[int, Dict[int, Tuple[float, float]]] = {}
+        redundant_instances: Dict[int, set[int]] = {}
+
         def _nodes_for_instance(inst_id: int) -> Dict[int, Tuple[float, float]]:
+            if inst_id in nodes_by_instance:
+                return nodes_by_instance[inst_id]
             inst_df = s_df[s_instance_keys == inst_id]
-            return {
+            node_dict = {
                 int(b): (float(x), float(y))
                 for b, x, y in inst_df[["Bodypoint", "X", "Y"]].itertuples(index=False)
             }
+            nodes_by_instance[inst_id] = node_dict
+            return node_dict
 
         def _track_anchor_xy_for_instance(
             tid: int,
@@ -624,7 +631,7 @@ def get_complete_tracks(
                 aruco_cam_i,
                 sleap_cam_i,
             )
-            used_inst.add(inst_id)
+            used_inst.update(redundant_instances.get(inst_id, {inst_id}))
             tag_id = inst_aruco_id.get(inst_id)
             if forced_aruco_xy is not None or tag_id == int(tid):
                 used_tag.add(int(tid))
@@ -661,6 +668,19 @@ def get_complete_tracks(
         ) -> Tuple[float, int] | None:
             if not candidates:
                 return None
+            from tracking.core.pose_candidates import duplicate_groups
+            # Collapse only verified aliases inside a camera before the nearest
+            # physical-pose decision. A partial duplicate must not displace its
+            # corresponding complete prediction just because its anchor is closer.
+            groups = duplicate_groups(candidates, _nodes_for_instance,
+                sleap_cam_by_inst, inst_aruco_id,
+                association_distance=aruco_sleap_max_distance, same_camera_only=True)
+            candidates = []
+            for group in groups:
+                representative = min(group, key=lambda item: (
+                    -sleap_fullness_by_inst.get(int(item[1]), 0), float(item[0]), int(item[1])))
+                candidates.append(representative)
+                redundant_instances.setdefault(int(representative[1]), set()).update(int(item[1]) for item in group)
             cams = {
                 sleap_cam_by_inst.get(int(inst_id))
                 for _dist, inst_id in candidates
@@ -901,8 +921,16 @@ def get_complete_tracks(
                         continue
                     if dist <= distance_limit:
                         cands.append((float(dist), inst_id))
-                if len(cands) == 1:
-                    _, inst_id = cands[0]
+                from tracking.core.pose_candidates import duplicate_groups
+                groups = duplicate_groups(cands, _nodes_for_instance,
+                    sleap_cam_by_inst, inst_aruco_id,
+                    association_distance=aruco_sleap_max_distance)
+                if len(groups) == 1:
+                    # Camera/NN aliases count as one physical hypothesis. Claim
+                    # every alias so a second lost TrackID cannot take another
+                    # view of the same observed ant later in this frame.
+                    _, inst_id = _select_sleap_candidate(groups[0])
+                    redundant_instances.setdefault(inst_id, set()).update(int(item[1]) for item in groups[0])
                     _assign_sleap_instance(int(tid), inst_id)
 
             # Finally, if the matching post-filter ArUco tag is visible but no
@@ -975,7 +1003,7 @@ def get_complete_tracks(
                     if spawn_dist > _scaled_aruco_distance_limit(age):
                         continue
 
-            used_inst.add(inst_id)
+            used_inst.update(redundant_instances.get(inst_id, {inst_id}))
             used_tag.add(tag_id)
             tid = tag_id
             aruco_xy = (float(ax), float(ay))

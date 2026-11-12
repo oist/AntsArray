@@ -80,15 +80,15 @@ def contacts(block,output,ants):
     meta.write_text(json.dumps(fingerprint,indent=2)+'\n');print('Exact contacts ready',flush=True)
 
 
-def align_body(xy,scale):
+def align_body(xy,scale,axis_bounds=(.1,1.25),max_landmark_mm=5.):
     """All ten points; tag origin, petiole->tag anterior, reflection retained."""
     axis=xy[:,0]-xy[:,2];length=np.linalg.norm(axis,axis=1)
     anterior=axis/np.maximum(length[:,None],1e-12);lateral=np.column_stack([-anterior[:,1],anterior[:,0]])
     relative=xy-xy[:,0:1]
     aligned=np.stack([(relative*anterior[:,None]).sum(axis=2),
         (relative*lateral[:,None]).sum(axis=2)],axis=2)*MM_PER_PX/scale
-    good=np.isfinite(aligned).all(axis=(1,2))&(length*MM_PER_PX>=.1)&(length*MM_PER_PX<=1.25)
-    good&=(np.linalg.norm(relative,axis=2)*MM_PER_PX<=5).all(axis=1)
+    good=np.isfinite(aligned).all(axis=(1,2))&(length*MM_PER_PX>=axis_bounds[0])&(length*MM_PER_PX<=axis_bounds[1])
+    good&=(np.linalg.norm(relative,axis=2)*MM_PER_PX<=max_landmark_mm).all(axis=1)
     aligned[~good]=np.nan
     return aligned,anterior,good
 
@@ -98,6 +98,12 @@ def extract_one(task):
     root=output/'sequences'/row['ant'].replace(':','_');root.mkdir(parents=True,exist_ok=True)
     source=Path(row.get('source_path',block/'stitched/per_track'/row['track_name']))
     signature=dict(source=stamp(source),measurement_version='full_body_camera_v2',smoothing_radius_frames=5)
+    geometry={}
+    protocol=output/'analysis_protocol.json'
+    if protocol.exists() and json.loads(protocol.read_text()).get('mode')=='single_ant':
+        config=json.loads((output/'geometry.json').read_text())
+        geometry=dict(axis_bounds=config['axis_bounds_mm'],max_landmark_mm=config['max_landmark_mm'])
+        signature['geometry']=geometry
     meta=root/'metadata.json'
     if meta.exists() and meta.stat().st_size and json.loads(meta.read_text())['signature']==signature:
         return dict(ant=row['ant'],cached=True)
@@ -125,14 +131,17 @@ def extract_one(task):
             target[f]=np.where(np.isfinite(values),values,-1).astype(np.int16)
     duplicate=(seen>1).any(axis=1);xy[duplicate]=np.nan;cam[duplicate]=-1;del seen
     lengths=np.linalg.norm(xy[:,0]-xy[:,2],axis=1)*MM_PER_PX
-    scale=float(np.nanmedian(lengths[(lengths>=.1)&(lengths<=1.25)]));m=(n+1)//2
+    bounds=geometry.get('axis_bounds',(.1,1.25))
+    scale=float(np.nanmedian(lengths[(lengths>=bounds[0])&(lengths<=bounds[1])]))
+    if not np.isfinite(scale):raise ValueError(f'No valid body-axis scale for {row["ant"]}')
+    m=(n+1)//2
     pose=np.full((m,20),np.nan,np.float32);motion=np.full((m,5),np.nan,np.float32);cameras=np.full(m,-1,np.int16)
     pose_rate=np.full((m,20),np.nan,np.float32)
     count=0;first=np.zeros(20);second=np.zeros((20,20))
     for lo in range(0,n,120000):
         hi=min(n,lo+120000);centers=np.arange(lo,hi,2)
         begin=max(0,lo-5);end=min(n,hi+5);local=centers-begin
-        shape,anterior,valid=align_body(xy[begin:end],scale)
+        shape,anterior,valid=align_body(xy[begin:end],scale,**geometry)
         aligned,derivative=camera_local_fit(shape,cam[begin:end],recording[begin:end],local)
         derivative*=FPS*scale
         # Position and posture are in the common panorama but may legitimately
@@ -157,6 +166,8 @@ def extract_one(task):
     for name,values in (('pose',pose),('motion',motion),('camera',cameras),
                         ('pose_rate',pose_rate),('recording',recording[::2])):
         np.save(root/(name+'.npy'),values)
+    if geometry:
+        np.save(root/'position.npy',position)
     assert stamp(source)==signature['source']
     np.savez(root/'moments.npz',count=count,first=first,second=second)
     result=dict(signature=signature,code_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),ant=row['ant'],

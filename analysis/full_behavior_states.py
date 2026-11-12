@@ -34,6 +34,17 @@ SETS = dict(posture4=[list(range(4)),list(range(24,29)),[29,30]],
             dynamics=[list(range(8)),list(range(24,29)),[29,30],list(range(8,16)),list(range(16,24))])
 
 
+def has_social_features(root):
+    path=Path(root)/'analysis_protocol.json'
+    return not path.exists() or json.loads(path.read_text()).get('social_features',True)
+
+
+def feature_sets(root):
+    if has_social_features(root):return SETS
+    return {name:[group for group in groups if all(column<29 for column in group)]
+            for name,groups in SETS.items()}
+
+
 def segment_windows(valid, camera, width=12, minimum=3):
     """Nonoverlapping <=1-s pieces; never bridge gaps/cameras, keep short tails."""
     valid=np.asarray(valid,bool)
@@ -56,6 +67,8 @@ def make_features(task):
     signature=dict(version='camera_local_rates_v1',
         sequence=hashlib.sha256((source/'metadata.json').read_bytes()).hexdigest(),
         pca=hashlib.sha256((root/'full_body_pca.npz').read_bytes()).hexdigest())
+    social=has_social_features(root)
+    if not social:signature['social_features']=False
     if (output/'metadata.json').exists():
         cached=json.loads((output/'metadata.json').read_text())
         if cached.get('signature')==signature:return cached
@@ -63,12 +76,14 @@ def make_features(task):
     pose=np.load(source/'pose.npy',mmap_mode='r');motion=np.load(source/'motion.npy',mmap_mode='r')
     camera=np.load(source/'recording.npy',mmap_mode='r')
     pose_rate=np.load(source/'pose_rate.npy',mmap_mode='r')
-    contact=np.load(root/'contacts'/(ant.replace(':','_')+'.npy'),mmap_mode='r')
-    coverage=np.load(root/'contacts'/(ant.split(':')[0]+'_covered.npy'),mmap_mode='r')
+    if social:
+        contact=np.load(root/'contacts'/(ant.replace(':','_')+'.npy'),mmap_mode='r')
+        coverage=np.load(root/'contacts'/(ant.split(':')[0]+'_covered.npy'),mmap_mode='r')
     with np.load(root/'full_body_pca.npz') as z:
         pc=((pose-z['center'])@z['modes'][:8].T).astype(np.float32)
         pc_rate=(pose_rate@z['modes'][:8].T).astype(np.float32)
-    valid=np.isfinite(pc).all(axis=1)&np.isfinite(motion).all(axis=1)&coverage[::2][:len(pc)]
+    valid=np.isfinite(pc).all(axis=1)&np.isfinite(motion).all(axis=1)
+    if social:valid&=coverage[::2][:len(pc)]
     # At least 250 ms is necessary for a variation/rate estimate. This is a
     # feature-support rule, not hourly/ant filtering. Audit the omitted tails.
     # Camera changes do not split body-aligned features; recordings and missing
@@ -85,13 +100,15 @@ def make_features(task):
         speeds=motion[ix]
         peaks=np.where(mask[:,:,None],speeds[:,:,:2],-np.inf).max(axis=1)
         averages=(speeds[:,:,2:]*mask[:,:,None]).sum(axis=1)/length[:,None]
-        fr=s[:,None]*2+np.arange(24)[None,:]
-        cmask=np.arange(24)[None,:]<length[:,None]*2
-        fr=np.minimum(fr,len(contact)-1)
-        hits=contact[fr]
-        exact=np.column_stack([(hits*cmask).sum(axis=1)/(length*2),np.where(cmask,hits,0).max(axis=1)])
+        exact=np.full((len(s),2),np.nan)
+        if social:
+            fr=s[:,None]*2+np.arange(24)[None,:]
+            cmask=np.arange(24)[None,:]<length[:,None]*2
+            fr=np.minimum(fr,len(contact)-1)
+            hits=contact[fr]
+            exact=np.column_stack([(hits*cmask).sum(axis=1)/(length*2),np.where(cmask,hits,0).max(axis=1)])
         features[lo:hi]=np.column_stack([mean,sd,rate,peaks,averages,exact])
-    assert np.isfinite(features).all()
+    assert np.isfinite(features if social else features[:,:29]).all()
     np.save(output/'raw.npy',features);np.save(output/'start.npy',starts);np.save(output/'length.npy',lengths)
     info=dict(signature=signature,ant=ant,n_windows=n,n_observed_samples=int(valid.sum()),n_assigned_samples=int(lengths.sum()),
               excluded_short_samples=int(valid.sum()-lengths.sum()),median_window_seconds=float(np.median(lengths)/HZ),
@@ -100,10 +117,10 @@ def make_features(task):
     return info
 
 
-def fit_normalizer(raw, representation):
+def fit_normalizer(raw, representation, groups=None):
     values=transform(raw)
     normalizer=[]
-    for columns in SETS[representation]:
+    for columns in (SETS[representation] if groups is None else groups):
         data=values[:,columns]
         normalizer.append(dict(columns=columns,center=data.mean(axis=0).tolist(),scale=max(float(np.sqrt(data.var(axis=0).sum())),1e-6)))
     return normalizer
@@ -339,7 +356,7 @@ def learn(root):
         path=output/(name+'.npz')
         if path.exists():
             search.extend(pd.read_csv(path.with_suffix('.csv')).to_dict('records'));continue
-        norm=fit_normalizer(raw,name);x=encode(raw,norm)
+        norm=fit_normalizer(raw,name,feature_sets(root)[name]);x=encode(raw,norm)
         g=graph(x);small=graph(x[keep],SEED+1)
         neighbors=NearestNeighbors(n_neighbors=5,n_jobs=4).fit(x[keep])
         d,ix=neighbors.kneighbors(x[evaluate])

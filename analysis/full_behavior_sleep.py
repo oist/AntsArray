@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from analysis.full_behavior_extract import FPS,HZ
+from analysis.single_ant_timeline import recording_support, support_mask
 
 
 def contact_history_audit(tracks,bouts,fps=FPS,prior_seconds=10):
@@ -61,7 +62,7 @@ def sleep_from_windows(starts,lengths,labels,n_frames,quiet_states,minimum_secon
     return state,bouts
 
 
-def select_quiet_states(root,body_limit=.05,antenna_limit=.15):
+def select_quiet_states(root,body_limit=.05,antenna_limit=.15,require_candidate=True):
     with np.load(root/'models/dictionary.npz') as z:raw=z['raw'];state=z['state']
     rows=[]
     for s in range(int(state.max()+1)):
@@ -76,13 +77,15 @@ def select_quiet_states(root,body_limit=.05,antenna_limit=.15):
     table=pd.DataFrame(rows)
     table['quiet_candidate']=(table.body_peak_median_mm_s<=body_limit)&(table.antenna_median_mm_s<=antenna_limit)
     quiet=table.loc[table.quiet_candidate,'state'].to_numpy(int)
-    if not len(quiet):raise ValueError('No state meets the stated quiet-state interpretation; inspect profiles, do not force a sleep state.')
+    if not len(quiet) and require_candidate:raise ValueError('No state meets the stated quiet-state interpretation; inspect profiles, do not force a sleep state.')
     return quiet,table
 
 
-def build(root,block,quiet_states=(0,),minimum_seconds=0):
+def build(root,block,quiet_states=(0,),minimum_seconds=0,require_candidate=True):
+    from analysis.sleep_motion_utils import motion_cache_root
+    motion_root=motion_cache_root(block)
     output=root/'sleep_from_states';output.mkdir(exist_ok=True)
-    auto,profiles=select_quiet_states(root)
+    auto,profiles=select_quiet_states(root,require_candidate=require_candidate)
     if quiet_states is None:quiet_states=auto
     quiet_states=list(map(int,quiet_states))
     if not quiet_states or not set(quiet_states).issubset(set(profiles.state)):
@@ -99,9 +102,11 @@ def build(root,block,quiet_states=(0,),minimum_seconds=0):
     # Re-running an interactive cell must not invalidate expensive downstream
     # context caches when the assignments and interpretation are unchanged.
     signature=hashlib.sha256(json.dumps(parameters,sort_keys=True).encode())
+    support=recording_support(root)
+    if support is not None:signature.update(json.dumps(support,sort_keys=True).encode())
     signature.update((root/'inventory.csv').read_bytes())
     for ant in inventory.itertuples():
-        signature.update((block/'stitched/sleep_motion/per_track'/Path(ant.track_name).stem/'sleep_motion_metadata.json').read_bytes())
+        signature.update((motion_root/'per_track'/Path(ant.track_name).stem/'sleep_motion_metadata.json').read_bytes())
         if ant.selected:
             name=ant.ant.replace(':','_')
             for path in (root/'features'/name/'start.npy',root/'features'/name/'length.npy',root/'assignments'/name/'state.npy'):
@@ -119,11 +124,14 @@ def build(root,block,quiet_states=(0,),minimum_seconds=0):
             start=np.load(root/'features'/name/'start.npy');length=np.load(root/'features'/name/'length.npy')
             labels=np.load(root/'assignments'/name/'state.npy')
             state,bouts=sleep_from_windows(start,length,labels,n,quiet_states,minimum_seconds)
+            if support is not None:
+                state[~support_mask(support,len(state))]=-1
+                bouts=quiet_bouts(state)
             bouts=bouts.assign(ant=ant.ant,side=ant.side,track_id=ant.track_id)
             all_bouts.append(bouts)
         else:state=np.full(n,-1,np.int8)
         # Match the motion cache's global-frame origin for downstream utilities.
-        motion=json.loads((block/'stitched/sleep_motion/per_track'/Path(ant.track_name).stem/'sleep_motion_metadata.json').read_text())
+        motion=json.loads((motion_root/'per_track'/Path(ant.track_name).stem/'sleep_motion_metadata.json').read_text())
         lo,hi=int(motion['frame_min']),int(motion['frame_max'])+1
         folder=output/'per_track'/Path(ant.track_name).stem;folder.mkdir(parents=True,exist_ok=True)
         np.save(folder/'sleep_state.npy',state[lo:hi])

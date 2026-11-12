@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 
 from analysis import sleep_motion_utils as sm
+from analysis.single_ant_timeline import recording_support, support_mask
 from analysis.compute_sleep_motion_labels import (
     _atomic_save_array, _atomic_write_json, _atomic_write_parquet, _sleep_bouts,
 )
@@ -114,7 +115,8 @@ def calibrate(source,work,output):
         n_calibration_ants=int(sample[sample.state.eq(0)].ant.nunique()),
         dictionary_sha256=sha(source/'models/dictionary.npz'),inventory_sha256=sha(source/'inventory.csv'),
         calibration_samples_sha256=sha(output/'calibration_samples.parquet'),code_sha256=sha(__file__),
-        note='Motion-only readout calibrated from S0; can include S1 and other low-motion observations. No cached sleep labels.'))
+        note='Motion-only readout calibrated from S0; can include S1 and other low-motion observations. No cached sleep labels.',
+        **({'recording_support':recording_support(source)} if recording_support(source) is not None else {})))
     print('S0 motion thresholds (mm/s):',limits,flush=True)
 
 
@@ -130,6 +132,12 @@ def label(source,work,output,index):
         window_seconds=parameters['window_seconds'],quiet_fraction_threshold=parameters['quiet_fraction_threshold'],
         min_valid_fraction=parameters['min_valid_frame_fraction'],require_full_window=True)
     folder=output/'per_track'/stem;folder.mkdir(parents=True,exist_ok=True);state=result['state']
+    support=recording_support(source)
+    if support is not None:
+        observed=support_mask(support,len(state),motion['frame_min'],round(parameters['window_seconds']*motion['fps']))
+        state[~observed]=-1
+        result['quiet_fraction'][~observed]=np.nan
+        result['valid_fraction'][~observed]=0
     for name,key,dtype in [('sleep_state','state',np.int8),('quiet_fraction','quiet_fraction',np.float16),('valid_fraction','valid_fraction',np.float16)]:
         _atomic_save_array(folder/(name+'.npy'),result[key].astype(dtype))
     bouts=_sleep_bouts(state,result['quiet_fraction'],result['valid_fraction'],frame_min=motion['frame_min'],fps=motion['fps'])

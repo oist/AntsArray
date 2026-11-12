@@ -26,6 +26,8 @@ def side_from_track(track_name: str, track_dir: Path | None = None) -> str | Non
         return "left"
     if stem.endswith("_right.parquet") or stem.endswith("_right") or dir_name.endswith("_right"):
         return "right"
+    if stem.endswith("_single.parquet") or stem.endswith("_single") or dir_name.endswith("_single"):
+        return "single"
     return None
 
 
@@ -120,6 +122,14 @@ def recording_context(dataset_root: Path, tracks: pd.DataFrame) -> dict:
                     recording_date=start.strftime("%Y%m%d"), frame_min=0,
                     frame_stop=int(meta["num_frames"]), fps=float(meta["fps"]),
                     blocks=[block["name"] for block in meta["blocks"]])
+    single=resolve_stitched_root(root)/'manifest.json'
+    if single.is_file():
+        meta=json.loads(single.read_text())
+        if meta.get('protocol','').startswith('manual_cup'):
+            start=datetime.fromisoformat(meta['start_datetime'])
+            return dict(start_clock_seconds=start.hour*3600+start.minute*60+start.second,
+                recording_date=start.strftime('%Y%m%d'),frame_min=0,frame_stop=int(meta['n_frames']),
+                fps=float(meta['fps']),blocks=[s['block'] for s in meta.get('recording_segments',[])])
     if root.name == "stitched":
         root = root.parent
     return dict(start_clock_seconds=start_time_from_track_table(tracks),

@@ -30,6 +30,11 @@ dashboards have been removed; their committed versions remain in Git history.
 See [analysis workflows](analysis/README.md)
 and [block combination](tracking/colony/block_combination.md) for entry points.
 
+For individually housed ants, use the
+[manual-cup workflow](tracking/single_ant/manual_cup_tracking.md). It provides
+tracking and cross-date stitching, single-ant eigenposture analysis, observed
+state exports, and sleep/speed reports with an explicit putative sleep-state set.
+
 Matching a local run also requires the same external inputs and settings:
 recordings/detections or finished tracks, calibration homographies, panorama
 annotations, and any trained SLEAP or sleep-classifier model. These are dataset

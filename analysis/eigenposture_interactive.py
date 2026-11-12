@@ -37,9 +37,10 @@ from matplotlib.colors import ListedColormap
 BLOCK=Path(os.environ.get('ANTS_DATASET_ROOT','/home/sam-reiter/bucket/ReiterU/Ants/basler/20260724/block01'))
 SOURCE=Path(os.environ.get('ANTS_BEHAVIOR_SOURCE',str(BLOCK/'analysis_outputs/full_body_behavior_20261011')))
 SIDE=os.environ.get('ANTS_COLONY_SIDE','right')
-assert SIDE in ('left','right')
-ROLE_MODELS=Path(os.environ.get('ANTS_ROLE_MODELS',str(SOURCE/('roles' if SIDE=='right' else 'roles_left'))))
-OUTPUT=Path(os.environ.get('ANTS_ROLE_OUTPUT',str(SOURCE/('report' if SIDE=='right' else 'report_left'))))
+assert SIDE in ('left','right','single')
+SINGLE=SIDE=='single'
+ROLE_MODELS=Path(os.environ.get('ANTS_ROLE_MODELS',str(SOURCE/('roles' if SIDE!='left' else 'roles_left'))))
+OUTPUT=Path(os.environ.get('ANTS_ROLE_OUTPUT',str(SOURCE/('report' if SIDE!='left' else 'report_left'))))
 REDUCTION=Path(os.environ.get('ANTS_REDUCTION_AUDIT',str(SOURCE/'reduction_20261011')))
 ROLE_REDUCTION=Path(os.environ.get('ANTS_ROLE_REDUCTION_AUDIT',str(REDUCTION if SIDE=='right' else SOURCE/'reduction_left_20261011')))
 LIGHT_ON,LIGHT_OFF=5.5,19.5
@@ -189,6 +190,7 @@ mean_pose,mean_features=state_means['mean_pose'],state_means['mean_features']
 assert mean_pose.shape==(n_states,10,2) and mean_features.shape==(n_states,7)
 np.testing.assert_array_equal(state_means['ants'],cohort.ant.to_numpy(str))
 mean_table=pd.DataFrame(mean_features,columns=state_means['feature_names'])
+if SINGLE:mean_table=mean_table.iloc[:,:5]
 mean_table.insert(0,'observed_hours',state_means['sample_count']/HZ/3600)
 mean_table.insert(0,'state',np.arange(n_states));mean_table.to_csv(OUTPUT/'state_mean_features.csv',index=False)
 pd.DataFrame(mean_pose.reshape(n_states,20),index=state_names,
@@ -213,21 +215,23 @@ for s in range(n_states):
 # A common raw color scale would mix mm/s, rad/s and partner counts. Normalize
 # each column between its smallest/largest state mean, printing the raw values.
 # These are pooled means, unlike the ant-balanced dictionary medians above.
-scaled=(mean_features-mean_features.min(axis=0))/np.maximum(np.ptp(mean_features,axis=0),1e-12)
+display_features=mean_features[:,:5] if SINGLE else mean_features
+scaled=(display_features-display_features.min(axis=0))/np.maximum(np.ptp(display_features,axis=0),1e-12)
 ax=fig.add_subplot(grid[-1,:]);image=ax.imshow(scaled,aspect='auto',cmap='viridis',vmin=0,vmax=1)
 feature_labels=['Forward peak\n(mm/s)','Lateral peak\n(mm/s)','Antenna A mean\n(mm/s)',
     'Antenna B mean\n(mm/s)','Turning mean\n(rad/s)','Contact mean\n(partners)','Contact peak\n(partners)']
-ax.set(xticks=np.arange(7),xticklabels=feature_labels,yticks=np.arange(n_states),yticklabels=state_names)
+feature_labels=feature_labels[:display_features.shape[1]]
+ax.set(xticks=np.arange(len(feature_labels)),xticklabels=feature_labels,yticks=np.arange(n_states),yticklabels=state_names)
 for s in range(n_states):
-    for j in range(7):ax.text(j,s,f'{mean_features[s,j]:.3g}',ha='center',va='center',color='black' if scaled[s,j]>.5 else 'white')
-ax.axvline(4.5,color='white',lw=2)
+    for j in range(len(feature_labels)):ax.text(j,s,f'{display_features[s,j]:.3g}',ha='center',va='center',color='black' if scaled[s,j]>.5 else 'white')
+if not SINGLE:ax.axvline(4.5,color='white',lw=2)
 fig.colorbar(image,ax=ax,pad=.02,label='Within-feature scale: lowest → highest state mean')
-fig.suptitle('4b. Mean posture and velocity / interaction features by behavioral state',fontsize=14)
+fig.suptitle('4b. Mean posture and '+('velocity features' if SINGLE else 'velocity / interaction features')+' by behavioral state',fontsize=14)
 fig.text(.08,.065,'Postures: body in teal, antennae in orange; anterior points right. All panels use the same body-normalized scale.\n'
-    'Heatmap numbers: observed-duration-weighted means. Forward/lateral speeds and peak contacts are maxima within ≤1 s windows.\n'
-    f"Both colonies: {len(cohort)} ants; {state_means['sample_count'].sum():,} assigned posture observations. Color is scaled separately for each feature.",fontsize=9,linespacing=1.6)
+    'Heatmap numbers: observed-duration-weighted means. '+('Forward/lateral speeds are maxima within ≤1 s windows.\n' if SINGLE else 'Forward/lateral speeds and peak contacts are maxima within ≤1 s windows.\n')+
+    ('Single-ant cohort: ' if SINGLE else 'Both colonies: ')+f"{len(cohort)} ants; {state_means['sample_count'].sum():,} assigned posture observations. Color is scaled separately for each feature.",fontsize=9,linespacing=1.6)
 show('04_mean_posture_motion')
-quiet_states,motion_profiles=select_quiet_states(SOURCE)
+quiet_states,motion_profiles=select_quiet_states(SOURCE,require_candidate=not SINGLE)
 if SLEEP_STATES is not None:quiet_states=np.asarray(SLEEP_STATES,int)
 motion_profiles['putative_sleep']=motion_profiles.state.isin(quiet_states)
 motion_profiles.to_csv(OUTPUT/'state_motion_profiles.csv',index=False)
@@ -387,6 +391,7 @@ coverage=cohort[['ant','side','n_frames','detection_fraction']].merge(extraction
     pd.read_csv(SOURCE/'feature_coverage.csv'),on='ant',validate='one_to_one')
 assert len(coverage)==len(cohort)
 stages=['detection_fraction','posture_fraction','motion_fraction','contact_fraction','assigned_fraction']
+if SINGLE:stages[3]='feature_support_fraction'
 for target,column in zip(stages[1:],['valid_pose_samples','valid_motion_samples','n_observed_samples','n_assigned_samples']):
     coverage[target]=coverage[column]/coverage.total_samples
 assert (np.diff(coverage[stages[1:]].to_numpy(),axis=1)<=0).all()
@@ -398,7 +403,7 @@ fig,ax=plt.subplots(figsize=(11,5))
 for i,(side,values) in enumerate(coverage_summary.iterrows()):
     bars=ax.bar(np.arange(len(stages))+(i-.5)*.36,values*100,width=.36,label=f'{side}: {cohort.side.eq(side).sum()} ants')
     ax.bar_label(bars,fmt='%.1f%%',fontsize=9)
-ax.set(xticks=np.arange(len(stages)),xticklabels=['Detected position','Valid full-body\nposture','+ Valid motion','+ Contacts\navailable','State assigned\n(≥250 ms segments)'],
+ax.set(xticks=np.arange(len(stages)),xticklabels=['Detected position','Valid full-body\nposture','+ Valid motion','+ Feature\nsupport' if SINGLE else '+ Contacts\navailable','State assigned\n(≥250 ms segments)'],
     ylabel='Mean ant coverage (% of full recording)',ylim=(0,100),title='6d. Where coverage is lost before state assignment')
 ax.legend()
 fig.text(.08,.025,'Posture: all 10 landmarks, geometry checks, five observations within one camera (±5 frames).\n'
@@ -537,7 +542,7 @@ ax.legend();ax.grid(alpha=.25)
 motion_sleep.to_csv(OUTPUT/'class_motion_sleep.csv',index=False)
 motion_ant_sleep.to_parquet(OUTPUT/'ant_motion_sleep_bins.parquet',index=False)
 show('05_motion_sleep')
-sleep_root = build_state_sleep(SOURCE, BLOCK, quiet_states, MIN_SLEEP_SECONDS)
+sleep_root = build_state_sleep(SOURCE, BLOCK, quiet_states, MIN_SLEEP_SECONDS,require_candidate=not SINGLE)
 bouts=pd.read_parquet(sleep_root/'quiet_bouts.parquet').merge(
     cluster_ids[['side','track_id','cluster_id']],on=['side','track_id'],how='inner',validate='many_to_one')
 fig,ax=plt.subplots(figsize=(8,4),layout='constrained')
@@ -558,7 +563,14 @@ ant_summary=ants[['ant','side','track_id','track_name','ant_class']].merge(
     pd.read_csv(sleep_root/'ant_quiet_summary.csv')[['side','track_id','classified_seconds','quiet_seconds']],
     on=['side','track_id'],validate='one_to_one')
 ant_summary['sleep_fraction']=ant_summary.quiet_seconds/ant_summary.classified_seconds
-if MIN_SLEEP_SECONDS==0:np.testing.assert_allclose(ant_summary.sleep_fraction,proportions[:,quiet_states].sum(axis=1))
+if MIN_SLEEP_SECONDS==0:
+    if SINGLE:
+        # Expanding 12-Hz labels to an odd raw-frame boundary can expose one
+        # unrecorded edge frame. Structural support removes it explicitly.
+        edge_allowance=2*len(context['blocks'])
+        assert np.max(np.abs(ant_summary.classified_seconds*FPS-2*counts.sum(axis=1)))<=edge_allowance
+        assert np.max(np.abs(ant_summary.quiet_seconds*FPS-2*counts[:,quiet_states].sum(axis=1)))<=edge_allowance
+    else:np.testing.assert_allclose(ant_summary.sleep_fraction,proportions[:,quiet_states].sum(axis=1))
 speed_means=[]
 for row in ant_summary.itertuples():
     folder=stitched/'speed_vectors/per_track'/Path(row.track_name).stem
