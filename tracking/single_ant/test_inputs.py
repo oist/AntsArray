@@ -1,3 +1,4 @@
+import hashlib
 import json
 
 import h5py
@@ -88,6 +89,104 @@ def test_interrupted_camera_requires_acknowledgment_and_preserves_its_short_span
     assert m["synchronization"]["diagnostics"]["cam02"]["first_block_id"] is None
     tail = next(f for f in m["files"] if f["camera"] == "cam02")
     assert tail["frames"] == 3 and tail["aruco_frames"] == 4
+
+
+def realign(block, rid="r1", chunks=(0, 1), record_gaps=None):
+    """cam02 lost trigger pulse 2: its sidecar records the gap, and its exports were re-cut
+    onto the pulse grid (tracking/colony/realign_offgrid_camera.py --sidecar-gaps) and tagged."""
+    diag = next(block.glob("cam02*.diag.json"))
+    prefix = diag.name[:-len(".mkv.diag.json")]
+    gap = dict(blockId=3, previousBlockId=1, blocksMissing=1, fileFrameIndex=2,
+               discontinuity="forward_gap")
+    d = json.loads(diag.read_text())
+    d["recorder"]["framesEncoded"] = 4
+    d["provenance"].update(gaps=[gap], lastEncodedFrame=dict(blockId=4, fileFrameIndex=3))
+    diag.write_text(json.dumps(d))
+    for i in chunks:
+        for path in (block / "data").glob(f"{prefix}_{i:03d}_*.h5"):
+            with h5py.File(path, "r+") as h:
+                h.attrs["realign_id"] = rid
+    record = dict(schema=1, kind="in_place", id=rid, installed="2026-11-16T00:00:00Z", total_frames=5,
+                  videos={prefix: dict(camera="cam02",
+                                       sidecar_gaps=[gap] if record_gaps is None else record_gaps,
+                                       sidecar_sha256=hashlib.sha256(diag.read_bytes()).hexdigest(),
+                                       unrecorded_frames=[[2, 3]],
+                                       video_frame_map=dict(entries=[[0, 0], [3, 1]]),
+                                       chunks=[dict(chunk=i) for i in chunks])})
+    (block / "REALIGN.json").write_text(json.dumps(record))
+    return prefix
+
+
+def test_lost_pulses_are_accepted_only_through_an_installed_realignment(tmp_path):
+    block, _ = exports(tmp_path)
+    realign(block)
+    record = block / "REALIGN.json"
+    kept = record.read_text()
+    record.unlink()
+    with pytest.raises(ValueError, match="realignment"):
+        detection_manifest(block)
+    record.write_text(kept)
+    m, _ = detection_manifest(block)
+    assert m["n_frames"] == 5
+    diag = m["synchronization"]["diagnostics"]["cam02"]
+    assert diag["frames"] == 5 and diag["last_block_id"] == 4 and diag["recorded_frames"] == 4
+    assert diag["realigned"] is True and diag["unrecorded_frames"] == [[2, 3]]
+    assert m["synchronization"]["realigned_cameras"] == ["cam02"]
+    assert m["synchronization"]["realignment"]["unrecorded_frames"] == {"cam02": [[2, 3]]}
+    assert m["synchronization"]["realignment"]["video_frame_map"] == {"cam02": [[0, 0], [3, 1]]}
+    assert "realigned" not in m["synchronization"]["diagnostics"]["cam01"]
+
+
+@pytest.mark.parametrize("marker", [None, "view"])
+def test_clean_blocks_report_no_realignment(tmp_path, marker):
+    block, _ = exports(tmp_path)
+    if marker == "view":
+        # realign_offgrid_camera.py's view mode writes a REALIGN.json of another kind
+        (block / "REALIGN.json").write_text(json.dumps(dict(schema=1, video="cam02_x", offset=457)))
+    m, _ = detection_manifest(block)
+    assert m["synchronization"]["realigned_cameras"] == []
+    assert m["synchronization"]["realignment"] is None
+
+
+@pytest.mark.parametrize("problem", ["gaps_differ", "redetected_chunk", "sidecar_changed",
+                                     "not_installed", "stray_camera", "chunk_missing_from_record",
+                                     "holes_differ", "total_differs"])
+def test_refuses_a_realignment_that_does_not_match_the_exports(tmp_path, problem):
+    block, _ = exports(tmp_path)
+    if problem == "gaps_differ":
+        realign(block, record_gaps=[dict(blockId=4, previousBlockId=1, blocksMissing=2,
+                                         fileFrameIndex=2, discontinuity="forward_gap")])
+    elif problem == "chunk_missing_from_record":
+        prefix = realign(block, chunks=(1,))      # chunk 0 holds the hole but is not listed
+    else:
+        prefix = realign(block)
+    record = block / "REALIGN.json"
+    if problem in ("holes_differ", "total_differs"):
+        r = json.loads(record.read_text())
+        if problem == "holes_differ":
+            r["videos"][prefix]["unrecorded_frames"] = [[3, 4]]
+        else:
+            r["total_frames"] = 6
+        record.write_text(json.dumps(r))
+    if problem == "redetected_chunk":
+        with h5py.File(next((block / "data").glob(f"{prefix}_001_sleap_data.h5")), "r+") as h:
+            del h.attrs["realign_id"]
+    elif problem == "sidecar_changed":
+        diag = next(block.glob("cam02*.diag.json"))
+        d = json.loads(diag.read_text())
+        d["recorder"]["note"] = "edited"
+        diag.write_text(json.dumps(d))
+    elif problem == "not_installed":
+        r = json.loads(record.read_text())
+        del r["installed"]
+        record.write_text(json.dumps(r))
+    elif problem == "stray_camera":
+        r = json.loads(record.read_text())
+        cam01 = next(block.glob("cam01*.diag.json")).name[:-len(".mkv.diag.json")]
+        r["videos"][cam01] = dict(r["videos"][prefix], camera="cam01")
+        record.write_text(json.dumps(r))
+    with pytest.raises(ValueError):
+        detection_manifest(block)
 
 
 def test_interrupted_mode_does_not_accept_normal_sidecars_or_internal_stream_gaps(tmp_path):
