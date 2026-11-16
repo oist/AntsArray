@@ -10,6 +10,10 @@ keyframe grid is shifted by 3, so its source chunks hold [0,13) [13,23) [23,33)
 [33,37). Every ArUco and SLEAP record stores its TRUE frame in X (and the dense
 ArUco summary stores it too), so after the re-cut a record is correct exactly
 when chunk_idx * 10 + Frame == X -- the same arithmetic stitch_tracks.py uses.
+
+The frame-drop block: the dropping camera lost 2 pulses (true frames 24-25) at
+file frame 24, so it has 35 file frames cut on the file grid [10,10,10,5]; its
+file frame f is true frame f, or f + 2 from file frame 24 on.
 """
 import json
 import os
@@ -61,12 +65,14 @@ def _worklist_cap(idx):
     return P if idx < N - 1 else TOTAL - (N - 1) * P
 
 
-def _write_chunk(data, vname, idx, first_true, n, sleap_cap=None):
-    """One chunk whose records sit on true frames first_true .. first_true+n-1."""
+def _write_chunk(data, vname, idx, first_true, n, sleap_cap=None, true_frames=None):
+    """One chunk whose local frame f holds records of true frame true_frames[f]
+    (default first_true + f)."""
     name = "%s_%03d" % (vname, idx)
     frames = np.arange(n)
-    rows = [(f, (first_true + f) % IDS, float(first_true + f), 1.0) for f in frames]
-    rows += [(f, (first_true + f + 1) % IDS, float(first_true + f), 2.0) for f in frames[::3]]
+    true = np.arange(first_true, first_true + n) if true_frames is None else np.asarray(true_frames)
+    rows = [(f, int(true[f]) % IDS, float(true[f]), 1.0) for f in frames]
+    rows += [(f, int(true[f] + 1) % IDS, float(true[f]), 2.0) for f in frames[::3]]
     tracks = np.zeros((n, IDS, 2), dtype=np.float32)
     conf = np.zeros((n, IDS), dtype=np.float32)
     for f, marker, x, y in rows:
@@ -77,7 +83,8 @@ def _write_chunk(data, vname, idx, first_true, n, sleap_cap=None):
     det["Confidence"] = np.ones(len(det), dtype=np.float32)
     save_aruco_outputs(data, name, tracks, conf, det, "h5")
 
-    rec = np.array([(f, i, b, float(first_true + f), 0.0, 0.9)
+    # Instance is a file-wide running index, as sleap2h5.py writes it
+    rec = np.array([(f, 2 * f + i, b, float(true[f]), 0.0, 0.9)
                     for f in frames for i in range(2) for b in range(3)], dtype=SLEAP_DTYPE)
     with h5py.File(os.path.join(data, name + "_sleap_data.h5"), "w") as h:
         h.attrs["source_file"] = name + ".slp"
@@ -112,6 +119,84 @@ class Block:
         shutil.rmtree(self.date, ignore_errors=True)
 
 
+# --- frame-drop block --------------------------------------------------------
+DROP = "cam03_cam2_2099-01-01-00-00-00"
+CLEAN = "cam01_cam0_2099-01-01-00-00-00"
+GAP_FILE, GAP_MISSING = 24, 2
+FILE_TOTAL = TOTAL - GAP_MISSING            # 35 file frames on the dropping camera
+DROP_LENGTHS = [P, P, P, FILE_TOTAL - 3 * P]
+
+
+def _true_of_file(f):
+    return f + (GAP_MISSING if f >= GAP_FILE else 0)
+
+
+def _sidecar(frames, gaps):
+    missing = sum(g["blocksMissing"] for g in gaps)
+    return {"schemaVersion": 2, "context": {"fps": 1.0}, "recorder": {"framesEncoded": frames},
+            "provenance": {"firstEncodedFrame": {"blockId": 0, "fileFrameIndex": 0},
+                           "lastEncodedFrame": {"blockId": frames - 1 + missing,
+                                                "fileFrameIndex": frames - 1},
+                           "gaps": gaps, "resetEvents": [], "invalidIdEvents": [],
+                           "wrapEvents": [], "eventOverflowCount": 0}}
+
+
+DROP_GAP = {"blockId": GAP_FILE + GAP_MISSING, "previousBlockId": GAP_FILE - 1,
+            "blocksMissing": GAP_MISSING, "fileFrameIndex": GAP_FILE,
+            "discontinuity": "forward_gap", "hostEpochMs": 1, "cameraTimestampTicks": 2}
+
+
+class DropBlock:
+    def __init__(self):
+        self.date = tempfile.mkdtemp(prefix="rltest_drop_")
+        self.root = os.path.join(self.date, "block01")
+        self.data = os.path.join(self.root, "data")
+        os.makedirs(self.data)
+        videos = {DROP: {"n_chunks": N, "fps": 1.0, "frame_count": FILE_TOTAL},
+                  CLEAN: {"n_chunks": N, "fps": 1.0, "frame_count": TOTAL}}
+        ps.write(self.data, ps.new_state(self.root, P, "mkv", videos, {}))
+        for v, frames, gaps in ((DROP, FILE_TOTAL, [DROP_GAP]), (CLEAN, TOTAL, [])):
+            open(os.path.join(self.root, v + ".mkv"), "w").close()
+            self.write_sidecar(v, _sidecar(frames, [dict(g) for g in gaps]))
+        start = 0
+        for c, n in enumerate(DROP_LENGTHS):
+            _write_chunk(self.data, DROP, c, 0, n,
+                         true_frames=[_true_of_file(start + f) for f in range(n)])
+            start += n
+        for c in range(N):
+            _write_chunk(self.data, CLEAN, c, c * P, min(P, TOTAL - c * P))
+
+    def sidecar_path(self, v):
+        return os.path.join(self.root, v + ".mkv.diag.json")
+
+    def write_sidecar(self, v, doc):
+        with open(self.sidecar_path(v), "w") as f:
+            json.dump(doc, f)
+
+    def cleanup(self):
+        shutil.rmtree(self.date, ignore_errors=True)
+
+
+def _assert_on_true_grid(path_prefix, i, holes=()):
+    """Every record of re-cut chunk i sits on its true frame; hole frames are empty."""
+    with h5py.File(path_prefix + "_aruco_tracks.h5", "r") as h:
+        rec = h["aruco_detections"][:]
+        assert np.all(rec["Frame"] + i * P == rec["X"])
+        dense = h["aruco_tracks"][:]
+        f, m = np.nonzero(dense[:, :, 0])
+        assert np.all(f + i * P == dense[f, m, 0])
+        for lo, hi in holes:
+            assert not np.any(dense[lo:hi]) and not np.any(h["aruco_confidences"][lo:hi])
+            assert not np.any((rec["Frame"] >= lo) & (rec["Frame"] < hi))
+    with h5py.File(path_prefix + "_sleap_data.h5", "r") as h:
+        s = h["sleap_data"][:]
+        assert np.all(s["Frame"] + i * P == s["X"])
+        keys = s["Frame"].astype(np.int64) * 10 ** 6 + s["Instance"] * 10 + s["Bodypoint"]
+        assert len(np.unique(keys)) == len(s)
+        for lo, hi in holes:
+            assert not np.any((s["Frame"] >= lo) & (s["Frame"] < hi))
+
+
 def _quiet(_msg):
     pass
 
@@ -120,9 +205,179 @@ def _quiet(_msg):
 def test_pieces_tile_the_true_grid():
     starts = roc.source_layout(SRC_LENGTHS, P, OFF, TOTAL)
     assert starts == [0, 13, 23, 33]
-    assert roc.pieces_for(0, starts, SRC_LENGTHS, P, TOTAL) == [(0, 0, 10, 0)]
-    assert roc.pieces_for(1, starts, SRC_LENGTHS, P, TOTAL) == [(0, 10, 13, 0), (1, 0, 7, 3)]
-    assert roc.pieces_for(3, starts, SRC_LENGTHS, P, TOTAL) == [(2, 7, 10, 0), (3, 0, 4, 3)]
+    runs = roc.source_runs(starts, SRC_LENGTHS)
+    assert roc.pieces_for(0, runs, P, TOTAL) == [(0, 0, 10, 0)]
+    assert roc.pieces_for(1, runs, P, TOTAL) == [(0, 10, 13, 0), (1, 0, 7, 3)]
+    assert roc.pieces_for(3, runs, P, TOTAL) == [(2, 7, 10, 0), (3, 0, 4, 3)]
+
+
+def test_drop_runs_pieces_and_holes():
+    starts = roc.source_layout(DROP_LENGTHS, P, 0, FILE_TOTAL)
+    assert starts == [0, 10, 20, 30]
+    gaps = [(GAP_FILE, GAP_MISSING)]
+    runs = roc.source_runs(starts, DROP_LENGTHS, gaps)
+    assert runs == [(0, 0, 10, 0), (1, 0, 10, 10), (2, 0, 4, 20), (2, 4, 10, 26), (3, 0, 5, 32)]
+    holes = roc.hole_spans(gaps)
+    assert holes == [(24, 26)]
+    assert roc.pieces_for(1, runs, P, TOTAL, holes) == [(1, 0, 10, 0)]
+    assert roc.pieces_for(2, runs, P, TOTAL, holes) == [(2, 0, 4, 0), (2, 4, 8, 6)]
+    assert roc.pieces_for(3, runs, P, TOTAL, holes) == [(2, 8, 10, 0), (3, 0, 5, 2)]
+    assert roc.chunk_holes(2, P, TOTAL, holes) == [[4, 6]]
+    assert roc.chunk_holes(3, P, TOTAL, holes) == []
+
+
+def test_drop_refuses_undeclared_holes_and_impossible_gaps():
+    starts = roc.source_layout(DROP_LENGTHS, P, 0, FILE_TOTAL)
+    runs = roc.source_runs(starts, DROP_LENGTHS, [(GAP_FILE, GAP_MISSING)])
+    try:
+        roc.pieces_for(2, runs, P, TOTAL)          # the 2 empty frames were not declared
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("accepted an undeclared hole")
+    for gaps in ([(0, 2)], [(FILE_TOTAL, 2)], [(GAP_FILE, 0)]):
+        try:
+            roc.source_runs(starts, DROP_LENGTHS, gaps)
+        except ValueError:
+            continue
+        raise AssertionError("accepted gap %s" % gaps)
+
+
+def test_sidecar_gaps_are_read_and_checked():
+    b = DropBlock()
+    try:
+        gaps, raw, frames = roc.sidecar_gaps(b.root, DROP)
+        assert gaps == [(GAP_FILE, GAP_MISSING)] and raw == [DROP_GAP] and frames == FILE_TOTAL
+        assert roc.sidecar_gaps(b.root, CLEAN)[0] == []
+        bad = [("lastEncodedFrame", {"blockId": FILE_TOTAL - 1, "fileFrameIndex": FILE_TOTAL - 1}),
+               ("resetEvents", [{"blockId": 3}]),
+               ("gaps", [dict(DROP_GAP, blockId=GAP_FILE + GAP_MISSING + 1)])]
+        for key, value in bad:
+            doc = _sidecar(FILE_TOTAL, [dict(DROP_GAP)])
+            doc["provenance"][key] = value
+            b.write_sidecar(DROP, doc)
+            try:
+                roc.sidecar_gaps(b.root, DROP)
+            except ValueError:
+                continue
+            raise AssertionError("accepted a sidecar with a bad %s" % key)
+    finally:
+        b.cleanup()
+
+
+def test_drop_recut_puts_every_record_on_its_true_frame():
+    b = DropBlock()
+    out = tempfile.mkdtemp(prefix="rltest_out_")
+    try:
+        lengths, rows = roc.realign_video(b.data, out, DROP, N, P, 0, TOTAL, _quiet, False,
+                                          gaps=[(GAP_FILE, GAP_MISSING)])
+        assert lengths == DROP_LENGTHS
+        assert [r["frames"] for r in rows] == [10, 10, 10, 7]
+        assert [r["holes"] for r in rows] == [[], [], [[4, 6]], []]
+        assert [r["changed"] for r in rows] == [False, False, True, True]
+        for i in range(N):
+            prefix = os.path.join(out, "%s_%03d" % (DROP, i))
+            _assert_on_true_grid(prefix, i, rows[i]["holes"])
+            with h5py.File(prefix + "_sleap_data.h5", "r") as h:
+                assert int(h.attrs["frame_count"]) == int(h.attrs["expected_frames"]) == rows[i]["frames"]
+                assert json.loads(h.attrs["hole_frames"]) == rows[i]["holes"]
+            with h5py.File(prefix + "_aruco_tracks.h5", "r") as h:
+                assert int(h.attrs["num_frames"]) == rows[i]["frames"]
+                assert json.loads(h.attrs["hole_frames"]) == rows[i]["holes"]
+        counts = roc.check_conservation(b.data, DROP, lengths, rows)
+        assert counts["sleap_records"] == FILE_TOTAL * 6
+    finally:
+        b.cleanup()
+        shutil.rmtree(out, ignore_errors=True)
+
+
+def test_only_changed_chunks_are_written():
+    b = DropBlock()
+    out = tempfile.mkdtemp(prefix="rltest_out_")
+    try:
+        lengths, rows = roc.realign_video(b.data, out, DROP, N, P, 0, TOTAL, _quiet, False,
+                                          gaps=[(GAP_FILE, GAP_MISSING)], only_changed=True,
+                                          realign_id="abc")
+        written = sorted(os.listdir(out))
+        assert written == sorted("%s_%03d%s" % (DROP, i, s) for i in (2, 3)
+                                 for s in ("_aruco_tracks.h5", "_aruco_detections.h5", "_sleap_data.h5"))
+        with h5py.File(os.path.join(out, "%s_002_sleap_data.h5" % DROP), "r") as h:
+            assert h.attrs["realign_id"] == "abc"
+        with h5py.File(os.path.join(out, "%s_002_aruco_tracks.h5" % DROP), "r") as h:
+            assert h.attrs["realign_id"] == "abc"
+        roc.check_conservation(b.data, DROP, lengths, rows)
+    finally:
+        b.cleanup()
+        shutil.rmtree(out, ignore_errors=True)
+
+
+def _stage(b, stage):
+    return roc.main(["--block", b.root, "--video", DROP, "--sidecar-gaps",
+                     "--stage", stage, "--group", ""])
+
+
+def test_stage_and_install_in_place():
+    b = DropBlock()
+    stage = tempfile.mkdtemp(prefix="rltest_stage_")
+    try:
+        assert _stage(b, stage) == 0
+        with open(os.path.join(stage, roc.MARKER)) as f:
+            record = json.load(f)
+        assert record["kind"] == "in_place" and record["total_frames"] == TOTAL
+        entry = record["videos"][DROP]
+        assert entry["camera"] == "cam03" and entry["sidecar_gaps"] == [DROP_GAP]
+        assert entry["unrecorded_frames"] == [[24, 26]] and entry["recorded_frames"] == FILE_TOTAL
+        assert [c["chunk"] for c in entry["chunks"]] == [2, 3]
+        assert not os.path.exists(os.path.join(b.root, roc.MARKER))       # staging writes nothing
+        assert not os.path.exists(os.path.join(b.data, roc.ORIGINALS))
+
+        assert roc.main(["--block", b.root, "--install", stage, "--group", ""]) == 0
+        with open(os.path.join(b.root, roc.MARKER)) as f:
+            installed = json.load(f)
+        assert installed["id"] == record["id"] and installed["installed"]
+        for i in range(N):
+            prefix = os.path.join(b.data, "%s_%03d" % (DROP, i))
+            _assert_on_true_grid(prefix, i, [[4, 6]] if i == 2 else [])
+            with h5py.File(prefix + "_sleap_data.h5", "r") as h:
+                assert (h.attrs.get("realign_id") == record["id"]) == (i >= 2)
+        for i in (2, 3):
+            for s in ("_aruco_tracks.h5", "_aruco_detections.h5", "_sleap_data.h5"):
+                assert os.path.isfile(os.path.join(b.data, roc.ORIGINALS, "%s_%03d%s" % (DROP, i, s)))
+            assert os.path.isfile(os.path.join(b.data, "%s_%03d.slp" % (DROP, i)))  # .slp stay
+        assert not any(n.startswith(CLEAN) for n in os.listdir(os.path.join(b.data, roc.ORIGINALS)))
+        # installing again is a no-op
+        assert roc.main(["--block", b.root, "--install", stage, "--group", ""]) == 0
+    finally:
+        b.cleanup()
+        shutil.rmtree(stage, ignore_errors=True)
+
+
+def test_install_refuses_a_source_changed_after_staging():
+    b = DropBlock()
+    stage = tempfile.mkdtemp(prefix="rltest_stage_")
+    try:
+        assert _stage(b, stage) == 0
+        with h5py.File(os.path.join(b.data, "%s_003_sleap_data.h5" % DROP), "r+") as h:
+            h.attrs["touched"] = 1
+        assert roc.main(["--block", b.root, "--install", stage, "--group", ""]) == 2
+        assert not os.path.exists(os.path.join(b.root, roc.MARKER))
+        assert not os.path.exists(os.path.join(b.data, roc.ORIGINALS))
+    finally:
+        b.cleanup()
+        shutil.rmtree(stage, ignore_errors=True)
+
+
+def test_stage_refuses_a_drop_that_does_not_match_the_clean_cameras():
+    b = DropBlock()
+    stage = tempfile.mkdtemp(prefix="rltest_stage_")
+    try:
+        gap = dict(DROP_GAP, blocksMissing=3, blockId=GAP_FILE + 3)
+        b.write_sidecar(DROP, _sidecar(FILE_TOTAL, [gap]))
+        assert _stage(b, stage) == 2
+        assert not os.path.exists(os.path.join(stage, roc.MARKER))
+    finally:
+        b.cleanup()
+        shutil.rmtree(stage, ignore_errors=True)
 
 
 def test_layout_refuses_an_inconsistent_shift():
