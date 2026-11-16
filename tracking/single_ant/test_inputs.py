@@ -106,7 +106,7 @@ def realign(block, rid="r1", chunks=(0, 1), record_gaps=None):
         for path in (block / "data").glob(f"{prefix}_{i:03d}_*.h5"):
             with h5py.File(path, "r+") as h:
                 h.attrs["realign_id"] = rid
-    record = dict(schema=1, kind="in_place", id=rid, installed="2026-11-16T00:00:00Z",
+    record = dict(schema=1, kind="in_place", id=rid, installed="2026-11-16T00:00:00Z", total_frames=5,
                   videos={prefix: dict(camera="cam02",
                                        sidecar_gaps=[gap] if record_gaps is None else record_gaps,
                                        sidecar_sha256=hashlib.sha256(diag.read_bytes()).hexdigest(),
@@ -137,23 +137,37 @@ def test_lost_pulses_are_accepted_only_through_an_installed_realignment(tmp_path
     assert "realigned" not in m["synchronization"]["diagnostics"]["cam01"]
 
 
-def test_clean_blocks_report_no_realignment(tmp_path):
+@pytest.mark.parametrize("marker", [None, "view"])
+def test_clean_blocks_report_no_realignment(tmp_path, marker):
     block, _ = exports(tmp_path)
+    if marker == "view":
+        # realign_offgrid_camera.py's view mode writes a REALIGN.json of another kind
+        (block / "REALIGN.json").write_text(json.dumps(dict(schema=1, video="cam02_x", offset=457)))
     m, _ = detection_manifest(block)
     assert m["synchronization"]["realigned_cameras"] == []
     assert m["synchronization"]["realignment"] is None
 
 
 @pytest.mark.parametrize("problem", ["gaps_differ", "redetected_chunk", "sidecar_changed",
-                                     "not_installed", "stray_camera"])
+                                     "not_installed", "stray_camera", "chunk_missing_from_record",
+                                     "holes_differ", "total_differs"])
 def test_refuses_a_realignment_that_does_not_match_the_exports(tmp_path, problem):
     block, _ = exports(tmp_path)
     if problem == "gaps_differ":
         realign(block, record_gaps=[dict(blockId=4, previousBlockId=1, blocksMissing=2,
                                          fileFrameIndex=2, discontinuity="forward_gap")])
+    elif problem == "chunk_missing_from_record":
+        prefix = realign(block, chunks=(1,))      # chunk 0 holds the hole but is not listed
     else:
         prefix = realign(block)
     record = block / "REALIGN.json"
+    if problem in ("holes_differ", "total_differs"):
+        r = json.loads(record.read_text())
+        if problem == "holes_differ":
+            r["videos"][prefix]["unrecorded_frames"] = [[3, 4]]
+        else:
+            r["total_frames"] = 6
+        record.write_text(json.dumps(r))
     if problem == "redetected_chunk":
         with h5py.File(next((block / "data").glob(f"{prefix}_001_sleap_data.h5")), "r+") as h:
             del h.attrs["realign_id"]

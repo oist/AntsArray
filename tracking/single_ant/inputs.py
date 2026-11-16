@@ -30,27 +30,47 @@ def realignment(block):
     if not path.is_file():
         return None
     record = json.loads(path.read_text())
-    if (record.get("schema") != 1 or record.get("kind") != "in_place" or not record.get("id")
-            or not record.get("installed")):
+    if record.get("kind") != "in_place":
+        return None     # the view-mode marker of an off-grid re-cut: no lost pulses involved
+    if record.get("schema") != 1 or not record.get("id") or not record.get("installed"):
         raise ValueError(f"Not an installed in-place realignment record: {path}")
     return dict(record, path=str(path), sha256=sha256(path))
+
+
+def lost_pulse_spans(gaps):
+    """Pulse spans [lo, hi) that a camera's sidecar gaps leave without a frame."""
+    spans, lost = [], 0
+    for g in sorted(gaps, key=lambda g: int(g["fileFrameIndex"])):
+        start = int(g["fileFrameIndex"]) + lost
+        lost += int(g["blocksMissing"])
+        spans.append([start, start + int(g["blocksMissing"])])
+    return spans
 
 
 def realigned_entry(record, prefix, diag, diag_sha256, gaps):
     """The record's entry for a camera whose sidecar shows lost pulses; refuse any mismatch."""
     entry = (record or {}).get("videos", {}).get(prefix)
-    if entry is None or entry.get("sidecar_gaps") != gaps or entry.get("sidecar_sha256") != diag_sha256:
+    if (entry is None or entry.get("sidecar_gaps") != gaps or entry.get("sidecar_sha256") != diag_sha256
+            or entry.get("unrecorded_frames") != lost_pulse_spans(gaps)):
         raise ValueError(f"Lost trigger pulses need a matching installed realignment record ({REALIGN}): {diag}")
     return entry
 
 
-def check_realigned_exports(record, realigned, tags, files):
-    """Every re-cut chunk still carries the record's id (a later re-detection would not)."""
+def check_realigned_exports(record, realigned, tags, files, total):
+    """Exactly the chunks from the first lost pulse on were re-cut, and each still carries the
+    record's id (a later re-detection would not)."""
+    if int(record.get("total_frames", -1)) != total:
+        raise ValueError(f"{REALIGN} describes {record.get('total_frames')} frames, the block has {total}")
     for camera, (prefix, entry) in realigned.items():
+        first = entry["unrecorded_frames"][0][0]
+        camera_files = [f for f in files if f["camera"] == camera]
+        expected = {f["index"] for f in camera_files if f["frame_start"] + f["frames"] > first}
         listed = {int(c["chunk"]) for c in entry["chunks"]}
-        for f in (f for f in files if f["camera"] == camera):
-            tagged = tags[camera, f["index"]]
-            if tagged != ((record["id"],) * 2 if f["index"] in listed else (None, None)):
+        if listed != expected:
+            raise ValueError(f"{REALIGN} re-cut {camera} chunks {sorted(listed)}, "
+                             f"but pulses are lost from chunk {min(expected):03d} on")
+        for f in camera_files:
+            if tags[camera, f["index"]] != ((record["id"],) * 2 if f["index"] in listed else (None, None)):
                 raise ValueError(f"Exports differ from realignment {record['id']} ({REALIGN}): "
                                  f"{camera} chunk {f['index']:03d}")
     stray = set(record["videos"]) - {prefix for prefix, _ in realigned.values()}
@@ -152,8 +172,6 @@ def detection_manifest(block, regions=None, homography=None, timezone="Asia/Toky
     expected = {f"cam{i:02d}" for i in range(1, len(matrices)+1)}
     if set(cameras) != expected or not interrupted_cameras <= expected or len(rates) != 1:
         raise ValueError(f"Incomplete camera roster or incompatible FPS: {block}")
-    if record is not None:
-        check_realigned_exports(record, realigned, tags, files)
     for camera, info in cameras.items():
         if info["frames"] != diagnostics[camera]["frames"]:
             raise ValueError(f"Incomplete detection recording: {camera} in {block}")
@@ -164,6 +182,8 @@ def detection_manifest(block, regions=None, homography=None, timezone="Asia/Toky
     total = max(lengths)
     if any(v["frames"] != total and camera not in interrupted_cameras for camera, v in cameras.items()):
         raise ValueError("Common-trigger cameras have different frame counts")
+    if record is not None:
+        check_realigned_exports(record, realigned, tags, files, total)
     log = next(block.glob("sess_*.txt"))
     trigger = [line for line in log.read_text().splitlines() if "\tTX\tstart " in line]
     if len(trigger) != 1:

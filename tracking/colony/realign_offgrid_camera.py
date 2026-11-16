@@ -89,8 +89,11 @@ TRK, DET, SDAT = "_aruco_tracks.h5", "_aruco_detections.h5", "_sleap_data.h5"
 KINDS = (TRK, DET, SDAT)
 ORIGINALS = "_pre_realign"
 IN_PLACE_NOTE = ("Only the _aruco_tracks/_aruco_detections/_sleap_data exports of the listed chunks "
-                 "were re-cut; the replaced files are in data/%s. The .slp files and the raw videos "
-                 "keep their own (file) frame numbering: use video_frame_map." % ORIGINALS)
+                 "were re-cut; the replaced files are in data/%s. The files tracking reads "
+                 "(_aruco_tracks.h5, _sleap_data.h5) carry realign_id; _aruco_detections.h5 is covered "
+                 "by its sha256 here only. SLEAP Instance is renumbered as a running index per file. "
+                 "The .slp files and the raw videos keep their own (file) frame numbering: use "
+                 "video_frame_map." % ORIGINALS)
 
 
 def _utcnow():
@@ -196,6 +199,9 @@ def pieces_for(i, runs, per_chunk, total, holes=()):
         a, b = max(lo, t_lo), min(hi, t_lo + s_hi - s_lo)
         if a < b:
             out.append((c, s_lo + a - t_lo, s_lo + b - t_lo, a - lo))
+    out.sort(key=lambda p: p[3])
+    if any(a[3] + a[2] - a[1] > b[3] for a, b in zip(out, out[1:])):
+        raise ValueError("true chunk %03d: source runs overlap" % i)
     empty = sum(b - a for a, b in chunk_holes(i, per_chunk, total, holes))
     if sum(p[2] - p[1] for p in out) + empty != hi - lo:
         raise ValueError("true chunk %03d is not fully covered by the source chunks" % i)
@@ -342,8 +348,21 @@ def build_chunk(pieces, cache, dst_len):
         sources.append({"src_chunk": c, "src_frames": [lo, hi], "dst_first": dst_lo,
                         "sleap_attrs": slp["attrs"]})
     return {"tracks": trk, "conf": conf,
-            "aruco": np.concatenate(a_rec), "sleap": np.concatenate(s_rec),
+            "aruco": np.concatenate(a_rec), "sleap": renumber_instances(np.concatenate(s_rec)),
             "sources": sources}
+
+
+def renumber_instances(rec):
+    """SLEAP Instance as sleap2h5.py writes it: a running index over the file, frame by frame.
+
+    Pieces from two source chunks would otherwise repeat Instance values within one file.
+    (ArUco Instance is the tag ID and is never renumbered.)
+    """
+    if len(rec):
+        key = rec["Frame"].astype(np.int64) * (int(rec["Instance"].max()) + 1) + rec["Instance"]
+        _, rank = np.unique(key, return_inverse=True)
+        rec["Instance"] = rank.astype(rec.dtype["Instance"])
+    return rec
 
 
 def _realigned_from(chunk):
@@ -572,6 +591,9 @@ def plan_drop(block_dir, state, vname, all_videos):
     if frames != file_total:
         raise ValueError("%s: the sidecar has %d frames, the contract %d" % (vname, frames, file_total))
     total = file_total + sum(m for _g, m in gaps)
+    if -(-total // per_chunk) != n_chunks:
+        raise ValueError("%s: %d frames need %d chunks but it has %d; a re-cut that adds a chunk "
+                         "is not supported" % (vname, total, -(-total // per_chunk), n_chunks))
     others = set(int(v["frame_count"]) for name, v in state["chunking"]["videos"].items()
                  if name not in all_videos)
     if others != {total}:
@@ -609,6 +631,10 @@ def stage(args, log):
     data_dir = os.path.join(block_dir, "data")
     total_chunks, _cs, state = mwb.block_chunk_total(block_dir)
     require_complete(block_dir, total_chunks, state, args.allow_incomplete)
+    for done in (os.path.join(block_dir, MARKER), os.path.join(data_dir, ORIGINALS)):
+        if os.path.exists(done):
+            raise ValueError("%s exists: this block was already realigned (restore data/%s first "
+                             "to redo it)" % (done, ORIGINALS))
     out = os.path.abspath(args.stage)
     if os.path.exists(os.path.join(out, MARKER)) and not args.force:
         raise ValueError("%s already holds a staged realignment; pass --force to redo it" % out)
@@ -637,12 +663,16 @@ def stage(args, log):
     return 0
 
 
-def install_plan(record, data_dir, stage_data):
+def install_plan(record, block_dir, stage_data):
     """[(name, needs_move, sha256)] still to install. Verifies every file before anything moves."""
+    data_dir = os.path.join(block_dir, "data")
     orig_dir = os.path.join(data_dir, ORIGINALS)
     todo = []
     for vname in sorted(record["videos"]):
-        for chunk in record["videos"][vname]["chunks"]:
+        entry = record["videos"][vname]
+        if sha256_file(os.path.join(block_dir, entry["sidecar"])) != entry["sidecar_sha256"]:
+            raise ValueError("%s changed after staging" % entry["sidecar"])
+        for chunk in entry["chunks"]:
             for s in KINDS:
                 f = chunk["files"][s]
                 name = f["name"]
@@ -663,14 +693,18 @@ def install_plan(record, data_dir, stage_data):
     return todo
 
 
-def keep_logs(stage_dir, orig_dir):
+def keep_logs(stage_dir, orig_dir, log):
+    """Copy the stage/install logs next to the originals; the install itself is already done."""
     src = os.path.join(stage_dir, "realign_logs")
-    if os.path.isdir(src) and os.path.isdir(orig_dir):
-        dst = os.path.join(orig_dir, "realign_logs")
-        if not os.path.isdir(dst):
-            os.makedirs(dst)
-        for n in os.listdir(src):
-            shutil.copyfile(os.path.join(src, n), os.path.join(dst, n))
+    try:
+        if os.path.isdir(src) and os.path.isdir(orig_dir):
+            dst = os.path.join(orig_dir, "realign_logs")
+            if not os.path.isdir(dst):
+                os.makedirs(dst)
+            for n in os.listdir(src):
+                shutil.copyfile(os.path.join(src, n), os.path.join(dst, n))
+    except OSError as e:
+        log("[WARN] the install is complete, but its logs were not copied to %s: %s" % (orig_dir, e))
 
 
 def install(args, log):
@@ -690,26 +724,31 @@ def install(args, log):
             if json.load(f).get("id") != record["id"]:
                 raise ValueError("%s holds a different realignment" % target)
     log.open(os.path.join(stage_dir, "realign_logs"))
-    todo = install_plan(record, data_dir, os.path.join(stage_dir, "data"))
-    if todo and not os.path.isdir(orig_dir):
-        os.makedirs(orig_dir)
-        mwb._group_share(orig_dir, args.group, is_dir=True)
-    for name, move, new_sha in todo:
-        cur = os.path.join(data_dir, name)
-        if move:
-            os.rename(cur, os.path.join(orig_dir, name))
-        tmp = cur + ".realign_tmp"
-        shutil.copyfile(os.path.join(stage_dir, "data", name), tmp)
-        if sha256_file(tmp) != new_sha:
-            raise ValueError("the copy of %s does not match its sha256" % name)
-        os.replace(tmp, cur)
-        mwb._group_share(cur, args.group, is_dir=False)
-        log("installed %s (original -> data/%s/)" % (name, ORIGINALS))
-    if not os.path.exists(target):
-        record["installed"] = _utcnow()
-        write_json(target, record, args.group)
+    todo = install_plan(record, block_dir, os.path.join(stage_dir, "data"))
+    try:
+        if todo and not os.path.isdir(orig_dir):
+            os.makedirs(orig_dir)
+            mwb._group_share(orig_dir, args.group, is_dir=True)
+        for name, move, new_sha in todo:
+            cur = os.path.join(data_dir, name)
+            if move:
+                os.rename(cur, os.path.join(orig_dir, name))
+            tmp = cur + ".realign_tmp"
+            shutil.copyfile(os.path.join(stage_dir, "data", name), tmp)
+            if sha256_file(tmp) != new_sha:
+                raise ValueError("the copy of %s does not match its sha256" % name)
+            os.replace(tmp, cur)
+            mwb._group_share(cur, args.group, is_dir=False)
+            log("installed %s (original -> data/%s/)" % (name, ORIGINALS))
+        if not os.path.exists(target):
+            record["installed"] = _utcnow()
+            write_json(target, record, args.group)
+    except (ValueError, OSError):
+        log("[ERR] INCOMPLETE INSTALL: data/ now mixes re-cut and original files and %s is not "
+            "written (tracking refuses this block); rerun --install to finish" % MARKER)
+        raise
     log("%s: %d file(s) installed now; record %s (id %s)" % (block_dir, len(todo), target, record["id"]))
-    keep_logs(stage_dir, orig_dir)
+    keep_logs(stage_dir, orig_dir, log)
     return 0
 
 
