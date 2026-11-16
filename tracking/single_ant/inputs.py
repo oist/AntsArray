@@ -15,6 +15,47 @@ from tracking.colony.combine_blocks import fingerprint
 from tracking.single_ant.manual_cup_tracking import load_cups, sha256, validate_timing
 
 ARUCO = re.compile(r"^(cam\d+)_cam\d+_\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}_(\d+)_aruco_tracks_?\.h5$")
+REALIGN = "REALIGN.json"
+
+
+def realignment(block):
+    """The block's installed in-place frame-drop realignment, or None.
+
+    Written by tracking/colony/realign_offgrid_camera.py --sidecar-gaps: a camera that lost
+    trigger pulses on the way to the PC had its exports re-cut onto the pulse grid, with the
+    lost pulses as empty frames. Its sidecar still records the gap, so it is accepted only
+    through this record (checked against the sidecar and the exports' realign_id attrs).
+    """
+    path = Path(block) / REALIGN
+    if not path.is_file():
+        return None
+    record = json.loads(path.read_text())
+    if (record.get("schema") != 1 or record.get("kind") != "in_place" or not record.get("id")
+            or not record.get("installed")):
+        raise ValueError(f"Not an installed in-place realignment record: {path}")
+    return dict(record, path=str(path), sha256=sha256(path))
+
+
+def realigned_entry(record, prefix, diag, diag_sha256, gaps):
+    """The record's entry for a camera whose sidecar shows lost pulses; refuse any mismatch."""
+    entry = (record or {}).get("videos", {}).get(prefix)
+    if entry is None or entry.get("sidecar_gaps") != gaps or entry.get("sidecar_sha256") != diag_sha256:
+        raise ValueError(f"Lost trigger pulses need a matching installed realignment record ({REALIGN}): {diag}")
+    return entry
+
+
+def check_realigned_exports(record, realigned, tags, files):
+    """Every re-cut chunk still carries the record's id (a later re-detection would not)."""
+    for camera, (prefix, entry) in realigned.items():
+        listed = {int(c["chunk"]) for c in entry["chunks"]}
+        for f in (f for f in files if f["camera"] == camera):
+            tagged = tags[camera, f["index"]]
+            if tagged != ((record["id"],) * 2 if f["index"] in listed else (None, None)):
+                raise ValueError(f"Exports differ from realignment {record['id']} ({REALIGN}): "
+                                 f"{camera} chunk {f['index']:03d}")
+    stray = set(record["videos"]) - {prefix for prefix, _ in realigned.values()}
+    if stray:
+        raise ValueError(f"{REALIGN} lists cameras without lost pulses: {sorted(stray)}")
 
 
 def annotations(block, regions=None, homography=None):
@@ -40,6 +81,7 @@ def detection_manifest(block, regions=None, homography=None, timezone="Asia/Toky
     if matrices.ndim != 3 or matrices.shape[1:] != (3, 3) or not np.isfinite(matrices).all():
         raise ValueError("Invalid camera homographies")
     files, cameras, diagnostics, rates = [], {}, {}, set()
+    record, realigned, tags = realignment(block), {}, {}
     for path in sorted((block / "data").glob("cam*_aruco_tracks*.h5")):
         match = ARUCO.fullmatch(path.name)
         if not match:
@@ -60,6 +102,8 @@ def detection_manifest(block, regions=None, homography=None, timezone="Asia/Toky
                 raise ValueError(f"Incomplete/mismatched detection frame spans: {path}")
             if not {"Frame", "Instance", "Bodypoint", "X", "Y", "Score_node"} <= set(s["sleap_data"].dtype.names or ()):
                 raise ValueError(f"Invalid SLEAP export schema: {sleap}")
+            tags[camera, index] = tuple(None if h.attrs.get("realign_id") is None else str(h.attrs["realign_id"])
+                                        for h in (a, s))
         info = cameras.setdefault(camera, dict(chunks=[], offset=0, frames=0))
         if index != len(info["chunks"]):
             raise ValueError(f"Missing or duplicate chunk before {path}")
@@ -74,7 +118,9 @@ def detection_manifest(block, regions=None, homography=None, timezone="Asia/Toky
         if index == 0:
             diag = block / (prefix + ".mkv.diag.json")
             d = json.loads(diag.read_text())
+            diag_sha256 = sha256(diag)
             total = int(d["recorder"]["framesEncoded"])
+            recorded, entry = total, None
             interrupted = camera in interrupted_cameras
             if interrupted:
                 if (not d.get("synthesized") or "provenance" in d
@@ -85,19 +131,29 @@ def detection_manifest(block, regions=None, homography=None, timezone="Asia/Toky
                     raise ValueError(f"Missing recorder telemetry; explicitly acknowledge interrupted cameras: {diag}")
                 p = d["provenance"]
                 first, last = p["firstEncodedFrame"], p["lastEncodedFrame"]
+                if p.get("gaps"):
+                    # Lost trigger pulses: the exports were re-cut onto the pulse grid.
+                    entry = realigned_entry(record, prefix, diag, diag_sha256, p["gaps"])
+                    realigned[camera] = (prefix, entry)
+                    total += sum(int(g["blocksMissing"]) for g in p["gaps"])
                 if (first["blockId"] != 0 or first["fileFrameIndex"] != 0
-                        or last["blockId"] != total-1 or last["fileFrameIndex"] != total-1
-                        or any(p.get(key) for key in ["gaps", "resetEvents", "invalidIdEvents", "wrapEvents"])
+                        or last["blockId"] != total-1 or last["fileFrameIndex"] != recorded-1
+                        or any(p.get(key) for key in ["resetEvents", "invalidIdEvents", "wrapEvents"])
                         or p.get("eventOverflowCount", 0)):
                     raise ValueError(f"Cannot establish common-trigger alignment: {diag}")
             rates.add(float(d["context"]["fps"]))
-            diagnostics[camera] = dict(path=str(diag), sha256=sha256(diag),
+            diagnostics[camera] = dict(path=str(diag), sha256=diag_sha256,
                                        first_block_id=None if interrupted else 0,
                                        last_block_id=None if interrupted else total-1, frames=total,
                                        interrupted=interrupted, telemetry_available=not interrupted)
+            if entry is not None:
+                diagnostics[camera].update(realigned=True, recorded_frames=recorded,
+                                           unrecorded_frames=entry["unrecorded_frames"])
     expected = {f"cam{i:02d}" for i in range(1, len(matrices)+1)}
     if set(cameras) != expected or not interrupted_cameras <= expected or len(rates) != 1:
         raise ValueError(f"Incomplete camera roster or incompatible FPS: {block}")
+    if record is not None:
+        check_realigned_exports(record, realigned, tags, files)
     for camera, info in cameras.items():
         if info["frames"] != diagnostics[camera]["frames"]:
             raise ValueError(f"Incomplete detection recording: {camera} in {block}")
@@ -124,6 +180,19 @@ def detection_manifest(block, regions=None, homography=None, timezone="Asia/Toky
             origin = origin.replace(tzinfo=ZoneInfo(timezone))
     stride = int(round(fps * 1800))
     meta = json.loads(metadata.read_text())
+    limitations = []
+    if interrupted_cameras:
+        limitations.append("Interrupted cameras have no recorder telemetry; common-trigger alignment is assumed, "
+                           "and dropped frames cannot be ruled out. Their terminal ArUco-only tails are excluded.")
+    if realigned:
+        limitations.append("Realigned cameras lost trigger pulses on the way to the PC; their exports were re-cut "
+                           "onto the pulse grid and the lost pulses are empty frames (unrecorded_frames). "
+                           "Their raw video and .slp frame numbers follow video_frame_map, not the pulse.")
+    realignment_info = None if not realigned else dict(
+        path=record["path"], sha256=record["sha256"], id=record["id"],
+        unrecorded_frames={camera: entry["unrecorded_frames"] for camera, (_, entry) in sorted(realigned.items())},
+        video_frame_map={camera: entry["video_frame_map"]["entries"]
+                         for camera, (_, entry) in sorted(realigned.items())})
     result = dict(block=str(block), fps=fps, n_frames=total, cameras=cameras, files=files,
                   chunks=[dict(index=i, start=s, stop=min(s+stride, total)) for i, s in enumerate(range(0, total, stride))],
                   board_px_per_mm=1/float(meta["mm_per_pixel"]), homographies=matrices.tolist(),
@@ -131,9 +200,8 @@ def detection_manifest(block, regions=None, homography=None, timezone="Asia/Toky
                   origin=origin.isoformat(), timezone=timezone,
                   synchronization=dict(method="common hardware trigger/block IDs", diagnostics=diagnostics,
                                        alignment_assumed_cameras=sorted(interrupted_cameras),
-                                       limitation=("Interrupted cameras have no recorder telemetry; common-trigger alignment is assumed, "
-                                                   "and dropped frames cannot be ruled out. Their terminal ArUco-only tails are excluded."
-                                                   if interrupted_cameras else None),
+                                       realigned_cameras=sorted(realigned), realignment=realignment_info,
+                                       limitation=" ".join(limitations) or None,
                                        session_log=str(log), session_sha256=sha256(log), trigger_start_line=trigger[0]),
                   annotation_source=str(regions))
     validate_timing(result)
